@@ -14,7 +14,7 @@ const PRICING: Record<string, Record<string, Rate>> = {
   anthropic: {
     'claude-sonnet-5': { inUsdPer1M: 3, outUsdPer1M: 15 },
     'claude-haiku-4-5': { inUsdPer1M: 1, outUsdPer1M: 5 },
-    'claude-opus-4-8': { inUsdPer1M: 15, outUsdPer1M: 75 },
+    'claude-opus-4-8': { inUsdPer1M: 5, outUsdPer1M: 25 },
   },
   openai: {
     'gpt-4.1': { inUsdPer1M: 2, outUsdPer1M: 8 },

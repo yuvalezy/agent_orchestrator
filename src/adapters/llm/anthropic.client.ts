@@ -7,10 +7,12 @@ import { LlmProviderError, kindForStatus } from './errors';
 // top-level `output_config.format` json_schema (the current canonical mechanism,
 // confirmed against platform.claude.com docs) — the result lands in a `text`
 // content block as a JSON string. claude-sonnet-5 runs adaptive thinking ON by
-// default and does NOT support thinking:{type:'disabled'} or budget_tokens (→ 400),
-// so we send NEITHER and instead locate the answer by content.find(type==='text'),
-// which correctly skips the preceding `thinking` block (DA R41). Never logs
-// messages/headers (the messages carry the customer body; headers carry the key).
+// default; `budget_tokens` is unsupported (→ 400) and `thinking:{type:'disabled'}`
+// support is model-specific (ok on sonnet/opus, NOT on Fable-5), so we send NEITHER
+// — omitting the field is portable across every model — and locate the answer by
+// content.find(type==='text'), which skips any preceding `thinking` block (R41).
+// (Forced tool-use + strict:true is a valid alternative if the gate ever needs it.)
+// Never logs messages/headers (messages carry the customer body; headers the key).
 
 const ANTHROPIC_VERSION = '2023-06-01';
 
