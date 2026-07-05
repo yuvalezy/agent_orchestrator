@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Run the agent-orchestrator (backend-only) in a tmux session so it can be
-# restarted/inspected independently. `npm run dev` is tsx-watch, so it also
-# auto-restarts on file changes. Always kills a leftover session first — safe to
-# re-run anytime.
+# restarted/inspected independently. Always kills a leftover session first.
 #
-#   ./debug.sh                     # start (attaches if interactive)
-#   ./debug.sh --fast-reconcile    # start with WHATSAPP_RECONCILE_INTERVAL_MS=15000 (drills)
+# STABLE run by default (`tsx src/main.ts`, NO watch) — a watch server would
+# auto-reload and live-execute in-progress edits (which once processed real gate
+# data mid-build). Re-run this script to restart after a code change. Use --watch
+# ONLY for active local dev on a branch nobody is editing underneath you.
+#
+#   ./debug.sh                     # stable run (attaches if interactive)
+#   ./debug.sh --fast-reconcile    # stable + WHATSAPP_RECONCILE_INTERVAL_MS=15000 (drills)
+#   ./debug.sh --watch             # tsx-watch (auto-reload) — dev only, NOT during a build
 #   tmux capture-pane -pt ao-debug # peek at logs without attaching
 #   tmux kill-session -t ao-debug  # stop
 #
@@ -18,11 +22,16 @@ LOG_DIR="$ROOT_DIR/tmp"
 LOG_FILE="$LOG_DIR/ao-debug.log"
 mkdir -p "$LOG_DIR"
 
-# Optional: a short reconcile interval for the M1.3 gate drills.
-DEV_CMD="npm run dev"
-if [ "${1:-}" = "--fast-reconcile" ]; then
-  DEV_CMD="WHATSAPP_RECONCILE_INTERVAL_MS=15000 npm run dev"
-fi
+# Stable (non-watch) by default; opt into watch explicitly.
+RUN="npx tsx src/main.ts"
+ENVP=""
+for arg in "$@"; do
+  case "$arg" in
+    --watch) RUN="npm run dev" ;;
+    --fast-reconcile) ENVP="WHATSAPP_RECONCILE_INTERVAL_MS=15000 $ENVP" ;;
+  esac
+done
+DEV_CMD="${ENVP}${RUN}"
 
 # Kill any prior session so we always start clean.
 tmux kill-session -t "$SESSION" 2>/dev/null || true
