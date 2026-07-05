@@ -3,6 +3,10 @@ import { logger } from '../logger';
 import type { ChannelInstanceConfig } from '../ports/channel.port';
 import { buildWhatsAppAdapter } from './whatsapp-manager/factory';
 import type { WhatsAppManagerAdapter } from './whatsapp-manager/whatsapp-manager.adapter';
+import { buildEmailAdapter } from './email/factory';
+import type { EmailChannelAdapter } from './email/email-channel.adapter';
+
+type ChannelAdapterImpl = WhatsAppManagerAdapter | EmailChannelAdapter;
 
 // Channel registry loader (tasks.md 3.1). Reads channel_instances and instantiates
 // one adapter per row via a provider→factory map. Lives in the ADAPTER/composition
@@ -21,8 +25,8 @@ interface ChannelInstanceRow {
 
 export interface RegisteredChannel {
   instance: ChannelInstanceConfig;
-  /** The WA adapter when provider is implemented; null for unimplemented ones. */
-  adapter: WhatsAppManagerAdapter | null;
+  /** The adapter when the provider is implemented; null for unimplemented ones. */
+  adapter: ChannelAdapterImpl | null;
   state: 'ready' | 'unimplemented';
 }
 
@@ -55,17 +59,24 @@ export class ChannelRegistry {
     for (const row of rows) {
       const instance = toConfig(row);
       let registered: RegisteredChannel;
-      switch (row.provider) {
-        case 'whatsapp_manager':
-          registered = { instance, adapter: buildWhatsAppAdapter(instance), state: 'ready' };
-          break;
-        default:
-          // gmail (M1.6), ezy_service_desk (M1.7) — registered, not yet built.
-          logger.info(
-            { instance: row.name, provider: row.provider },
-            'channel registry: provider not implemented yet (skipped)',
-          );
-          registered = { instance, adapter: null, state: 'unimplemented' };
+      try {
+        switch (row.provider) {
+          case 'whatsapp_manager':
+            registered = { instance, adapter: buildWhatsAppAdapter(instance), state: 'ready' };
+            break;
+          case 'gmail':
+            registered = { instance, adapter: buildEmailAdapter(instance), state: 'ready' };
+            break;
+          default:
+            // ezy_service_desk (M1.7) — registered, not yet built.
+            logger.info({ instance: row.name, provider: row.provider }, 'channel registry: provider not implemented yet (skipped)');
+            registered = { instance, adapter: null, state: 'unimplemented' };
+        }
+      } catch (err) {
+        // A misconfigured instance (e.g. gmail without accountEmail/creds) must not
+        // crash the whole registry — skip it and keep the others.
+        logger.warn({ instance: row.name, provider: row.provider, reason: (err as Error)?.message }, 'channel registry: instance skipped (build failed)');
+        registered = { instance, adapter: null, state: 'unimplemented' };
       }
       registry.channels.set(row.id, registered);
     }
@@ -92,7 +103,14 @@ export class ChannelRegistry {
   /** The primary WhatsApp channel (the single whatsapp_manager instance in Phase 1). */
   whatsappPrimary(): { instance: ChannelInstanceConfig; adapter: WhatsAppManagerAdapter } | null {
     const wa = this.all().find((c) => c.instance.provider === 'whatsapp_manager' && c.adapter);
-    return wa && wa.adapter ? { instance: wa.instance, adapter: wa.adapter } : null;
+    return wa && wa.adapter ? { instance: wa.instance, adapter: wa.adapter as WhatsAppManagerAdapter } : null;
+  }
+
+  /** All ready Gmail email instances (one reconcile poller each — M1.6). */
+  emailAdapters(): Array<{ instance: ChannelInstanceConfig; adapter: EmailChannelAdapter }> {
+    return this.ready()
+      .filter((c) => c.instance.provider === 'gmail' && c.adapter)
+      .map((c) => ({ instance: c.instance, adapter: c.adapter as EmailChannelAdapter }));
   }
 
   /** Per-instance health for /health surfacing (implemented adapters only). */

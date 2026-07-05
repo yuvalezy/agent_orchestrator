@@ -7,6 +7,7 @@ import { startWorker, type WorkerDefinition } from './workers/worker-runner';
 import { ChannelRegistry } from './adapters/channel-registry';
 import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
 import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
+import { buildEmailReconcileWorker } from './adapters/email/reconcile.worker';
 import { ingestInbound } from './inbox/ingestion';
 import { credentialsStore } from './config/credentials-store';
 import { buildAdminRouter } from './adapters/admin/admin.router';
@@ -60,6 +61,21 @@ async function main(): Promise<void> {
   } else {
     logger.warn('no active whatsapp_manager channel — WhatsApp ingestion disabled');
   }
+
+  // M1.6: one email reconcile poller per ready Gmail instance (bootstrap on first
+  // run). Misconfigured instances (no OAuth/accountEmail) are skipped by the registry.
+  for (const { instance, adapter } of registry.emailAdapters()) {
+    ingestionWorkers.push(
+      buildEmailReconcileWorker({
+        instanceId: instance.id,
+        instanceName: instance.name,
+        adapter,
+        sink: ingestInbound,
+        intervalMs: env.EMAIL_RECONCILE_INTERVAL_MS,
+      }),
+    );
+  }
+  logger.info({ emailInstances: registry.emailAdapters().length }, 'email pollers registered');
 
   // M1.5b: the money-loop workers (inbox processor + Telegram callback poller).
   // Both require Telegram (the loop notifies the founder) — skip cleanly if it is

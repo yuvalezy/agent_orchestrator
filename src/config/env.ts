@@ -41,6 +41,9 @@ const envSchema = z.object({
   WHATSAPP_RECONCILE_LOOKBACK_MS: z.coerce.number().int().nonnegative().default(5_000), // boundary overlap
   WHATSAPP_RECONCILE_MAX_PAGES: z.coerce.number().int().positive().default(200), // 20k rows @ limit 100
 
+  // ── M1.6: email (Gmail) poll interval per instance (non-secret).
+  EMAIL_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+
   // ── M1.4: LLM gateway (non-secret). Provider KEYS are NOT here — resolved via
   // resolveCredential (ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY), and
   // CREDENTIALS_ENCRYPTION_KEY / ADMIN_API_KEY are read directly via process.env.

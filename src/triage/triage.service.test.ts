@@ -87,7 +87,7 @@ async function seedInbox(msgId: string, body: string | null): Promise<ClaimedInb
   return {
     id: rows[0].id, channel_instance_id: waInstanceId, channel_type: 'whatsapp',
     channel_thread_id: '50900000001', sender_address: '50900000001', sender_name: null,
-    subject: null, body, received_at: rows[0].received_at,
+    subject: null, body, received_at: rows[0].received_at, recipients: null, account_email: null,
   };
 }
 

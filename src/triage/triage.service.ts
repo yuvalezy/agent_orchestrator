@@ -17,6 +17,19 @@ import { markProcessed, markSkipped, setInboxCustomer, type ClaimedInbox } from 
 export const CANCEL_PREFIX = 'x:';
 const cancelButton = (taskRef: string) => [{ id: `${CANCEL_PREFIX}${taskRef}`, label: '❌ Cancel task' }];
 
+/** Categories that represent an explicit ask (→ a task). The rest are context. */
+export const ACTIONABLE = new Set(['bug_report', 'new_feature_request', 'custom_development', 'question_existing', 'follow_up']);
+
+/** CC-only (DM6-5): an email where the founder's own address is in CC but not TO —
+ *  a message they were merely copied on, not directly asked. */
+export function isCcOnly(row: Pick<ClaimedInbox, 'channel_type' | 'account_email' | 'recipients'>): boolean {
+  if (row.channel_type !== 'email' || !row.account_email || !row.recipients) return false;
+  const me = row.account_email.toLowerCase();
+  const to = row.recipients.to.map((a) => a.toLowerCase());
+  const cc = row.recipients.cc.map((a) => a.toLowerCase());
+  return cc.includes(me) && !to.includes(me);
+}
+
 export interface TriageDeps {
   taskTarget: TaskTargetPort;
   llm: AgentLlmPort;
@@ -103,21 +116,29 @@ export class TriageService {
     // Task refs created across this message's intents — so a second distinct intent
     // doesn't dedup into intent #1's just-created task (code-review #2).
     const createdThisRun = new Set<string>();
+    const ccOnly = isCcOnly(row);
     for (const intent of intents) {
-      await this.act(intent, { row, config, customerId, threadKey, openTasks }, createdThisRun);
+      await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly }, createdThisRun);
     }
     await markProcessed(inboxId);
   }
 
   private async act(
     intent: Intent,
-    ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[] },
+    ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[]; ccOnly: boolean },
     createdThisRun: Set<string>,
   ): Promise<void> {
     const { row, config, customerId, threadKey } = ctx;
     const inboxId = row.id;
     const projectRef = config.projectRef as string; // process() guarded non-null
     const workItemTypeRef = config.workItemTypeRef as string;
+
+    // CC-only email + non-actionable intent → context only, no task (DM6-5). An
+    // explicit ask (actionable category) on a CC'd email STILL creates.
+    if (ctx.ccOnly && !ACTIONABLE.has(intent.category)) {
+      await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'accepted' });
+      return;
+    }
 
     // Low confidence / unclear → human-in-the-loop, no task (design triage contract).
     // Record the audit row BEFORE notifying (code-review: a failed notify must not

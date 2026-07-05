@@ -20,8 +20,8 @@ const UPSERT_SQL = `
 WITH ins AS (
   INSERT INTO agent_inbox
     (channel_instance_id, channel_message_id, channel_thread_id, sender_address, sender_name,
-     direction, subject, body, raw_metadata, received_at, status)
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     direction, subject, body, raw_metadata, received_at, status, recipients)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
   ON CONFLICT (channel_instance_id, channel_message_id) DO UPDATE
      SET body         = COALESCE(agent_inbox.body, EXCLUDED.body),
          raw_metadata = EXCLUDED.raw_metadata
@@ -60,6 +60,7 @@ export async function ingestInbound(msg: InboundMessage): Promise<IngestResult> 
     JSON.stringify(msg.raw ?? null),
     msg.sentAt,
     status,
+    msg.recipients ? JSON.stringify(msg.recipients) : null,
   ]);
   let result = rows[0];
   if (!result) {
