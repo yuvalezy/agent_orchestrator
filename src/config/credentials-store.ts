@@ -66,7 +66,9 @@ class CredentialsStore {
       throw new Error('Encrypted credentials store is disabled (CREDENTIALS_ENCRYPTION_KEY not set).');
     }
     const sealed: SealedSecret = encrypt(value);
-    const last4 = value.slice(-4);
+    // Mask, never reveal: .slice(-4) would return the WHOLE value for a ≤4-char
+    // secret, and last4 is surfaced by the admin API (code-review Finding 2).
+    const last4 = value.length > 4 ? value.slice(-4) : '*'.repeat(value.length);
     const { rows } = await query<CredentialSummary>(
       `INSERT INTO credentials (name, ciphertext, iv, auth_tag, last4, updated_at)
        VALUES ($1, $2, $3, $4, $5, now())

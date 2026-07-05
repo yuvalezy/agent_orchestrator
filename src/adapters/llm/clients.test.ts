@@ -11,9 +11,9 @@ interface CapturedBody {
   model: string;
   messages: Array<{ role: string; content: string }>;
   response_format?: { type: string; json_schema?: { strict?: boolean } };
-  thinking?: { type: string };
-  tools?: Array<{ strict?: boolean }>;
-  tool_choice?: { name: string };
+  output_config?: { format?: { type?: string; schema?: object } };
+  thinking?: unknown;
+  tools?: unknown;
 }
 
 function mockFetch(status: number, jsonBody: unknown, capture?: (url: string, init: RequestInit) => void): typeof fetch {
@@ -58,20 +58,28 @@ test('DeepSeek: structured uses json_object and embeds the schema in the system 
   assert.match(sent!.messages[0].content, /JSON Schema/); // schema embedded in system
 });
 
-test('Anthropic: structured forces strict tool-use, disables thinking, parses tool_use by type', async () => {
+test('Anthropic: structured uses output_config.format, parses the text block after a thinking block', async () => {
   let sent: CapturedBody | undefined;
   const fetchImpl = mockFetch(
     200,
-    { content: [{ type: 'thinking', text: '...' }, { type: 'tool_use', name: 'emit', input: { ok: true } }], usage: { input_tokens: 20, output_tokens: 4 } },
+    {
+      // adaptive thinking is on by default → a thinking block precedes the text block
+      content: [
+        { type: 'thinking', thinking: 'reasoning…' },
+        { type: 'text', text: '{"ok":true}' },
+      ],
+      usage: { input_tokens: 20, output_tokens: 4 },
+    },
     (_url, init) => { sent = JSON.parse(String(init.body)) as CapturedBody; },
   );
   const client = new AnthropicClient(() => 'sk-ant', 'https://api.anthropic.com', fetchImpl);
   const { value, usage } = await client.completeStructured<{ ok: boolean }>({ model: 'claude-sonnet-5', system: 's', messages: [{ role: 'user', content: 'u' }], maxTokens: 100, schema: SCHEMA });
-  assert.equal(value.ok, true); // parsed the tool_use block, NOT content[0] (a thinking block)
+  assert.equal(value.ok, true); // parsed the TEXT block, NOT content[0] (a thinking block)
   assert.deepEqual(usage, { inputTokens: 20, outputTokens: 4 });
-  assert.deepEqual(sent!.thinking, { type: 'disabled' });
-  assert.equal(sent!.tools![0].strict, true);
-  assert.equal(sent!.tool_choice!.name, 'emit');
+  assert.equal(sent!.output_config!.format!.type, 'json_schema');
+  // never send the unsupported thinking-disable / tool-use fields for sonnet-5
+  assert.equal(sent!.thinking, undefined);
+  assert.equal(sent!.tools, undefined);
 });
 
 test('providers classify 401 as an auth error (hard failover trigger)', async () => {

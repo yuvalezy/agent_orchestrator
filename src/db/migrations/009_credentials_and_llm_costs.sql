@@ -16,7 +16,7 @@ CREATE TABLE credentials (
 CREATE TRIGGER trg_credentials_updated_at BEFORE UPDATE ON credentials
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();  -- set_updated_at() from migration 001
 
--- Per-call LLM cost accounting. Drives the daily cost cap / kill-switch (R14):
+-- Per-call LLM cost accounting. Drives the daily cost cap / kill-switch (R17):
 -- SELECT sum(cost_usd) WHERE created_at >= date_trunc('day', now()).
 CREATE TABLE llm_costs (
   id             BIGSERIAL PRIMARY KEY,

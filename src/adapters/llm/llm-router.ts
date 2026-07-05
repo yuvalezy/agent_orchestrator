@@ -48,6 +48,11 @@ export class LlmRouter implements AgentLlmPort {
   }
 
   private capNotifiedFor: string | null = null;
+  // SOFT cap (DA §6-Q1 / code-review Finding 1): this is a check-then-act — under
+  // concurrency N overlapping calls can each read "under cap" and then each bill,
+  // overshooting by ≤ (in-flight × per-call cost). Harmless in M1.4 (the only
+  // caller is the single-shot triage:sample CLI). M1.5b wires this into concurrent
+  // inbound processing → HARDEN there (atomic reserve-then-spend / advisory lock).
   private async enforceCap(): Promise<void> {
     const spent = await this.spentTodayUsd();
     if (spent >= this.deps.dailyCapUsd) {

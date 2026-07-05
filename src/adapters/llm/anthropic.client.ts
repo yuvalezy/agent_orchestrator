@@ -4,19 +4,19 @@ import type { LlmMessage, LlmProviderClient, TokenUsage } from '../../ports/llm.
 import { LlmProviderError, kindForStatus } from './errors';
 
 // Anthropic Messages API provider (DM4-4). Raw fetch, no SDK. Structured output =
-// forced tool-use with strict:true (DA B2 — strict GUARANTEES the tool_use.input
-// conforms; without it the primary provider isn't schema-safe). Adaptive thinking
-// is DISABLED (DA R41 — sonnet-5 thinks by default → a thinking block ahead of the
-// answer, latency, and budget_tokens would 400); the tool_use block is located by
-// content.find(type==='tool_use'), NEVER content[0]. Never logs messages/headers.
+// top-level `output_config.format` json_schema (the current canonical mechanism,
+// confirmed against platform.claude.com docs) — the result lands in a `text`
+// content block as a JSON string. claude-sonnet-5 runs adaptive thinking ON by
+// default and does NOT support thinking:{type:'disabled'} or budget_tokens (→ 400),
+// so we send NEITHER and instead locate the answer by content.find(type==='text'),
+// which correctly skips the preceding `thinking` block (DA R41). Never logs
+// messages/headers (the messages carry the customer body; headers carry the key).
 
 const ANTHROPIC_VERSION = '2023-06-01';
 
 interface ContentBlock {
-  type: string;
+  type: string; // 'thinking' | 'text' | …
   text?: string;
-  name?: string;
-  input?: unknown;
 }
 interface MessagesResponse {
   content: ContentBlock[];
@@ -79,6 +79,11 @@ export class AnthropicClient implements LlmProviderClient {
     return { inputTokens: res.usage?.input_tokens ?? 0, outputTokens: res.usage?.output_tokens ?? 0 };
   }
 
+  /** The assistant's text, skipping any leading `thinking` block (R41). */
+  private textOf(res: MessagesResponse): string {
+    return res.content.find((b) => b.type === 'text')?.text ?? '';
+  }
+
   async complete(req: {
     model: string;
     system: string;
@@ -90,10 +95,8 @@ export class AnthropicClient implements LlmProviderClient {
       max_tokens: req.maxTokens,
       system: req.system,
       messages: this.toMessages(req.messages),
-      thinking: { type: 'disabled' },
     });
-    const text = res.content.find((b) => b.type === 'text')?.text ?? '';
-    return { text, usage: this.usageOf(res) };
+    return { text: this.textOf(res), usage: this.usageOf(res) };
   }
 
   async completeStructured<T>(req: {
@@ -108,15 +111,17 @@ export class AnthropicClient implements LlmProviderClient {
       max_tokens: req.maxTokens,
       system: req.system,
       messages: this.toMessages(req.messages),
-      thinking: { type: 'disabled' }, // R41: no adaptive thinking block ahead of the tool_use
-      tools: [{ name: 'emit', description: 'Emit the structured result.', input_schema: req.schema, strict: true }],
-      tool_choice: { type: 'tool', name: 'emit' },
+      // Canonical structured output: json_schema format → JSON string in a text block.
+      output_config: { format: { type: 'json_schema', schema: req.schema } },
     });
-    // R41: locate the tool_use block by type, never content[0].
-    const block = res.content.find((b) => b.type === 'tool_use');
-    if (!block || block.input === undefined) {
-      throw new LlmProviderError('anthropic', 'schema', 'no tool_use block in response');
+    // Adaptive thinking is on by default → a `thinking` block precedes the `text`
+    // block. Parse the text block (JSON string), NEVER content[0] (R41).
+    const text = this.textOf(res);
+    if (!text) throw new LlmProviderError('anthropic', 'schema', 'no text block in response');
+    try {
+      return { value: JSON.parse(text) as T, usage: this.usageOf(res) };
+    } catch {
+      throw new LlmProviderError('anthropic', 'schema', 'structured output was not valid JSON');
     }
-    return { value: block.input as T, usage: this.usageOf(res) };
   }
 }
