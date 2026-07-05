@@ -121,4 +121,28 @@ export class TelegramClient {
     if (input.inlineKeyboard) params.reply_markup = { inline_keyboard: input.inlineKeyboard };
     return this.call('sendMessage', params);
   }
+
+  /** Poll for updates (M1.5b callback routing). `timeout: 0` = short poll — the
+   *  callback-poller worker owns the cadence, so the fetch never long-hangs.
+   *  `offset` acks everything below it (persist it to stop restart re-delivery). */
+  async getUpdates(offset: number): Promise<TelegramUpdate[]> {
+    return this.call('getUpdates', { offset, timeout: 0, allowed_updates: ['callback_query'] });
+  }
+
+  /** Acknowledge a tapped inline button (stops the client spinner). Best-effort —
+   *  a stale id (>48h / post-restart) fails harmlessly; the caller swallows it. */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    await this.call('answerCallbackQuery', { callback_query_id: callbackQueryId, ...(text ? { text } : {}) });
+  }
+}
+
+export interface TelegramCallbackQuery {
+  id: string;
+  from: { id: number };
+  data?: string;
+}
+
+export interface TelegramUpdate {
+  update_id: number;
+  callback_query?: TelegramCallbackQuery;
 }

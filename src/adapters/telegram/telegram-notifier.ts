@@ -24,7 +24,11 @@ function render(n: Notification): string {
   return parts.join('\n');
 }
 
+type DecisionHandler = (d: { notificationRef: string; optionId: string; by: string }) => Promise<void>;
+
 export class TelegramNotifier implements FounderNotifierPort {
+  private decisionHandler: DecisionHandler | null = null;
+
   constructor(
     private readonly client: TelegramClient,
     private readonly opts: TelegramNotifierOptions,
@@ -43,7 +47,11 @@ export class TelegramNotifier implements FounderNotifierPort {
     return { ref: String(topic.message_thread_id) };
   }
 
-  async notifyCustomerEvent(customerId: string, n: Notification): Promise<void> {
+  async notifyCustomerEvent(
+    customerId: string,
+    n: Notification,
+    buttons?: Array<{ id: string; label: string }>,
+  ): Promise<void> {
     const topicId = await this.opts.resolveCustomerTopicId(customerId);
     if (!topicId) {
       throw new Error(`No Telegram topic for customer ${customerId} — onboard before notifying`);
@@ -52,6 +60,7 @@ export class TelegramNotifier implements FounderNotifierPort {
       chatId: this.opts.supergroupChatId,
       messageThreadId: topicId,
       text: render(n),
+      inlineKeyboard: buttons ? [buttons.map((b) => ({ text: b.label, callback_data: b.id }))] : undefined,
     });
   }
 
@@ -79,15 +88,48 @@ export class TelegramNotifier implements FounderNotifierPort {
     });
   }
 
-  onDecision(
-    _handler: (d: { notificationRef: string; optionId: string; by: string }) => Promise<void>,
-  ): void {
-    // GENUINELY INERT until M1.5b (DA amendment / flag 5): no callback_query
-    // polling, no webhook, no fake dispatch. We only record that a receiver was
-    // requested but is not yet wired, so a caller can't mistake silence for
-    // delivery. Wiring lands with the inbox decision loop (M1.5b).
-    logger.warn(
-      'FounderNotifier.onDecision: callback routing is not wired until M1.5b — taps will not be delivered',
-    );
+  /** Register the tap handler (M1.5b). The callback-poller (composition) drives
+   *  dispatchCallback() from getUpdates. */
+  onDecision(handler: DecisionHandler): void {
+    this.decisionHandler = handler;
+  }
+
+  /**
+   * Route one callback_query's data to the registered handler (M1.5b). callback_data
+   * is `<optionId>:<notificationRef>` (e.g. 'x:<taskRef>') — split on the FIRST ':'.
+   * Returns silently when no handler is registered.
+   */
+  async dispatchCallback(data: string, by: string): Promise<void> {
+    if (!this.decisionHandler) {
+      logger.warn('TelegramNotifier.dispatchCallback: no onDecision handler registered');
+      return;
+    }
+    const i = data.indexOf(':');
+    const optionId = i < 0 ? data : data.slice(0, i);
+    const notificationRef = i < 0 ? '' : data.slice(i + 1);
+    await this.decisionHandler({ notificationRef, optionId, by });
+  }
+
+  /**
+   * One callback poll (M1.5b): fetch callback_query updates from `offset`, dispatch
+   * each to the handler, ack it, and return the next offset to persist. A dispatch
+   * error is logged + skipped (the override may already be claimed — DA residual);
+   * a stale `answerCallbackQuery` is swallowed (the cancel already applied).
+   */
+  async poll(offset: number): Promise<number> {
+    const updates = await this.client.getUpdates(offset);
+    let next = offset;
+    for (const u of updates) {
+      next = Math.max(next, u.update_id + 1);
+      const cq = u.callback_query;
+      if (!cq?.data) continue;
+      try {
+        await this.dispatchCallback(cq.data, String(cq.from.id));
+      } catch (err) {
+        logger.error({ reason: (err as Error)?.message }, 'Telegram callback dispatch failed');
+      }
+      await this.client.answerCallbackQuery(cq.id).catch(() => undefined);
+    }
+    return next;
   }
 }

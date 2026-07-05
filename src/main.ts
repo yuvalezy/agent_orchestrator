@@ -4,13 +4,15 @@ import { runMigrations } from './db/migrate';
 import { closePool } from './db';
 import { buildApp, type AppDeps } from './app';
 import { startWorker, type WorkerDefinition } from './workers/worker-runner';
-import { heartbeatWorker } from './workers/heartbeat.worker';
 import { ChannelRegistry } from './adapters/channel-registry';
 import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
 import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
 import { ingestInbound } from './inbox/ingestion';
 import { credentialsStore } from './config/credentials-store';
 import { buildAdminRouter } from './adapters/admin/admin.router';
+import { buildTelegramNotifier } from './adapters/telegram/factory';
+import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
+import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
 
 /**
  * Composition root (blueprint §4). env → migrate → listen → workers → graceful
@@ -59,15 +61,27 @@ async function main(): Promise<void> {
     logger.warn('no active whatsapp_manager channel — WhatsApp ingestion disabled');
   }
 
+  // M1.5b: the money-loop workers (inbox processor + Telegram callback poller).
+  // Both require Telegram (the loop notifies the founder) — skip cleanly if it is
+  // not configured so ingestion still runs. One shared notifier so onDecision is
+  // registered on the same instance the poller drives.
+  const triageWorkers: WorkerDefinition[] = [];
+  try {
+    const notifier = buildTelegramNotifier();
+    triageWorkers.push(buildInboxProcessorWorker(notifier), buildCallbackPollerWorker(notifier));
+    logger.info('money-loop workers registered (inbox processor + Telegram callback poller)');
+  } catch (err) {
+    logger.warn({ reason: (err as Error)?.message }, 'money-loop disabled — Telegram not configured');
+  }
+
   const app = buildApp(appDeps);
   const server = app.listen(env.PORT, () => {
     logger.info(`agent-orchestrator listening on http://localhost:${env.PORT}`);
   });
 
-  // Heartbeat (M1.1 framework self-test — retire at M1.5b) + the M1.3 ingestion
-  // pollers. Later milestones add: inbox processor (M1.5b), outbound drainer
-  // (M1.8), email/service-desk pollers (M1.6/M1.7).
-  const workers = [startWorker(heartbeatWorker), ...ingestionWorkers.map(startWorker)];
+  // M1.3 ingestion pollers + M1.5b money-loop workers. (Heartbeat retired at M1.5b —
+  // the inbox processor is the first real worker.) M1.8 adds the outbound drainer.
+  const workers = [...ingestionWorkers, ...triageWorkers].map(startWorker);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

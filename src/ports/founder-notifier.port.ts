@@ -24,7 +24,13 @@ export interface FounderNotifierPort {
    * returns the existing ref when one is already known.
    */
   ensureCustomerTopic(customerId: string, name: string): Promise<{ ref: string }>;
-  notifyCustomerEvent(customerId: string, n: Notification): Promise<void>; // → customer topic
+  /** → customer topic. Optional inline buttons (M1.5b — e.g. the ❌ cancel action);
+   *  taps arrive via onDecision. `id` becomes the callback_data (≤ 64 bytes). */
+  notifyCustomerEvent(
+    customerId: string,
+    n: Notification,
+    buttons?: Array<{ id: string; label: string }>,
+  ): Promise<void>;
   notifyAdmin(n: Notification): Promise<void>; // → admin topic
   askFounder(
     customerId: string,
