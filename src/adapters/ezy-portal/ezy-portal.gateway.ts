@@ -11,6 +11,10 @@ const TAG_MAX = 64;
 const TAGS_MAX = 50;
 /** Non-terminal statuses = "open" (server-side `status IN ?` filter; exact spellings). */
 const OPEN_STATUSES = 'backlog,todo,in-progress,review';
+/** Every status — for the source dedup: the portal enforces UNIQUE(sourceService,
+ *  sourceEntityType, sourceEntityId) across ALL statuses, so a closed task still
+ *  "owns" its source and a new create 400s. Dedup must find it (any status). */
+const ALL_STATUSES = 'backlog,todo,in-progress,review,done,cancelled';
 
 // EzyPortalGateway — the single adapter behind the EZY Portal ports (invariant
 // #4). M1.2 implements CustomerDirectoryPort plus the real two-hop
@@ -71,6 +75,17 @@ interface Paged<T> {
 
 function fullName(c: EzyContact): string {
   return [c.firstName, c.lastName].filter((s) => s && s.trim()).join(' ').trim();
+}
+
+/** Portal task row → opaque TargetTask (the task API has no url field). */
+function mapTask(t: EzyTask): TargetTask {
+  return {
+    ref: t.id,
+    title: t.title,
+    status: t.status,
+    projectRef: t.projectId,
+    updatedAt: t.updatedAt ? new Date(t.updatedAt) : undefined,
+  };
 }
 
 /** Truncate to ≤max Unicode code points. The portal counts title/description in
@@ -231,14 +246,25 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
       search: q.text, // ⚠ the portal param is `search`, NOT `text` (unknown params are ignored)
       status: OPEN_STATUSES, // server-side non-terminal filter
     });
-    return res.data.map((t) => ({
-      ref: t.id,
-      title: t.title,
-      status: t.status,
-      projectRef: t.projectId,
-      updatedAt: t.updatedAt ? new Date(t.updatedAt) : undefined,
-      // the task API has no url field — leave undefined (M1.5b/change-04 can deep-link)
-    }));
+    return res.data.map(mapTask);
+  }
+
+  /**
+   * Find the task that OWNS a source (any status) — the portal's source-triple
+   * uniqueness means at most one exists, and a create with the same source 400s
+   * even when it is cancelled/done. The money-loop dedups the thread against THIS
+   * (not open-only) so a closed thread's follow-up comments on the existing task
+   * instead of failing to create.
+   */
+  async findTasksBySource(q: { projectRef?: string; sourceEntity: { type: string; id: string } }): Promise<TargetTask[]> {
+    const res = await this.http.get<Paged<EzyTask>>('/api/projects/tasks', {
+      projectId: q.projectRef,
+      sourceService: SOURCE_SERVICE,
+      sourceEntityType: q.sourceEntity.type,
+      sourceEntityId: q.sourceEntity.id,
+      status: ALL_STATUSES,
+    });
+    return res.data.map(mapTask);
   }
 
   async setStatus(task: TaskRef, status: string): Promise<void> {

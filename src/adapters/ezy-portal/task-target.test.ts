@@ -96,6 +96,16 @@ test('createTask truncates title on code points without splitting a surrogate pa
   assert.ok(!title.includes('�')); // no replacement char from a split surrogate
 });
 
+test('findTasksBySource queries ALL statuses (a closed task still owns its source)', async () => {
+  const { gw, calls } = gatewayWith(200, { data: [{ id: 't-closed', title: 'T', status: 'cancelled', projectId: 'p' }] });
+  const tasks = await gw.findTasksBySource({ projectRef: 'p', sourceEntity: { type: 'whatsapp', id: '509' } });
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].status, 'cancelled');
+  const u = new URL(calls[0].url);
+  assert.equal(u.searchParams.get('status'), 'backlog,todo,in-progress,review,done,cancelled');
+  assert.equal(u.searchParams.get('sourceEntityId'), '509');
+});
+
 test('addComment posts {body} to /:id/comments', async () => {
   const { gw, calls } = gatewayWith(201, {});
   await gw.addComment({ ref: 'task-1' }, 'a note');

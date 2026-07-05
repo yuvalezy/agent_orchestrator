@@ -57,10 +57,9 @@ function fakes(intents: Intent[], contactKind: 'known' | 'unknown') {
         return { ref };
       },
       addComment: async () => {},
-      findOpenTasks: async (q) => {
-        const match = q.sourceEntity ? openTasks.filter((t) => t.entityId === q.sourceEntity!.id) : openTasks;
-        return match.map((t) => ({ ref: t.ref, title: t.title, status: t.status }));
-      },
+      findOpenTasks: async () => openTasks.map((t) => ({ ref: t.ref, title: t.title, status: t.status })),
+      findTasksBySource: async (q) =>
+        openTasks.filter((t) => t.entityId === q.sourceEntity.id).map((t) => ({ ref: t.ref, title: t.title, status: t.status })),
       setStatus: async () => {},
       listWorkItemTypes: async () => [],
     },

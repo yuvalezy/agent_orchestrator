@@ -9,7 +9,7 @@ const task = (ref: string, title: string, updated?: string): TargetTask => ({
 
 function ports(threadTasks: TargetTask[], scores: number[]) {
   return {
-    taskTarget: { findOpenTasks: async () => threadTasks },
+    taskTarget: { findTasksBySource: async () => threadTasks },
     llm: { judgeSimilarity: async () => scores },
   };
 }

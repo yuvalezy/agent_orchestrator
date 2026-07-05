@@ -10,7 +10,7 @@ import type { TargetTask, TaskTargetPort } from '../ports/task-target.port';
 export const SIMILARITY_THRESHOLD = 0.8;
 
 export interface DedupPorts {
-  taskTarget: Pick<TaskTargetPort, 'findOpenTasks'>;
+  taskTarget: Pick<TaskTargetPort, 'findTasksBySource'>;
   llm: Pick<AgentLlmPort, 'judgeSimilarity'>;
 }
 
@@ -38,10 +38,12 @@ export async function decideDedup(
   },
   ports: DedupPorts,
 ): Promise<DedupResult> {
-  // 1. Same-thread open task (durable + status-aware) — from PRIOR messages, not a
-  // sibling intent's task created moments ago in this same run.
+  // 1. Same-thread task — ANY status (the portal enforces source-triple uniqueness,
+  // so a closed task still owns the source and a new create would 400; comment on
+  // it, which the portal allows even when cancelled/done). Exclude sibling-intent
+  // tasks created moments ago in this same run.
   const threadTasks = (
-    await ports.taskTarget.findOpenTasks({
+    await ports.taskTarget.findTasksBySource({
       projectRef: ctx.projectRef,
       sourceEntity: { type: ctx.channelType, id: ctx.threadKey },
     })

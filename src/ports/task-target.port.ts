@@ -39,6 +39,10 @@ export interface TaskTargetPort {
     sourceEntity?: { type: string; id: string };
     text?: string;
   }): Promise<TargetTask[]>;
+  /** Find the task owning a source across ALL statuses (the target may enforce
+   *  source uniqueness, so a closed task still blocks a new create) — used by the
+   *  money-loop's thread dedup. At most one for a source-unique target. */
+  findTasksBySource(q: { projectRef?: string; sourceEntity: { type: string; id: string } }): Promise<TargetTask[]>;
   listWorkItemTypes(projectRef: string): Promise<Array<{ ref: string; name: string }>>;
   setStatus(task: TaskRef, status: string): Promise<void>; // used from change 04
 }
