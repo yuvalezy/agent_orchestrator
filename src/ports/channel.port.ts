@@ -45,6 +45,11 @@ export interface OutboundMessage {
   inReplyTo?: string; // email Message-ID chain header
   subject?: string;
   body: string;
+  /** Whether the target is a group vs a 1:1 contact. MUST be set explicitly by
+   *  the enqueuer (M1.8, from agent_customer_contacts.is_group) — it CANNOT be
+   *  inferred from the address: whatsapp_manager's normalizeNumber() strips the
+   *  '@g.us'/hyphen group markers, so every id reaching us is plain digits. */
+  isGroup?: boolean;
 }
 
 export interface ChannelAdapter {

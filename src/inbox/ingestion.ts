@@ -61,7 +61,22 @@ export async function ingestInbound(msg: InboundMessage): Promise<IngestResult> 
     msg.sentAt,
     status,
   ]);
-  const result = rows[0];
+  let result = rows[0];
+  if (!result) {
+    // R35 residual: a same-id race (e.g. webhook + a concurrent reconcile tick)
+    // where the other writer committed a non-null body just after this statement's
+    // snapshot began → the ON CONFLICT DO UPDATE was guarded off AND the CTE
+    // fallback SELECT ran under the stale snapshot → zero rows. A fresh SELECT
+    // (new snapshot) sees the now-committed row. This is a dedup, never a new row.
+    const reselect = await query<{ id: string }>(
+      `SELECT id FROM agent_inbox WHERE channel_instance_id = $1 AND channel_message_id = $2`,
+      [msg.instanceId, msg.providerMessageId],
+    );
+    if (!reselect.rows[0]) {
+      throw new Error(`ingest: no row after upsert for ${msg.instanceId}/${msg.providerMessageId}`);
+    }
+    result = { id: reselect.rows[0].id, created: false };
+  }
   logger.info(
     {
       instanceId: msg.instanceId,

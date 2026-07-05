@@ -34,10 +34,13 @@ test('routable → inbound: 1:1 text maps thread=contact, sender=author', () => 
 });
 
 test('routable → inbound: group pins thread=groupId, sender=individual author', () => {
+  // whatsapp_manager normalizeNumber() strips the '@g.us'/'-' markers, so a real
+  // group id arrives as plain digits (NOT hyphenated) — same shape as a phone
+  // number. Group-ness is NOT inferrable from the id (see OutboundMessage.isGroup).
   const m: RoutableMessage = {
     messageId: 'wa2',
-    chatId: '123-456@g.us',
-    contactNumber: '123-456', // group id pinned as thread by whatsapp_manager
+    chatId: '120363012345678901@g.us',
+    contactNumber: '120363012345678901', // group id pinned as thread by whatsapp_manager
     senderNumber: '50761111111', // the actual author
     senderName: 'Bob',
     body: 'in group',
@@ -46,7 +49,7 @@ test('routable → inbound: group pins thread=groupId, sender=individual author'
     timestamp: '2026-07-05T10:01:00.000Z',
   };
   const out = routableToInbound(m, INSTANCE);
-  assert.equal(out.threadKey, '123-456');
+  assert.equal(out.threadKey, '120363012345678901');
   assert.equal(out.sender.address, '50761111111');
 });
 

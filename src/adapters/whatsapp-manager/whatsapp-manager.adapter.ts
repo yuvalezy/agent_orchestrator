@@ -127,14 +127,15 @@ export class WhatsAppManagerAdapter implements ChannelAdapter {
     }
   }
 
-  /** POST /outbound/send. 403 under the read-only key until M1.8 (R1). */
+  /** POST /outbound/send. 403 under the read-only key until M1.8 (R1). Group vs
+   *  contact is an EXPLICIT signal (OutboundMessage.isGroup) — it cannot be
+   *  inferred from the id, which whatsapp_manager normalizes to plain digits for
+   *  both (code-review finding). target = threadKey (the WA thread) ?? address. */
   async send(msg: OutboundMessage): Promise<{ providerMessageId: string }> {
-    // WhatsApp threadKey is the contact number (1:1) or group id; recipientAddress
-    // carries the contact number. A group id (…@g.us shape) routes via groupId.
-    const isGroup = msg.threadKey?.includes('-') || msg.recipientAddress.includes('-');
-    const payload = isGroup
-      ? { groupId: msg.threadKey ?? msg.recipientAddress, message: msg.body }
-      : { number: msg.recipientAddress, message: msg.body };
+    const target = msg.threadKey ?? msg.recipientAddress;
+    const payload = msg.isGroup
+      ? { groupId: target, message: msg.body }
+      : { number: target, message: msg.body };
     const res = await this.http.postJson<{ data: { messageId: string } }>('/outbound/send', payload);
     return { providerMessageId: res.data.messageId };
   }
