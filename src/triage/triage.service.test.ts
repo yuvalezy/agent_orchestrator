@@ -101,9 +101,11 @@ test('create path: known sender → createTask + bridge + decision + notify(butt
   const dec = await query<{ n: string }>(`SELECT count(*)::int AS n FROM agent_decisions WHERE inbox_message_id = $1 AND decision_type = 'triage'`, [row.id]);
   assert.equal(Number(dec.rows[0].n), 1);
 
-  // R49 short-circuit: re-process the same row → no second createTask.
+  // R49 short-circuit: re-process the same row → no second createTask, but DOES
+  // re-notify (so a prior notify-failure doesn't leave the founder un-notified).
   await f.svc.process(row);
   assert.equal(f.created.length, 1, 'R49: createTask NOT called again');
+  assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
 });
 
 test('unknown sender → skipped + counter bumped, no task', async (t) => {

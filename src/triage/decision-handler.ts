@@ -21,17 +21,18 @@ export function buildCancelHandler(deps: {
     if (!taskRef) return;
 
     const customerId = await findCustomerByTaskRef(taskRef);
-    // Atomic guard (DA note 1): only the first tap claims the override. A
-    // re-delivered callback finds it already claimed → no double-cancel.
+    // setStatus FIRST (DA): cancelling is idempotent at the portal, so a re-tap
+    // retries the cancel if it once failed (self-healing). If it throws, the whole
+    // handler throws → the tap re-delivers → retried (the override is NOT yet
+    // claimed, so the retry proceeds).
+    await deps.taskTarget.setStatus({ ref: taskRef }, 'cancelled');
+    // THEN claim the override atomically (ON CONFLICT). Only the first tap records
+    // it + notifies → no double-override, no double-notify (R11/R21).
     const claimed = await claimOverride({ taskRef, customerId, by });
     if (!claimed) {
-      logger.info({ taskRef }, 'cancel: already overridden — no-op (idempotent)');
+      logger.info({ taskRef }, 'cancel: already overridden — no re-notify (idempotent)');
       return;
     }
-    // Residual: if setStatus throws AFTER the override was claimed, the task stays
-    // open and a re-tap won't retry (override already claimed) — rare; the founder
-    // can cancel in the portal. Acceptable for Phase 1.
-    await deps.taskTarget.setStatus({ ref: taskRef }, 'cancelled');
     if (customerId) {
       await deps.notifier.notifyCustomerEvent(customerId, {
         title: '❌ Task cancelled',

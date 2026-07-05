@@ -5,7 +5,7 @@ import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
-import { recordTaskBridge, findTaskByInbox, recordTriageDecision } from '../decisions/decisions';
+import { recordTaskBridge, findTaskByInbox, recordTriageDecision, findCustomerByTaskRef } from '../decisions/decisions';
 import { markProcessed, markSkipped, setInboxCustomer, type ClaimedInbox } from '../inbox/inbox-repo';
 
 // Triage pipeline (tasks 6.2-6.5, CORE — injected ports + db only, imports NO
@@ -40,7 +40,19 @@ export class TriageService {
     // accepted Phase-1 tradeoff (single-intent dominant).
     const existing = await findTaskByInbox(inboxId);
     if (existing) {
-      logger.info({ inboxId, taskRef: existing }, 'triage: already produced a task (R49) — marking processed');
+      // A prior attempt created the task but may have failed AT/AFTER notify (DA) →
+      // re-notify (a duplicate Telegram message is benign vs a silently un-notified
+      // task). markProcessed only AFTER notify succeeds, so a Telegram outage keeps
+      // the row retrying until it recovers rather than dropping the notification.
+      logger.info({ inboxId, taskRef: existing }, 'triage: task exists (R49) — re-notifying');
+      const customerId = await findCustomerByTaskRef(existing);
+      if (customerId) {
+        await this.deps.notifier.notifyCustomerEvent(
+          customerId,
+          { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing) },
+          cancelButton(existing),
+        );
+      }
       await markProcessed(inboxId);
       return;
     }
