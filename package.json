@@ -13,6 +13,8 @@
     "migrate": "tsx src/db/migrate.ts",
     "db:create": "tsx scripts/create-db.ts",
     "onboard": "tsx scripts/onboard-customer.ts --",
+    "reconcile:once": "tsx scripts/reconcile-once.ts",
+    "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",

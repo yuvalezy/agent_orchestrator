@@ -2,9 +2,13 @@ import { env } from './config/env';
 import { logger } from './logger';
 import { runMigrations } from './db/migrate';
 import { closePool } from './db';
-import { buildApp } from './app';
-import { startWorker } from './workers/worker-runner';
+import { buildApp, type AppDeps } from './app';
+import { startWorker, type WorkerDefinition } from './workers/worker-runner';
 import { heartbeatWorker } from './workers/heartbeat.worker';
+import { ChannelRegistry } from './adapters/channel-registry';
+import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
+import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
+import { ingestInbound } from './inbox/ingestion';
 
 /**
  * Composition root (blueprint §4). env → migrate → listen → workers → graceful
@@ -14,16 +18,38 @@ import { heartbeatWorker } from './workers/heartbeat.worker';
 async function main(): Promise<void> {
   await runMigrations();
 
-  const app = buildApp();
+  // M1.3: load the channel registry and wire the WhatsApp ingestion path
+  // (webhook receiver + pull reconciliation). buildWhatsAppAdapter resolves
+  // WEBHOOK_SECRET eagerly, so a missing secret fails fast here at boot.
+  const registry = await ChannelRegistry.load();
+  const wa = registry.whatsappPrimary();
+  const appDeps: AppDeps = {};
+  const ingestionWorkers: WorkerDefinition[] = [];
+  if (wa) {
+    appDeps.whatsappWebhook = buildWhatsAppWebhookRouter(wa.adapter, ingestInbound);
+    ingestionWorkers.push(
+      buildWhatsAppReconcileWorker({
+        instanceId: wa.instance.id,
+        adapter: wa.adapter,
+        sink: ingestInbound,
+        intervalMs: env.WHATSAPP_RECONCILE_INTERVAL_MS,
+        lookbackMs: env.WHATSAPP_RECONCILE_LOOKBACK_MS,
+        maxPages: env.WHATSAPP_RECONCILE_MAX_PAGES,
+      }),
+    );
+  } else {
+    logger.warn('no active whatsapp_manager channel — WhatsApp ingestion disabled');
+  }
+
+  const app = buildApp(appDeps);
   const server = app.listen(env.PORT, () => {
     logger.info(`agent-orchestrator listening on http://localhost:${env.PORT}`);
   });
 
-  // M1.1 registers exactly ONE ephemeral framework self-test worker. Extension
-  // point for later milestones — no code change here, only new startWorker(...)
-  // calls: inbox processor (M1.5b), outbound drainer (M1.8), ingestion pollers
-  // (M1.3/M1.6/M1.7). Adapter/channel-registry wiring (M1.3) also plugs in here.
-  const workers = [startWorker(heartbeatWorker)];
+  // Heartbeat (M1.1 framework self-test — retire at M1.5b) + the M1.3 ingestion
+  // pollers. Later milestones add: inbox processor (M1.5b), outbound drainer
+  // (M1.8), email/service-desk pollers (M1.6/M1.7).
+  const workers = [startWorker(heartbeatWorker), ...ingestionWorkers.map(startWorker)];
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

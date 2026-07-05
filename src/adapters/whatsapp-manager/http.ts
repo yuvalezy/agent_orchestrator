@@ -43,4 +43,32 @@ export class WhatsAppHttp {
     logger.info({ path, status: res.status, durationMs }, 'whatsapp_manager request ok');
     return (await res.json()) as T;
   }
+
+  /**
+   * POST a JSON body. Used by the M1.3 adapter's send() (POST /outbound/send).
+   * NOTE (R1): whatsapp_manager's external x-api-key is read-only under JWT, so
+   * this returns 403 until the M1.8 scoped-key change — the error message is
+   * surfaced verbatim (no body logged) so the failure is diagnosable.
+   */
+  async postJson<T>(path: string, body: unknown): Promise<T> {
+    const started = Date.now();
+    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': this.resolveApiKey(),
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    const durationMs = Date.now() - started;
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      logger.warn({ path, status: res.status, durationMs }, 'whatsapp_manager POST non-2xx');
+      throw new Error(`whatsapp_manager POST ${path} failed (${res.status}): ${detail.slice(0, 200)}`);
+    }
+    logger.info({ path, status: res.status, durationMs }, 'whatsapp_manager POST ok');
+    return (await res.json()) as T;
+  }
 }

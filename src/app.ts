@@ -1,16 +1,30 @@
-import express, { NextFunction, Request, Response } from 'express';
+import express, { NextFunction, Request, Response, Router } from 'express';
 import helmet from 'helmet';
 import { logger } from './logger';
 import { getHealth } from './health/health.service';
+
+/** Composition-injected routers (D1) — adapters wire these in src/main.ts. */
+export interface AppDeps {
+  /** whatsapp_manager webhook receiver (M1.3). Mounted BEFORE express.json() so
+   *  its own path-scoped express.raw() wins for HMAC-over-raw-bytes verification. */
+  whatsappWebhook?: Router;
+}
 
 /**
  * Pure Express factory — no side effects, no listen, no migrations. The
  * composition root (src/main.ts) owns bootstrap. This split keeps the app
  * independently testable (blueprint decision #1).
  */
-export function buildApp() {
+export function buildApp(deps: AppDeps = {}) {
   const app = express();
   app.use(helmet());
+
+  // Mount raw-body webhook receivers BEFORE the global JSON parser so their
+  // path-scoped express.raw() handles the request end-to-end (a matched route
+  // responds and the chain ends). Non-webhook paths fall through to express.json()
+  // and the malformed-JSON 400 handler below, unchanged from M1.1 (DM3-1).
+  if (deps.whatsappWebhook) app.use('/webhooks/whatsapp', deps.whatsappWebhook);
+
   app.use(express.json({ limit: '256kb' }));
 
   // Malformed / oversized JSON body → 400. Log ONLY safe request metadata, never

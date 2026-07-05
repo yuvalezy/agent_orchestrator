@@ -34,6 +34,12 @@ const envSchema = z.object({
   // is missing when Telegram is actually used (onboarding CLI).
   TELEGRAM_SUPERGROUP_CHAT_ID: z.string().optional(),
   TELEGRAM_ADMIN_TOPIC_ID: z.string().optional(),
+
+  // ── M1.3: WhatsApp pull-reconciliation tuning (non-secret). Defaults suit prod;
+  // the test env may set the interval low (e.g. 15_000) for deterministic drills.
+  WHATSAPP_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(900_000), // 15 min
+  WHATSAPP_RECONCILE_LOOKBACK_MS: z.coerce.number().int().nonnegative().default(5_000), // boundary overlap
+  WHATSAPP_RECONCILE_MAX_PAGES: z.coerce.number().int().positive().default(200), // 20k rows @ limit 100
 });
 
 const parsed = envSchema.safeParse(process.env);

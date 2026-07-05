@@ -6,6 +6,10 @@ export interface WorkerDefinition {
   intervalMs: number;
   run: () => Promise<void>;
   maxBackoffMs?: number; // default 10 × intervalMs
+  /** Run the first tick immediately (delay 0) instead of after intervalMs. Used
+   *  for startup catch-up pollers (M1.3 reconcile) so downtime is covered at boot
+   *  rather than one interval later. Backward-compatible: defaults to false. */
+  runImmediately?: boolean;
 }
 
 export interface WorkerStatus {
@@ -76,7 +80,7 @@ export function startWorker(def: WorkerDefinition): { stop(): void } {
     scheduleNext(delayMs);
   };
 
-  scheduleNext(def.intervalMs);
+  scheduleNext(def.runImmediately ? 0 : def.intervalMs);
 
   return {
     stop(): void {
