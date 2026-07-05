@@ -16,6 +16,7 @@
     "reconcile:once": "tsx scripts/reconcile-once.ts",
     "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
     "triage:sample": "tsx scripts/triage-sample.ts --",
+    "contract:ezy": "tsx scripts/contract-ezy-tasks.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
