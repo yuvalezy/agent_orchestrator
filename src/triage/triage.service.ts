@@ -19,6 +19,9 @@ const cancelButton = (taskRef: string) => [{ id: `${CANCEL_PREFIX}${taskRef}`, l
 
 /** Categories that represent an explicit ask (→ a task). The rest are context. */
 export const ACTIONABLE = new Set(['bug_report', 'new_feature_request', 'custom_development', 'question_existing', 'follow_up']);
+/** Below this the intent is too uncertain to act on unprompted (→ askFounder,
+ *  or context-only when CC'd). */
+const CONFIDENCE_MIN = 0.5;
 
 /** CC-only (DM6-5): an email where the founder's own address is in CC but not TO —
  *  a message they were merely copied on, not directly asked. */
@@ -133,9 +136,11 @@ export class TriageService {
     const projectRef = config.projectRef as string; // process() guarded non-null
     const workItemTypeRef = config.workItemTypeRef as string;
 
-    // CC-only email + non-actionable intent → context only, no task (DM6-5). An
-    // explicit ask (actionable category) on a CC'd email STILL creates.
-    if (ctx.ccOnly && !ACTIONABLE.has(intent.category)) {
+    // CC-only email → context only UNLESS it's an explicit, CONFIDENT ask
+    // (actionable category AND confidence ≥ threshold). A CC'd unclear/low-confidence
+    // message must NOT ping the founder (DA residual #1) — they were merely copied,
+    // not asked; so this guard precedes (and suppresses) the askFounder branch.
+    if (ctx.ccOnly && !(ACTIONABLE.has(intent.category) && intent.confidence >= CONFIDENCE_MIN)) {
       await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'accepted' });
       return;
     }
@@ -143,7 +148,7 @@ export class TriageService {
     // Low confidence / unclear → human-in-the-loop, no task (design triage contract).
     // Record the audit row BEFORE notifying (code-review: a failed notify must not
     // lose the decision) — matches the create/comment branches' order.
-    if (intent.confidence < 0.5 || intent.category === 'unclear') {
+    if (intent.confidence < CONFIDENCE_MIN || intent.category === 'unclear') {
       await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'pending' });
       await this.deps.notifier.notifyCustomerEvent(customerId, {
         title: '❓ Needs your input',
