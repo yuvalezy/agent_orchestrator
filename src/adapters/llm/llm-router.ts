@@ -140,7 +140,12 @@ export class LlmRouter implements AgentLlmPort {
       schema: INTENTS_SCHEMA,
       system: TRIAGE_SYSTEM,
       messages: [{ role: 'user', content: triageUserMessage(input) }],
-      maxTokens: 1024,
+      // R44: Anthropic sonnet-5 runs adaptive thinking ON, and max_tokens caps
+      // thinking + output COMBINED — a tight budget could let thinking truncate the
+      // JSON (→ parse fail → failover masking a dark primary). Give ample headroom;
+      // max_tokens is a ceiling, so cheaper/non-thinking providers pay only for what
+      // they actually emit.
+      maxTokens: 4096,
       validate: parseIntents,
       customerId,
     });
