@@ -120,15 +120,22 @@ export class TelegramNotifier implements FounderNotifierPort {
     const updates = await this.client.getUpdates(offset);
     let next = offset;
     for (const u of updates) {
-      next = Math.max(next, u.update_id + 1);
       const cq = u.callback_query;
-      if (!cq?.data) continue;
-      try {
-        await this.dispatchCallback(cq.data, String(cq.from.id));
-      } catch (err) {
-        logger.error({ reason: (err as Error)?.message }, 'Telegram callback dispatch failed');
+      if (cq?.data) {
+        try {
+          await this.dispatchCallback(cq.data, String(cq.from.id));
+        } catch (err) {
+          // Do NOT advance the offset past a FAILED dispatch (code-review #1):
+          // getUpdates(offset) never re-delivers anything below `offset`, and there
+          // is no other durable record of the tap — advancing would SILENTLY LOSE the
+          // founder's ❌. Halt here; the remaining batch re-delivers next poll
+          // (claimOverride's ON CONFLICT + idempotent setStatus make replay safe).
+          logger.error({ reason: (err as Error)?.message }, 'Telegram callback dispatch failed — holding offset for retry');
+          return next;
+        }
+        await this.client.answerCallbackQuery(cq.id).catch(() => undefined);
       }
-      await this.client.answerCallbackQuery(cq.id).catch(() => undefined);
+      next = u.update_id + 1; // advance ONLY after this update is fully handled
     }
     return next;
   }

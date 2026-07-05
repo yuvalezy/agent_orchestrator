@@ -100,8 +100,11 @@ export class TriageService {
       return;
     }
 
+    // Task refs created across this message's intents — so a second distinct intent
+    // doesn't dedup into intent #1's just-created task (code-review #2).
+    const createdThisRun = new Set<string>();
     for (const intent of intents) {
-      await this.act(intent, { row, config, customerId, threadKey, openTasks });
+      await this.act(intent, { row, config, customerId, threadKey, openTasks }, createdThisRun);
     }
     await markProcessed(inboxId);
   }
@@ -109,6 +112,7 @@ export class TriageService {
   private async act(
     intent: Intent,
     ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[] },
+    createdThisRun: Set<string>,
   ): Promise<void> {
     const { row, config, customerId, threadKey } = ctx;
     const inboxId = row.id;
@@ -116,19 +120,21 @@ export class TriageService {
     const workItemTypeRef = config.workItemTypeRef as string;
 
     // Low confidence / unclear → human-in-the-loop, no task (design triage contract).
+    // Record the audit row BEFORE notifying (code-review: a failed notify must not
+    // lose the decision) — matches the create/comment branches' order.
     if (intent.confidence < 0.5 || intent.category === 'unclear') {
+      await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'pending' });
       await this.deps.notifier.notifyCustomerEvent(customerId, {
         title: '❓ Needs your input',
         body: `An unclear message from ${config.displayName} (${intent.category}). Please review:\n“${intent.summary}”`,
         severity: 'action',
       });
-      await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'pending' });
       return;
     }
 
     const dedup = await decideDedup(
       intent,
-      { channelType: row.channel_type, threadKey, projectRef, openTasks: ctx.openTasks },
+      { channelType: row.channel_type, threadKey, projectRef, openTasks: ctx.openTasks, excludeTaskRefs: createdThisRun },
       { taskTarget: this.deps.taskTarget, llm: this.deps.llm },
     );
 
@@ -154,6 +160,7 @@ export class TriageService {
       source: { service: 'agent-orchestrator', entityType: row.channel_type, entityId: threadKey, display: `${config.displayName} · ${threadKey}` },
       tags: [intent.category],
     });
+    createdThisRun.add(task.ref); // exclude from sibling intents' thread dedup (code-review #2)
     await recordTaskBridge({ taskRef: task.ref, customerId, inboxMessageId: inboxId, relationship: 'created_from' });
     await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'accepted', taskRef: task.ref });
     await this.deps.notifier.notifyCustomerEvent(

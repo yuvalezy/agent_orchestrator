@@ -39,3 +39,10 @@ test('no thread task, no open tasks → create', async () => {
   const r = await decideDedup(intent, { ...base, openTasks: [] }, ports([], []));
   assert.deepEqual(r, { action: 'create' });
 });
+
+test('a sibling task created this run is EXCLUDED from the thread match → create (no collapse)', async () => {
+  const threadTasks = [task('t-sibling', 'x', '2026-07-05')]; // intent #1's just-created task
+  const excludeTaskRefs = new Set(['t-sibling']);
+  const r = await decideDedup(intent, { ...base, openTasks: [], excludeTaskRefs }, ports(threadTasks, []));
+  assert.deepEqual(r, { action: 'create' }); // excluded → falls through to create its own task
+});

@@ -26,14 +26,26 @@ function byUpdatedDesc(a: TargetTask, b: TargetTask): number {
  */
 export async function decideDedup(
   intent: { suggested_title: string },
-  ctx: { channelType: string; threadKey: string; projectRef: string; openTasks: TargetTask[] },
+  ctx: {
+    channelType: string;
+    threadKey: string;
+    projectRef: string;
+    openTasks: TargetTask[];
+    /** Task refs CREATED earlier in this same message's process() — excluded from
+     *  the thread match so a second distinct intent doesn't merge into intent #1's
+     *  just-created task (code-review #2: multi-intent collapse). */
+    excludeTaskRefs?: Set<string>;
+  },
   ports: DedupPorts,
 ): Promise<DedupResult> {
-  // 1. Same-thread open task (durable + status-aware).
-  const threadTasks = await ports.taskTarget.findOpenTasks({
-    projectRef: ctx.projectRef,
-    sourceEntity: { type: ctx.channelType, id: ctx.threadKey },
-  });
+  // 1. Same-thread open task (durable + status-aware) — from PRIOR messages, not a
+  // sibling intent's task created moments ago in this same run.
+  const threadTasks = (
+    await ports.taskTarget.findOpenTasks({
+      projectRef: ctx.projectRef,
+      sourceEntity: { type: ctx.channelType, id: ctx.threadKey },
+    })
+  ).filter((t) => !ctx.excludeTaskRefs?.has(t.ref));
   if (threadTasks.length) {
     const mostRecent = [...threadTasks].sort(byUpdatedDesc)[0];
     return { action: 'comment', taskRef: mostRecent.ref };

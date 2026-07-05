@@ -24,11 +24,13 @@ async function dbReady(): Promise<boolean> {
   } catch { return false; }
 }
 
+const CUST = `display_name = 'Triage Test Co'`;
 after(async () => {
-  await query(`DELETE FROM agent_decisions WHERE customer_id = $1`, [customerId]).catch(() => {});
-  await query(`DELETE FROM agent_tasks WHERE customer_id = $1`, [customerId]).catch(() => {});
+  // FK-safe order across BOTH seeded customers: decisions → tasks → inbox → customers.
+  await query(`DELETE FROM agent_decisions WHERE customer_id IN (SELECT id FROM agent_customers WHERE ${CUST})`).catch(() => {});
+  await query(`DELETE FROM agent_tasks WHERE customer_id IN (SELECT id FROM agent_customers WHERE ${CUST})`).catch(() => {});
   await query(`DELETE FROM agent_inbox WHERE channel_message_id LIKE '${TAG}-%'`).catch(() => {});
-  await query(`DELETE FROM agent_customers WHERE display_name = 'Triage Test Co'`).catch(() => {});
+  await query(`DELETE FROM agent_customers WHERE ${CUST}`).catch(() => {});
   await closePool();
 });
 
@@ -42,11 +44,23 @@ function fakes(intents: Intent[], contactKind: 'known' | 'unknown') {
     findContactByAddress: async () => (contactKind === 'known' ? { customerId, contactId: 'c1' } : null),
     findCustomersByEmailDomain: async () => [],
   };
+  // Realistic fake: createTask registers a task keyed by its sourceEntityId, and
+  // findOpenTasks(sourceEntity) returns matching tasks — so the multi-intent
+  // collapse (code-review #2) is actually exercisable.
+  const openTasks: Array<{ ref: string; title: string; status: string; entityId?: string }> = [];
   const svc = new TriageService({
     taskTarget: {
-      createTask: async (i) => { created.push(i); return { ref: `task-${created.length}` }; },
+      createTask: async (i) => {
+        const ref = `task-${openTasks.length + 1}`;
+        openTasks.push({ ref, title: i.title, status: 'todo', entityId: i.source.entityId });
+        created.push(i);
+        return { ref };
+      },
       addComment: async () => {},
-      findOpenTasks: async () => [],
+      findOpenTasks: async (q) => {
+        const match = q.sourceEntity ? openTasks.filter((t) => t.entityId === q.sourceEntity!.id) : openTasks;
+        return match.map((t) => ({ ref: t.ref, title: t.title, status: t.status }));
+      },
       setStatus: async () => {},
       listWorkItemTypes: async () => [],
     },
@@ -106,6 +120,20 @@ test('create path: known sender → createTask + bridge + decision + notify(butt
   await f.svc.process(row);
   assert.equal(f.created.length, 1, 'R49: createTask NOT called again');
   assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
+});
+
+test('multi-intent message → two distinct tasks (no sibling collapse)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-multi', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const BUG2: Intent = { ...BUG, suggested_title: 'Fix login', summary: 'login broken' };
+  const f = fakes([BUG, BUG2], 'known'); // one message, two distinct intents
+  const row = await seedInbox(`${TAG}-multi`, 'export is broken and also login is broken');
+  await f.svc.process(row);
+  assert.equal(f.created.length, 2, 'two distinct intents → two tasks, not one + a comment');
 });
 
 test('unknown sender → skipped + counter bumped, no task', async (t) => {
