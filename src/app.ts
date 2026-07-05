@@ -8,6 +8,9 @@ export interface AppDeps {
   /** whatsapp_manager webhook receiver (M1.3). Mounted BEFORE express.json() so
    *  its own path-scoped express.raw() wins for HMAC-over-raw-bytes verification. */
   whatsappWebhook?: Router;
+  /** Admin API (M1.4 — credential management). Mounted AFTER express.json() (needs
+   *  the JSON body) and before the 404. Present only when ADMIN_API_KEY is set. */
+  adminRouter?: Router;
 }
 
 /**
@@ -59,6 +62,9 @@ export function buildApp(deps: AppDeps = {}) {
   app.get('/', (_req, res) => {
     res.json({ service: 'agent-orchestrator', endpoints: ['GET /health'] });
   });
+
+  // Admin API (M1.4) — after express.json(), before the 404 catch-all.
+  if (deps.adminRouter) app.use('/admin', deps.adminRouter);
 
   // 404
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));

@@ -9,6 +9,8 @@ import { ChannelRegistry } from './adapters/channel-registry';
 import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
 import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
 import { ingestInbound } from './inbox/ingestion';
+import { credentialsStore } from './config/credentials-store';
+import { buildAdminRouter } from './adapters/admin/admin.router';
 
 /**
  * Composition root (blueprint §4). env → migrate → listen → workers → graceful
@@ -18,12 +20,28 @@ import { ingestInbound } from './inbox/ingestion';
 async function main(): Promise<void> {
   await runMigrations();
 
+  // M1.4: decrypt the sealed credential store into memory BEFORE anything resolves
+  // a credential — the M1.3 registry eagerly resolves WEBHOOK_SECRET, so a
+  // store-only secret would be missed if this ran after ChannelRegistry.load().
+  await credentialsStore.load();
+
   // M1.3: load the channel registry and wire the WhatsApp ingestion path
   // (webhook receiver + pull reconciliation). buildWhatsAppAdapter resolves
   // WEBHOOK_SECRET eagerly, so a missing secret fails fast here at boot.
   const registry = await ChannelRegistry.load();
   const wa = registry.whatsappPrimary();
   const appDeps: AppDeps = {};
+
+  // M1.4: admin API — mounted ONLY when ADMIN_API_KEY is set (fail-closed).
+  // ADMIN_API_KEY is read from process.env, not the store (it guards the endpoint
+  // that writes the store) and not the zod schema (it is a secret).
+  const adminKey = process.env.ADMIN_API_KEY;
+  if (adminKey?.trim()) {
+    appDeps.adminRouter = buildAdminRouter(adminKey);
+    logger.info('admin router mounted at /admin');
+  } else {
+    logger.info('admin router not mounted (ADMIN_API_KEY unset)');
+  }
   const ingestionWorkers: WorkerDefinition[] = [];
   if (wa) {
     appDeps.whatsappWebhook = buildWhatsAppWebhookRouter(wa.adapter, ingestInbound);

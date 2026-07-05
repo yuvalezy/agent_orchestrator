@@ -40,6 +40,18 @@ const envSchema = z.object({
   WHATSAPP_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(900_000), // 15 min
   WHATSAPP_RECONCILE_LOOKBACK_MS: z.coerce.number().int().nonnegative().default(5_000), // boundary overlap
   WHATSAPP_RECONCILE_MAX_PAGES: z.coerce.number().int().positive().default(200), // 20k rows @ limit 100
+
+  // ── M1.4: LLM gateway (non-secret). Provider KEYS are NOT here — resolved via
+  // resolveCredential (ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY), and
+  // CREDENTIALS_ENCRYPTION_KEY / ADMIN_API_KEY are read directly via process.env.
+  // Per-(provider,role) model overrides are read in the LLM factory as
+  // LLM_MODEL_<PROVIDER>_<ROLE> (too many combos for the schema; all optional).
+  LLM_DEFAULT_PROVIDER: z.string().default('anthropic'),
+  LLM_FALLBACK_CHAIN: z.string().default('openai,deepseek'), // csv, ordered
+  LLM_DAILY_COST_CAP_USD: z.coerce.number().nonnegative().default(10),
+  ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
+  OPENAI_BASE_URL: z.string().url().default('https://api.openai.com/v1'),
+  DEEPSEEK_BASE_URL: z.string().url().default('https://api.deepseek.com'),
 });
 
 const parsed = envSchema.safeParse(process.env);
