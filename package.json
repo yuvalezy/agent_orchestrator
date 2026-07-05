@@ -12,7 +12,9 @@
     "dev": "tsx watch src/main.ts",
     "migrate": "tsx src/db/migrate.ts",
     "db:create": "tsx scripts/create-db.ts",
+    "onboard": "tsx scripts/onboard-customer.ts --",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
     "lint:boundary": "node scripts/check-boundary.mjs"
   },

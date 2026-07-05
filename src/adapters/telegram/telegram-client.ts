@@ -1,0 +1,124 @@
+import { logger } from '../../logger';
+import { DEFAULT_RETRY, RetryOptions, withRetry } from '../shared/retry';
+
+// Minimal Telegram Bot API caller (blueprint §1). Two invariants beyond plain
+// HTTP:
+//   1. Success is `{ ok: true }` in the BODY, not just a 2xx status — the Bot API
+//      returns 200 with `{ ok:false, description }` for logical failures.
+//   2. On 429 it returns `parameters.retry_after` (seconds) — honored via retry.ts.
+//
+// The bot TOKEN is a secret embedded in the request URL, so this module logs the
+// METHOD name only, never the URL.
+
+interface TgResponse<T> {
+  ok: boolean;
+  result?: T;
+  description?: string;
+  error_code?: number;
+  parameters?: { retry_after?: number };
+}
+
+export class TelegramError extends Error {
+  constructor(
+    readonly method: string,
+    readonly status: number,
+    description: string,
+    readonly retryable: boolean,
+    readonly retryAfterMs?: number,
+  ) {
+    super(`Telegram ${method} failed (${status}): ${description}`);
+    this.name = 'TelegramError';
+  }
+}
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+export interface SendMessageInput {
+  chatId: string;
+  messageThreadId?: string;
+  text: string;
+  inlineKeyboard?: InlineKeyboardButton[][];
+}
+
+export interface TelegramClientOptions {
+  resolveToken: () => string;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+  retry?: Partial<RetryOptions>;
+}
+
+export class TelegramClient {
+  private readonly resolveToken: () => string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
+  private readonly retry: Partial<RetryOptions>;
+
+  constructor(opts: TelegramClientOptions) {
+    this.resolveToken = opts.resolveToken;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.timeoutMs = opts.timeoutMs ?? 15_000;
+    this.retry = opts.retry ?? {};
+  }
+
+  private async call<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    const url = `https://api.telegram.org/bot${this.resolveToken()}/${method}`;
+    let attempt = 0;
+
+    const doAttempt = async (): Promise<T> => {
+      attempt += 1;
+      const started = Date.now();
+      const res = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      const durationMs = Date.now() - started;
+      const json = (await res.json().catch(() => null)) as TgResponse<T> | null;
+      if (!res.ok || !json || json.ok !== true) {
+        const retryAfterMs =
+          json?.parameters?.retry_after !== undefined
+            ? json.parameters.retry_after * 1000
+            : undefined;
+        const retryable = res.status === 429 || res.status >= 500 || retryAfterMs !== undefined;
+        logger.warn({ tgMethod: method, status: res.status, attempt, durationMs }, 'Telegram call failed');
+        throw new TelegramError(
+          method,
+          res.status,
+          json?.description ?? 'unknown error',
+          retryable,
+          retryAfterMs,
+        );
+      }
+      logger.info({ tgMethod: method, status: res.status, attempt, durationMs }, 'Telegram call ok');
+      return json.result as T;
+    };
+
+    return withRetry(doAttempt, {
+      ...DEFAULT_RETRY,
+      isRetryable: (err) => (err instanceof TelegramError ? err.retryable : true),
+      retryAfterMs: (err) => (err instanceof TelegramError ? err.retryAfterMs : undefined),
+      onRetry: ({ attempt: a, nextDelayMs }) =>
+        logger.warn({ tgMethod: method, attempt: a, nextDelayMs }, 'Telegram retrying'),
+      ...this.retry,
+    });
+  }
+
+  async getMe(): Promise<{ id: number; username: string }> {
+    return this.call('getMe', {});
+  }
+
+  async createForumTopic(chatId: string, name: string): Promise<{ message_thread_id: number; name: string }> {
+    return this.call('createForumTopic', { chat_id: chatId, name });
+  }
+
+  async sendMessage(input: SendMessageInput): Promise<{ message_id: number }> {
+    const params: Record<string, unknown> = { chat_id: input.chatId, text: input.text };
+    if (input.messageThreadId !== undefined) params.message_thread_id = Number(input.messageThreadId);
+    if (input.inlineKeyboard) params.reply_markup = { inline_keyboard: input.inlineKeyboard };
+    return this.call('sendMessage', params);
+  }
+}

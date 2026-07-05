@@ -16,6 +16,14 @@ export interface Notification {
 }
 
 export interface FounderNotifierPort {
+  /**
+   * Ensure a per-customer notification thread exists, returning its opaque ref
+   * (D7). Provider-agnostic on purpose (DA amendment 1): the Telegram adapter
+   * creates a forum topic; a future web-push adapter (change 06) can mint its
+   * own channel handle without this being a Telegram-only concept. Idempotent —
+   * returns the existing ref when one is already known.
+   */
+  ensureCustomerTopic(customerId: string, name: string): Promise<{ ref: string }>;
   notifyCustomerEvent(customerId: string, n: Notification): Promise<void>; // → customer topic
   notifyAdmin(n: Notification): Promise<void>; // → admin topic
   askFounder(
