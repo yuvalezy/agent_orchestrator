@@ -17,6 +17,7 @@
     "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
     "triage:sample": "tsx scripts/triage-sample.ts --",
     "contract:ezy": "tsx scripts/contract-ezy-tasks.ts",
+    "gmail:oauth": "tsx scripts/gmail-oauth.ts --",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
