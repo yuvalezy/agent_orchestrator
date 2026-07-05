@@ -14,6 +14,10 @@ export function buildEmailAdapter(instance: ChannelInstanceConfig): EmailChannel
   if (!accountEmail || accountEmail.startsWith('CHANGE_ME')) {
     throw new Error(`email instance ${instance.name} has no accountEmail set (config.accountEmail)`);
   }
+  // Eager existence check so a MISSING OAuth credential also skips at registry load
+  // (consistent with the accountEmail case), not on the first reconcile tick
+  // (code-review note 2). The client still re-resolves lazily per call for rotation.
+  resolveCredential(instance.credentialsRef);
   const client = new GmailClient(() => resolveCredential(instance.credentialsRef));
   return new EmailChannelAdapter(instance, client, accountEmail);
 }
