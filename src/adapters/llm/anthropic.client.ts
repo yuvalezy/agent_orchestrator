@@ -91,13 +91,21 @@ export class AnthropicClient implements LlmProviderClient {
     system: string;
     messages: LlmMessage[];
     maxTokens: number;
+    effort?: string;
   }): Promise<{ text: string; usage: TokenUsage }> {
-    const res = await this.post({
+    const body: Record<string, unknown> = {
       model: req.model,
       max_tokens: req.maxTokens,
       system: req.system,
       messages: this.toMessages(req.messages),
-    });
+    };
+    // effort guides adaptive thinking depth (output_config.effort) — pair with an
+    // explicit adaptive thinking mode. Opt-in only (adaptive-thinking models only).
+    if (req.effort) {
+      body.thinking = { type: 'adaptive' };
+      body.output_config = { effort: req.effort };
+    }
+    const res = await this.post(body);
     return { text: this.textOf(res), usage: this.usageOf(res) };
   }
 
@@ -107,15 +115,23 @@ export class AnthropicClient implements LlmProviderClient {
     messages: LlmMessage[];
     maxTokens: number;
     schema: object;
+    effort?: string;
   }): Promise<{ value: T; usage: TokenUsage }> {
-    const res = await this.post({
+    // Canonical structured output: json_schema format → JSON string in a text block.
+    // effort (when set) is merged into the SAME output_config object.
+    const outputConfig: Record<string, unknown> = { format: { type: 'json_schema', schema: req.schema } };
+    const body: Record<string, unknown> = {
       model: req.model,
       max_tokens: req.maxTokens,
       system: req.system,
       messages: this.toMessages(req.messages),
-      // Canonical structured output: json_schema format → JSON string in a text block.
-      output_config: { format: { type: 'json_schema', schema: req.schema } },
-    });
+      output_config: outputConfig,
+    };
+    if (req.effort) {
+      outputConfig.effort = req.effort;
+      body.thinking = { type: 'adaptive' };
+    }
+    const res = await this.post(body);
     // Adaptive thinking is on by default → a `thinking` block precedes the `text`
     // block. Parse the text block (JSON string), NEVER content[0] (R41).
     const text = this.textOf(res);

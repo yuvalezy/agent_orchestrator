@@ -16,6 +16,10 @@ export interface LlmRouterDeps {
   fallbackChain: string[];
   /** Per-(provider,role) model id (DA B1 — a fallback provider uses ITS OWN model). */
   modelFor: (provider: string, role: LlmRole) => string;
+  /** Optional per-(provider,role) reasoning effort ('low'..'max'). Undefined = the
+   *  provider default (no effort param sent). Must be undefined for models that
+   *  don't support it (e.g. Anthropic classify=haiku, OpenAI gpt-4.1). */
+  effortFor?: (provider: string, role: LlmRole) => string | undefined;
   /** Preferred provider per role (defaults to defaultProvider). */
   providerForRole?: (role: LlmRole) => string | undefined;
   dailyCapUsd: number;
@@ -107,6 +111,7 @@ export class LlmRouter implements AgentLlmPort {
           messages: opts.messages,
           maxTokens: opts.maxTokens,
           schema: opts.schema,
+          effort: this.deps.effortFor?.(provider, opts.role),
         });
         await this.recordCost(provider, model, opts.role, usage, opts.customerId); // tokens spent → bill
         try {

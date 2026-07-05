@@ -23,6 +23,10 @@ export interface OpenAiCompatibleOptions {
   baseUrl: string; // includes the /v1 segment where applicable
   resolveKey: () => string | undefined;
   structuredMode: StructuredMode;
+  /** Whether to forward `effort` as OpenAI's `reasoning_effort` param (reasoning
+   *  models only). OpenAI: true. DeepSeek: false (reasoning = the deepseek-reasoner
+   *  model, no per-call effort param). */
+  supportsReasoningEffort?: boolean;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
@@ -32,6 +36,7 @@ export class OpenAiCompatibleClient implements LlmProviderClient {
   private readonly baseUrl: string;
   private readonly resolveKey: () => string | undefined;
   private readonly structuredMode: StructuredMode;
+  private readonly supportsReasoningEffort: boolean;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
 
@@ -40,8 +45,15 @@ export class OpenAiCompatibleClient implements LlmProviderClient {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
     this.resolveKey = opts.resolveKey;
     this.structuredMode = opts.structuredMode;
+    this.supportsReasoningEffort = opts.supportsReasoningEffort ?? false;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 60_000;
+  }
+
+  /** OpenAI reasoning_effort (only when configured + supported). Opt-in: the user
+   *  sets it only when the configured model is a reasoning model (not gpt-4.1). */
+  private effortField(effort?: string): Record<string, unknown> {
+    return effort && this.supportsReasoningEffort ? { reasoning_effort: effort } : {};
   }
 
   private key(): string {
@@ -96,11 +108,13 @@ export class OpenAiCompatibleClient implements LlmProviderClient {
     system: string;
     messages: LlmMessage[];
     maxTokens: number;
+    effort?: string;
   }): Promise<{ text: string; usage: TokenUsage }> {
     const res = await this.post({
       model: req.model,
       max_tokens: req.maxTokens,
       messages: this.toMessages(req.system, req.messages),
+      ...this.effortField(req.effort),
     });
     return { text: res.choices[0]?.message.content ?? '', usage: this.usageOf(res) };
   }
@@ -111,6 +125,7 @@ export class OpenAiCompatibleClient implements LlmProviderClient {
     messages: LlmMessage[];
     maxTokens: number;
     schema: object;
+    effort?: string;
   }): Promise<{ value: T; usage: TokenUsage }> {
     let system = req.system;
     let responseFormat: Record<string, unknown>;
@@ -128,6 +143,7 @@ export class OpenAiCompatibleClient implements LlmProviderClient {
       max_tokens: req.maxTokens,
       messages: this.toMessages(system, req.messages),
       response_format: responseFormat,
+      ...this.effortField(req.effort),
     });
     const text = res.choices[0]?.message.content ?? '';
     let value: T;

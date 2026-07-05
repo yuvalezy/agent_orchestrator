@@ -11,9 +11,10 @@ interface CapturedBody {
   model: string;
   messages: Array<{ role: string; content: string }>;
   response_format?: { type: string; json_schema?: { strict?: boolean } };
-  output_config?: { format?: { type?: string; schema?: object } };
-  thinking?: unknown;
+  output_config?: { format?: { type?: string; schema?: object }; effort?: string };
+  thinking?: { type?: string };
   tools?: unknown;
+  reasoning_effort?: string;
 }
 
 function mockFetch(status: number, jsonBody: unknown, capture?: (url: string, init: RequestInit) => void): typeof fetch {
@@ -93,6 +94,33 @@ test('providers classify 401 as an auth error (hard failover trigger)', async ()
     oai.completeStructured({ model: 'gpt-4.1', system: 's', messages: [], maxTokens: 10, schema: SCHEMA }),
     (e) => e instanceof LlmProviderError && e.kind === 'auth',
   );
+});
+
+test('effort: Anthropic sets output_config.effort + thinking:adaptive; omitted when unset', async () => {
+  const anthRes = { content: [{ type: 'text', text: '{"ok":true}' }], usage: {} };
+  let withBody: CapturedBody | undefined;
+  const c1 = new AnthropicClient(() => 'k', 'https://api.anthropic.com', mockFetch(200, anthRes, (_u, i) => { withBody = JSON.parse(String(i.body)) as CapturedBody; }));
+  await c1.completeStructured({ model: 'claude-sonnet-5', system: 's', messages: [], maxTokens: 100, schema: SCHEMA, effort: 'low' });
+  assert.equal(withBody!.output_config!.effort, 'low');
+  assert.deepEqual(withBody!.thinking, { type: 'adaptive' });
+
+  let noBody: CapturedBody | undefined;
+  const c2 = new AnthropicClient(() => 'k', 'https://api.anthropic.com', mockFetch(200, anthRes, (_u, i) => { noBody = JSON.parse(String(i.body)) as CapturedBody; }));
+  await c2.completeStructured({ model: 'claude-sonnet-5', system: 's', messages: [], maxTokens: 100, schema: SCHEMA });
+  assert.equal(noBody!.output_config!.effort, undefined);
+  assert.equal(noBody!.thinking, undefined);
+});
+
+test('effort: OpenAI forwards reasoning_effort; DeepSeek ignores it', async () => {
+  let oaiBody: CapturedBody | undefined;
+  const oai = buildOpenAiClient(() => 'k', 'https://api.openai.com/v1', mockFetch(200, { choices: [{ message: { content: '{"ok":true}' } }], usage: {} }, (_u, i) => { oaiBody = JSON.parse(String(i.body)) as CapturedBody; }));
+  await oai.completeStructured({ model: 'o4', system: 's', messages: [], maxTokens: 100, schema: SCHEMA, effort: 'low' });
+  assert.equal(oaiBody!.reasoning_effort, 'low');
+
+  let dsBody: CapturedBody | undefined;
+  const ds = buildDeepSeekClient(() => 'k', 'https://api.deepseek.com', mockFetch(200, { choices: [{ message: { content: '{"ok":true}' } }], usage: {} }, (_u, i) => { dsBody = JSON.parse(String(i.body)) as CapturedBody; }));
+  await ds.completeStructured({ model: 'deepseek-chat', system: 's', messages: [], maxTokens: 100, schema: SCHEMA, effort: 'low' });
+  assert.equal(dsBody!.reasoning_effort, undefined); // DeepSeek: model choice, not a per-call param
 });
 
 test('a missing key surfaces a config error (→ router failover), not a crash', async () => {

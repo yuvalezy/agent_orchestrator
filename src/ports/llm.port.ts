@@ -61,6 +61,11 @@ export interface LlmProviderClient {
     system: string;
     messages: LlmMessage[];
     maxTokens: number;
+    /** Reasoning/thinking effort ('low'|'medium'|'high'|'xhigh'|'max'). Optional;
+     *  omitted = provider default. Only applies to reasoning-capable models
+     *  (Anthropic sonnet/opus via output_config.effort; OpenAI reasoning models via
+     *  reasoning_effort). Ignored by DeepSeek (model choice = chat vs reasoner). */
+    effort?: string;
   }): Promise<{ text: string; usage: TokenUsage }>;
   completeStructured<T>(req: {
     model: string;
@@ -68,6 +73,7 @@ export interface LlmProviderClient {
     messages: LlmMessage[];
     maxTokens: number;
     schema: object;
+    effort?: string;
   }): Promise<{ value: T; usage: TokenUsage }>;
 }
 

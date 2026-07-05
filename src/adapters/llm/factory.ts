@@ -24,6 +24,18 @@ function modelFor(provider: string, role: LlmRole): string {
   return override?.trim() || MODEL_DEFAULTS[provider]?.[role] || MODEL_DEFAULTS[provider]?.triage || 'unknown';
 }
 
+// Optional reasoning effort per (provider, role). A provider-level default
+// (LLM_<PROVIDER>_EFFORT, e.g. LLM_ANTHROPIC_EFFORT=low) applies to triage/draft
+// only — NOT classify, whose default models (anthropic=haiku-4-5) don't support
+// effort and would 400. A fine-grained LLM_EFFORT_<PROVIDER>_<ROLE> overrides that.
+function effortFor(provider: string, role: LlmRole): string | undefined {
+  const P = provider.toUpperCase();
+  const roleOverride = process.env[`LLM_EFFORT_${P}_${role.toUpperCase()}`];
+  if (roleOverride !== undefined) return roleOverride.trim() || undefined;
+  if (role === 'classify') return undefined;
+  return process.env[`LLM_${P}_EFFORT`]?.trim() || undefined;
+}
+
 export interface BuildLlmRouterOptions {
   notifyAdmin: (msg: string) => Promise<void>;
   /** Injectable transport for tests. */
@@ -50,6 +62,7 @@ export function buildLlmRouter(opts: BuildLlmRouterOptions): LlmRouter {
     defaultProvider,
     fallbackChain,
     modelFor,
+    effortFor,
     dailyCapUsd: env.LLM_DAILY_COST_CAP_USD,
     notifyAdmin: opts.notifyAdmin,
   });

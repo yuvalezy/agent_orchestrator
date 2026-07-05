@@ -8,6 +8,7 @@ export function buildOpenAiClient(resolveKey: () => string | undefined, baseUrl:
     baseUrl, // e.g. https://api.openai.com/v1
     resolveKey,
     structuredMode: 'json_schema',
+    supportsReasoningEffort: true, // reasoning models only; opt-in via LLM_OPENAI_EFFORT
     fetchImpl,
   });
 }
