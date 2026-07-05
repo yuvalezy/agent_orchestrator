@@ -67,6 +67,35 @@ test('findOpenTasks filters by sourceEntity + open statuses, maps text→search'
   assert.equal(u.searchParams.get('status'), 'backlog,todo,in-progress,review');
 });
 
+test('findOpenTasks throws on an unscoped query (no projectRef/sourceEntity) — R46', async () => {
+  const { gw, calls } = gatewayWith(200, { data: [] });
+  await assert.rejects(gw.findOpenTasks({ customerRef: 'bp-1', text: 'export' }), /requires projectRef or sourceEntity/);
+  assert.equal(calls.length, 0); // never hit the wire
+});
+
+test('createTask truncates a multibyte tag to <=64 BYTES (not UTF-16 units)', async () => {
+  const { gw, calls } = gatewayWith(201, { id: 't', title: 'T' });
+  const longUtf8 = '日'.repeat(40); // 40 chars × 3 bytes = 120 bytes
+  await gw.createTask({
+    customerRef: 'b', projectRef: 'p', workItemTypeRef: 'w', title: 'x', description: 'd', priority: 'low',
+    source: { service: 'agent-orchestrator', entityType: 'whatsapp', entityId: 'e', display: 'd' }, tags: [longUtf8],
+  });
+  const tag = (calls[0].body!.tags as string[])[0];
+  assert.ok(Buffer.byteLength(tag, 'utf8') <= 64, `tag is ${Buffer.byteLength(tag, 'utf8')} bytes`);
+});
+
+test('createTask truncates title on code points without splitting a surrogate pair', async () => {
+  const { gw, calls } = gatewayWith(201, { id: 't', title: 'T' });
+  const emoji = '😀'; // 1 code point, 2 UTF-16 units
+  await gw.createTask({
+    customerRef: 'b', projectRef: 'p', workItemTypeRef: 'w', title: emoji.repeat(300), description: 'd', priority: 'low',
+    source: { service: 'agent-orchestrator', entityType: 'whatsapp', entityId: 'e', display: 'd' }, tags: [],
+  });
+  const title = calls[0].body!.title as string;
+  assert.equal(Array.from(title).length, 240); // 240 code points, none corrupted
+  assert.ok(!title.includes('�')); // no replacement char from a split surrogate
+});
+
 test('addComment posts {body} to /:id/comments', async () => {
   const { gw, calls } = gatewayWith(201, {});
   await gw.addComment({ ref: 'task-1' }, 'a note');

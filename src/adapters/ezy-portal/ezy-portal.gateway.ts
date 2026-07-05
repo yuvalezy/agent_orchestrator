@@ -73,6 +73,27 @@ function fullName(c: EzyContact): string {
   return [c.firstName, c.lastName].filter((s) => s && s.trim()).join(' ').trim();
 }
 
+/** Truncate to ≤max Unicode code points. The portal counts title/description in
+ *  RUNES (utf8.RuneCountInString), so this matches its limit AND never splits a
+ *  UTF-16 surrogate pair (which would corrupt an emoji to U+FFFD) — code-review #4. */
+function truncateRunes(s: string, max: number): string {
+  const runes = Array.from(s);
+  return runes.length > max ? runes.slice(0, max).join('') : s;
+}
+
+/** Truncate to ≤maxBytes UTF-8 bytes. The portal's TAG limit is BYTE-based (Go
+ *  len()), so UTF-16-unit `.slice` could leave a multibyte tag >64 bytes → 400.
+ *  Cut on rune boundaries so bytes never exceed the cap (code-review #3). */
+function truncateBytes(s: string, maxBytes: number): string {
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s;
+  let out = '';
+  for (const r of Array.from(s)) {
+    if (Buffer.byteLength(out + r, 'utf8') > maxBytes) break;
+    out += r;
+  }
+  return out;
+}
+
 export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
   constructor(private readonly http: EzyPortalHttpClient) {}
 
@@ -146,7 +167,13 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
   // listWorkItemTypes guarantees a match). Write errors: 422 = validation (bad/
   // missing WIT); 409 = "Project is read-only" (terminal project) or "WIP limit
   // exceeded" (setStatus) — the EzyHttpError carries `.status` so callers/the
-  // contract test distinguish them (R45). Idempotency-Key is minted per POST.
+  // contract test distinguish them (R45).
+  //
+  // ⚠ R47: the portal's projects/tasks module does NOT honor Idempotency-Key (only
+  // the bp module wired that middleware), so a transport-retry after a committed
+  // create would DOUBLE-create. `createTask` is therefore NOT exactly-once on its
+  // own — M1.5b's pre-create findOpenTasks(sourceEntity) reconcile is the
+  // compensating control (and a portal-side idempotency handler is the real fix).
 
   async createTask(input: {
     customerRef: string;
@@ -161,15 +188,15 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
     const created = await this.http.post<EzyTask>('/api/projects/tasks', {
       projectId: input.projectRef,
       workItemTypeId: input.workItemTypeRef,
-      title: input.title.slice(0, TITLE_MAX),
-      description: input.description.slice(0, DESC_MAX),
+      title: truncateRunes(input.title, TITLE_MAX),
+      description: truncateRunes(input.description, DESC_MAX),
       priority: input.priority,
       sourceService: input.source.service,
       sourceEntityType: input.source.entityType,
       sourceEntityId: input.source.entityId,
       sourceDisplay: input.source.display,
       sourceUrl: input.source.url,
-      tags: input.tags.slice(0, TAGS_MAX).map((t) => t.slice(0, TAG_MAX)),
+      tags: input.tags.slice(0, TAGS_MAX).map((t) => truncateBytes(t, TAG_MAX)),
     });
     return { ref: created.id, display: created.title };
   }
@@ -184,6 +211,17 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
     sourceEntity?: { type: string; id: string };
     text?: string;
   }): Promise<TargetTask[]> {
+    // ⚠ R46: the portal ListTasks has NO customer/BP filter (Task carries no BP
+    // field), so `customerRef` is INERT here. A query with neither projectRef nor
+    // sourceEntity would return tenant-wide open tasks (page 1) — a wrong-scope
+    // dedup hazard for M1.5b. Fail loud instead of silently over-matching.
+    if (!q.projectRef && !q.sourceEntity) {
+      throw new Error(
+        'findOpenTasks requires projectRef or sourceEntity (customerRef is not a portal task filter; an unscoped query returns tenant-wide tasks — R46)',
+      );
+    }
+    // NOTE: page 1 only (default pageSize 25). Sufficient for exact sourceEntity
+    // dedup; a list-all-open use (change 04) must paginate.
     const res = await this.http.get<Paged<EzyTask>>('/api/projects/tasks', {
       projectId: q.projectRef,
       // dedup lookup: our created tasks all carry sourceService='agent-orchestrator'
