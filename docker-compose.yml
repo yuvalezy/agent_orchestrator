@@ -1,0 +1,35 @@
+# Orchestrator app service only — it does NOT define its own postgres. It reaches
+# the shared ops-dev `ezy-postgres` at localhost:42016.
+#
+# ◆ BF1 / ADR-11: network_mode: host. Verified topology — whatsapp_manager runs
+# in its OWN compose with its own Postgres (host-published 3000, NOT on
+# ezy-network); portal-business is a HOST process on 5040 (only nginx-dev is
+# containerised). network_mode: host makes localhost:3000 (WA), localhost:5040
+# (portal) and localhost:42016 (ezy-postgres host port) all reachable from one
+# address space. DB env therefore uses localhost:42016 (not ezy-postgres:5432).
+# Under host mode `ports:` is ignored — PORT=3100 binds directly on the host.
+services:
+  agent-orchestrator:
+    build: .
+    container_name: agent-orchestrator
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      NODE_ENV: production
+      PORT: 3100
+      LOG_LEVEL: info
+      PGHOST: localhost
+      PGPORT: 42016
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: agent_orchestrator
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:3100/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

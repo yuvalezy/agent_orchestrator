@@ -1,0 +1,42 @@
+{
+  "name": "agent-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Solo-founder chief-of-staff: multi-channel ingestion + triage orchestrator (WhatsApp / Gmail / EZY service desk). M1.1 service skeleton.",
+  "license": "MIT",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc && npm run copy:sql",
+    "copy:sql": "node -e \"const fs=require('fs'),p=require('path');const s='src/db/migrations',d='dist/db/migrations';fs.mkdirSync(d,{recursive:true});for(const f of fs.readdirSync(s))if(f.endsWith('.sql'))fs.copyFileSync(p.join(s,f),p.join(d,f));\"",
+    "start": "node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "db:create": "tsx scripts/create-db.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:boundary": "node scripts/check-boundary.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "helmet": "^8.0.0",
+    "pg": "^8.13.1",
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.0",
+    "@types/pg": "^8.11.10",
+    "eslint": "^9",
+    "eslint-import-resolver-typescript": "^3.7",
+    "eslint-plugin-import": "^2.31",
+    "tsx": "^4.19.2",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
