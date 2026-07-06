@@ -1,0 +1,102 @@
+# Operations
+
+Running and operating the Agent Orchestrator day to day. New here? Start with the [README](./README.md).
+
+## Running the service
+
+`./debug.sh` runs the backend in a detached **tmux** session named `ao-debug`. It kills any prior session first, so it doubles as a restart. The default is a **stable, non-watch** run (`npx tsx src/main.ts`) — a watch server would auto-reload and live-execute in-progress edits, so re-run the script by hand after a code change.
+
+| Command | What it does |
+|---------|--------------|
+| `./debug.sh` | Stable run. Attaches to the tmux pane if interactive; stays detached otherwise. |
+| `./debug.sh --fast-reconcile` | Stable run with `WHATSAPP_RECONCILE_INTERVAL_MS=15000` — for reconcile drills. |
+| `./debug.sh --watch` | `npm run dev` (tsx watch, auto-reload). **Local dev only** — not while a build is in progress. |
+
+The backend listens on `http://localhost:3100` (override with `PORT`).
+
+### Logs
+
+The tmux pane is mirrored to a logfile, so you can read logs without attaching:
+
+```bash
+tail -f tmp/ao-debug.log            # follow the mirrored log
+tmux capture-pane -pt ao-debug      # snapshot the pane
+tmux attach -t ao-debug             # attach interactively
+tmux kill-session -t ao-debug       # stop the service
+```
+
+### Health check
+
+`GET /health` (no auth) is the Docker/compose probe. It returns **200** when healthy and **503** when the DB probe fails (`status: degraded`). The DB probe degrades independently of the backlog fields.
+
+```jsonc
+{
+  "status": "ok",              // "ok" | "degraded"
+  "uptime": 1234.5,            // seconds
+  "db": "ok",                  // "ok" | "down"
+  "backlog": {
+    "inbox":         { "pending": 0, "failed": 0, "oldestPendingAgeSeconds": null },
+    "outboundQueue": { "pending": 0, "failed": 0, "oldestPendingAgeSeconds": null }
+  },
+  "workers": [
+    {
+      "name": "inbox:processor",
+      "intervalMs": 10000,
+      "lastRunAt": "…", "lastSuccessAt": "…",
+      "lastDurationMs": 42,
+      "lastError": null,        // error MESSAGE only, never a payload
+      "consecutiveFailures": 0
+    }
+  ]
+}
+```
+
+```bash
+curl -s http://localhost:3100/health | jq
+```
+
+A growing `backlog.inbox.pending` or a rising `consecutiveFailures` on any worker is the first sign something is wedged.
+
+## Background workers
+
+All workers run on an interval/backoff loop (recursive `setTimeout`; exponential backoff on consecutive failures, capped at 10× the interval). Each tick is isolated — one failure never blocks the others. Their live status is exposed on `/health`.
+
+| Worker | What it does | Interval |
+|--------|--------------|----------|
+| `whatsapp:reconcile` | Pull-reconciles messages from whatsapp_manager — the safety net for the lossy webhook and the **only** delivery path for late voice transcripts. Advances a cursor only on a fully-drained tick. Runs immediately at boot for catch-up. | `WHATSAPP_RECONCILE_INTERVAL_MS` (default 900000 = 15 min) |
+| `email:reconcile:<instance>` | One per ready Gmail instance. Polls Gmail since the stored cursor and ingests; cursor advances only after every message ingests. Runs immediately at boot. | `EMAIL_RECONCILE_INTERVAL_MS` (default 60000 = 60 s) |
+| `inbox:processor` | The money-loop core. Claims a batch of pending `agent_inbox` rows, runs triage (LLM → EZY task create/update/comment → Telegram notify), and fails poison-pill rows after max attempts. | Fixed **10 s** (not env-configurable) |
+| `telegram:callbacks` | Polls Telegram `getUpdates` from a persisted offset and dispatches the **❌-cancel** decision to the cancel handler (sets the EZY task to `cancelled`). | Fixed **3 s** (not env-configurable) |
+
+The two money-loop workers (`inbox:processor`, `telegram:callbacks`) require Telegram to be configured. If it is not, they are skipped with a warning and **ingestion still runs** — but nothing gets triaged or notified.
+
+## npm scripts
+
+| Script | Invocation | Purpose |
+|--------|------------|---------|
+| `db:create` | `npm run db:create` | One-off bootstrap: `CREATE DATABASE agent_orchestrator` (idempotent — skips if it exists). |
+| `migrate` | `npm run migrate` | Apply pending SQL migrations from `src/db/migrations`. |
+| `dev` | `npm run dev` | Run with `tsx watch` (auto-reload). Prefer `./debug.sh` for a stable run. |
+| `onboard` | `npm run onboard -- --bp-ref=<uuid> --project-ref=<uuid> [--work-item-type-ref=<uuid>]` | Onboard a customer — see [below](#onboarding-a-customer). |
+| `gmail:oauth` | `npm run gmail:oauth -- --client ~/Downloads/client_secret_XXX.json` | Mint a Gmail refresh token (readonly + send) for one account via the loopback flow. See [channels/gmail.md](./channels/gmail.md). |
+| `reconcile:once` | `npm run reconcile:once` | Run exactly one `whatsapp:reconcile` tick and exit (deterministic drills). Shares the same cursor as the worker. |
+| `smoke:webhook` | `npm run smoke:webhook -- [--id=<msgId>] [--body="text"] [--from=<number>] [--voice] [--outbound] [--tamper]` | POST a signed synthetic WhatsApp webhook to a running orchestrator; `--tamper` proves the 401 path. See [channels/whatsapp.md](./channels/whatsapp.md). |
+| `triage:sample` | `npm run triage:sample -- [--provider=openai]` | Run the LLM router on a canned message — prints extracted intents + the recorded `llm_costs` row. See [integrations/llm.md](./integrations/llm.md). |
+| `contract:ezy` | `npm run contract:ezy` | Live create → find → comment → status round-trip against the EZY test tenant (needs `TEST_PROJECT_REF`/`TEST_BP_REF`). See [integrations/ezy-portal.md](./integrations/ezy-portal.md). |
+
+## Onboarding a customer
+
+```bash
+npm run onboard -- --bp-ref=<uuid> --project-ref=<uuid> [--work-item-type-ref=<uuid>]
+```
+
+`--bp-ref` is the EZY business-partner (customer) uuid; `--project-ref` is the EZY project the tasks land in. The run is **idempotent on `bp_ref`** — re-run it any time to refresh fields and re-import contacts. It:
+
+1. Reads the customer, contacts, and work-item-types from EZY Portal, and validates the work-item-type belongs to the project's project type (auto-picks it if the project type has exactly one; otherwise you must pass `--work-item-type-ref`).
+2. Upserts the row in `agent_customers`.
+3. Imports contacts into `agent_customer_contacts` from the EZY business-partner directory (email + WhatsApp) **and** from the whatsapp_manager whitelist/groups matching this customer. If whatsapp_manager auth is not yet configured, that step is skipped with a warning and onboarding still completes.
+4. Creates the customer's Telegram topic and sends a welcome — **skipped entirely** once a topic already exists (guarded by `telegram_topic_id`).
+
+> **Why this matters:** an inbound WhatsApp/email sender is only actioned if it resolves to a contact in `agent_customer_contacts` on (`channel_type`, `address`). Senders that don't resolve are counted (`skipped_unknown_senders`) and skipped. If a customer's messages aren't turning into tasks, check that the sender's address was imported here first.
+
+See also: [configuration.md](./configuration.md) · [integrations/ezy-portal.md](./integrations/ezy-portal.md) · [integrations/telegram.md](./integrations/telegram.md)
