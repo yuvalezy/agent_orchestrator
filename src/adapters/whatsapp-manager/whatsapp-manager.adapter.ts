@@ -5,7 +5,7 @@ import type {
   InboundMessage,
   OutboundMessage,
 } from '../../ports/channel.port';
-import { WhatsAppHttp, WhatsAppHttpError } from './http';
+import { WhatsAppHttp, WhatsAppHttpError, waMediaPath } from './http';
 import { OutboundSendError } from '../../outbound/send-error';
 import { verifySignature } from './signature';
 import {
@@ -162,9 +162,10 @@ export class WhatsAppManagerAdapter implements ChannelAdapter {
       let bytes: Uint8Array;
       let contentType: string;
       try {
-        ({ bytes, contentType } = await this.http.getBytes(
-          `/messages/${encodeURIComponent(msg.attachment.ref)}/media`,
-        ));
+        // Same timeout headroom as the media POST — the GET moves the full payload too.
+        ({ bytes, contentType } = await this.http.getBytes(waMediaPath(msg.attachment.ref), {
+          timeoutMs: MEDIA_SEND_TIMEOUT_MS,
+        }));
       } catch (err) {
         throw mapMediaFetchError(err);
       }
@@ -223,14 +224,17 @@ function mapWhatsAppHttpError(err: WhatsAppHttpError): OutboundSendError {
 /**
  * Map a PRE-SEND media-fetch failure (getBytes) → OutboundSendError (M2 Milestone B
  * F10/R-B1). The media GET runs BEFORE /outbound/send, so NOTHING is delivered →
- * possiblyDelivered is ALWAYS false. A transient fault (5xx / timeout / connError) is
- * retriable (the GET is idempotent and no send occurred); a 4xx (bad/missing ref) is
- * permanent (retrying the same ref won't help). reason is a short, non-body string.
+ * possiblyDelivered is ALWAYS false. The ONLY non-retriable case is a definitive 4xx
+ * (bad/missing ref → retrying the same ref won't help); EVERY other fault — 5xx,
+ * timeout, connError, or an ambiguous transport reset (ECONNRESET, no status) — is
+ * retriable, because the GET is idempotent and no send occurred (a socket reset here
+ * can NOT have delivered anything, unlike the send path). reason is a short, non-body
+ * string. (code-review: a no-status transport error must not be permanently failed.)
  */
 function mapMediaFetchError(err: unknown): OutboundSendError {
   if (err instanceof WhatsAppHttpError) {
     const s = err.status;
-    const retriable = err.connError || err.timedOut || (s !== undefined && s >= 500);
+    const retriable = s === undefined || s >= 500; // 4xx = permanent; all else transient
     return new OutboundSendError({
       retriable,
       possiblyDelivered: false,

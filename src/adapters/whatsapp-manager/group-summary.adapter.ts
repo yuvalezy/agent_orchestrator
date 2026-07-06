@@ -5,7 +5,7 @@ import type {
   GroupImageRef,
   GroupMedia,
 } from '../../ports/group-summary.port';
-import { WhatsAppHttp } from './http';
+import { WhatsAppHttp, waMediaPath } from './http';
 import { WhatsAppDirectoryClient, type WaGroupEntry } from './directory-client';
 
 // GroupSummaryAdapter (M2) — the single adapter behind GroupSummaryPort. HTTP-only
@@ -127,15 +127,13 @@ export class GroupSummaryAdapter implements GroupSummaryPort {
 
   async fetchMedia(ref: string): Promise<GroupMedia> {
     // READ key. GET /messages/:id/media → binary body + Content-Type header.
-    const { bytes, contentType } = await this.http.getBytes(
-      `/messages/${encodeURIComponent(ref)}/media`,
-    );
+    const { bytes, contentType } = await this.http.getBytes(waMediaPath(ref));
     return { bytes, contentType, filename: `wa-media-${ref}.${extForMime(contentType)}` };
   }
 
   mediaUrl(ref: string): string {
     // KEYLESS by design (see GroupSummaryPort.mediaUrl) — never embed the api_key.
-    return `${this.baseUrl}/messages/${encodeURIComponent(ref)}/media`;
+    return `${this.baseUrl}${waMediaPath(ref)}`;
   }
 
   private async listGroupsCached(): Promise<WaGroupEntry[]> {

@@ -185,3 +185,29 @@ test('media-fetch 500 → transient (retriable), not-delivered; NO send POST fir
   });
   assert.equal(calls.length, 1, 'no POST after a failed media fetch');
 });
+
+test('media-fetch transport reset (ECONNRESET, no status) → retriable, not-delivered (CR-1)', async () => {
+  // A pre-send socket reset is NOT delivered (the GET is idempotent and no send ran),
+  // so it must be RETRIABLE — never permanently failed like a real 4xx bad ref.
+  let fetchCalls = 0;
+  const fetchImpl = (async () => {
+    fetchCalls += 1;
+    const e = new TypeError('fetch failed');
+    (e as { cause?: unknown }).cause = { code: 'ECONNRESET' };
+    throw e;
+  }) as unknown as typeof fetch;
+  const http = new WhatsAppHttp({
+    baseUrl: 'http://wa.test',
+    resolveApiKey: () => 'READ_KEY',
+    resolveWriteApiKey: () => 'WRITE_KEY',
+    fetchImpl,
+  });
+  const adapter = new WhatsAppManagerAdapter(INSTANCE, http, 'secret');
+  await assert.rejects(adapter.send(base({ attachment: { source: 'whatsapp', ref: '9' } })), (err: unknown) => {
+    assert.ok(err instanceof OutboundSendError);
+    assert.equal(err.retriable, true, 'a pre-send reset is safe to retry (nothing delivered)');
+    assert.equal(err.possiblyDelivered, false);
+    return true;
+  });
+  assert.equal(fetchCalls, 1, 'only the media GET was attempted — no send POST fired');
+});

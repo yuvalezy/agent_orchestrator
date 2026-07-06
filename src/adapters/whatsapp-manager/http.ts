@@ -47,6 +47,13 @@ export class WhatsAppHttpError extends Error {
 // resend that would duplicate a real customer message.
 const CONN_ERROR_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND']);
 
+/** The whatsapp_manager media path for a stored message ref — the SINGLE source of
+ *  truth for `GET /messages/:id/media`, shared by the group-summary attach path and
+ *  the outbound media send path (DRY: was built inline in three places). */
+export function waMediaPath(ref: string): string {
+  return `/messages/${encodeURIComponent(ref)}/media`;
+}
+
 export class WhatsAppHttp {
   private readonly baseUrl: string;
   private readonly resolveApiKey: () => string;
@@ -60,6 +67,29 @@ export class WhatsAppHttp {
     this.resolveWriteApiKey = opts.resolveWriteApiKey;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 15_000;
+  }
+
+  /** Classify a fetch REJECTION (a thrown transport fault, NOT a non-2xx response)
+   *  into a typed WhatsAppHttpError — the single source of truth for the
+   *  transport→delivery-outcome mapping shared by getBytes + postJson (DRY). `verb`
+   *  only labels the log/message. timedOut (Abort/Timeout, after the request may have
+   *  been written) and connError (ECONNREFUSED/ENOTFOUND, pre-delivery, safe) are
+   *  distinguished; every other reject (incl. ECONNRESET) is an ambiguous transport
+   *  error (neither flag) — the caller decides its delivery semantics. Never logs a body. */
+  private transportError(err: unknown, path: string, verb: string, started: number): WhatsAppHttpError {
+    const e = err as { name?: string; cause?: { code?: string } };
+    const durationMs = Date.now() - started;
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      logger.warn({ path, durationMs }, `whatsapp_manager ${verb} timed out`);
+      return new WhatsAppHttpError({ timedOut: true, connError: false, message: `whatsapp_manager ${verb} ${path} timed out` });
+    }
+    const code = e?.cause?.code;
+    if (code && CONN_ERROR_CODES.has(code)) {
+      logger.warn({ path, code, durationMs }, `whatsapp_manager ${verb} connection error`);
+      return new WhatsAppHttpError({ timedOut: false, connError: true, message: `whatsapp_manager ${verb} ${path} connection error (${code})` });
+    }
+    logger.warn({ path, name: e?.name, code, durationMs }, `whatsapp_manager ${verb} transport error`);
+    return new WhatsAppHttpError({ timedOut: false, connError: false, message: `whatsapp_manager ${verb} ${path} transport error (${e?.name ?? 'unknown'})` });
   }
 
   async getJson<T>(path: string): Promise<T> {
@@ -90,27 +120,19 @@ export class WhatsAppHttp {
    * 5xx/timeout/connError (safe to retry — the GET is idempotent, nothing sent).
    * Best-effort callers (group-summary attach) simply catch it as any Error.
    */
-  async getBytes(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+  async getBytes(path: string, opts?: { timeoutMs?: number }): Promise<{ bytes: Uint8Array; contentType: string }> {
     const started = Date.now();
+    // Per-call override (M2 Milestone B): a media download can be large, so the send
+    // path passes the same headroom as its POST — the GET also moves the full payload.
+    const timeoutMs = opts?.timeoutMs ?? this.timeoutMs;
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.baseUrl}${path}`, {
         headers: { 'x-api-key': this.resolveApiKey() },
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
-      const e = err as { name?: string; cause?: { code?: string } };
-      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
-        logger.warn({ path, durationMs: Date.now() - started }, 'whatsapp_manager media GET timed out');
-        throw new WhatsAppHttpError({ timedOut: true, connError: false, message: `whatsapp_manager GET ${path} timed out` });
-      }
-      const code = e?.cause?.code;
-      if (code && CONN_ERROR_CODES.has(code)) {
-        logger.warn({ path, code, durationMs: Date.now() - started }, 'whatsapp_manager media GET connection error');
-        throw new WhatsAppHttpError({ timedOut: false, connError: true, message: `whatsapp_manager GET ${path} connection error (${code})` });
-      }
-      logger.warn({ path, name: e?.name, code, durationMs: Date.now() - started }, 'whatsapp_manager media GET transport error');
-      throw new WhatsAppHttpError({ timedOut: false, connError: false, message: `whatsapp_manager GET ${path} transport error (${e?.name ?? 'unknown'})` });
+      throw this.transportError(err, path, 'media GET', started);
     }
     const durationMs = Date.now() - started;
     if (!res.ok) {
@@ -158,18 +180,7 @@ export class WhatsAppHttp {
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
-      const e = err as { name?: string; cause?: { code?: string } };
-      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
-        logger.warn({ path, durationMs: Date.now() - started }, 'whatsapp_manager POST timed out');
-        throw new WhatsAppHttpError({ timedOut: true, connError: false, message: `whatsapp_manager POST ${path} timed out` });
-      }
-      const code = e?.cause?.code;
-      if (code && CONN_ERROR_CODES.has(code)) {
-        logger.warn({ path, code, durationMs: Date.now() - started }, 'whatsapp_manager POST connection error');
-        throw new WhatsAppHttpError({ timedOut: false, connError: true, message: `whatsapp_manager POST ${path} connection error (${code})` });
-      }
-      logger.warn({ path, name: e?.name, code, durationMs: Date.now() - started }, 'whatsapp_manager POST transport error');
-      throw new WhatsAppHttpError({ timedOut: false, connError: false, message: `whatsapp_manager POST ${path} transport error (${e?.name ?? 'unknown'})` });
+      throw this.transportError(err, path, 'POST', started);
     }
     const durationMs = Date.now() - started;
     if (!res.ok) {
