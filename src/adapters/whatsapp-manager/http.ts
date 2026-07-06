@@ -80,20 +80,43 @@ export class WhatsAppHttp {
 
   /**
    * GET raw BINARY bytes (read key). Used to pull media (GET /messages/:id/media)
-   * for the group-mention attach path (M2). Returns the bytes + the response
-   * Content-Type header. NEVER logs the body — only {path,status,durationMs,bytes}.
+   * for the group-mention attach path (M2) and the outbound media send path
+   * (M2 Milestone B). Returns the bytes + the response Content-Type header. NEVER
+   * logs the body — only {path,status,durationMs,bytes}.
+   *
+   * Throws a typed WhatsAppHttpError (mirrors postJson, M2 Milestone B F10) so a
+   * caller that needs to classify a PRE-SEND media fetch (outbound adapter) can
+   * distinguish a permanent 4xx (bad/missing ref → give up) from a transient
+   * 5xx/timeout/connError (safe to retry — the GET is idempotent, nothing sent).
+   * Best-effort callers (group-summary attach) simply catch it as any Error.
    */
   async getBytes(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
     const started = Date.now();
-    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
-      headers: { 'x-api-key': this.resolveApiKey() },
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        headers: { 'x-api-key': this.resolveApiKey() },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      const e = err as { name?: string; cause?: { code?: string } };
+      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+        logger.warn({ path, durationMs: Date.now() - started }, 'whatsapp_manager media GET timed out');
+        throw new WhatsAppHttpError({ timedOut: true, connError: false, message: `whatsapp_manager GET ${path} timed out` });
+      }
+      const code = e?.cause?.code;
+      if (code && CONN_ERROR_CODES.has(code)) {
+        logger.warn({ path, code, durationMs: Date.now() - started }, 'whatsapp_manager media GET connection error');
+        throw new WhatsAppHttpError({ timedOut: false, connError: true, message: `whatsapp_manager GET ${path} connection error (${code})` });
+      }
+      logger.warn({ path, name: e?.name, code, durationMs: Date.now() - started }, 'whatsapp_manager media GET transport error');
+      throw new WhatsAppHttpError({ timedOut: false, connError: false, message: `whatsapp_manager GET ${path} transport error (${e?.name ?? 'unknown'})` });
+    }
     const durationMs = Date.now() - started;
     if (!res.ok) {
       await res.text().catch(() => ''); // drain, never logged
       logger.warn({ path, status: res.status, durationMs }, 'whatsapp_manager media request non-2xx');
-      throw new Error(`whatsapp_manager GET ${path} failed (${res.status})`);
+      throw new WhatsAppHttpError({ status: res.status, timedOut: false, connError: false, message: `whatsapp_manager GET ${path} failed (${res.status})` });
     }
     const contentType = res.headers.get('content-type') ?? 'application/octet-stream';
     const bytes = new Uint8Array(await res.arrayBuffer());
@@ -114,9 +137,14 @@ export class WhatsAppHttp {
    * treated as ambiguous/possibly-delivered (see CONN_ERROR_CODES). No response
    * body is logged or carried in the message (invariant #5-adjacent, no-body).
    */
-  async postJson<T>(path: string, body: unknown): Promise<T> {
+  async postJson<T>(path: string, body: unknown, opts?: { timeoutMs?: number }): Promise<T> {
     const started = Date.now();
     const resolveKey = this.resolveWriteApiKey ?? this.resolveApiKey;
+    // Per-call override (M2 Milestone B F12/R-B5): a media send uploads+sends
+    // synchronously before whatsapp_manager responds, so the outbound adapter passes
+    // a larger timeout for attachments — otherwise a slow-but-successful large send
+    // trips the 15s default → a false "possibly delivered → review" (safe, no dup).
+    const timeoutMs = opts?.timeoutMs ?? this.timeoutMs;
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.baseUrl}${path}`, {
@@ -127,7 +155,7 @@ export class WhatsAppHttp {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       const e = err as { name?: string; cause?: { code?: string } };

@@ -44,6 +44,12 @@ interface StatusResponse {
   data: { state: string; readyAt: string | null; pushname: string | null };
 }
 
+/** Timeout for a media /outbound/send (M2 Milestone B F12/R-B5). whatsapp_manager
+ *  uploads+sends the media to WhatsApp synchronously before it responds, so a large
+ *  image needs headroom over the 15s default — otherwise a slow-but-successful send
+ *  trips the client timeout → a false "possibly delivered → review" (safe, no dup). */
+const MEDIA_SEND_TIMEOUT_MS = 60_000;
+
 const CAPABILITIES: ChannelCapabilities = {
   canSend: true,
   threads: false, // WhatsApp uses the contact/group as the thread
@@ -134,14 +140,46 @@ export class WhatsAppManagerAdapter implements ChannelAdapter {
    *  whatsapp_manager normalizes to plain digits for both (code-review finding).
    *  target = threadKey (the WA thread) ?? address. A transport error is mapped to
    *  an OutboundSendError (D-C1) so the drainer never blind-resends a possibly-
-   *  delivered message. */
+   *  delivered message.
+   *
+   *  M2 Milestone B:
+   *   • Phase 4 — quoted reply: inReplyTo (for WhatsApp = the quoted message_id) →
+   *     `quotedMessageId`. The route 400s if it isn't a message in THIS thread; for a
+   *     GROUP that holds because whatsapp_manager stores a group row's contact_number
+   *     as the group id (the same threadKey we ingested from) → the quote round-trips.
+   *   • Phase 3 — media: attachment is a REFERENCE; resolve it to bytes at send time
+   *     (read key, PRE-SEND GET), base64, and post as {data,mimetype,filename}. `body`
+   *     then acts as the caption ('' → caption-less). A media send uploads
+   *     synchronously before the HTTP response → a larger timeout (R-B5). */
   async send(msg: OutboundMessage): Promise<{ providerMessageId: string }> {
     const target = msg.threadKey ?? msg.recipientAddress;
-    const payload = msg.isGroup
+    const payload: Record<string, unknown> = msg.isGroup
       ? { groupId: target, message: msg.body }
       : { number: target, message: msg.body };
+    if (msg.inReplyTo) payload.quotedMessageId = msg.inReplyTo; // Phase 4
+    if (msg.attachment) {
+      // PRE-SEND media resolution: any failure means nothing was delivered.
+      let bytes: Uint8Array;
+      let contentType: string;
+      try {
+        ({ bytes, contentType } = await this.http.getBytes(
+          `/messages/${encodeURIComponent(msg.attachment.ref)}/media`,
+        ));
+      } catch (err) {
+        throw mapMediaFetchError(err);
+      }
+      payload.attachment = {
+        data: Buffer.from(bytes).toString('base64'),
+        mimetype: msg.attachment.mimeType ?? contentType, // ref hint wins; else the fetched type
+        filename: msg.attachment.filename,
+      };
+    }
     try {
-      const res = await this.http.postJson<{ data: { messageId: string } }>('/outbound/send', payload);
+      const res = await this.http.postJson<{ data: { messageId: string } }>(
+        '/outbound/send',
+        payload,
+        msg.attachment ? { timeoutMs: MEDIA_SEND_TIMEOUT_MS } : undefined,
+      );
       return { providerMessageId: res.data.messageId };
     } catch (err) {
       if (err instanceof WhatsAppHttpError) throw mapWhatsAppHttpError(err);
@@ -168,7 +206,8 @@ export class WhatsAppManagerAdapter implements ChannelAdapter {
  * is `possiblyDelivered` → NEVER auto-resend. reason is a short, non-body string.
  *   • connError (down/restarting)  → retriable, not delivered.
  *   • 429 / 503 (transient reject)  → retriable, not delivered.
- *   • 400 / 403 (bad body / wall)   → permanent, not delivered (no 3× churn).
+ *   • 400 / 403 / 413 (bad body /   → permanent, not delivered (no 3× churn). 413 =
+ *     wall / oversize media)          oversize media, rejected PRE-send (M2 Milestone B).
  *   • timeout / 5xx / unknown       → possibly delivered → failReview, never resend.
  */
 function mapWhatsAppHttpError(err: WhatsAppHttpError): OutboundSendError {
@@ -176,7 +215,27 @@ function mapWhatsAppHttpError(err: WhatsAppHttpError): OutboundSendError {
   if (err.connError) return new OutboundSendError({ retriable: true, possiblyDelivered: false, reason: 'whatsapp_manager connection error' });
   if (err.timedOut) return new OutboundSendError({ retriable: false, possiblyDelivered: true, reason: 'whatsapp_manager send timed out (possibly delivered)' });
   if (s === 429 || s === 503) return new OutboundSendError({ retriable: true, possiblyDelivered: false, reason: `whatsapp_manager ${s} (transient)` });
-  if (s === 400 || s === 403) return new OutboundSendError({ retriable: false, possiblyDelivered: false, reason: `whatsapp_manager ${s} (permanent reject)` });
+  if (s === 400 || s === 403 || s === 413) return new OutboundSendError({ retriable: false, possiblyDelivered: false, reason: `whatsapp_manager ${s} (permanent reject)` });
   if (s !== undefined && s >= 500) return new OutboundSendError({ retriable: false, possiblyDelivered: true, reason: `whatsapp_manager ${s} (possibly delivered)` });
   return new OutboundSendError({ retriable: false, possiblyDelivered: true, reason: 'whatsapp_manager send failed (ambiguous)' });
+}
+
+/**
+ * Map a PRE-SEND media-fetch failure (getBytes) → OutboundSendError (M2 Milestone B
+ * F10/R-B1). The media GET runs BEFORE /outbound/send, so NOTHING is delivered →
+ * possiblyDelivered is ALWAYS false. A transient fault (5xx / timeout / connError) is
+ * retriable (the GET is idempotent and no send occurred); a 4xx (bad/missing ref) is
+ * permanent (retrying the same ref won't help). reason is a short, non-body string.
+ */
+function mapMediaFetchError(err: unknown): OutboundSendError {
+  if (err instanceof WhatsAppHttpError) {
+    const s = err.status;
+    const retriable = err.connError || err.timedOut || (s !== undefined && s >= 500);
+    return new OutboundSendError({
+      retriable,
+      possiblyDelivered: false,
+      reason: `attachment media fetch failed${s !== undefined ? ` (${s})` : ''}`,
+    });
+  }
+  return new OutboundSendError({ retriable: true, possiblyDelivered: false, reason: 'attachment media fetch failed (pre-send)' });
 }

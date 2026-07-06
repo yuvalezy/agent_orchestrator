@@ -1,5 +1,6 @@
 import { query } from '../db';
 import { normalizeEmailAddress, normalizeWhatsappAddress } from '../customers/onboarding';
+import type { OutboundAttachmentRef } from '../ports/channel.port';
 import type { BusinessHour, Holiday } from './send-window';
 
 // Outbound-queue data-access for the M1.8 drainer (core, db-only — no adapter, D1).
@@ -23,6 +24,7 @@ export interface ClaimedOutbound {
   timezone: string | null; // customer tz (null → drainer uses OUTBOUND_DEFAULT_TZ)
   faith: string | null; // customer faith (null → 'none')
   is_group: boolean | null; // from agent_customer_contacts (null → treat as 1:1)
+  attachment_ref: OutboundAttachmentRef | null; // M2 Milestone B (JSONB → parsed object)
 }
 
 /**
@@ -51,11 +53,11 @@ export async function claimDue(limit: number): Promise<ClaimedOutbound[]> {
            LIMIT $1
         )
         RETURNING id, customer_id, channel_instance_id, recipient_address, thread_key,
-                  in_reply_to, subject, body, retry_count
+                  in_reply_to, subject, body, retry_count, attachment_ref
      )
      SELECT c.id, c.customer_id, c.channel_instance_id, ci.channel_type,
             c.recipient_address, c.thread_key, c.in_reply_to, c.subject, c.body, c.retry_count,
-            cust.timezone, cust.faith, cc.is_group
+            c.attachment_ref, cust.timezone, cust.faith, cc.is_group
        FROM claimed c
        JOIN channel_instances ci ON ci.id = c.channel_instance_id
        LEFT JOIN agent_customers cust ON cust.id = c.customer_id
@@ -194,10 +196,11 @@ export interface EnqueueOutboundInput {
   channelInstanceId: string;
   channelType: string; // to pick the address normalizer (R37 join must hit — F2)
   recipientAddress: string;
-  body: string;
+  body: string; // '' allowed when attachmentRef is set (media caption-less send)
   threadKey?: string | null;
   subject?: string | null;
   inReplyTo?: string | null;
+  attachmentRef?: OutboundAttachmentRef | null; // M2 Milestone B (JSONB media reference)
   customerId?: string | null;
 }
 
@@ -220,8 +223,8 @@ export async function enqueueOutbound(input: EnqueueOutboundInput): Promise<stri
   const { rows } = await query<{ id: string }>(
     `INSERT INTO agent_outbound_queue
         (customer_id, channel_instance_id, recipient_address, thread_key, in_reply_to, subject, body,
-         status, is_draft, approved_by, approved_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved', false, 'admin', now())
+         attachment_ref, status, is_draft, approved_by, approved_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'approved', false, 'admin', now())
      RETURNING id`,
     [
       input.customerId ?? null,
@@ -231,6 +234,7 @@ export async function enqueueOutbound(input: EnqueueOutboundInput): Promise<stri
       input.inReplyTo ?? null,
       input.subject ?? null,
       input.body,
+      input.attachmentRef ? JSON.stringify(input.attachmentRef) : null,
     ],
   );
   return rows[0].id;

@@ -5,7 +5,7 @@ import { buildOutboundDrainerWorker, type OutboundRepo } from './outbound-draine
 import type { ClaimedOutbound } from '../../outbound/outbound-repo';
 import type { BusinessHour } from '../../outbound/send-window';
 import type { FounderNotifierPort, Notification } from '../../ports/founder-notifier.port';
-import type { ChannelInstanceConfig } from '../../ports/channel.port';
+import type { ChannelInstanceConfig, OutboundMessage } from '../../ports/channel.port';
 import { WhatsAppHttp } from '../whatsapp-manager/http';
 import { WhatsAppManagerAdapter } from '../whatsapp-manager/whatsapp-manager.adapter';
 
@@ -46,6 +46,7 @@ function claimRow(over: Partial<ClaimedOutbound> = {}): ClaimedOutbound {
     timezone: null,
     faith: null,
     is_group: null,
+    attachment_ref: null,
     ...over,
   };
 }
@@ -149,6 +150,23 @@ test('isGroup from contact → routes {groupId}', async () => {
   assert.equal(body!.groupId, '50760009999');
   assert.equal(body!.number, undefined);
   assert.deepEqual(calls.markSent, [{ id: '1', pmid: 'wamid.OK' }]);
+});
+
+test('passes attachment_ref + in_reply_to from the row through to the adapter (M2 B)', async () => {
+  // Row→OutboundMessage mapping (drainer level); the real getBytes→base64→post
+  // behaviour is covered by the adapter unit test. A capturing stub isolates the map.
+  let received: OutboundMessage | null = null;
+  const stub = {
+    capabilities: { canSend: true },
+    send: async (m: OutboundMessage) => { received = m; return { providerMessageId: 'wamid.X' }; },
+  } as unknown as WhatsAppManagerAdapter;
+  const { calls } = await runTick({
+    adapter: stub,
+    row: claimRow({ in_reply_to: 'wamid.QUOTED', attachment_ref: { source: 'whatsapp', ref: '501', mimeType: 'image/jpeg' } }),
+  });
+  assert.equal(received!.inReplyTo, 'wamid.QUOTED');
+  assert.deepEqual(received!.attachment, { source: 'whatsapp', ref: '501', mimeType: 'image/jpeg' });
+  assert.deepEqual(calls.markSent, [{ id: '1', pmid: 'wamid.X' }]);
 });
 
 // ── F1 classification matrix (end-to-end http-error → adapter → drainer action) ──

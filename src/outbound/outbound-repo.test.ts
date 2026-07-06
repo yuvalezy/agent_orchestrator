@@ -159,3 +159,43 @@ test('failuresSince: excludes possibly-delivered failures from the breaker count
   // 3 'failed' rows exist, but only the 2 genuine ones count → recipient not over-paused
   assert.equal(await repo.failuresSince(inst.wa, recipient, since), 2, 'possibly-delivered excluded');
 });
+
+test('enqueueOutbound → claimDue round-trips attachment_ref (JSONB) + in_reply_to (M2 B)', async (t) => {
+  const inst = await dbReady();
+  if (!inst) return t.skip('no database reachable');
+
+  const recipient = `${PREFIX}7001`;
+  const attachmentRef = { source: 'whatsapp', ref: '501', mimeType: 'image/jpeg', filename: 'p.jpg' };
+  const id = await repo.enqueueOutbound({
+    channelInstanceId: inst.wa,
+    channelType: 'whatsapp',
+    recipientAddress: recipient,
+    body: '', // caption-less media send — '' is valid (body is NOT NULL, not required non-empty)
+    inReplyTo: 'wamid.QUOTED',
+    attachmentRef,
+  });
+
+  const claimed = await repo.claimDue(200);
+  const row = claimed.find((r) => r.id === id);
+  assert.ok(row, 'enqueued row is claimed');
+  // JSONB comes back PARSED (a JS object), not a string / double-encoded (guards the
+  // $N::jsonb + JSON.stringify insert form).
+  assert.deepEqual(row!.attachment_ref, attachmentRef);
+  assert.equal(row!.in_reply_to, 'wamid.QUOTED');
+  assert.equal(row!.body, '');
+});
+
+test('enqueueOutbound: attachment_ref defaults to null when omitted', async (t) => {
+  const inst = await dbReady();
+  if (!inst) return t.skip('no database reachable');
+
+  const id = await repo.enqueueOutbound({
+    channelInstanceId: inst.wa,
+    channelType: 'whatsapp',
+    recipientAddress: `${PREFIX}7002`,
+    body: 'plain text',
+  });
+  const row = (await repo.claimDue(200)).find((r) => r.id === id);
+  assert.ok(row);
+  assert.equal(row!.attachment_ref, null);
+});

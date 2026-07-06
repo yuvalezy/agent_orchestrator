@@ -162,7 +162,8 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       return;
     }
 
-    // (e) dispatch. isGroup from the joined contact row (R37); threadKey/subject/inReplyTo from the row.
+    // (e) dispatch. isGroup from the joined contact row (R37); threadKey/subject/inReplyTo
+    // from the row; attachment_ref (JSONB) → media reference resolved by the adapter (M2 B).
     const msg: OutboundMessage = {
       instanceId: row.channel_instance_id,
       recipientAddress: row.recipient_address,
@@ -170,6 +171,7 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       inReplyTo: row.in_reply_to ?? undefined,
       subject: row.subject ?? undefined,
       body: row.body,
+      attachment: row.attachment_ref ?? undefined,
       isGroup: row.is_group ?? false,
     };
     try {

@@ -3,6 +3,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { logger } from '../../logger';
 import { credentialsStore } from '../../config/credentials-store';
 import { enqueueOutbound } from '../../outbound/outbound-repo';
+import type { OutboundAttachmentRef } from '../../ports/channel.port';
 import type { ChannelRegistry } from '../channel-registry';
 
 // Admin API for provider-key management (DM4-8). Mounted ONLY when ADMIN_API_KEY
@@ -68,16 +69,55 @@ export function buildAdminRouter(adminKey: string, registry: OutboundRegistry): 
   // never a 500 from an FK violation (F10). The `isGroup` field is accepted for
   // forward-compat; in M1.8 group routing is driven by the agent_customer_contacts
   // join (R37) — a per-message group flag needs a queue column (deferred).
+  // M2 Milestone B: also accepts `inReplyTo` (quoted reply) and `attachment`
+  // (media reference) — `body` becomes an optional caption when `attachment` is set.
   router.post('/outbound', async (req: Request, res: Response) => {
     const b = (req.body ?? {}) as Record<string, unknown>;
     const recipient = b.recipient;
-    const body = b.body;
-    if (typeof recipient !== 'string' || !recipient.trim() || typeof body !== 'string' || !body.trim()) {
-      res.status(400).json({ error: '"recipient" and "body" (non-empty strings) are required' });
+    if (typeof recipient !== 'string' || !recipient.trim()) {
+      res.status(400).json({ error: '"recipient" (non-empty string) is required' });
+      return;
+    }
+    // body is optional when an attachment is present (caption-less media send); when
+    // provided it must be a string (may be '' as an empty caption).
+    if (b.body !== undefined && typeof b.body !== 'string') {
+      res.status(400).json({ error: '"body" must be a string when provided' });
       return;
     }
     if (b.isGroup !== undefined && typeof b.isGroup !== 'boolean') {
       res.status(400).json({ error: '"isGroup" must be a boolean when provided' });
+      return;
+    }
+    // Optional media reference (M2 Milestone B, F11): require NON-EMPTY source+ref and
+    // string mimeType/filename when present, BEFORE relaxing the body rule — so a
+    // {source:'x',ref:''}+empty-body request can't enqueue a guaranteed-fail junk row.
+    let attachmentRef: OutboundAttachmentRef | null = null;
+    if (b.attachment !== undefined) {
+      const a = b.attachment as Record<string, unknown>;
+      if (
+        typeof a !== 'object' ||
+        a === null ||
+        Array.isArray(a) ||
+        typeof a.source !== 'string' ||
+        !a.source.trim() ||
+        typeof a.ref !== 'string' ||
+        !a.ref.trim() ||
+        (a.mimeType !== undefined && typeof a.mimeType !== 'string') ||
+        (a.filename !== undefined && typeof a.filename !== 'string')
+      ) {
+        res.status(400).json({ error: '"attachment" must be { source, ref (non-empty strings), mimeType?, filename? }' });
+        return;
+      }
+      attachmentRef = {
+        source: a.source,
+        ref: a.ref,
+        mimeType: a.mimeType as string | undefined,
+        filename: a.filename as string | undefined,
+      };
+    }
+    const bodyStr = typeof b.body === 'string' ? b.body : '';
+    if (!bodyStr.trim() && !attachmentRef) {
+      res.status(400).json({ error: 'one of "body" (non-empty) or "attachment" is required' });
       return;
     }
 
@@ -122,10 +162,11 @@ export function buildAdminRouter(adminKey: string, registry: OutboundRegistry): 
         channelInstanceId: instanceId,
         channelType,
         recipientAddress: recipient,
-        body,
+        body: bodyStr,
         threadKey: str(b.threadKey),
         subject: str(b.subject),
         inReplyTo: str(b.inReplyTo),
+        attachmentRef,
         customerId,
       });
       logger.info({ instanceId, channelType, outboundId: id }, 'admin: outbound enqueued');

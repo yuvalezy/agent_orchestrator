@@ -38,13 +38,35 @@ export interface InboundMessage {
   raw: unknown; // full provider payload → agent_inbox.raw_metadata
 }
 
+/** A media REFERENCE for an outbound send (M2 Milestone B, Phase 3) — resolved to
+ *  bytes by the adapter at send time, never bytes on the queue. `source` names where
+ *  the ref lives (MVP: a whatsapp_manager message id); `mimeType`/`filename` are
+ *  hints. Shared by OutboundMessage, the queue row, and the /admin/outbound seam. */
+export interface OutboundAttachmentRef {
+  source: string;
+  ref: string;
+  mimeType?: string;
+  filename?: string;
+}
+
 export interface OutboundMessage {
   instanceId: string;
   recipientAddress: string;
   threadKey?: string; // reply into thread/ticket when set
-  inReplyTo?: string; // email Message-ID chain header
+  /** Reply-into-thread reference. PER-CHANNEL meaning, mapped strictly inside each
+   *  adapter (never leaked across): email = the RFC Message-ID chain header;
+   *  WhatsApp = the quoted message_id (→ whatsapp_manager `quotedMessageId`). */
+  inReplyTo?: string;
   subject?: string;
+  /** Text body. When `attachment` is present it is the media CAPTION and MAY be ''
+   *  (empty) — the DB column is NOT NULL, so a caption-less send is '' not null. */
   body: string;
+  /** Optional media to send (M2 Milestone B, Phase 3). A REFERENCE the adapter
+   *  resolves to bytes at SEND time (GET /messages/:ref/media) — never bytes on the
+   *  queue or the wire. `source` names where the ref lives (MVP: a whatsapp_manager
+   *  message id); `mimeType`/`filename` are hints (the adapter falls back to the
+   *  fetched Content-Type when `mimeType` is absent). */
+  attachment?: OutboundAttachmentRef;
   /** Whether the target is a group vs a 1:1 contact. MUST be set explicitly by
    *  the enqueuer (M1.8, from agent_customer_contacts.is_group) — it CANNOT be
    *  inferred from the address: whatsapp_manager's normalizeNumber() strips the
