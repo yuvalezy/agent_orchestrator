@@ -10,6 +10,8 @@ import type { ChannelRegistry } from '../channel-registry';
 // header (constant-time compare, length-guarded first — same footgun as the M1.3
 // signature). Secret VALUES are never returned or logged — only `last4`.
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function constantTimeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
@@ -102,19 +104,43 @@ export function buildAdminRouter(adminKey: string, registry: OutboundRegistry): 
       return;
     }
 
+    // M1.8 delivers WhatsApp only — reject other channels rather than enqueue a row
+    // the WhatsApp-only drainer claim will never pick up (a silent dead-letter). F6.
+    if (channelType !== 'whatsapp') {
+      res.status(400).json({ error: `M1.8 supports WhatsApp outbound only (instance channel is "${channelType}")` });
+      return;
+    }
+
     const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null);
-    const id = await enqueueOutbound({
-      channelInstanceId: instanceId,
-      channelType,
-      recipientAddress: recipient,
-      body,
-      threadKey: str(b.threadKey),
-      subject: str(b.subject),
-      inReplyTo: str(b.inReplyTo),
-      customerId: str(b.customerId),
-    });
-    logger.info({ instanceId, channelType, outboundId: id }, 'admin: outbound enqueued');
-    res.status(201).json({ data: { id } });
+    const customerId = str(b.customerId);
+    if (customerId && !UUID_RE.test(customerId)) {
+      res.status(400).json({ error: '"customerId" must be a UUID when provided' });
+      return;
+    }
+    try {
+      const id = await enqueueOutbound({
+        channelInstanceId: instanceId,
+        channelType,
+        recipientAddress: recipient,
+        body,
+        threadKey: str(b.threadKey),
+        subject: str(b.subject),
+        inReplyTo: str(b.inReplyTo),
+        customerId,
+      });
+      logger.info({ instanceId, channelType, outboundId: id }, 'admin: outbound enqueued');
+      res.status(201).json({ data: { id } });
+    } catch (err) {
+      // A well-formed but unknown customerId trips the FK (23503); an unparseable
+      // value trips 22P02. Both are caller errors → 400, never a 500 (F3/F10).
+      const code = (err as { code?: string })?.code;
+      if (code === '23503' || code === '22P02') {
+        res.status(400).json({ error: 'unknown or invalid customerId' });
+        return;
+      }
+      logger.error({ instanceId, reason: (err as Error)?.message }, 'admin: outbound enqueue failed');
+      res.status(500).json({ error: 'enqueue failed' });
+    }
   });
 
   return router;

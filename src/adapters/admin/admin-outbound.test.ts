@@ -42,6 +42,21 @@ const registryNoWa: Registry = {
   whatsappPrimary: (() => null) as Registry['whatsappPrimary'],
 };
 
+const emailInstance = (id: string): ChannelInstanceConfig => ({
+  id,
+  channelType: 'email',
+  provider: 'gmail',
+  name: 'email:test',
+  config: {},
+  credentialsRef: '',
+});
+function registryWithEmail(id: string): Registry {
+  return {
+    get: ((x: string) => (x === id ? { instance: emailInstance(id), adapter: {}, state: 'ready' } : undefined)) as Registry['get'],
+    whatsappPrimary: (() => null) as Registry['whatsappPrimary'],
+  };
+}
+
 async function startApp(registry: Registry): Promise<{ url: string; close: () => Promise<void> }> {
   const app = express();
   app.use(express.json());
@@ -117,6 +132,38 @@ test('isGroup must be boolean when provided → 400', async () => {
   const app = await startApp(registryWithWa('id'));
   try {
     const r = await post(app.url, { channel: 'whatsapp', recipient: `${PREFIX}4`, body: 'hi', isGroup: 'yes' });
+    assert.equal(r.status, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+test('non-whatsapp instanceId → 400 (M1.8 is WhatsApp-only; no silent dead-letter — F6)', async () => {
+  const app = await startApp(registryWithEmail('email-1'));
+  try {
+    const r = await post(app.url, { instanceId: 'email-1', recipient: `${PREFIX}7`, body: 'hi' });
+    assert.equal(r.status, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+test('malformed customerId → 400 (not a 500 — F3)', async () => {
+  const app = await startApp(registryWithWa('id'));
+  try {
+    const r = await post(app.url, { channel: 'whatsapp', recipient: `${PREFIX}8`, body: 'hi', customerId: 'not-a-uuid' });
+    assert.equal(r.status, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+test('well-formed but unknown customerId → 400 via FK, never 500 (F3)', async (t) => {
+  const id = await waInstanceId();
+  if (!id) return t.skip('no database reachable');
+  const app = await startApp(registryWithWa(id));
+  try {
+    const r = await post(app.url, { channel: 'whatsapp', recipient: `${PREFIX}9`, body: 'hi', customerId: '11111111-1111-1111-1111-111111111111' });
     assert.equal(r.status, 400);
   } finally {
     await app.close();

@@ -67,17 +67,25 @@ export async function claimDue(limit: number): Promise<ClaimedOutbound[]> {
   return rows;
 }
 
+/** Sentinel prefix on `last_error` for POSSIBLY-DELIVERED terminal failures
+ *  (timeout / 5xx / ambiguous reset / stuck-reclaim). The failure circuit-breaker
+ *  (failuresSince) excludes these so a delivered-but-ambiguous send never pauses a
+ *  recipient who actually received it (F2). Internal to this module — the writer
+ *  (failReview/reclaimStuck) and the reader (failuresSince) are the only users. */
+const POSSIBLY_DELIVERED_PREFIX = 'possibly-delivered: ';
+
 /**
  * Rows wedged in 'sending' past the stuck window → 'failed' (possibly delivered —
  * NO resend). A crash after adapter.send() but before markSent parks the row here;
  * reclaiming by AGE (never a status flip back to 'approved') proves termination
- * (D-C F12). Returns the ids so the caller raises ONE admin alert.
+ * (D-C F12). Tagged possibly-delivered so it does not count toward the breaker.
+ * Returns the ids so the caller raises ONE admin alert.
  */
 export async function reclaimStuck(stuckMinutes: number): Promise<string[]> {
   const { rows } = await query<{ id: string }>(
     `UPDATE agent_outbound_queue
         SET status = 'failed',
-            last_error = 'stuck in sending (possibly delivered) — manual review'
+            last_error = '${POSSIBLY_DELIVERED_PREFIX}stuck in sending — manual review'
       WHERE status = 'sending' AND updated_at < now() - make_interval(mins => $1::int)
       RETURNING id`,
     [stuckMinutes],
@@ -126,11 +134,15 @@ export async function deferUntil(id: string, sendAfter: Date): Promise<void> {
   ]);
 }
 
-/** Terminal failure surfaced for manual review (permanent reject / possibly-delivered). */
-export async function failReview(id: string, reason: string): Promise<void> {
+/** Terminal failure surfaced for manual review. `possiblyDelivered` (timeout / 5xx
+ *  / ambiguous reset) tags the row with the sentinel so the failure breaker skips
+ *  it — a send that may have reached the customer is not a clean delivery failure
+ *  (F2). Permanent rejects (400/403) pass false → they DO count toward the breaker. */
+export async function failReview(id: string, reason: string, opts?: { possiblyDelivered?: boolean }): Promise<void> {
+  const last = opts?.possiblyDelivered ? `${POSSIBLY_DELIVERED_PREFIX}${reason}` : reason;
   await query(`UPDATE agent_outbound_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
     id,
-    reason,
+    last,
   ]);
 }
 
@@ -164,11 +176,15 @@ export async function lastSentAt(instanceId: string, recipient: string): Promise
   return rows[0]?.last ?? null;
 }
 
-/** Recent failures to a recipient (failure circuit-breaker — served by idx_agent_outbound_sent). */
+/** Recent GENUINE delivery failures to a recipient (failure circuit-breaker —
+ *  served by idx_agent_outbound_sent). Excludes possibly-delivered rows (sentinel
+ *  prefix) so an ambiguous timeout/5xx/reset that may have reached the customer
+ *  does not pause them (F2). */
 export async function failuresSince(instanceId: string, recipient: string, sinceIso: string): Promise<number> {
   const { rows } = await query<{ n: number }>(
     `SELECT count(*)::int AS n FROM agent_outbound_queue
-      WHERE channel_instance_id = $1 AND recipient_address = $2 AND status = 'failed' AND updated_at >= $3`,
+      WHERE channel_instance_id = $1 AND recipient_address = $2 AND status = 'failed' AND updated_at >= $3
+        AND (last_error IS NULL OR last_error NOT LIKE '${POSSIBLY_DELIVERED_PREFIX}%')`,
     [instanceId, recipient, sinceIso],
   );
   return rows[0]?.n ?? 0;

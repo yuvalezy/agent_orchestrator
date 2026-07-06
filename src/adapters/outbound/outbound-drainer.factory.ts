@@ -30,7 +30,7 @@ export interface OutboundRepo {
   markSent(id: string, providerMessageId: string): Promise<void>;
   retryLater(id: string, err: string, maxAttempts: number, backoffMs: number): Promise<{ failed: boolean }>;
   deferUntil(id: string, sendAfter: Date): Promise<void>;
-  failReview(id: string, reason: string): Promise<void>;
+  failReview(id: string, reason: string, opts?: { possiblyDelivered?: boolean }): Promise<void>;
   countSentSince(instanceId: string, recipient: string, sinceIso: string): Promise<number>;
   oldestSentSince(instanceId: string, recipient: string, sinceIso: string): Promise<Date | null>;
   lastSentAt(instanceId: string, recipient: string): Promise<Date | null>;
@@ -84,7 +84,7 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
     }
 
     if (possiblyDelivered) {
-      await repo.failReview(row.id, reason);
+      await repo.failReview(row.id, reason, { possiblyDelivered: true });
       logger.info({ worker: NAME, id: row.id, status: 'failReview' }, 'outbound: possibly-delivered failure (no resend)');
       await alertAdmin(`#${row.id} to ${row.recipient_address} FAILED (possibly delivered — no auto-resend): ${reason}. Manual review needed.`);
     } else if (retriable) {
@@ -93,13 +93,14 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       logger.info({ worker: NAME, id: row.id, status: failed ? 'failed' : 'retry' }, 'outbound: transient failure');
       if (failed) await alertAdmin(`#${row.id} to ${row.recipient_address} FAILED after ${MAX_SEND_ATTEMPTS} attempts: ${reason}.`);
     } else {
-      await repo.failReview(row.id, reason);
+      // Permanent, definitely-not-delivered (400/403) → counts toward the breaker.
+      await repo.failReview(row.id, reason, { possiblyDelivered: false });
       logger.info({ worker: NAME, id: row.id, status: 'failReview' }, 'outbound: permanent rejection');
       await alertAdmin(`#${row.id} to ${row.recipient_address} permanently rejected: ${reason}.`);
     }
   }
 
-  async function processRow(row: ClaimedOutbound, businessHours: BusinessHour[], holidays: Holiday[]): Promise<void> {
+  async function processRow(row: ClaimedOutbound, businessHours: BusinessHour[], holidays: Holiday[], alertedPauses: Set<string>): Promise<void> {
     // (a) send-capable adapter?
     const reg = registry.get(row.channel_instance_id);
     const adapter = reg?.adapter;
@@ -118,7 +119,13 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
     if (failures >= cfg.maxRecipientFailures) {
       await repo.deferUntil(row.id, new Date(now + cfg.failureWindowMin * 60_000)); // defer FIRST
       logger.info({ worker: NAME, id: row.id, status: 'paused' }, 'outbound: recipient paused (failure breaker)');
-      await alertAdmin(`Sends to ${row.recipient_address} paused after ${failures} failures (auto-resumes in ~${cfg.failureWindowMin}m).`);
+      // Alert ONCE per recipient per tick — N queued rows to one paused recipient
+      // must not fan out to N identical alerts (F2).
+      const pauseKey = `${row.channel_instance_id}|${row.recipient_address}`;
+      if (!alertedPauses.has(pauseKey)) {
+        alertedPauses.add(pauseKey);
+        await alertAdmin(`Sends to ${row.recipient_address} paused after ${failures} failures (auto-resumes in ~${cfg.failureWindowMin}m).`);
+      }
       return;
     }
 
@@ -193,9 +200,10 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       const nowMs = Date.now();
       const holidays = await repo.loadHolidays(isoDate(nowMs - DAY_MS), isoDate(nowMs + 15 * DAY_MS));
 
+      const alertedPauses = new Set<string>(); // dedupe breaker alerts within this tick (F2)
       for (const row of rows) {
         try {
-          await processRow(row, businessHours, holidays);
+          await processRow(row, businessHours, holidays, alertedPauses);
         } catch (err) {
           // A DB/unexpected error leaves the row 'sending' → reclaimStuck handles it
           // by age (never a resend). One bad row can't block the batch.

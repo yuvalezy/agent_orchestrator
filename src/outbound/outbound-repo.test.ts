@@ -139,3 +139,23 @@ test('rate/failure helpers: markSent, countSentSince, oldestSentSince, lastSentA
   assert.equal(await repo.failuresSince(inst.wa, failRecipient, since), 1);
   assert.equal(await repo.failuresSince(inst.wa, recipient, since), 0);
 });
+
+test('failuresSince: excludes possibly-delivered failures from the breaker count (F2)', async (t) => {
+  const inst = await dbReady();
+  if (!inst) return t.skip('no database reachable');
+
+  const recipient = `${PREFIX}6001`;
+  const since = new Date(Date.now() - 3_600_000).toISOString();
+
+  // two GENUINE (permanent/exhausted) failures — these count toward the breaker
+  const g1 = await insertRow(inst.wa, { recipient, status: 'sending' });
+  await repo.failReview(g1, '403 permanent reject');
+  const g2 = await insertRow(inst.wa, { recipient, status: 'sending' });
+  await repo.failReview(g2, 'exhausted retries');
+  // one POSSIBLY-DELIVERED failure (timeout/5xx/reset) — must NOT count
+  const pd = await insertRow(inst.wa, { recipient, status: 'sending' });
+  await repo.failReview(pd, 'send timed out', { possiblyDelivered: true });
+
+  // 3 'failed' rows exist, but only the 2 genuine ones count → recipient not over-paused
+  assert.equal(await repo.failuresSince(inst.wa, recipient, since), 2, 'possibly-delivered excluded');
+});

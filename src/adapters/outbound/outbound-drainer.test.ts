@@ -54,7 +54,7 @@ interface Calls {
   markSent: Array<{ id: string; pmid: string }>;
   retryLater: Array<{ id: string; backoff: number }>;
   deferUntil: Array<{ id: string; when: Date }>;
-  failReview: Array<{ id: string; reason: string }>;
+  failReview: Array<{ id: string; reason: string; possiblyDelivered?: boolean }>;
 }
 
 function fakeRepo(calls: Calls, over: Partial<OutboundRepo>, retryTipsToFailed = false): OutboundRepo {
@@ -64,7 +64,7 @@ function fakeRepo(calls: Calls, over: Partial<OutboundRepo>, retryTipsToFailed =
     markSent: async (id, pmid) => { calls.markSent.push({ id, pmid }); },
     retryLater: async (id, _err, _max, backoff) => { calls.retryLater.push({ id, backoff }); return { failed: retryTipsToFailed }; },
     deferUntil: async (id, when) => { calls.deferUntil.push({ id, when }); },
-    failReview: async (id, reason) => { calls.failReview.push({ id, reason }); },
+    failReview: async (id, reason, opts) => { calls.failReview.push({ id, reason, possiblyDelivered: opts?.possiblyDelivered }); },
     countSentSince: async () => 0,
     oldestSentSince: async () => null,
     lastSentAt: async () => null,
@@ -152,15 +152,18 @@ test('isGroup from contact → routes {groupId}', async () => {
 });
 
 // ── F1 classification matrix (end-to-end http-error → adapter → drainer action) ──
-const MATRIX: Array<{ name: string; fetchImpl: typeof fetch; expect: 'failReview' | 'retryLater' }> = [
-  { name: 'client timeout → failReview (possibly delivered, no resend)', fetchImpl: timeoutFetch, expect: 'failReview' },
-  { name: '5xx → failReview (possibly delivered, no resend)', fetchImpl: statusFetch(500), expect: 'failReview' },
+const MATRIX: Array<{ name: string; fetchImpl: typeof fetch; expect: 'failReview' | 'retryLater'; pd?: boolean }> = [
+  { name: 'client timeout → failReview (possibly delivered, no resend)', fetchImpl: timeoutFetch, expect: 'failReview', pd: true },
+  { name: '5xx → failReview (possibly delivered, no resend)', fetchImpl: statusFetch(500), expect: 'failReview', pd: true },
   { name: '429 → retryLater (transient)', fetchImpl: statusFetch(429), expect: 'retryLater' },
   { name: '503 → retryLater (transient)', fetchImpl: statusFetch(503), expect: 'retryLater' },
-  { name: 'ECONNREFUSED → retryLater (down/restarting)', fetchImpl: connFetch('ECONNREFUSED'), expect: 'retryLater' },
-  { name: 'ECONNRESET → retryLater', fetchImpl: connFetch('ECONNRESET'), expect: 'retryLater' },
-  { name: '400 → failReview (permanent, no churn)', fetchImpl: statusFetch(400), expect: 'failReview' },
-  { name: '403 → failReview (permanent, no churn)', fetchImpl: statusFetch(403), expect: 'failReview' },
+  { name: 'ECONNREFUSED → retryLater (pre-delivery, safe)', fetchImpl: connFetch('ECONNREFUSED'), expect: 'retryLater' },
+  { name: 'ENOTFOUND → retryLater (pre-delivery, safe)', fetchImpl: connFetch('ENOTFOUND'), expect: 'retryLater' },
+  // F1: whatsapp_manager delivers BEFORE it responds, so a mid-send reset is
+  // ambiguous → possibly delivered → failReview, NEVER an auto-resend (no duplicate).
+  { name: 'ECONNRESET → failReview (ambiguous, no resend — F1)', fetchImpl: connFetch('ECONNRESET'), expect: 'failReview', pd: true },
+  { name: '400 → failReview (permanent, no churn)', fetchImpl: statusFetch(400), expect: 'failReview', pd: false },
+  { name: '403 → failReview (permanent, no churn)', fetchImpl: statusFetch(403), expect: 'failReview', pd: false },
 ];
 
 for (const c of MATRIX) {
@@ -170,12 +173,27 @@ for (const c of MATRIX) {
     if (c.expect === 'failReview') {
       assert.equal(calls.failReview.length, 1, 'failReview once');
       assert.equal(calls.retryLater.length, 0, 'no retry (no resend risk)');
+      // possiblyDelivered drives whether the failure breaker counts it (F2): an
+      // ambiguous outcome must NOT count; a permanent 400/403 must.
+      assert.equal(calls.failReview[0].possiblyDelivered, c.pd, 'possiblyDelivered flag');
     } else {
       assert.equal(calls.retryLater.length, 1, 'retryLater once');
       assert.equal(calls.failReview.length, 0);
     }
   });
 }
+
+test('failure breaker: N queued rows to ONE paused recipient → deferUntil each, exactly ONE alert (F2)', async () => {
+  const r1 = claimRow({ id: '1', recipient_address: '50760001234' });
+  const r2 = claimRow({ id: '2', recipient_address: '50760001234' });
+  const { calls, admin } = await runTick({
+    adapter: waAdapter(okFetch()),
+    repoOver: { claimDue: async () => [r1, r2], failuresSince: async () => 3 },
+  });
+  assert.equal(calls.deferUntil.length, 2, 'both rows paused (deferred)');
+  assert.equal(calls.markSent.length, 0, 'nothing sent while paused');
+  assert.equal(admin.length, 1, 'exactly one paused alert for the recipient, not one per row');
+});
 
 test('retryLater tipping to failed raises one admin alert', async () => {
   const { calls, admin } = await runTick({ adapter: waAdapter(statusFetch(429)), retryTipsToFailed: true });

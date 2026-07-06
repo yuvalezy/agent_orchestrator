@@ -38,7 +38,14 @@ export class WhatsAppHttpError extends Error {
   }
 }
 
-const CONN_ERROR_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'ECONNRESET']);
+// Only PRE-delivery connection failures are safe to auto-retry. ECONNREFUSED /
+// ENOTFOUND mean the request never reached whatsapp_manager (nothing delivered).
+// ECONNRESET is EXCLUDED on purpose (D-C1 / F1): whatsapp_manager delivers the
+// WhatsApp message BEFORE it writes its HTTP response (outbound.routes.ts:83→88),
+// so a socket reset mid-send (e.g. a restart) can fire AFTER delivery. It must
+// fall through to the possibly-delivered path (→ failReview), never a blind
+// resend that would duplicate a real customer message.
+const CONN_ERROR_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND']);
 
 export class WhatsAppHttp {
   private readonly baseUrl: string;
@@ -79,8 +86,9 @@ export class WhatsAppHttp {
    * Throws a typed WhatsAppHttpError (M1.8, D-C1) so the adapter can classify
    * delivery outcome: a NON-2xx carries `status`; a client timeout →
    * `timedOut` (AbortSignal.timeout raises TimeoutError/AbortError, AFTER the
-   * request may have been written → possibly delivered); a socket-level failure →
-   * `connError` (whatsapp_manager down/restarting → safe to retry). No response
+   * request may have been written → possibly delivered); a PRE-delivery socket
+   * failure (ECONNREFUSED/ENOTFOUND) → `connError` (safe to retry). ECONNRESET is
+   * treated as ambiguous/possibly-delivered (see CONN_ERROR_CODES). No response
    * body is logged or carried in the message (invariant #5-adjacent, no-body).
    */
   async postJson<T>(path: string, body: unknown): Promise<T> {
@@ -109,7 +117,7 @@ export class WhatsAppHttp {
         logger.warn({ path, code, durationMs: Date.now() - started }, 'whatsapp_manager POST connection error');
         throw new WhatsAppHttpError({ timedOut: false, connError: true, message: `whatsapp_manager POST ${path} connection error (${code})` });
       }
-      logger.warn({ path, name: e?.name, durationMs: Date.now() - started }, 'whatsapp_manager POST transport error');
+      logger.warn({ path, name: e?.name, code, durationMs: Date.now() - started }, 'whatsapp_manager POST transport error');
       throw new WhatsAppHttpError({ timedOut: false, connError: false, message: `whatsapp_manager POST ${path} transport error (${e?.name ?? 'unknown'})` });
     }
     const durationMs = Date.now() - started;
