@@ -8,6 +8,7 @@ import { ChannelRegistry } from './adapters/channel-registry';
 import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
 import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
 import { buildEmailReconcileWorker } from './adapters/email/reconcile.worker';
+import { buildReconcileWorker } from './adapters/reconcile-worker';
 import { ingestInbound } from './inbox/ingestion';
 import { credentialsStore } from './config/credentials-store';
 import { buildAdminRouter } from './adapters/admin/admin.router';
@@ -76,6 +77,24 @@ async function main(): Promise<void> {
     );
   }
   logger.info({ emailInstances: registry.emailAdapters().length }, 'email pollers registered');
+
+  // M1.7: one service-desk reconcile poller per ready ezy_service_desk instance
+  // (bootstrap lookback on first run). Uses the generic reconcile worker (D-E):
+  // the adapter's fetchSince drains the ticket list + threads; the worker persists
+  // the cursor (advance-after-all-ingest / hold-on-throw / write-only-on-change).
+  for (const { instance, adapter } of registry.serviceDeskAdapters()) {
+    ingestionWorkers.push(
+      buildReconcileWorker({
+        instanceId: instance.id,
+        instanceName: instance.name,
+        namePrefix: 'servicedesk:reconcile',
+        fetchSince: adapter.fetchSince.bind(adapter),
+        sink: ingestInbound,
+        intervalMs: env.SERVICE_DESK_RECONCILE_INTERVAL_MS,
+      }),
+    );
+  }
+  logger.info({ serviceDeskInstances: registry.serviceDeskAdapters().length }, 'service-desk pollers registered');
 
   // M1.5b: the money-loop workers (inbox processor + Telegram callback poller).
   // Both require Telegram (the loop notifies the founder) — skip cleanly if it is

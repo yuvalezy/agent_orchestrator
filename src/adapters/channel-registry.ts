@@ -5,8 +5,12 @@ import { buildWhatsAppAdapter } from './whatsapp-manager/factory';
 import type { WhatsAppManagerAdapter } from './whatsapp-manager/whatsapp-manager.adapter';
 import { buildEmailAdapter } from './email/factory';
 import type { EmailChannelAdapter } from './email/email-channel.adapter';
+import { buildServiceDeskAdapter } from './service-desk/factory';
+import type { ServiceDeskAdapter } from './service-desk/service-desk.adapter';
+import { buildEzyPortalGateway } from './ezy-portal/factory';
+import type { EzyPortalGateway } from './ezy-portal/ezy-portal.gateway';
 
-type ChannelAdapterImpl = WhatsAppManagerAdapter | EmailChannelAdapter;
+type ChannelAdapterImpl = WhatsAppManagerAdapter | EmailChannelAdapter | ServiceDeskAdapter;
 
 // Channel registry loader (tasks.md 3.1). Reads channel_instances and instantiates
 // one adapter per row via a provider→factory map. Lives in the ADAPTER/composition
@@ -56,6 +60,12 @@ export class ChannelRegistry {
         ORDER BY name`,
     );
 
+    // One shared portal gateway injected into every service-desk adapter (M1.7).
+    // Constructing it does NO I/O — the tenant key resolves lazily per request —
+    // so this is safe even when no ezy_service_desk row is active.
+    let ezyGateway: EzyPortalGateway | null = null;
+    const sharedEzyGateway = (): EzyPortalGateway => (ezyGateway ??= buildEzyPortalGateway());
+
     for (const row of rows) {
       const instance = toConfig(row);
       let registered: RegisteredChannel;
@@ -67,8 +77,10 @@ export class ChannelRegistry {
           case 'gmail':
             registered = { instance, adapter: buildEmailAdapter(instance), state: 'ready' };
             break;
+          case 'ezy_service_desk':
+            registered = { instance, adapter: buildServiceDeskAdapter(instance, sharedEzyGateway()), state: 'ready' };
+            break;
           default:
-            // ezy_service_desk (M1.7) — registered, not yet built.
             logger.info({ instance: row.name, provider: row.provider }, 'channel registry: provider not implemented yet (skipped)');
             registered = { instance, adapter: null, state: 'unimplemented' };
         }
@@ -111,6 +123,13 @@ export class ChannelRegistry {
     return this.ready()
       .filter((c) => c.instance.provider === 'gmail' && c.adapter)
       .map((c) => ({ instance: c.instance, adapter: c.adapter as EmailChannelAdapter }));
+  }
+
+  /** All ready service-desk instances (one reconcile poller each — M1.7). */
+  serviceDeskAdapters(): Array<{ instance: ChannelInstanceConfig; adapter: ServiceDeskAdapter }> {
+    return this.ready()
+      .filter((c) => c.instance.provider === 'ezy_service_desk' && c.adapter)
+      .map((c) => ({ instance: c.instance, adapter: c.adapter as ServiceDeskAdapter }));
   }
 
   /** Per-instance health for /health surfacing (implemented adapters only). */

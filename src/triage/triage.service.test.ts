@@ -41,6 +41,7 @@ function fakes(intents: Intent[], contactKind: 'known' | 'unknown') {
   const notified: Array<{ title: string; buttons: boolean }> = [];
   let skipped = 0;
   const contactQueries: ContactResolutionQueries = {
+    findCustomerByBpRef: async () => null, // WA rows never take the bp-ref path
     findContactByAddress: async () => (contactKind === 'known' ? { customerId, contactId: 'c1' } : null),
     findCustomersByEmailDomain: async () => [],
   };

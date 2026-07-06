@@ -44,6 +44,12 @@ const envSchema = z.object({
   // ── M1.6: email (Gmail) poll interval per instance (non-secret).
   EMAIL_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
 
+  // ── M1.7: service-desk poll interval + first-run bootstrap lookback (non-secret).
+  // The bootstrap window bounds first-boot volume and lets the gate pick up an
+  // already-open ticket (D-D). Set to 0 to start from now() (clean-slate boot).
+  SERVICE_DESK_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  SERVICE_DESK_BOOTSTRAP_WINDOW_DAYS: z.coerce.number().int().nonnegative().default(7),
+
   // ── M1.4: LLM gateway (non-secret). Provider KEYS are NOT here — resolved via
   // resolveCredential (ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY), and
   // CREDENTIALS_ENCRYPTION_KEY / ADMIN_API_KEY are read directly via process.env.

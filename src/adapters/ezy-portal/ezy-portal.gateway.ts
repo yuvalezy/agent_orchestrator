@@ -1,4 +1,12 @@
-import { CustomerDirectoryPort, TaskTargetPort, TaskRef, TargetTask } from '../../ports';
+import {
+  CustomerDirectoryPort,
+  TaskTargetPort,
+  TaskRef,
+  TargetTask,
+  TicketingPort,
+  TargetTicket,
+  TicketThreadEntry,
+} from '../../ports';
 import { EzyPortalHttpClient } from './http-client';
 
 /** The orchestrator's identity in the portal `sourceService` field (D5 dedup). */
@@ -73,6 +81,76 @@ interface Paged<T> {
   data: T[];
 }
 
+// ── Service-desk raw shapes (recon §2; camelCase JSON, only fields we read) ──
+interface EzyTicket {
+  id: string;
+  ticketNumber: string;
+  subject: string;
+  description?: string | null;
+  status: string;
+  priority: string;
+  source?: string | null;
+  requesterType: string;
+  requesterBPID?: string | null;
+  requesterContactID?: string | null;
+  requesterName?: string | null;
+  requesterEmail?: string | null;
+  accountId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  tags?: string[] | null;
+}
+
+/** The changed-ticket list envelope (recon §2): {data, totalCount, pageNumber, pageSize}. */
+interface EzyTicketList {
+  data: EzyTicket[];
+  totalCount: number;
+  pageNumber: number;
+  pageSize: number;
+}
+
+interface EzyTicketThreadEntry {
+  id: string;
+  ticketId?: string;
+  entryType: string;
+  visibility: string;
+  body: string;
+  authorName?: string | null;
+  authorIsExternal: boolean;
+  createdAt: string;
+}
+
+/** Raw portal ticket → opaque TargetTicket (refs are UUID strings). */
+function mapTicket(t: EzyTicket): TargetTicket {
+  return {
+    id: t.id,
+    ticketNumber: t.ticketNumber,
+    subject: t.subject,
+    description: t.description ?? null,
+    status: t.status as TargetTicket['status'],
+    priority: t.priority as TargetTicket['priority'],
+    requesterType: t.requesterType as TargetTicket['requesterType'],
+    requesterBPID: t.requesterBPID ?? null,
+    requesterEmail: t.requesterEmail ?? null,
+    requesterName: t.requesterName ?? null,
+    createdAt: new Date(t.createdAt),
+    updatedAt: new Date(t.updatedAt),
+  };
+}
+
+/** Raw thread entry → opaque TicketThreadEntry. */
+function mapEntry(e: EzyTicketThreadEntry): TicketThreadEntry {
+  return {
+    id: e.id,
+    body: e.body,
+    authorName: e.authorName ?? '',
+    authorIsExternal: e.authorIsExternal,
+    visibility: e.visibility as TicketThreadEntry['visibility'],
+    entryType: e.entryType as TicketThreadEntry['entryType'],
+    createdAt: new Date(e.createdAt),
+  };
+}
+
 function fullName(c: EzyContact): string {
   return [c.firstName, c.lastName].filter((s) => s && s.trim()).join(' ').trim();
 }
@@ -109,7 +187,7 @@ function truncateBytes(s: string, maxBytes: number): string {
   return out;
 }
 
-export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
+export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, TicketingPort {
   constructor(private readonly http: EzyPortalHttpClient) {}
 
   async getCustomer(
@@ -270,5 +348,71 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort {
   async setStatus(task: TaskRef, status: string): Promise<void> {
     // Dedicated endpoint — POST /:id/status, NOT PATCH /:id (task_update.go).
     await this.http.post(`/api/projects/tasks/${task.ref}/status`, { status });
+  }
+
+  // ── TicketingPort (M1.7) — READ half wired (service-desk.view); WRITE half
+  // (postReply/setTicketStatus) port-complete but UNWIRED (needs service-desk.manage,
+  // M1.8). All routes go through nginx as /api/service-desk/* (CLAUDE.md rewrite).
+
+  /**
+   * Drain the changed-ticket list on an INCLUSIVE `updatedAfter` (recon §2, D-D):
+   * `sortBy=updatedAt&sortDescending=false&pageSize=100`, walking `pageNumber`
+   * until `(pageNumber-1)*pageSize >= totalCount`. `nextCursor = max(updatedAt)`
+   * across the drained set, or the passed `updatedAfter` on an empty drain (never
+   * null — B9). Re-delivered boundary rows are deduped downstream by id (no +1ns).
+   */
+  async listChangedTickets(updatedAfter: string): Promise<{ tickets: TargetTicket[]; nextCursor: string }> {
+    const pageSize = 100; // hard-capped server-side
+    const tickets: TargetTicket[] = [];
+    let pageNumber = 1;
+    let totalCount = Infinity;
+    // Drain EVERY page before advancing (R32) — a partial drain would lose rows
+    // past the cursor once max(updatedAt) advances.
+    while ((pageNumber - 1) * pageSize < totalCount) {
+      const res = await this.http.get<EzyTicketList>('/api/service-desk/tickets', {
+        updatedAfter,
+        sortBy: 'updatedAt',
+        sortDescending: 'false',
+        pageNumber: String(pageNumber),
+        pageSize: String(pageSize),
+      });
+      totalCount = res.totalCount;
+      for (const t of res.data) tickets.push(mapTicket(t));
+      if (res.data.length === 0) break; // safety: no more rows than totalCount claims
+      pageNumber += 1;
+    }
+    let maxMs = new Date(updatedAfter).getTime();
+    for (const t of tickets) maxMs = Math.max(maxMs, t.updatedAt.getTime());
+    return { tickets, nextCursor: new Date(maxMs).toISOString() };
+  }
+
+  /** Public thread entries only — `?visibility=public` excludes internal notes.
+   *  The endpoint returns a RAW ARRAY (created_at ASC), not a paged envelope. */
+  async getThread(ticketRef: string): Promise<TicketThreadEntry[]> {
+    const entries = await this.http.get<EzyTicketThreadEntry[]>(
+      `/api/service-desk/tickets/${ticketRef}/thread`,
+      { visibility: 'public' },
+    );
+    return entries.map(mapEntry);
+  }
+
+  /** UNWIRED (M1.8) — needs service-desk.manage. Endpoint shape is best-effort
+   *  (recon §2 documents only reads); revisit when outbound is wired. */
+  async postReply(ticketRef: string, body: string, visibility: 'public' | 'internal'): Promise<void> {
+    await this.http.post(`/api/service-desk/tickets/${ticketRef}/thread`, {
+      body,
+      visibility,
+      entryType: 'reply',
+    });
+  }
+
+  /** UNWIRED (M1.8) — needs service-desk.manage. See postReply note on endpoint shape. */
+  async setTicketStatus(ticketRef: string, status: 'open' | 'pending' | 'resolved' | 'closed'): Promise<void> {
+    await this.http.post(`/api/service-desk/tickets/${ticketRef}/status`, { status });
+  }
+
+  /** Cheap connectivity probe for the service-desk channel health check (D-F). */
+  async pingServiceDesk(): Promise<void> {
+    await this.http.get<EzyTicketList>('/api/service-desk/tickets', { pageSize: '1' });
   }
 }
