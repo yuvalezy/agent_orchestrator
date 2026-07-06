@@ -84,6 +84,57 @@ export class EzyPortalHttpClient {
     return this.request<T>('POST', path, { body, idempotencyKey: crypto.randomUUID() });
   }
 
+  /**
+   * POST a multipart/form-data upload (M2 group-mention attach). Builds a FormData
+   * with a single `file` part (the field name the portal's upload handler reads)
+   * and lets fetch set the multipart boundary — so NO explicit Content-Type here.
+   * NO Idempotency-Key (the files module doesn't honor it, and attach is
+   * best-effort/non-fatal, not exactly-once). Single attempt (no retry loop):
+   * re-POSTing an upload could double-store. Never logs the body or the key.
+   */
+  async uploadFile<T>(
+    path: string,
+    query: Record<string, string | undefined>,
+    file: { bytes: Uint8Array; filename: string; contentType: string },
+  ): Promise<T> {
+    const url = new URL(`${this.baseUrl}${path}`);
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== '') url.searchParams.set(k, v);
+    }
+    const form = new FormData();
+    // Copy into a fresh (ArrayBuffer-backed) Uint8Array so the Blob part is typed
+    // Uint8Array<ArrayBuffer> (a caller-supplied Uint8Array widens to ArrayBufferLike
+    // and isn't a BlobPart). Small (image) payloads — the copy is negligible.
+    const part = new Uint8Array(file.bytes.byteLength);
+    part.set(file.bytes);
+    form.append('file', new Blob([part], { type: file.contentType }), file.filename);
+
+    const started = Date.now();
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: 'POST',
+        // NO Content-Type — fetch derives multipart/form-data + boundary from the
+        // FormData body. Setting it manually would break the boundary.
+        headers: { 'X-Api-Key': this.resolveApiKey(), Accept: 'application/json' },
+        body: form,
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      logger.warn({ path, durationMs: Date.now() - started, err }, 'EZY upload transport error');
+      throw err;
+    }
+    const durationMs = Date.now() - started;
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      logger.warn({ path, status: res.status, durationMs }, 'EZY upload non-2xx');
+      throw new EzyHttpError(res.status, 'POST', path, detail.slice(0, 300));
+    }
+    logger.info({ path, status: res.status, durationMs }, 'EZY upload ok');
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  }
+
   private async request<T>(
     method: 'GET' | 'POST',
     path: string,

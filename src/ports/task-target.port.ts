@@ -54,4 +54,8 @@ export interface TaskTargetPort {
   findTasksBySource(q: { projectRef?: string; sourceEntity: SourceEntityRef }): Promise<TargetTask[]>;
   listWorkItemTypes(projectRef: string): Promise<Array<{ ref: string; name: string }>>;
   setStatus(task: TaskRef, status: string): Promise<void>; // used from change 04
+  /** Attach a binary file to a task (M2 group-mention media path). Best-effort at
+   *  the call site — the adapter uploads the caller-supplied bytes (already fetched
+   *  from the source channel) as multipart/form-data. */
+  attachFileToTask(task: TaskRef, bytes: Uint8Array, filename: string, contentType: string): Promise<void>;
 }

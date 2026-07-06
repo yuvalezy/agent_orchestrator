@@ -4,6 +4,7 @@ import type { ChannelInstanceConfig } from '../../ports/channel.port';
 import { WhatsAppHttp } from './http';
 import { WhatsAppDirectoryClient } from './directory-client';
 import { WhatsAppManagerAdapter } from './whatsapp-manager.adapter';
+import { GroupSummaryAdapter } from './group-summary.adapter';
 
 /**
  * Build the whatsapp_manager directory client from non-secret env + the lazily-
@@ -38,4 +39,23 @@ export function buildWhatsAppAdapter(instance: ChannelInstanceConfig): WhatsAppM
   });
   const webhookSecret = resolveCredential('WEBHOOK_SECRET'); // eager → fail-closed
   return new WhatsAppManagerAdapter(instance, http, webhookSecret);
+}
+
+/**
+ * Build the M2 group-summary adapter with BOTH keys: the READ key
+ * (`WHATSAPP_MANAGER_API_KEY`) for thread reads + media fetch, and the WRITE key
+ * (`WHATSAPP_MANAGER_WRITE_KEY`, scoped to POST /messages/:id/summarize) for the
+ * summarize POST — falling back to the read key (→ a clean 403, never a silent
+ * unauthenticated call). All keys resolve lazily (no secret in env.ts). The
+ * directory client rides the same http (listGroups is a getJson → read key).
+ */
+export function buildGroupSummaryAdapter(): GroupSummaryAdapter {
+  const http = new WhatsAppHttp({
+    baseUrl: env.WHATSAPP_MANAGER_BASE_URL,
+    resolveApiKey: () => resolveCredential('WHATSAPP_MANAGER_API_KEY'),
+    resolveWriteApiKey: () =>
+      tryResolveCredential('WHATSAPP_MANAGER_WRITE_KEY') ?? resolveCredential('WHATSAPP_MANAGER_API_KEY'),
+  });
+  const directory = new WhatsAppDirectoryClient(http);
+  return new GroupSummaryAdapter(http, directory, env.WHATSAPP_MANAGER_BASE_URL);
 }

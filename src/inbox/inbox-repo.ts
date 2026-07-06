@@ -22,6 +22,13 @@ export interface ClaimedInbox {
   recipients: { to: string[]; cc: string[] } | null; // email TO/CC (M1.6)
   account_email: string | null; // the receiving email instance's own address (M1.6 CC rule)
   ticket_number: string | null; // service-desk only (raw_metadata.ticketNumber, e.g. 'SD-00042'); null for other channels (M1.7)
+  // WhatsApp group-mention routing (M2). Read from raw_metadata->'metadata' (the
+  // whatsapp_manager StoredMessage/RoutableMessage carries them at runtime). null
+  // when absent (non-WA channels, or history-backfill rows that bypass the
+  // events.ts augmentation) → those fall through to the author path unchanged.
+  is_group: boolean | null;
+  chat_muted: boolean | null;
+  mentions_me: boolean | null;
 }
 
 /** Claim a batch of triageable inbound rows. A voice note lands body=NULL and the
@@ -48,7 +55,10 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
      SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_thread_id,
             c.sender_address, c.sender_name, c.subject, c.body, c.received_at,
             c.recipients, ci.config->>'accountEmail' AS account_email,
-            c.raw_metadata->>'ticketNumber' AS ticket_number
+            c.raw_metadata->>'ticketNumber' AS ticket_number,
+            (c.raw_metadata->'metadata'->>'isGroup')::boolean   AS is_group,
+            (c.raw_metadata->'metadata'->>'chatMuted')::boolean AS chat_muted,
+            (c.raw_metadata->'metadata'->>'mentionsMe')::boolean AS mentions_me
        FROM claimed c JOIN channel_instances ci ON ci.id = c.channel_instance_id
       ORDER BY c.id ASC`,
     [limit, MAX_ATTEMPTS],

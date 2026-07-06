@@ -8,3 +8,4 @@ export * from './ticketing.port';
 export * from './founder-notifier.port';
 export * from './llm.port';
 export * from './embedding.port';
+export * from './group-summary.port';

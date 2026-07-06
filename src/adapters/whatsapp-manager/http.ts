@@ -79,6 +79,29 @@ export class WhatsAppHttp {
   }
 
   /**
+   * GET raw BINARY bytes (read key). Used to pull media (GET /messages/:id/media)
+   * for the group-mention attach path (M2). Returns the bytes + the response
+   * Content-Type header. NEVER logs the body — only {path,status,durationMs,bytes}.
+   */
+  async getBytes(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const started = Date.now();
+    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      headers: { 'x-api-key': this.resolveApiKey() },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    const durationMs = Date.now() - started;
+    if (!res.ok) {
+      await res.text().catch(() => ''); // drain, never logged
+      logger.warn({ path, status: res.status, durationMs }, 'whatsapp_manager media request non-2xx');
+      throw new Error(`whatsapp_manager GET ${path} failed (${res.status})`);
+    }
+    const contentType = res.headers.get('content-type') ?? 'application/octet-stream';
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    logger.info({ path, status: res.status, durationMs, bytes: bytes.byteLength }, 'whatsapp_manager media ok');
+    return { bytes, contentType };
+  }
+
+  /**
    * POST a JSON body. Used by the M1.3 adapter's send() (POST /outbound/send).
    * Presents the WRITE key when configured (R1/D-G), else the read key (→ a clean
    * 403 until the scoped-key fork lands — never a silent unauthenticated send).

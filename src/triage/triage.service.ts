@@ -2,6 +2,7 @@ import { logger } from '../logger';
 import type { AgentLlmPort, Intent } from '../ports/llm.port';
 import type { TargetTask, TaskTargetPort } from '../ports/task-target.port';
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
+import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/group-summary.port';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
@@ -69,12 +70,34 @@ export interface TriageDeps {
   deepLink: (taskRef: string) => string | undefined;
   /** Increment the skipped-unknown-sender tally (app_state counter). */
   bumpSkipped: () => Promise<void>;
+  /** M2: the muted-group @-mention path (summarize + media). Optional — when absent
+   *  a group-mention row is safely skipped rather than crashing the batch. */
+  groupSummary?: GroupSummaryPort;
 }
+
+/** How far back (minutes) the group-mention path pulls images for attach/reference
+ *  — mirrors the summarize window (last hour). */
+const GROUP_LOOKBACK_MINUTES = 60;
 
 export class TriageService {
   constructor(private readonly deps: TriageDeps) {}
 
   async process(row: ClaimedInbox): Promise<void> {
+    // M2 muted-group routing (top-of-loop). A muted group is low-attention by
+    // design — act ONLY when it @-mentions the founder. Flags come from
+    // raw_metadata->'metadata' (claimBatch); ABSENT (null) on non-WA channels and
+    // history-backfill rows → both conditions are falsy → the author path runs
+    // unchanged.
+    if (row.is_group && row.chat_muted && !row.mentions_me) {
+      await markSkipped(row.id, 'muted group, no mention');
+      logger.info({ inboxId: row.id }, 'triage: muted group without mention — skipped');
+      return;
+    }
+    if (row.is_group && row.chat_muted && row.mentions_me) {
+      await this.processGroupMention(row);
+      return;
+    }
+
     const inboxId = row.id;
 
     // R49 short-circuit: a prior attempt already ran the LLM + created a task and
@@ -121,6 +144,18 @@ export class TriageService {
 
     const customerId = resolution.customerId;
     await setInboxCustomer(inboxId, customerId);
+    await this.runMoneyLoop(row, customerId);
+  }
+
+  /**
+   * The per-row money-loop: config load → context → intents → create/comment/dedup
+   * → bridge/audit → notify → markProcessed. Shared by the author path and the
+   * muted-group path (which passes a row with the group summary as subject/body and
+   * the group's BP customer). PURE refactor of the original process() tail — same
+   * ordering and side effects.
+   */
+  private async runMoneyLoop(row: ClaimedInbox, customerId: string): Promise<void> {
+    const inboxId = row.id;
     const config = await loadCustomerConfig(customerId);
     if (!config || !config.projectRef || !config.workItemTypeRef) {
       await markSkipped(inboxId, 'customer missing project/work-item-type config');
@@ -132,6 +167,7 @@ export class TriageService {
       return;
     }
 
+    const address = row.sender_address ?? '';
     const threadKey = row.channel_thread_id ?? address;
     const openTasks = await this.deps.taskTarget.findOpenTasks({ projectRef: config.projectRef });
     const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks);
@@ -151,6 +187,143 @@ export class TriageService {
       await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly }, createdThisRun);
     }
     await markProcessed(inboxId);
+  }
+
+  /**
+   * Muted-group @-mention path (M2). Bypasses author resolution: resolve
+   * group → BP → customer, summarize the last hour (whatsapp_manager's vision
+   * model reads the images; only the summary TEXT drives triage), then run the
+   * money-loop on the summary and best-effort attach the raw images (Phase 2).
+   *   • no summary        → skip + admin note (nothing actionable to triage).
+   *   • BP not onboarded  → founder note (summary + keyless media refs) + ONE admin
+   *                         onboard note + skip (do NOT auto-onboard).
+   *   • onboarded         → runMoneyLoop(summary) → attach images to the task.
+   */
+  private async processGroupMention(row: ClaimedInbox): Promise<void> {
+    const inboxId = row.id;
+    const gs = this.deps.groupSummary;
+    const groupId = row.channel_thread_id;
+    if (!gs || !groupId) {
+      await markSkipped(inboxId, 'group summary unavailable');
+      logger.warn({ inboxId, hasPort: !!gs, hasGroup: !!groupId }, 'triage: group mention not processable — skipped');
+      return;
+    }
+
+    const bpRef = await gs.resolveGroupBpRef(groupId);
+    const customer = bpRef ? await this.deps.contactQueries.findCustomerByBpRef(bpRef) : null;
+
+    const summary = await gs.summarizeLastHour(groupId);
+    if (!summary) {
+      await markSkipped(inboxId, 'summary unavailable');
+      await this.deps.notifier.notifyAdmin({
+        title: '⚠️ Group summary unavailable',
+        body: `A muted group (${groupId}) @-mentioned you, but the last-hour summary could not be produced. Row skipped.`,
+        severity: 'warning',
+      });
+      logger.info({ inboxId, groupId }, 'triage: group summary unavailable — skipped');
+      return;
+    }
+
+    if (!customer) {
+      // Un-onboarded BP: still surface the summary + keyless media refs to the
+      // founder, raise ONE admin onboard note, and skip. No auto-onboard (project +
+      // work-item-type aren't derivable).
+      const images = await this.gatherGroupImages(groupId, gs);
+      await this.deps.notifier.notifyAdmin({
+        title: '🔗 Group not onboarded',
+        body: `Muted group ${groupId} @-mentioned you but is not linked to an onboarded BP (${bpRef ? `BP ${bpRef}` : 'no BP link'}). Link/onboard it so future mentions create tasks.`,
+        severity: 'action',
+      });
+      await this.deps.notifier.notifyAdmin({
+        title: '🖼️ Group summary (no task)',
+        body: this.groupSummaryBody(summary, images, gs),
+        severity: 'info',
+      });
+      await markSkipped(inboxId, 'group BP not onboarded');
+      logger.info({ inboxId, groupId, hasBp: !!bpRef }, 'triage: group BP not onboarded — founder-notified + skipped');
+      return;
+    }
+
+    // Feed the summary through the normal money-loop (task if actionable).
+    await this.runMoneyLoop({ ...row, subject: summary.title, body: summary.body }, customer.customerId);
+
+    // Phase 2: best-effort, non-fatal attach of the last-hour raw images.
+    await this.attachGroupImages(row, customer.customerId, groupId, summary, gs);
+  }
+
+  /**
+   * Phase 2 attach: after the money-loop, attach the group's last-hour images to
+   * the created task. NEVER fails the row (it is already processed/skipped) —
+   * per-file try/catch with an admin note on upload failure. When NO task exists
+   * (non-actionable summary), the founder notification carries the keyless refs.
+   */
+  private async attachGroupImages(
+    row: ClaimedInbox,
+    customerId: string,
+    groupId: string,
+    summary: GroupSummary,
+    gs: GroupSummaryPort,
+  ): Promise<void> {
+    const inboxId = row.id;
+    try {
+      const taskRef = await findTaskByInbox(inboxId);
+      const images = await this.gatherGroupImages(groupId, gs);
+
+      if (!taskRef) {
+        // No task created → reference the media in a founder notification instead.
+        if (images.length) {
+          await this.deps.notifier
+            .notifyCustomerEvent(customerId, {
+              title: '🖼️ Group images (no task)',
+              body: this.groupSummaryBody(summary, images, gs),
+            })
+            .catch((err) => logger.warn({ inboxId, reason: (err as Error)?.message }, 'group: media-ref notify failed'));
+        }
+        return;
+      }
+
+      for (const img of images) {
+        try {
+          const media = await gs.fetchMedia(img.ref);
+          await this.deps.taskTarget.attachFileToTask({ ref: taskRef }, media.bytes, media.filename, media.contentType);
+        } catch (err) {
+          // One bad file never strands the row (already processed). Reference the
+          // keyless media url in an admin note so the founder can retrieve it.
+          logger.warn({ inboxId, taskRef, ref: img.ref, reason: (err as Error)?.message }, 'group: attach image failed (non-fatal)');
+          await this.deps.notifier
+            .notifyAdmin({
+              title: '📎 Task image attach failed',
+              body: `Could not attach a group image (ref ${img.ref}) to task ${taskRef}. Reference: ${gs.mediaUrl(img.ref)}`,
+              severity: 'warning',
+            })
+            .catch(() => {});
+        }
+      }
+    } catch (err) {
+      // The whole attach path is best-effort — swallow anything so the row (already
+      // processed by runMoneyLoop) is never re-failed by an attach hiccup.
+      logger.warn({ inboxId, reason: (err as Error)?.message }, 'group: attach path failed (non-fatal)');
+    }
+  }
+
+  /** List the group's last-hour images defensively (never throws — a listing miss
+   *  must not fail the row). */
+  private async gatherGroupImages(groupId: string, gs: GroupSummaryPort): Promise<GroupImageRef[]> {
+    try {
+      return await gs.listRecentImages(groupId, GROUP_LOOKBACK_MINUTES);
+    } catch (err) {
+      logger.warn({ groupId, reason: (err as Error)?.message }, 'group: listRecentImages failed (non-fatal)');
+      return [];
+    }
+  }
+
+  /** Founder-facing body: summary + keyless media reference urls (NEVER api-keyed). */
+  private groupSummaryBody(summary: GroupSummary, images: GroupImageRef[], gs: GroupSummaryPort): string {
+    const parts = [summary.title, '', summary.body];
+    if (images.length) {
+      parts.push('', `Images (${images.length}):`, ...images.map((i) => gs.mediaUrl(i.ref)));
+    }
+    return parts.join('\n');
   }
 
   private async act(

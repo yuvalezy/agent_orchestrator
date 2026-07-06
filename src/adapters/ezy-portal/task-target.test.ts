@@ -130,3 +130,31 @@ test('setStatus posts {status} to /:id/status (POST, not PATCH)', async () => {
   assert.match(calls[0].url, /\/api\/projects\/tasks\/task-1\/status$/);
   assert.equal(calls[0].body!.status, 'in-progress');
 });
+
+test('attachFileToTask uploads multipart to /api/files/upload with the projects/Task source triple', async () => {
+  let seen: { method: string; url: string; hasFile: boolean; fileName?: string } | undefined;
+  const fetchImpl = (async (url: URL | string, init: RequestInit) => {
+    const form = init.body as FormData;
+    const file = form.get('file');
+    seen = {
+      method: String(init.method),
+      url: url.toString(),
+      hasFile: file != null,
+      fileName: file instanceof File ? file.name : undefined,
+    };
+    return { ok: true, status: 201, json: async () => ({ data: { StorageKey: 'k' } }), text: async () => '{}' } as Response;
+  }) as unknown as typeof fetch;
+  const http = new EzyPortalHttpClient({ baseUrl: 'http://portal', resolveApiKey: () => 'ten_key', fetchImpl });
+  const gw = new EzyPortalGateway(http);
+  await gw.attachFileToTask({ ref: 'task-9' }, new Uint8Array([1, 2, 3, 4]), 'wa-media-501.jpg', 'image/jpeg');
+  assert.ok(seen);
+  assert.equal(seen!.method, 'POST');
+  assert.equal(seen!.hasFile, true);
+  assert.equal(seen!.fileName, 'wa-media-501.jpg');
+  const u = new URL(seen!.url);
+  assert.match(u.pathname, /\/api\/files\/upload$/);
+  assert.equal(u.searchParams.get('sourceService'), 'projectsApp');
+  assert.equal(u.searchParams.get('sourceEntityType'), 'Task');
+  assert.equal(u.searchParams.get('sourceEntityId'), 'task-9');
+  assert.equal(u.searchParams.get('folder'), 'projects/tasks');
+});

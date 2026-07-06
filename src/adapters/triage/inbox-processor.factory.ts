@@ -9,6 +9,7 @@ import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { claimBatch, failStuck } from '../../inbox/inbox-repo';
 import { buildEzyPortalGateway } from '../ezy-portal';
 import { buildLlmRouter } from '../llm/factory';
+import { buildGroupSummaryAdapter } from '../whatsapp-manager/factory';
 
 // Composition (imports adapters + core): build the TriageService with the real
 // EZY gateway + LLM router + Telegram notifier, and the inbox-processor worker
@@ -30,6 +31,9 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     contactQueries: dbContactResolutionQueries,
     deepLink: (taskRef) => `${env.EZY_PORTAL_BASE_URL}/projects/tasks/${taskRef}`, // best-effort (verify route)
     bumpSkipped: () => incrementCounter(SKIPPED_COUNTER_KEY),
+    // M2: the muted-group @-mention path (summarize over write key + media over
+    // read key). Lazily-keyed adapter — no secret resolved at build.
+    groupSummary: buildGroupSummaryAdapter(),
   });
 
   // Early-warning tracker (§9.5): raises ONE admin alert as soon as triage failures

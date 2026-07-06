@@ -62,6 +62,45 @@ test('does NOT retry a 422 — it surfaces immediately', async () => {
   assert.equal(call, 1, '422 is not retried');
 });
 
+test('uploadFile POSTs multipart (field `file`, no JSON Content-Type, no Idempotency-Key, correct query)', async () => {
+  let seen: { headers: Record<string, string>; url: string; method: string; isForm: boolean; fileName?: string; fileType?: string } | undefined;
+  const fetchImpl = (async (url: URL | string, init: RequestInit) => {
+    const form = init.body as FormData;
+    const file = form.get('file');
+    seen = {
+      headers: init.headers as Record<string, string>,
+      url: url.toString(),
+      method: String(init.method),
+      isForm: form instanceof FormData,
+      fileName: file instanceof File ? file.name : undefined,
+      fileType: file instanceof File ? file.type : undefined,
+    };
+    return { ok: true, status: 200, json: async () => ({ data: { StorageKey: 'k1' } }), text: async () => '{}' } as Response;
+  }) as unknown as typeof fetch;
+
+  const client = new EzyPortalHttpClient({ baseUrl: 'http://portal.test', resolveApiKey: () => 'ten_key', fetchImpl });
+  const res = await client.uploadFile<{ data: { StorageKey: string } }>(
+    '/api/files/upload',
+    { sourceService: 'projectsApp', sourceEntityType: 'Task', sourceEntityId: 'task-9', folder: 'projects/tasks' },
+    { bytes: new Uint8Array([1, 2, 3]), filename: 'shot.jpg', contentType: 'image/png' },
+  );
+  assert.deepEqual(res, { data: { StorageKey: 'k1' } });
+  assert.ok(seen);
+  assert.equal(seen!.method, 'POST');
+  assert.equal(seen!.isForm, true, 'body is FormData');
+  assert.equal(seen!.fileName, 'shot.jpg', 'the file part is named `file` and carries the filename');
+  assert.equal(seen!.fileType, 'image/png');
+  assert.equal(seen!.headers['X-Api-Key'], 'ten_key');
+  assert.equal(seen!.headers['Content-Type'], undefined, 'no explicit Content-Type (fetch sets the multipart boundary)');
+  assert.equal(seen!.headers['Idempotency-Key'], undefined, 'no Idempotency-Key on an upload');
+  const u = new URL(seen!.url);
+  assert.match(u.pathname, /\/api\/files\/upload$/);
+  assert.equal(u.searchParams.get('sourceService'), 'projectsApp');
+  assert.equal(u.searchParams.get('sourceEntityType'), 'Task');
+  assert.equal(u.searchParams.get('sourceEntityId'), 'task-9');
+  assert.equal(u.searchParams.get('folder'), 'projects/tasks');
+});
+
 test('retries a 500 then succeeds', async () => {
   let call = 0;
   const fetchImpl: typeof fetch = async () => {

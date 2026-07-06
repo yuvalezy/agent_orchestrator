@@ -41,6 +41,14 @@ export interface StoredMessage {
   transcript: string | null;
   transcript_translated: string | null;
   reply_to_message_id: string | null;
+  // M2 type-level fix: whatsapp_manager persists these (events.ts augments the
+  // routable before storage) and GET /messages returns them — they already flow
+  // through `raw` → agent_inbox.raw_metadata at runtime; the orchestrator only
+  // reads them out of raw_metadata->'metadata' in claimBatch. Declared optional so
+  // the reconcile/pull path is typed. `metadata.chatMuted`/`mentionsMe` drive the
+  // muted-group @-mention branch; `mentions[]` is the raw @-list.
+  metadata?: Record<string, unknown> | null;
+  mentions?: unknown[] | null;
 }
 
 /** WhatsApp threads on the contact/group. Groups pin contactNumber=groupId; the

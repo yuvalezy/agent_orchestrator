@@ -349,6 +349,25 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
     await this.http.post(`/api/projects/tasks/${task.ref}/status`, { status });
   }
 
+  /**
+   * Attach a file to a task (M2). Multipart upload to the shared files endpoint
+   * with the projects/Task source triple — the tenant key already has
+   * projects.tasks Write. Field name is `file`; folder pins it under the task's
+   * project storage. Best-effort at the call site (never fails the inbox row).
+   */
+  async attachFileToTask(task: TaskRef, bytes: Uint8Array, filename: string, contentType: string): Promise<void> {
+    await this.http.uploadFile(
+      '/api/files/upload',
+      {
+        sourceService: 'projectsApp',
+        sourceEntityType: 'Task',
+        sourceEntityId: task.ref,
+        folder: 'projects/tasks',
+      },
+      { bytes, filename, contentType },
+    );
+  }
+
   // ── TicketingPort (M1.7) — READ half wired (service-desk.view); WRITE half
   // (postReply/setTicketStatus) port-complete but UNWIRED (needs service-desk.manage,
   // M1.8). All routes go through nginx as /api/service-desk/* (CLAUDE.md rewrite).
