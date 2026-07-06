@@ -11,10 +11,25 @@ import { buildEmailReconcileWorker } from './adapters/email/reconcile.worker';
 import { buildReconcileWorker } from './adapters/reconcile-worker';
 import { ingestInbound } from './inbox/ingestion';
 import { credentialsStore } from './config/credentials-store';
+import { tryResolveCredential } from './config/credentials';
 import { buildAdminRouter } from './adapters/admin/admin.router';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
+import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
+import { seedHolidays } from './adapters/outbound/holiday-seeder';
+import type { FounderNotifierPort } from './ports/founder-notifier.port';
+
+/** No-op notifier so the drainer can register even when Telegram is unconfigured
+ *  (D-M / clean fallback). Its alerts silently drop — a loud WARN is emitted at
+ *  boot when this fallback is used with OUTBOUND_ENABLED. */
+const noopNotifier: FounderNotifierPort = {
+  ensureCustomerTopic: async () => ({ ref: '' }),
+  notifyCustomerEvent: async () => {},
+  notifyAdmin: async () => {},
+  askFounder: async () => {},
+  onDecision: () => {},
+};
 
 /**
  * Composition root (blueprint §4). env → migrate → listen → workers → graceful
@@ -36,12 +51,20 @@ async function main(): Promise<void> {
   const wa = registry.whatsappPrimary();
   const appDeps: AppDeps = {};
 
+  // M1.8: seed public + jewish holidays for the current + next year (offline libs;
+  // idempotent). Non-fatal — the drainer degrades to business-hours-only gating.
+  try {
+    await seedHolidays({ country: env.HOLIDAY_COUNTRY });
+  } catch (err) {
+    logger.warn({ reason: (err as Error)?.message }, 'holiday seeding failed (non-fatal — business-hours gating still applies)');
+  }
+
   // M1.4: admin API — mounted ONLY when ADMIN_API_KEY is set (fail-closed).
   // ADMIN_API_KEY is read from process.env, not the store (it guards the endpoint
   // that writes the store) and not the zod schema (it is a secret).
   const adminKey = process.env.ADMIN_API_KEY;
   if (adminKey?.trim()) {
-    appDeps.adminRouter = buildAdminRouter(adminKey);
+    appDeps.adminRouter = buildAdminRouter(adminKey, registry); // M1.8: /outbound seam
     logger.info('admin router mounted at /admin');
   } else {
     logger.info('admin router not mounted (ADMIN_API_KEY unset)');
@@ -101,12 +124,44 @@ async function main(): Promise<void> {
   // not configured so ingestion still runs. One shared notifier so onDecision is
   // registered on the same instance the poller drives.
   const triageWorkers: WorkerDefinition[] = [];
+  let notifier: FounderNotifierPort | null = null;
   try {
-    const notifier = buildTelegramNotifier();
-    triageWorkers.push(buildInboxProcessorWorker(notifier), buildCallbackPollerWorker(notifier));
+    const telegram = buildTelegramNotifier();
+    notifier = telegram;
+    triageWorkers.push(buildInboxProcessorWorker(telegram), buildCallbackPollerWorker(telegram));
     logger.info('money-loop workers registered (inbox processor + Telegram callback poller)');
   } catch (err) {
     logger.warn({ reason: (err as Error)?.message }, 'money-loop disabled — Telegram not configured');
+  }
+
+  // M1.8: the outbound drainer — registered ONLY when OUTBOUND_ENABLED (D-J kill-
+  // switch). Reuses the money-loop notifier (or a no-op fallback so it still boots
+  // when Telegram is unconfigured). When enabled without a write key, warn LOUDLY
+  // (D-M) — a live-set key still resolves lazily, so we register regardless.
+  const outboundWorkers: WorkerDefinition[] = [];
+  if (env.OUTBOUND_ENABLED) {
+    if (!tryResolveCredential('WHATSAPP_MANAGER_WRITE_KEY')) {
+      logger.warn('⚠️  OUTBOUND_ENABLED=true but WHATSAPP_MANAGER_WRITE_KEY is UNSET — sends fall back to the read key and will 403 until a write key is set (POST /admin/credentials). See D-M.');
+    }
+    if (!notifier) {
+      logger.warn('⚠️  OUTBOUND_ENABLED=true but Telegram is unconfigured — drainer alerts/notes will be dropped (no-op notifier).');
+    }
+    outboundWorkers.push(
+      buildOutboundDrainerWorker({
+        registry,
+        notifier: notifier ?? noopNotifier,
+        intervalMs: env.OUTBOUND_DRAIN_INTERVAL_MS,
+        ratePerHour: env.OUTBOUND_RATE_PER_HOUR,
+        minGapMs: env.OUTBOUND_MIN_GAP_MS,
+        maxRecipientFailures: env.OUTBOUND_MAX_RECIPIENT_FAILURES,
+        failureWindowMin: env.OUTBOUND_FAILURE_WINDOW_MIN,
+        defaultTz: env.OUTBOUND_DEFAULT_TZ,
+        stuckMinutes: env.OUTBOUND_STUCK_MINUTES,
+      }),
+    );
+    logger.info('outbound drainer registered (OUTBOUND_ENABLED=true)');
+  } else {
+    logger.info('outbound drainer NOT registered (OUTBOUND_ENABLED=false) — approved rows sit in the queue, nothing sends');
   }
 
   const app = buildApp(appDeps);
@@ -116,7 +171,7 @@ async function main(): Promise<void> {
 
   // M1.3 ingestion pollers + M1.5b money-loop workers. (Heartbeat retired at M1.5b —
   // the inbox processor is the first real worker.) M1.8 adds the outbound drainer.
-  const workers = [...ingestionWorkers, ...triageWorkers].map(startWorker);
+  const workers = [...ingestionWorkers, ...triageWorkers, ...outboundWorkers].map(startWorker);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

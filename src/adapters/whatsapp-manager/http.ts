@@ -11,19 +11,46 @@ export interface WhatsAppHttpOptions {
   baseUrl: string;
   /** Lazy credential resolution — the M1.4 sealed-store seam. */
   resolveApiKey: () => string;
+  /** Optional WRITE-scoped key for POSTs (M1.8, R1/D-G). Falls back to resolveApiKey
+   *  (the read key → a clean 403, never a silent unauthenticated send). */
+  resolveWriteApiKey?: () => string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
 
+/**
+ * Typed transport error thrown by postJson (M1.8, D-C1). Carries just enough to
+ * classify delivery-outcome WITHOUT any response body: an HTTP status, or the
+ * timeout/connection-error flags. The adapter maps it to an OutboundSendError so
+ * the drainer never blind-resends a possibly-delivered message.
+ */
+export class WhatsAppHttpError extends Error {
+  readonly status?: number;
+  readonly timedOut: boolean;
+  readonly connError: boolean;
+
+  constructor(args: { status?: number; timedOut: boolean; connError: boolean; message: string }) {
+    super(args.message);
+    this.name = 'WhatsAppHttpError';
+    this.status = args.status;
+    this.timedOut = args.timedOut;
+    this.connError = args.connError;
+  }
+}
+
+const CONN_ERROR_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'ECONNRESET']);
+
 export class WhatsAppHttp {
   private readonly baseUrl: string;
   private readonly resolveApiKey: () => string;
+  private readonly resolveWriteApiKey?: () => string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
 
   constructor(opts: WhatsAppHttpOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
     this.resolveApiKey = opts.resolveApiKey;
+    this.resolveWriteApiKey = opts.resolveWriteApiKey;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 15_000;
   }
@@ -46,27 +73,50 @@ export class WhatsAppHttp {
 
   /**
    * POST a JSON body. Used by the M1.3 adapter's send() (POST /outbound/send).
-   * NOTE (R1): whatsapp_manager's external x-api-key is read-only under JWT, so
-   * this returns 403 until the M1.8 scoped-key change — the error message is
-   * surfaced verbatim (no body logged) so the failure is diagnosable.
+   * Presents the WRITE key when configured (R1/D-G), else the read key (→ a clean
+   * 403 until the scoped-key fork lands — never a silent unauthenticated send).
+   *
+   * Throws a typed WhatsAppHttpError (M1.8, D-C1) so the adapter can classify
+   * delivery outcome: a NON-2xx carries `status`; a client timeout →
+   * `timedOut` (AbortSignal.timeout raises TimeoutError/AbortError, AFTER the
+   * request may have been written → possibly delivered); a socket-level failure →
+   * `connError` (whatsapp_manager down/restarting → safe to retry). No response
+   * body is logged or carried in the message (invariant #5-adjacent, no-body).
    */
   async postJson<T>(path: string, body: unknown): Promise<T> {
     const started = Date.now();
-    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
-      method: 'POST',
-      headers: {
-        'x-api-key': this.resolveApiKey(),
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+    const resolveKey = this.resolveWriteApiKey ?? this.resolveApiKey;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method: 'POST',
+        headers: {
+          'x-api-key': resolveKey(),
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      const e = err as { name?: string; cause?: { code?: string } };
+      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+        logger.warn({ path, durationMs: Date.now() - started }, 'whatsapp_manager POST timed out');
+        throw new WhatsAppHttpError({ timedOut: true, connError: false, message: `whatsapp_manager POST ${path} timed out` });
+      }
+      const code = e?.cause?.code;
+      if (code && CONN_ERROR_CODES.has(code)) {
+        logger.warn({ path, code, durationMs: Date.now() - started }, 'whatsapp_manager POST connection error');
+        throw new WhatsAppHttpError({ timedOut: false, connError: true, message: `whatsapp_manager POST ${path} connection error (${code})` });
+      }
+      logger.warn({ path, name: e?.name, durationMs: Date.now() - started }, 'whatsapp_manager POST transport error');
+      throw new WhatsAppHttpError({ timedOut: false, connError: false, message: `whatsapp_manager POST ${path} transport error (${e?.name ?? 'unknown'})` });
+    }
     const durationMs = Date.now() - started;
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
+      await res.text().catch(() => ''); // drain the body (never logged/carried)
       logger.warn({ path, status: res.status, durationMs }, 'whatsapp_manager POST non-2xx');
-      throw new Error(`whatsapp_manager POST ${path} failed (${res.status}): ${detail.slice(0, 200)}`);
+      throw new WhatsAppHttpError({ status: res.status, timedOut: false, connError: false, message: `whatsapp_manager POST ${path} failed (${res.status})` });
     }
     logger.info({ path, status: res.status, durationMs }, 'whatsapp_manager POST ok');
     return (await res.json()) as T;

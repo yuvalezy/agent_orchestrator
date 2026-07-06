@@ -61,6 +61,24 @@ const envSchema = z.object({
   ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com/v1'),
   DEEPSEEK_BASE_URL: z.string().url().default('https://api.deepseek.com'),
+
+  // ── M1.8: outbound delivery (NON-secret; the WRITE key WHATSAPP_MANAGER_WRITE_KEY
+  // is a credential, resolved via resolveCredential — NEVER here). OUTBOUND_ENABLED
+  // is the kill-switch: the drainer is registered ONLY when true. It is parsed as a
+  // strict string→bool (NOT z.coerce.boolean, which turns the string "false" into
+  // true) — only the literal "true" enables it; unset/"false"/anything else → false.
+  OUTBOUND_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  OUTBOUND_DRAIN_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  OUTBOUND_RATE_PER_HOUR: z.coerce.number().int().positive().default(10),
+  OUTBOUND_MIN_GAP_MS: z.coerce.number().int().nonnegative().default(5000),
+  OUTBOUND_MAX_RECIPIENT_FAILURES: z.coerce.number().int().positive().default(3),
+  OUTBOUND_FAILURE_WINDOW_MIN: z.coerce.number().int().positive().default(60),
+  OUTBOUND_DEFAULT_TZ: z.string().default('America/Panama'),
+  OUTBOUND_STUCK_MINUTES: z.coerce.number().int().positive().default(10),
+  HOLIDAY_COUNTRY: z.string().default('PA'),
 });
 
 const parsed = envSchema.safeParse(process.env);

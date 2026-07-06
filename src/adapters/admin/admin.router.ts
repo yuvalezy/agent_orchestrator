@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { logger } from '../../logger';
 import { credentialsStore } from '../../config/credentials-store';
+import { enqueueOutbound } from '../../outbound/outbound-repo';
+import type { ChannelRegistry } from '../channel-registry';
 
 // Admin API for provider-key management (DM4-8). Mounted ONLY when ADMIN_API_KEY
 // is set (fail-closed — main.ts logs when it is not). Guarded by an x-admin-key
@@ -15,8 +17,12 @@ function constantTimeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-/** Build the admin router. `adminKey` is resolved eagerly by the caller (main.ts). */
-export function buildAdminRouter(adminKey: string): Router {
+/** The registry surface the /outbound seam needs (resolve an instance to enqueue against). */
+type OutboundRegistry = Pick<ChannelRegistry, 'get' | 'whatsappPrimary'>;
+
+/** Build the admin router. `adminKey` is resolved eagerly by the caller (main.ts).
+ *  `registry` backs the M1.8 /outbound enqueue seam (instance resolution). */
+export function buildAdminRouter(adminKey: string, registry: OutboundRegistry): Router {
   const router = Router();
 
   router.use((req: Request, res: Response, next: NextFunction) => {
@@ -52,6 +58,63 @@ export function buildAdminRouter(adminKey: string): Router {
   router.delete('/credentials/:name', async (req: Request, res: Response) => {
     const removed = await credentialsStore.remove(String(req.params.name));
     res.status(removed ? 200 : 404).json({ data: { removed } });
+  });
+
+  // Enqueue an outbound message (M1.8 seam; change 02's approve-flow reuses this).
+  // Thin: validate → resolve instance → core enqueueOutbound (which normalizes the
+  // recipient so the drainer's group join hits — F2). Validation returns 400/503,
+  // never a 500 from an FK violation (F10). The `isGroup` field is accepted for
+  // forward-compat; in M1.8 group routing is driven by the agent_customer_contacts
+  // join (R37) — a per-message group flag needs a queue column (deferred).
+  router.post('/outbound', async (req: Request, res: Response) => {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const recipient = b.recipient;
+    const body = b.body;
+    if (typeof recipient !== 'string' || !recipient.trim() || typeof body !== 'string' || !body.trim()) {
+      res.status(400).json({ error: '"recipient" and "body" (non-empty strings) are required' });
+      return;
+    }
+    if (b.isGroup !== undefined && typeof b.isGroup !== 'boolean') {
+      res.status(400).json({ error: '"isGroup" must be a boolean when provided' });
+      return;
+    }
+
+    let instanceId: string;
+    let channelType: string;
+    if (typeof b.instanceId === 'string' && b.instanceId.trim()) {
+      const reg = registry.get(b.instanceId);
+      if (!reg) {
+        res.status(400).json({ error: 'unknown instanceId' });
+        return;
+      }
+      instanceId = reg.instance.id;
+      channelType = reg.instance.channelType;
+    } else if (b.channel === 'whatsapp') {
+      const wa = registry.whatsappPrimary();
+      if (!wa) {
+        res.status(503).json({ error: 'no ready whatsapp instance' });
+        return;
+      }
+      instanceId = wa.instance.id;
+      channelType = wa.instance.channelType;
+    } else {
+      res.status(400).json({ error: 'provide "instanceId" or channel:"whatsapp"' });
+      return;
+    }
+
+    const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null);
+    const id = await enqueueOutbound({
+      channelInstanceId: instanceId,
+      channelType,
+      recipientAddress: recipient,
+      body,
+      threadKey: str(b.threadKey),
+      subject: str(b.subject),
+      inReplyTo: str(b.inReplyTo),
+      customerId: str(b.customerId),
+    });
+    logger.info({ instanceId, channelType, outboundId: id }, 'admin: outbound enqueued');
+    res.status(201).json({ data: { id } });
   });
 
   return router;

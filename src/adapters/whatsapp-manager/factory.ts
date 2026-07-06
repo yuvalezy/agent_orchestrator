@@ -1,5 +1,5 @@
 import { env } from '../../config/env';
-import { resolveCredential } from '../../config/credentials';
+import { resolveCredential, tryResolveCredential } from '../../config/credentials';
 import type { ChannelInstanceConfig } from '../../ports/channel.port';
 import { WhatsAppHttp } from './http';
 import { WhatsAppDirectoryClient } from './directory-client';
@@ -26,9 +26,15 @@ export function buildWhatsAppDirectoryClient(): WhatsAppDirectoryClient {
  * throws at boot — fail-closed, never accept unsigned pushes.
  */
 export function buildWhatsAppAdapter(instance: ChannelInstanceConfig): WhatsAppManagerAdapter {
+  const readRef = instance.credentialsRef || 'WHATSAPP_MANAGER_API_KEY';
   const http = new WhatsAppHttp({
     baseUrl: env.WHATSAPP_MANAGER_BASE_URL,
-    resolveApiKey: () => resolveCredential(instance.credentialsRef || 'WHATSAPP_MANAGER_API_KEY'),
+    resolveApiKey: () => resolveCredential(readRef),
+    // R1/D-G: a WRITE-scoped key for send()'s POST, falling back to the read key
+    // (→ a clean 403 until the scoped-key fork lands — never a silent open send).
+    // Resolved lazily per call so a key set later via /admin/credentials is picked
+    // up without a restart. No secret in env.ts (resolveCredential/tryResolve only).
+    resolveWriteApiKey: () => tryResolveCredential('WHATSAPP_MANAGER_WRITE_KEY') ?? resolveCredential(readRef),
   });
   const webhookSecret = resolveCredential('WEBHOOK_SECRET'); // eager → fail-closed
   return new WhatsAppManagerAdapter(instance, http, webhookSecret);

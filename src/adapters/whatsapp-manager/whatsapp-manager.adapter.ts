@@ -5,7 +5,8 @@ import type {
   InboundMessage,
   OutboundMessage,
 } from '../../ports/channel.port';
-import { WhatsAppHttp } from './http';
+import { WhatsAppHttp, WhatsAppHttpError } from './http';
+import { OutboundSendError } from '../../outbound/send-error';
 import { verifySignature } from './signature';
 import {
   routableToInbound,
@@ -127,17 +128,25 @@ export class WhatsAppManagerAdapter implements ChannelAdapter {
     }
   }
 
-  /** POST /outbound/send. 403 under the read-only key until M1.8 (R1). Group vs
-   *  contact is an EXPLICIT signal (OutboundMessage.isGroup) — it cannot be
-   *  inferred from the id, which whatsapp_manager normalizes to plain digits for
-   *  both (code-review finding). target = threadKey (the WA thread) ?? address. */
+  /** POST /outbound/send. Presents the write key (R1/D-G) → a clean 403 until the
+   *  scoped-key fork lands. Group vs contact is an EXPLICIT signal
+   *  (OutboundMessage.isGroup) — it cannot be inferred from the id, which
+   *  whatsapp_manager normalizes to plain digits for both (code-review finding).
+   *  target = threadKey (the WA thread) ?? address. A transport error is mapped to
+   *  an OutboundSendError (D-C1) so the drainer never blind-resends a possibly-
+   *  delivered message. */
   async send(msg: OutboundMessage): Promise<{ providerMessageId: string }> {
     const target = msg.threadKey ?? msg.recipientAddress;
     const payload = msg.isGroup
       ? { groupId: target, message: msg.body }
       : { number: target, message: msg.body };
-    const res = await this.http.postJson<{ data: { messageId: string } }>('/outbound/send', payload);
-    return { providerMessageId: res.data.messageId };
+    try {
+      const res = await this.http.postJson<{ data: { messageId: string } }>('/outbound/send', payload);
+      return { providerMessageId: res.data.messageId };
+    } catch (err) {
+      if (err instanceof WhatsAppHttpError) throw mapWhatsAppHttpError(err);
+      throw err;
+    }
   }
 
   /** GET /status → ok when the WhatsApp client is READY. */
@@ -150,4 +159,24 @@ export class WhatsAppManagerAdapter implements ChannelAdapter {
       return { ok: false, detail: err instanceof Error ? err.message : 'status unreachable' };
     }
   }
+}
+
+/**
+ * Map a transport WhatsAppHttpError → the core OutboundSendError the drainer reads
+ * (D-C1). whatsapp_manager has NO idempotency key, so an AMBIGUOUS outcome (client
+ * timeout, or a 5xx raised AFTER client.sendMessage at outbound.routes.ts:83→88)
+ * is `possiblyDelivered` → NEVER auto-resend. reason is a short, non-body string.
+ *   • connError (down/restarting)  → retriable, not delivered.
+ *   • 429 / 503 (transient reject)  → retriable, not delivered.
+ *   • 400 / 403 (bad body / wall)   → permanent, not delivered (no 3× churn).
+ *   • timeout / 5xx / unknown       → possibly delivered → failReview, never resend.
+ */
+function mapWhatsAppHttpError(err: WhatsAppHttpError): OutboundSendError {
+  const s = err.status;
+  if (err.connError) return new OutboundSendError({ retriable: true, possiblyDelivered: false, reason: 'whatsapp_manager connection error' });
+  if (err.timedOut) return new OutboundSendError({ retriable: false, possiblyDelivered: true, reason: 'whatsapp_manager send timed out (possibly delivered)' });
+  if (s === 429 || s === 503) return new OutboundSendError({ retriable: true, possiblyDelivered: false, reason: `whatsapp_manager ${s} (transient)` });
+  if (s === 400 || s === 403) return new OutboundSendError({ retriable: false, possiblyDelivered: false, reason: `whatsapp_manager ${s} (permanent reject)` });
+  if (s !== undefined && s >= 500) return new OutboundSendError({ retriable: false, possiblyDelivered: true, reason: `whatsapp_manager ${s} (possibly delivered)` });
+  return new OutboundSendError({ retriable: false, possiblyDelivered: true, reason: 'whatsapp_manager send failed (ambiguous)' });
 }
