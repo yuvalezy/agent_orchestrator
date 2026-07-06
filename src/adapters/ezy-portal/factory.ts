@@ -12,6 +12,7 @@ import { EzyPortalGateway } from './ezy-portal.gateway';
 export function buildEzyPortalGateway(): EzyPortalGateway {
   const http = new EzyPortalHttpClient({
     baseUrl: env.EZY_PORTAL_BASE_URL,
+    filesBaseUrl: env.EZY_PORTAL_CORE_BASE_URL, // /api/files/* → portal-core (:3450)
     resolveApiKey: () => resolveCredential('EZY_PORTAL_API_KEY'),
   });
   return new EzyPortalGateway(http);

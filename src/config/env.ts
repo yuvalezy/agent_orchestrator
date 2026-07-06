@@ -26,6 +26,10 @@ const envSchema = z.object({
   // ── M1.2: outbound-edge base URLs (non-secret). Host-mode defaults; under
   // docker network_mode:host the container uses these same localhost values.
   EZY_PORTAL_BASE_URL: z.string().url().default('http://localhost:5040'),
+  // ── M2: portal-CORE base for the generic files service (/api/files/*). A
+  // DIFFERENT service than portal-business (EZY_PORTAL_BASE_URL): tasks/BP/service-
+  // desk live on :5040 (Go); file uploads (task attachments) on portal-core (.NET).
+  EZY_PORTAL_CORE_BASE_URL: z.string().url().default('http://localhost:3450'),
   WHATSAPP_MANAGER_BASE_URL: z.string().url().default('http://localhost:3000'),
 
   // ── M1.2: Telegram forum ids (non-secret; the bot TOKEN is a credential).

@@ -26,6 +26,10 @@ export class EzyHttpError extends Error {
 
 export interface EzyPortalHttpClientOptions {
   baseUrl: string;
+  /** Base URL for the generic files service (/api/files/*) — portal-CORE, a
+   *  DIFFERENT service than baseUrl (portal-business /api/projects). Defaults to
+   *  baseUrl when unset. Used only by uploadFile (M2 task attachments). */
+  filesBaseUrl?: string;
   /** Lazy credential resolution (first call, not boot) — the M1.4 sealed-store seam. */
   resolveApiKey: () => string;
   /** Injectable transport (defaults to global fetch) — override in tests. */
@@ -57,6 +61,7 @@ function parseRetryAfter(header: string | null): number | undefined {
 
 export class EzyPortalHttpClient {
   private readonly baseUrl: string;
+  private readonly filesBaseUrl: string;
   private readonly resolveApiKey: () => string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
@@ -64,6 +69,7 @@ export class EzyPortalHttpClient {
 
   constructor(opts: EzyPortalHttpClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
+    this.filesBaseUrl = (opts.filesBaseUrl ?? opts.baseUrl).replace(/\/$/, '');
     this.resolveApiKey = opts.resolveApiKey;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 15_000;
@@ -97,7 +103,8 @@ export class EzyPortalHttpClient {
     query: Record<string, string | undefined>,
     file: { bytes: Uint8Array; filename: string; contentType: string },
   ): Promise<T> {
-    const url = new URL(`${this.baseUrl}${path}`);
+    // Files live on portal-CORE (filesBaseUrl), NOT portal-business (baseUrl).
+    const url = new URL(`${this.filesBaseUrl}${path}`);
     for (const [k, v] of Object.entries(query)) {
       if (v !== undefined && v !== '') url.searchParams.set(k, v);
     }

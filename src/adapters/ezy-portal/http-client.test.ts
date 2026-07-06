@@ -78,7 +78,7 @@ test('uploadFile POSTs multipart (field `file`, no JSON Content-Type, no Idempot
     return { ok: true, status: 200, json: async () => ({ data: { StorageKey: 'k1' } }), text: async () => '{}' } as Response;
   }) as unknown as typeof fetch;
 
-  const client = new EzyPortalHttpClient({ baseUrl: 'http://portal.test', resolveApiKey: () => 'ten_key', fetchImpl });
+  const client = new EzyPortalHttpClient({ baseUrl: 'http://portal.test', filesBaseUrl: 'http://portal-core.test', resolveApiKey: () => 'ten_key', fetchImpl });
   const res = await client.uploadFile<{ data: { StorageKey: string } }>(
     '/api/files/upload',
     { sourceService: 'projectsApp', sourceEntityType: 'Task', sourceEntityId: 'task-9', folder: 'projects/tasks' },
@@ -94,6 +94,7 @@ test('uploadFile POSTs multipart (field `file`, no JSON Content-Type, no Idempot
   assert.equal(seen!.headers['Content-Type'], undefined, 'no explicit Content-Type (fetch sets the multipart boundary)');
   assert.equal(seen!.headers['Idempotency-Key'], undefined, 'no Idempotency-Key on an upload');
   const u = new URL(seen!.url);
+  assert.equal(u.origin, 'http://portal-core.test', 'uploadFile targets the files base (portal-core), not the projects base');
   assert.match(u.pathname, /\/api\/files\/upload$/);
   assert.equal(u.searchParams.get('sourceService'), 'projectsApp');
   assert.equal(u.searchParams.get('sourceEntityType'), 'Task');
