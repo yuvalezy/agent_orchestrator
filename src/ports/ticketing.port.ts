@@ -7,8 +7,10 @@
 /**
  * A changed ticket surfaced by the service desk (recon §2 — camelCase JSON).
  * `description` is the initial body (nullable → fall back to `subject`).
- * `requesterBPID` is a BP link that is only trustworthy when `requesterType==='bp'`
- * (D-A). Identity is keyed off `requesterEmail` (lowercased) for the whole thread.
+ * Identity for the whole thread (D-A): `requesterBPID` PRIMARY — the portal
+ * backfills it from `requesterUserID` even on `account`-type tickets, so it is
+ * authoritative whenever present (matches `agent_customers.bp_ref`) — with
+ * `requesterEmail` as the FALLBACK when no BP ref is set.
  */
 export interface TargetTicket {
   id: string; // uuid — the `:id` used by getThread / getTicket
@@ -18,8 +20,8 @@ export interface TargetTicket {
   status: 'open' | 'pending' | 'resolved' | 'closed';
   priority: 'low' | 'medium' | 'high' | 'urgent';
   requesterType: 'bp' | 'account' | 'manual';
-  requesterBPID: string | null; // trust only when requesterType==='bp' (D-A)
-  requesterEmail: string | null; // the customer identity for the whole thread (B1)
+  requesterBPID: string | null; // PRIMARY identity — backfilled, authoritative when set (D-A)
+  requesterEmail: string | null; // FALLBACK identity for the whole thread when no BP ref (D-A/B1)
   requesterName: string | null;
   createdAt: Date;
   updatedAt: Date;
