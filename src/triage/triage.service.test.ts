@@ -282,6 +282,43 @@ test('muted group + @-mention → group path: summarize + task from summary + im
   assert.equal(inbox.rows[0].status, 'processed');
 });
 
+test('muted group + @-mention, re-processed (R49) → NO re-summarize, no second task, re-notified', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-group-r49', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const { gs, calls } = groupSummaryFake({ bpRef: 'bp-group-r49', summary: GROUP_SUMMARY, images: [{ ref: '601' }] });
+  const f = fakes([BUG], 'known', { groupSummary: gs, bpCustomerId: customerId });
+  const row = await seedGroupInbox(`${TAG}-grp-r49`, { isGroup: true, chatMuted: true, mentionsMe: true });
+
+  await f.svc.process(row);
+  assert.equal(calls.summarize, 1, 'summarized on the first pass');
+  assert.equal(f.created.length, 1, 'one task on the first pass');
+
+  // A reclaim after a post-createTask failure must hit the HOISTED R49 short-circuit
+  // (DA finding 1) — re-notify + finish, WITHOUT re-summarizing or re-creating.
+  await f.svc.process(row);
+  assert.equal(calls.summarize, 1, 'R49: NOT re-summarized on reclaim');
+  assert.equal(f.created.length, 1, 'R49: no second task');
+  assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
+});
+
+test('muted group + @-mention, summary unavailable → skipped + admin note, no task', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { gs, calls } = groupSummaryFake({ bpRef: 'bp-group-nosum', summary: null }); // summarizeLastHour → null
+  const f = fakes([BUG], 'known', { groupSummary: gs });
+  const row = await seedGroupInbox(`${TAG}-grp-nosum`, { isGroup: true, chatMuted: true, mentionsMe: true });
+  await f.svc.process(row);
+
+  assert.equal(calls.summarize, 1, 'summarize attempted');
+  assert.equal(f.created.length, 0, 'no task when there is no summary');
+  assert.ok(f.adminNotes.some((n) => n.title.includes('unavailable')), 'admin noted the unavailable summary');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'skipped');
+});
+
 test('muted group + no mention → skipped, no summarize', async (t) => {
   if (!(await dbReady())) return t.skip('no db');
   const { gs, calls } = groupSummaryFake({ bpRef: 'bp-x', summary: GROUP_SUMMARY });

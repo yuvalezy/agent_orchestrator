@@ -83,11 +83,17 @@ export class TriageService {
   constructor(private readonly deps: TriageDeps) {}
 
   async process(row: ClaimedInbox): Promise<void> {
-    // M2 muted-group routing (top-of-loop). A muted group is low-attention by
-    // design — act ONLY when it @-mentions the founder. Flags come from
-    // raw_metadata->'metadata' (claimBatch); ABSENT (null) on non-WA channels and
-    // history-backfill rows → both conditions are falsy → the author path runs
-    // unchanged.
+    // R49 idempotency short-circuit — applies to ALL paths (author + muted-group).
+    // A prior attempt created the task then failed AT/AFTER notify (e.g. Telegram
+    // down — the case M1.9 hardened) → re-notify + finish, never re-run the LLM/
+    // summary or re-dedup. Hoisted above the group routing (DA finding 1) so a
+    // reclaimed group-mention row does NOT re-summarize + add a spurious self-comment.
+    if (await this.tryR49Reconfirm(row.id)) return;
+
+    // M2 muted-group routing. A muted group is low-attention by design — act ONLY
+    // when it @-mentions the founder. Flags come from raw_metadata->'metadata'
+    // (claimBatch); ABSENT (null) on non-WA channels and history-backfill rows →
+    // both conditions are falsy → the author path runs unchanged.
     if (row.is_group && row.chat_muted && !row.mentions_me) {
       await markSkipped(row.id, 'muted group, no mention');
       logger.info({ inboxId: row.id }, 'triage: muted group without mention — skipped');
@@ -99,30 +105,6 @@ export class TriageService {
     }
 
     const inboxId = row.id;
-
-    // R49 short-circuit: a prior attempt already ran the LLM + created a task and
-    // then failed (e.g. Telegram down) → don't re-spend / re-dedup, just finish.
-    // Residual: a crash MID-multi-intent leaves the un-done intents unprocessed —
-    // accepted Phase-1 tradeoff (single-intent dominant).
-    const existing = await findTaskByInbox(inboxId);
-    if (existing) {
-      // A prior attempt created the task but may have failed AT/AFTER notify (DA) →
-      // re-notify (a duplicate Telegram message is benign vs a silently un-notified
-      // task). markProcessed only AFTER notify succeeds, so a Telegram outage keeps
-      // the row retrying until it recovers rather than dropping the notification.
-      logger.info({ inboxId, taskRef: existing }, 'triage: task exists (R49) — re-notifying');
-      const customerId = await findCustomerByTaskRef(existing);
-      if (customerId) {
-        await this.deps.notifier.notifyCustomerEvent(
-          customerId,
-          { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing) },
-          cancelButton(existing),
-        );
-      }
-      await markProcessed(inboxId);
-      return;
-    }
-
     const address = row.sender_address ?? '';
     const resolution = await resolveContact({ channelType: row.channel_type, address }, this.deps.contactQueries);
     if (resolution.kind === 'unknown') {
@@ -145,6 +127,29 @@ export class TriageService {
     const customerId = resolution.customerId;
     await setInboxCustomer(inboxId, customerId);
     await this.runMoneyLoop(row, customerId);
+  }
+
+  /**
+   * R49: if this inbox row already produced a task (a prior attempt that failed
+   * at/after notify), re-notify the task's customer and finish — never re-run the
+   * LLM/summary or dedup. Returns true iff it handled the row. Shared by the author
+   * path and the muted-group path so both are idempotent under reclaim.
+   * Residual (unchanged): a crash MID-multi-intent leaves un-done intents unprocessed.
+   */
+  private async tryR49Reconfirm(inboxId: string): Promise<boolean> {
+    const existing = await findTaskByInbox(inboxId);
+    if (!existing) return false;
+    logger.info({ inboxId, taskRef: existing }, 'triage: task exists (R49) — re-notifying');
+    const customerId = await findCustomerByTaskRef(existing);
+    if (customerId) {
+      await this.deps.notifier.notifyCustomerEvent(
+        customerId,
+        { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing) },
+        cancelButton(existing),
+      );
+    }
+    await markProcessed(inboxId);
+    return true;
   }
 
   /**
