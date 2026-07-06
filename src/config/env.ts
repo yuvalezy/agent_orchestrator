@@ -79,6 +79,12 @@ const envSchema = z.object({
   OUTBOUND_DEFAULT_TZ: z.string().default('America/Panama'),
   OUTBOUND_STUCK_MINUTES: z.coerce.number().int().positive().default(10),
   HOLIDAY_COUNTRY: z.string().default('PA'),
+
+  // ── M1.9 (§9.5): early-warning alert when triage rows start failing (a
+  // dependency is down — portal/LLM/DB). After this many CONSECUTIVE row failures
+  // the founder gets ONE admin Telegram notice (re-armed on recovery), instead of
+  // only the ~30-min failStuck terminal alert. Set low to be told sooner.
+  TRIAGE_FAILURE_ALERT_THRESHOLD: z.coerce.number().int().positive().default(3),
 });
 
 const parsed = envSchema.safeParse(process.env);
