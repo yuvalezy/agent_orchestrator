@@ -21,6 +21,7 @@ export interface ClaimedInbox {
   received_at: string;
   recipients: { to: string[]; cc: string[] } | null; // email TO/CC (M1.6)
   account_email: string | null; // the receiving email instance's own address (M1.6 CC rule)
+  ticket_number: string | null; // service-desk only (raw_metadata.ticketNumber, e.g. 'SD-00042'); null for other channels (M1.7)
 }
 
 /** Claim a batch of triageable inbound rows. A voice note lands body=NULL and the
@@ -42,11 +43,12 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
            FOR UPDATE SKIP LOCKED
            LIMIT $1
         )
-        RETURNING id, channel_instance_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients
+        RETURNING id, channel_instance_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients, raw_metadata
      )
      SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_thread_id,
             c.sender_address, c.sender_name, c.subject, c.body, c.received_at,
-            c.recipients, ci.config->>'accountEmail' AS account_email
+            c.recipients, ci.config->>'accountEmail' AS account_email,
+            c.raw_metadata->>'ticketNumber' AS ticket_number
        FROM claimed c JOIN channel_instances ci ON ci.id = c.channel_instance_id
       ORDER BY c.id ASC`,
     [limit, MAX_ATTEMPTS],

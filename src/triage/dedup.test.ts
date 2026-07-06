@@ -15,7 +15,7 @@ function ports(threadTasks: TargetTask[], scores: number[]) {
 }
 
 const intent = { suggested_title: 'Fix export' };
-const base = { channelType: 'whatsapp', threadKey: '509', projectRef: 'proj-1' };
+const base = { source: { service: 'agent-orchestrator', entityType: 'whatsapp', entityId: '509' }, projectRef: 'proj-1' };
 
 test('same-thread open task (portal sourceEntity) → comment on the most recent', async () => {
   const threadTasks = [task('t-old', 'x', '2026-07-01'), task('t-new', 'x', '2026-07-05')];

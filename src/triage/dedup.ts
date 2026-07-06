@@ -27,8 +27,10 @@ function byUpdatedDesc(a: TargetTask, b: TargetTask): number {
 export async function decideDedup(
   intent: { suggested_title: string },
   ctx: {
-    channelType: string;
-    threadKey: string;
+    /** The exact (service, entityType, entityId) triple this intent's task will be
+     *  (or was) created with — must match createTask's `source` so the lookup finds
+     *  it (D5). */
+    source: { service: string; entityType: string; entityId: string };
     projectRef: string;
     openTasks: TargetTask[];
     /** Task refs CREATED earlier in this same message's process() — excluded from
@@ -45,7 +47,7 @@ export async function decideDedup(
   const threadTasks = (
     await ports.taskTarget.findTasksBySource({
       projectRef: ctx.projectRef,
-      sourceEntity: { type: ctx.channelType, id: ctx.threadKey },
+      sourceEntity: { service: ctx.source.service, type: ctx.source.entityType, id: ctx.source.entityId },
     })
   ).filter((t) => !ctx.excludeTaskRefs?.has(t.ref));
   if (threadTasks.length) {

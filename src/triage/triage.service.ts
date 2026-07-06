@@ -33,6 +33,33 @@ export function isCcOnly(row: Pick<ClaimedInbox, 'channel_type' | 'account_email
   return cc.includes(me) && !to.includes(me);
 }
 
+/** The task-origin triple for a created/deduped task, keyed by channel type.
+ *  Service-desk tickets must match the portal's OWN convention (frontend
+ *  CreateProjectTaskDialog.tsx: sourceService='serviceDeskApp', entityType='Ticket')
+ *  so the ticket detail page's "linked Projects tasks" card — which queries by
+ *  those exact values — finds tasks this orchestrator creates too. */
+export function resolveTaskSource(
+  row: Pick<ClaimedInbox, 'channel_type' | 'ticket_number'>,
+  threadKey: string,
+  config: Pick<CustomerConfig, 'displayName'>,
+): { service: string; entityType: string; entityId: string; display: string; url?: string } {
+  if (row.channel_type === 'service_desk') {
+    return {
+      service: 'serviceDeskApp',
+      entityType: 'Ticket',
+      entityId: threadKey,
+      display: row.ticket_number ?? threadKey,
+      url: `/service-desk/tickets/${threadKey}`,
+    };
+  }
+  return {
+    service: 'agent-orchestrator',
+    entityType: row.channel_type,
+    entityId: threadKey,
+    display: `${config.displayName} · ${threadKey}`,
+  };
+}
+
 export interface TriageDeps {
   taskTarget: TaskTargetPort;
   llm: AgentLlmPort;
@@ -158,9 +185,10 @@ export class TriageService {
       return;
     }
 
+    const source = resolveTaskSource(row, threadKey, config);
     const dedup = await decideDedup(
       intent,
-      { channelType: row.channel_type, threadKey, projectRef, openTasks: ctx.openTasks, excludeTaskRefs: createdThisRun },
+      { source, projectRef, openTasks: ctx.openTasks, excludeTaskRefs: createdThisRun },
       { taskTarget: this.deps.taskTarget, llm: this.deps.llm },
     );
 
@@ -183,7 +211,7 @@ export class TriageService {
       title: intent.suggested_title,
       description: this.taskDescription(intent, row.body),
       priority: intent.priority,
-      source: { service: 'agent-orchestrator', entityType: row.channel_type, entityId: threadKey, display: `${config.displayName} · ${threadKey}` },
+      source,
       tags: [intent.category],
     });
     createdThisRun.add(task.ref); // exclude from sibling intents' thread dedup (code-review #2)

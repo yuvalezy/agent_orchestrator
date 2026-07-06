@@ -52,7 +52,7 @@ test('createTask posts camelCase body + source* + Idempotency-Key; truncates a l
 
 test('findOpenTasks filters by sourceEntity + open statuses, maps text→search', async () => {
   const { gw, calls } = gatewayWith(200, { data: [{ id: 't1', title: 'T', status: 'todo', projectId: 'proj-1', updatedAt: '2026-07-05T00:00:00Z' }] });
-  const tasks = await gw.findOpenTasks({ projectRef: 'proj-1', sourceEntity: { type: 'whatsapp', id: 'thread-9' }, text: 'export' });
+  const tasks = await gw.findOpenTasks({ projectRef: 'proj-1', sourceEntity: { service: 'agent-orchestrator', type: 'whatsapp', id: 'thread-9' }, text: 'export' });
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].ref, 't1');
   assert.equal(tasks[0].projectRef, 'proj-1');
@@ -98,12 +98,22 @@ test('createTask truncates title on code points without splitting a surrogate pa
 
 test('findTasksBySource queries ALL statuses (a closed task still owns its source)', async () => {
   const { gw, calls } = gatewayWith(200, { data: [{ id: 't-closed', title: 'T', status: 'cancelled', projectId: 'p' }] });
-  const tasks = await gw.findTasksBySource({ projectRef: 'p', sourceEntity: { type: 'whatsapp', id: '509' } });
+  const tasks = await gw.findTasksBySource({ projectRef: 'p', sourceEntity: { service: 'agent-orchestrator', type: 'whatsapp', id: '509' } });
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].status, 'cancelled');
   const u = new URL(calls[0].url);
   assert.equal(u.searchParams.get('status'), 'backlog,todo,in-progress,review,done,cancelled');
   assert.equal(u.searchParams.get('sourceEntityId'), '509');
+  assert.equal(u.searchParams.get('sourceService'), 'agent-orchestrator');
+});
+
+test('findTasksBySource passes through a non-agent-orchestrator sourceService (e.g. serviceDeskApp)', async () => {
+  const { gw, calls } = gatewayWith(200, { data: [] });
+  await gw.findTasksBySource({ projectRef: 'p', sourceEntity: { service: 'serviceDeskApp', type: 'Ticket', id: 'ticket-1' } });
+  const u = new URL(calls[0].url);
+  assert.equal(u.searchParams.get('sourceService'), 'serviceDeskApp');
+  assert.equal(u.searchParams.get('sourceEntityType'), 'Ticket');
+  assert.equal(u.searchParams.get('sourceEntityId'), 'ticket-1');
 });
 
 test('addComment posts {body} to /:id/comments', async () => {

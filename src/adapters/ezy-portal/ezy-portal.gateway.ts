@@ -3,14 +3,13 @@ import {
   TaskTargetPort,
   TaskRef,
   TargetTask,
+  SourceEntityRef,
   TicketingPort,
   TargetTicket,
   TicketThreadEntry,
 } from '../../ports';
 import { EzyPortalHttpClient } from './http-client';
 
-/** The orchestrator's identity in the portal `sourceService` field (D5 dedup). */
-const SOURCE_SERVICE = 'agent-orchestrator';
 /** Portal field limits (DA-verified vs task_input.go) — truncate defensively so a
  *  long LLM title/description never 422s. M1.5b should also validate upstream. */
 const TITLE_MAX = 240;
@@ -301,7 +300,7 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
   async findOpenTasks(q: {
     customerRef?: string;
     projectRef?: string;
-    sourceEntity?: { type: string; id: string };
+    sourceEntity?: SourceEntityRef;
     text?: string;
   }): Promise<TargetTask[]> {
     // ⚠ R46: the portal ListTasks has NO customer/BP filter (Task carries no BP
@@ -317,8 +316,8 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
     // dedup; a list-all-open use (change 04) must paginate.
     const res = await this.http.get<Paged<EzyTask>>('/api/projects/tasks', {
       projectId: q.projectRef,
-      // dedup lookup: our created tasks all carry sourceService='agent-orchestrator'
-      sourceService: q.sourceEntity ? SOURCE_SERVICE : undefined,
+      // dedup lookup: sourceService varies by origin channel (D5) — caller-supplied.
+      sourceService: q.sourceEntity?.service,
       sourceEntityType: q.sourceEntity?.type,
       sourceEntityId: q.sourceEntity?.id,
       search: q.text, // ⚠ the portal param is `search`, NOT `text` (unknown params are ignored)
@@ -334,10 +333,10 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
    * (not open-only) so a closed thread's follow-up comments on the existing task
    * instead of failing to create.
    */
-  async findTasksBySource(q: { projectRef?: string; sourceEntity: { type: string; id: string } }): Promise<TargetTask[]> {
+  async findTasksBySource(q: { projectRef?: string; sourceEntity: SourceEntityRef }): Promise<TargetTask[]> {
     const res = await this.http.get<Paged<EzyTask>>('/api/projects/tasks', {
       projectId: q.projectRef,
-      sourceService: SOURCE_SERVICE,
+      sourceService: q.sourceEntity.service,
       sourceEntityType: q.sourceEntity.type,
       sourceEntityId: q.sourceEntity.id,
       status: ALL_STATUSES,

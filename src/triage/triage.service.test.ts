@@ -13,6 +13,7 @@ import type { Intent } from '../ports/llm.port';
 
 const TAG = 'ttest';
 let waInstanceId: string;
+let sdInstanceId: string;
 let customerId: string;
 
 async function dbReady(): Promise<boolean> {
@@ -20,6 +21,15 @@ async function dbReady(): Promise<boolean> {
     const { rows } = await query<{ id: string }>(`SELECT id FROM channel_instances WHERE provider='whatsapp_manager' LIMIT 1`);
     if (!rows[0]) return false;
     waInstanceId = rows[0].id;
+    return true;
+  } catch { return false; }
+}
+
+async function serviceDeskReady(): Promise<boolean> {
+  try {
+    const { rows } = await query<{ id: string }>(`SELECT id FROM channel_instances WHERE provider='ezy_service_desk' LIMIT 1`);
+    if (!rows[0]) return false;
+    sdInstanceId = rows[0].id;
     return true;
   } catch { return false; }
 }
@@ -89,6 +99,21 @@ async function seedInbox(msgId: string, body: string | null): Promise<ClaimedInb
     id: rows[0].id, channel_instance_id: waInstanceId, channel_type: 'whatsapp',
     channel_thread_id: '50900000001', sender_address: '50900000001', sender_name: null,
     subject: null, body, received_at: rows[0].received_at, recipients: null, account_email: null,
+    ticket_number: null,
+  };
+}
+
+async function seedServiceDeskInbox(msgId: string, body: string, ticketId: string, ticketNumber: string): Promise<ClaimedInbox> {
+  const { rows } = await query<{ id: string; received_at: string }>(
+    `INSERT INTO agent_inbox (channel_instance_id, channel_message_id, channel_thread_id, sender_address, direction, body, received_at, status, raw_metadata)
+     VALUES ($1, $2, $3, $4, 'inbound', $5, now(), 'processing', $6::jsonb) RETURNING id, received_at`,
+    [sdInstanceId, msgId, ticketId, 'bp-triage-sd', body, JSON.stringify({ ticketNumber })],
+  );
+  return {
+    id: rows[0].id, channel_instance_id: sdInstanceId, channel_type: 'service_desk',
+    channel_thread_id: ticketId, sender_address: 'bp-triage-sd', sender_name: null,
+    subject: null, body, received_at: rows[0].received_at, recipients: null, account_email: null,
+    ticket_number: ticketNumber,
   };
 }
 
@@ -145,4 +170,28 @@ test('unknown sender → skipped + counter bumped, no task', async (t) => {
   assert.equal(f.skipped, 1);
   const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
   assert.equal(inbox.rows[0].status, 'skipped');
+});
+
+test('service-desk ticket → task source stamped with the portal serviceDeskApp/Ticket convention', async (t) => {
+  if (!(await serviceDeskReady())) return t.skip('no service-desk channel instance in this db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-sd', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+
+  const f = fakes([BUG], 'known');
+  const ticketId = 'ttest-ticket-uuid-1';
+  const row = await seedServiceDeskInbox(`${TAG}-sd-1`, 'the export button is broken', ticketId, 'SD-TEST-1');
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 1, 'createTask called once');
+  const source = (f.created[0] as { source: { service: string; entityType: string; entityId: string; display: string; url?: string } }).source;
+  assert.deepEqual(source, {
+    service: 'serviceDeskApp',
+    entityType: 'Ticket',
+    entityId: ticketId,
+    display: 'SD-TEST-1',
+    url: `/service-desk/tickets/${ticketId}`,
+  });
 });

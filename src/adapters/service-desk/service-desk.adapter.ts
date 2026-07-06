@@ -101,6 +101,7 @@ export class ServiceDeskAdapter implements ChannelAdapter {
       raw: {
         entry,
         ticketId: ticket.id,
+        ticketNumber: ticket.ticketNumber,
         requesterType: ticket.requesterType,
         requesterBPID: ticket.requesterBPID,
       },

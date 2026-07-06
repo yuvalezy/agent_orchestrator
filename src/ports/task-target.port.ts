@@ -21,6 +21,15 @@ export interface TargetTask {
   updatedAt?: Date;
 }
 
+/** A task's source-triple identity (D5) — (service, entityType, entityId) is the
+ *  target's own uniqueness key, so lookups must supply the same `service` the
+ *  task was created with (it varies per originating channel; not a constant). */
+export interface SourceEntityRef {
+  service: string;
+  type: string;
+  id: string;
+}
+
 export interface TaskTargetPort {
   createTask(input: {
     customerRef: string;
@@ -36,13 +45,13 @@ export interface TaskTargetPort {
   findOpenTasks(q: {
     customerRef?: string;
     projectRef?: string;
-    sourceEntity?: { type: string; id: string };
+    sourceEntity?: SourceEntityRef;
     text?: string;
   }): Promise<TargetTask[]>;
   /** Find the task owning a source across ALL statuses (the target may enforce
    *  source uniqueness, so a closed task still blocks a new create) — used by the
    *  money-loop's thread dedup. At most one for a source-unique target. */
-  findTasksBySource(q: { projectRef?: string; sourceEntity: { type: string; id: string } }): Promise<TargetTask[]>;
+  findTasksBySource(q: { projectRef?: string; sourceEntity: SourceEntityRef }): Promise<TargetTask[]>;
   listWorkItemTypes(projectRef: string): Promise<Array<{ ref: string; name: string }>>;
   setStatus(task: TaskRef, status: string): Promise<void>; // used from change 04
 }
