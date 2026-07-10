@@ -13,12 +13,13 @@ const envSchema = z.object({
     .default('info'),
 
   // Database — DATABASE_URL wins when present, otherwise discrete PG* vars.
-  // Defaults target the shared ops-dev `ezy-postgres`, host-published on 42016
-  // (ADR-11/BF1); under docker network_mode:host the container uses the same
-  // localhost values.
+  // Defaults target the DEDICATED pgvector Postgres `ao-postgres` (docker-compose.db.yml),
+  // host-published on 55432 — SEPARATE from the shared ops-dev ezy-postgres (:42016) so
+  // the vector RAG + migrations never bounce the portal dev stack. Under docker
+  // network_mode:host the container uses the same localhost values.
   DATABASE_URL: z.string().optional(),
   PGHOST: z.string().default('localhost'),
-  PGPORT: z.coerce.number().int().positive().default(42016),
+  PGPORT: z.coerce.number().int().positive().default(55432),
   PGUSER: z.string().default('postgres'),
   PGPASSWORD: z.string().default('postgres'),
   PGDATABASE: z.string().default('agent_orchestrator'),
@@ -89,6 +90,24 @@ const envSchema = z.object({
   // the founder gets ONE admin Telegram notice (re-armed on recovery), instead of
   // only the ~30-min failStuck terminal alert. Set low to be told sooner.
   TRIAGE_FAILURE_ALERT_THRESHOLD: z.coerce.number().int().positive().default(3),
+
+  // ── M2a: knowledge-sync (Layer-B folder-sourced doc ingestion into the RAG).
+  // Non-secret; OPENAI_API_KEY stays a credential (resolveCredential).
+  // KNOWLEDGE_SYNC_ENABLED is the kill-switch (mirrors OUTBOUND_ENABLED): the worker
+  // is registered ONLY when the literal "true". DORMANT by default so a boot doesn't
+  // embed the whole corpus by surprise — flip it once the corpus customers are onboarded.
+  // OPENAI_EMBEDDING_DIM MUST equal the vector(N) column in migration 014.
+  KNOWLEDGE_SYNC_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  KNOWLEDGE_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000), // 1h
+  OPENAI_EMBEDDING_MODEL: z.string().default('text-embedding-3-small'),
+  OPENAI_EMBEDDING_DIM: z.coerce.number().int().positive().default(1536),
+  // Refuse-to-tombstone guard: if a source's on-disk set vanishes such that the
+  // tombstone ratio exceeds this, the reconciler WARNs and skips (probable IO glitch,
+  // not a real deletion). 0..1; 0.5 = never tombstone more than half a source at once.
+  KNOWLEDGE_TOMBSTONE_MAX_RATIO: z.coerce.number().min(0).max(1).default(0.5),
 });
 
 const parsed = envSchema.safeParse(process.env);

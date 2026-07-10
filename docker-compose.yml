@@ -1,5 +1,6 @@
-# Orchestrator app service only — it does NOT define its own postgres. It reaches
-# the shared ops-dev `ezy-postgres` at localhost:42016.
+# Orchestrator app service only. Its Postgres is the dedicated pgvector container
+# `ao-postgres` (docker-compose.db.yml), host-published on localhost:55432 —
+# separate from the shared ops-dev `ezy-postgres` (:42016).
 #
 # ◆ BF1 / ADR-11: network_mode: host. Verified topology — whatsapp_manager runs
 # in its OWN compose with its own Postgres (host-published 3000, NOT on
@@ -19,7 +20,7 @@ services:
       PORT: 3100
       LOG_LEVEL: info
       PGHOST: localhost
-      PGPORT: 42016
+      PGPORT: 55432
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: agent_orchestrator

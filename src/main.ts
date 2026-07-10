@@ -1,7 +1,7 @@
 import { env } from './config/env';
 import { logger } from './logger';
 import { runMigrations } from './db/migrate';
-import { closePool } from './db';
+import { closePool, withClient } from './db';
 import { buildApp, type AppDeps } from './app';
 import { startWorker, type WorkerDefinition } from './workers/worker-runner';
 import { ChannelRegistry } from './adapters/channel-registry';
@@ -18,7 +18,15 @@ import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.fac
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
 import { seedHolidays } from './adapters/outbound/holiday-seeder';
+import { buildKnowledgeSyncWorker } from './adapters/knowledge/knowledge-sync.worker';
+import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
+import { buildEmbeddingAdapter } from './adapters/knowledge/openai-embeddings.client';
+import { memoryRepo } from './knowledge/memory-repo';
+import { dbContactResolutionQueries } from './customers/contact-resolution';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
+
+// M2a: advisory-lock namespace for the knowledge-sync reconcile ('know' as int32).
+const KNOWLEDGE_SYNC_LOCK_KEY = 0x6b6e6f77;
 
 /** No-op notifier so the drainer can register even when Telegram is unconfigured
  *  (D-M / clean fallback). Its alerts silently drop — a loud WARN is emitted at
@@ -164,14 +172,66 @@ async function main(): Promise<void> {
     logger.info('outbound drainer NOT registered (OUTBOUND_ENABLED=false) — approved rows sit in the queue, nothing sends');
   }
 
+  // M2a: knowledge-sync worker — registered ONLY when KNOWLEDGE_SYNC_ENABLED (kill-
+  // switch, mirrors OUTBOUND_ENABLED). DORMANT by default so a boot doesn't embed the
+  // whole corpus by surprise — flip the flag once corpus customers are onboarded. The
+  // reconciler is CORE (ports-only, no DB seam), so the pg_advisory_lock that serializes
+  // a double-boot lives HERE at the wiring layer (a second instance skips the tick).
+  const knowledgeWorkers: WorkerDefinition[] = [];
+  if (env.KNOWLEDGE_SYNC_ENABLED) {
+    if (!tryResolveCredential('OPENAI_API_KEY')) {
+      logger.warn('⚠️  KNOWLEDGE_SYNC_ENABLED=true but OPENAI_API_KEY is UNSET — embedding calls will fail until it is set.');
+    }
+    const syncWorker = buildKnowledgeSyncWorker({
+      docSource: buildFsDocSource(),
+      embedding: buildEmbeddingAdapter(
+        () => tryResolveCredential('OPENAI_API_KEY'),
+        env.OPENAI_BASE_URL,
+        { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+      ),
+      repo: memoryRepo,
+      resolveCustomerId: async (bpRef) =>
+        (await dbContactResolutionQueries.findCustomerByBpRef(bpRef))?.customerId ?? null,
+      log: logger,
+      intervalMs: env.KNOWLEDGE_SYNC_INTERVAL_MS,
+      tombstoneMaxRatio: env.KNOWLEDGE_TOMBSTONE_MAX_RATIO,
+    });
+    // Wrap the reconcile in a session advisory lock (try-lock → skip if not acquired,
+    // release in finally; a process crash ends the session and frees it automatically).
+    knowledgeWorkers.push({
+      ...syncWorker,
+      run: async () => {
+        await withClient(async (client) => {
+          const { rows } = await client.query<{ locked: boolean }>(
+            'SELECT pg_try_advisory_lock($1) AS locked',
+            [KNOWLEDGE_SYNC_LOCK_KEY],
+          );
+          if (!rows[0]?.locked) {
+            logger.warn('knowledge sync: another instance holds the advisory lock — skipping this tick');
+            return;
+          }
+          try {
+            await syncWorker.run();
+          } finally {
+            await client.query('SELECT pg_advisory_unlock($1)', [KNOWLEDGE_SYNC_LOCK_KEY]);
+          }
+        });
+      },
+    });
+    logger.info('knowledge-sync worker registered (KNOWLEDGE_SYNC_ENABLED=true)');
+  } else {
+    logger.info('knowledge-sync worker NOT registered (KNOWLEDGE_SYNC_ENABLED=false) — set it once corpus customers are onboarded, nothing ingests meanwhile');
+  }
+
   const app = buildApp(appDeps);
   const server = app.listen(env.PORT, () => {
     logger.info(`agent-orchestrator listening on http://localhost:${env.PORT}`);
   });
 
   // M1.3 ingestion pollers + M1.5b money-loop workers. (Heartbeat retired at M1.5b —
-  // the inbox processor is the first real worker.) M1.8 adds the outbound drainer.
-  const workers = [...ingestionWorkers, ...triageWorkers, ...outboundWorkers].map(startWorker);
+  // the inbox processor is the first real worker.) M1.8 adds the outbound drainer;
+  // M2a adds the (gated) knowledge-sync worker.
+  const workers = [...ingestionWorkers, ...triageWorkers, ...outboundWorkers, ...knowledgeWorkers].map(startWorker);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

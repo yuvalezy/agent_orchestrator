@@ -19,6 +19,9 @@ const PRICING: Record<string, Record<string, Rate>> = {
   openai: {
     'gpt-4.1': { inUsdPer1M: 2, outUsdPer1M: 8 },
     'gpt-4.1-mini': { inUsdPer1M: 0.4, outUsdPer1M: 1.6 },
+    // Embeddings: priced per input token only (no completion) — outUsdPer1M is 0
+    // and embed calls always record output_tokens=0 (see openai-embeddings.client).
+    'text-embedding-3-small': { inUsdPer1M: 0.02, outUsdPer1M: 0 },
   },
   deepseek: {
     'deepseek-chat': { inUsdPer1M: 0.27, outUsdPer1M: 1.1 },

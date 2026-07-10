@@ -19,5 +19,10 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "src/inbox/__illegal_import_fixture__.ts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/inbox/__illegal_import_fixture__.ts",
+    "src/knowledge/__illegal_import_fixture__.ts"
+  ]
 }

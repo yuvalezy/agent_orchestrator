@@ -5,15 +5,23 @@ import importPlugin from 'eslint-plugin-import';
 // (import/no-restricted-paths): core domain + port modules may NOT import
 // adapters — adapters are wired only in src/main.ts (the composition root).
 //
-// The committed negative fixture src/inbox/__illegal_import_fixture__.ts lives in
-// a REAL core dir, so THIS config's own zone (src/inbox → src/adapters) is what
-// rejects it — the guard exercises the actual target list the app relies on. It
-// is listed in `ignores` so `npm run lint` (and typecheck/build) stay green;
-// `npm run lint:boundary` lints just that file with `--no-ignore` (overriding the
-// ignore) and asserts THIS rule fires on it (green-on-healthy, fail-closed if the
-// rule ever stops firing). See scripts/check-boundary.mjs.
+// The committed negative fixtures (src/inbox/__illegal_import_fixture__.ts and
+// src/knowledge/__illegal_import_fixture__.ts) each live in a REAL core dir, so
+// THIS config's own zones (src/inbox → src/adapters, src/knowledge → src/adapters)
+// are what reject them — the guard exercises the actual target list the app relies
+// on. Each is listed in `ignores` so `npm run lint` (and typecheck/build) stay
+// green; `npm run lint:boundary` lints just those files with `--no-ignore`
+// (overriding the ignore) and asserts THIS rule fires on each (green-on-healthy,
+// fail-closed if the rule ever stops firing). See scripts/check-boundary.mjs.
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', 'src/inbox/__illegal_import_fixture__.ts'] },
+  {
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'src/inbox/__illegal_import_fixture__.ts',
+      'src/knowledge/__illegal_import_fixture__.ts',
+    ],
+  },
   ...tseslint.configs.recommended,
   {
     files: ['src/**/*.ts'],
@@ -41,6 +49,7 @@ export default tseslint.config(
                 './src/outbound',
                 './src/decisions',
                 './src/ports',
+                './src/knowledge',
               ],
               from: './src/adapters',
               message:

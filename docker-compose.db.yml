@@ -1,0 +1,29 @@
+# Dedicated Postgres for agent_orchestrator — pgvector-enabled (RAG / M2a knowledge sync).
+#
+# Deliberately SEPARATE from the shared ops-dev `ezy-postgres` (:42016) so this
+# service's vector extension, migrations, and restarts never touch or bounce the
+# portal dev stack. Host-published on :55432 — OUTSIDE the ops-dev 420xx range.
+#
+# Bring up:   docker compose -f docker-compose.db.yml up -d
+# Connect:    PGHOST=localhost PGPORT=55432 PGUSER=postgres PGDATABASE=agent_orchestrator
+services:
+  ao-postgres:
+    image: pgvector/pgvector:pg18
+    container_name: ao-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "55432:5432"
+    volumes:
+      # PG18 Debian image manages a version-specific subdir; mount the parent.
+      - ao_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+volumes:
+  ao_postgres_data:
