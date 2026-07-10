@@ -74,26 +74,45 @@ The two knowledge layers, side by side:
 
 ## What gets indexed
 
-The corpus is a **curated allow-list**, not a blanket scan — defined as a typed const
-in `src/adapters/knowledge/internal-sources.ts` (`INTERNAL_SOURCES`). Current sources:
+The corpus is a **curated, classified allow-list** — a typed const in
+`src/adapters/knowledge/internal-sources.ts` (`INTERNAL_SOURCES`). Each entry is one
+**`sourceId`**, which is the **citation prefix** of every doc it produces
+(`docKey = "<sourceId>:<repo-relative-path>"`) — so results are threaded by area.
+It spans **6 repos** (roots in `INTERNAL_REPO_ROOTS`): `yuval_dev_manager`, `ai-agent`,
+`portal`, `wms`, `ezy-integration`, `ezy-report-generator` — **~980 docs** total.
 
-| Source id | Repo | Includes |
+**Source classes:**
+
+| Class | `sourceId`s | What |
 |---|---|---|
-| `ao-plan` | `yuval_dev_manager` | `plan/EXECUTION-PLAN.md`, `plan/RISK-REGISTER.md`, `plan/project.md`, `plan/blueprints`, `plan/changes`, `plan/specs` |
-| `ai-agent-ref` | `ai-agent` | `plan/reference`, `docs/AI_Agent_SaaS_Platform_Specification.md` |
-| `portal-specs` | `portal` | `superplan/specs` |
+| Orchestrator / AI platform | `ao-plan`, `ai-agent-ref` | this repo's plan + the ai-agent SaaS spec/reference |
+| Portal cross-cutting | `portal-superplan`, `portal-plan`, `portal-origin`, `portal-core`, `portal-services`, `portal-mcp` | superplan, root plan/docs, `origin/` contracts hub, core plan+docs, the services overview, the portal MCP server |
+| Portal per micro-service | `svc-accounting`, `svc-catalog-automation`, `svc-insight-studio`, `svc-pos`, `svc-sbo-insights`, `svc-showcase` | each service's own `plan/` + `docs/` + root instruction files |
+| portal-business | `pb-shared` + `pb-<module>` (bp, inspect, items, payment-processor, pricing-tax, projects, prospects, service-desk) | the shared `plan/` + each module's internal design docs (`backend/internal/modules/<m>`) |
+| Portal per customer | `cust-<code>` (hola-doc, myezy, pilates-gal, red-cloud-quotation-tool, lavazza, cotton-candy-crm, home_group) | each customer's **internal** `plan/`+`docs/` (their customer-facing docs stay out) |
+| Sibling repos | `wms-plan`, `wms-backend`, `wms-frontend`, `ezy-integration`, `ezy-report-generator` | EZY WMS, ezy-integration, ezy-report-generator planning/architecture docs |
 
-Directory segments **excluded everywhere** (superseded scratch, not decision truth):
-`archive`, `active`, `executed`, `sessions`, `session-logs`, `prompts`, `tmp`.
-
-Absolute checkout roots per repo are `INTERNAL_REPO_ROOTS` in the same file.
+**What is EXCLUDED (by construction + `excludeDirs`):**
+- **Embedded customer-facing docs** — the DocArticle locale corpora served to customers
+  (`config/registration/docs/{en,es}`, `config/registration/modules/*/docs/{en,es}`,
+  `Infrastructure/Docs/Content`). These are the **customer** knowledge base (`sources.ts`),
+  never the internal brain. Excluded by never being included (curated paths point only at
+  internal dirs).
+- **Scratch / noise segments** skipped anywhere: `archive`, `active`, `executed`, `sessions`,
+  `session-logs`, `prompts`, `tmp`, `.tmp`, `node_modules`, `bin`, `obj`, `.git`, `.worktrees`,
+  `worktrees`, `.claude`, `summary`, `e2e`, `publish`, `test-results`, `logs`, `playwright-report`,
+  `temp-pdfs`, `output`, `reports`. (One deliberate exception: `ezy-report-generator/archive/planning`
+  — that repo's only architecture docs — is included.)
+- **Volume skipped by choice:** the portal design-system component docs (`core/ds-bundle`) and
+  per-service run-summaries / `e2e` test notes.
 
 ### Adding / changing a source
 
-Edit `INTERNAL_SOURCES` (add an entry, or add an `include` path / adjust `excludeDirs`),
-then re-embed (`npm run internal:reconcile:once`, or call the `resync_project_knowledge`
-MCP tool with no path). Identity is `docKey = "<sourceId>:<repo-relative-path>"`; a doc
-that drifts out of the includes is tombstoned (hidden from search) on the next reconcile.
+Edit `INTERNAL_SOURCES` (add an entry to the list, extend a `PORTAL_SERVICES` / `PB_MODULES` /
+`PORTAL_CUSTOMERS` array, or adjust `include`/`excludeDirs`; add a repo by extending the
+`InternalRepo` union + `INTERNAL_REPO_ROOTS`). Then re-embed — `npm run internal:reconcile:once`,
+or call the `resync_project_knowledge` MCP tool (no `path` = full reconcile). A doc that drifts
+out of the includes is tombstoned (hidden from search) on the next reconcile.
 
 ## One-time setup
 
