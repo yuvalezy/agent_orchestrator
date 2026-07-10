@@ -254,6 +254,31 @@ const envSchema = z.object({
   // ⚠︎ Confidence gate (0..2): a candidate whose cosine distance exceeds this is NOT a
   // merge — it stays a separate task. TIGHT by design (false-merge > duplicate).
   CROSS_CHANNEL_DEDUP_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.15),
+
+  // ── M5(a) "founder query engine" + Telegram `/ask` (Project Brain channel):
+  // a founder types `/ask <question>` in the admin/founder topic → internal-knowledge
+  // search → LLM-synthesized CITED answer posted back. Kill-switch (mirrors
+  // OUTBOUND_ENABLED strict-bool): the `/ask` handler is wired into the Telegram
+  // callback-poller ONLY when the literal "true"; unset/"false"/anything else → false.
+  // DORMANT by default so a boot never surfaces the founder query surface by surprise.
+  //
+  // Reuses the MI internal search (buildInternalKnowledgeSearch over internal_knowledge)
+  // and KNOWLEDGE_INTERNAL_K / _MAX_DISTANCE (same corpus). Adds a `answer` LLM role
+  // (LLM_MODEL_<PROVIDER>_ANSWER overridable). Embedding needs OPENAI_API_KEY (a
+  // credential, resolveCredential).
+  //
+  // ⚠︎ ISOLATION: the founder query path may reach internal + (future) customer rows,
+  // but the customer-DRAFTING retrieval (src/knowledge/retrieval.ts → agent_memory)
+  // remains structurally unable to reach internal_knowledge — this flag adds a NEW
+  // founder-only surface and does NOT weaken that boundary.
+  //
+  // PRECONDITION (Telegram): the `/ask` capture reads `message` updates, so the bot's
+  // group privacy mode MUST be OFF (BotFather /setprivacy) — same precondition as the
+  // ✏️ draft-edit capture (KNOWLEDGE_DRAFT_ENABLED).
+  QUERY_ENGINE_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -74,6 +74,17 @@ export class TelegramNotifier implements FounderNotifierPort {
     });
   }
 
+  /** Post a plain-text reply back to a specific forum topic (M5(a) `/ask` answers →
+   *  the same thread the question came from). Not on the port — a Telegram-adapter
+   *  convenience the callback-poller composition wires as the `postAnswer` capability. */
+  async replyInThread(threadId: string, text: string): Promise<void> {
+    await this.client.sendMessage({
+      chatId: this.opts.supergroupChatId,
+      messageThreadId: threadId,
+      text,
+    });
+  }
+
   async askFounder(
     customerId: string,
     question: Notification,

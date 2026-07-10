@@ -1,13 +1,14 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, DraftRequest, DraftResult, Intent, LlmMessage, LlmProviderClient, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, DraftRequest, DraftResult, Intent, LlmMessage, LlmProviderClient, TokenUsage, TriageContext } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
 import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draft-prompt';
+import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './answer-prompt';
 
-export type LlmRole = 'triage' | 'classify' | 'draft';
+export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
 
 export interface LlmRouterDeps {
   /** provider name → client (anthropic/openai/deepseek). */
@@ -34,7 +35,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -173,6 +174,27 @@ export class LlmRouter implements AgentLlmPort {
       // thinking + output combined (R44) — a tight budget could truncate the JSON.
       maxTokens: 1024,
       validate: parseDraft,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Synthesize a founder-facing answer (role 'answer', M5(a)). Reuses the golden
+   * structured-call path — cost accounting, ordered failover, daily cap — with the
+   * strict ANSWER_SCHEMA. The model answers ONLY from `input.sources` and reports the
+   * indexes it relied on (never a free-text citation). customerId null: a founder
+   * query is not billed to any one customer. NEVER logs the question or the answer.
+   */
+  async synthesizeAnswer(input: AnswerRequest): Promise<AnswerResult> {
+    return this.callStructured<AnswerResult>({
+      role: 'answer',
+      schema: ANSWER_SCHEMA,
+      system: ANSWER_SYSTEM,
+      messages: [{ role: 'user', content: answerUserMessage(input) }],
+      // Ample headroom: sonnet-5 runs adaptive thinking ON and max_tokens caps
+      // thinking + output combined (R44) — a tight budget could truncate the JSON.
+      maxTokens: 1500,
+      validate: parseAnswer,
       customerId: null,
     });
   }

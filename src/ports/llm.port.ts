@@ -103,6 +103,49 @@ export interface AgentLlmPort {
   draftReply(input: DraftRequest): Promise<DraftResult>;
 }
 
+/**
+ * One numbered source injected into a founder-query synthesis (M5(a), LLM role
+ * 'answer'). `content` is the retrieved chunk text; `label` is the human-readable
+ * citation the query engine renders back to the founder (never emitted by the model).
+ */
+export interface AnswerSource {
+  content: string;
+  label: string;
+}
+
+/**
+ * Request to synthesize a founder-facing answer (M5(a), LLM role 'answer'). The
+ * model answers `question` STRICTLY from the numbered `sources` and reports which it
+ * relied on by index — it NEVER emits free-text citations (the query engine renders
+ * those from the same sources). `sources` is always non-empty (the query service
+ * skips synthesis entirely — no LLM call — when retrieval returns nothing).
+ */
+export interface AnswerRequest {
+  question: string;
+  sources: AnswerSource[];
+}
+
+/**
+ * Structured answer result. `usedSourceIndexes` are 0-based indexes into
+ * `AnswerRequest.sources` the model actually relied on — the query engine renders
+ * the human-readable citation list from OUR sources at those indexes (validated /
+ * clamped), so a hallucinated citation is impossible (mirrors DraftResult).
+ */
+export interface AnswerResult {
+  body: string;
+  usedSourceIndexes: number[];
+}
+
+/**
+ * Founder-query answer synthesis (M5(a)). SEPARATE from AgentLlmPort (interface
+ * segregation): the query engine depends only on this, and existing triage fakes are
+ * untouched. Implemented by the LlmRouter alongside AgentLlmPort. Grounded ONLY in
+ * `input.sources`. NEVER logs the question or bodies.
+ */
+export interface AnswerSynthesizerPort {
+  synthesizeAnswer(input: AnswerRequest): Promise<AnswerResult>;
+}
+
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */
 export interface LlmProviderClient {
   readonly provider: string; // 'anthropic' | 'openai' | 'deepseek' | future
