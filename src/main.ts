@@ -20,6 +20,18 @@ import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer
 import { seedHolidays } from './adapters/outbound/holiday-seeder';
 import { buildKnowledgeSyncWorker } from './adapters/knowledge/knowledge-sync.worker';
 import { buildInternalSyncWorker } from './adapters/knowledge/internal-sync.worker';
+import { buildReleaseNoteWorker } from './adapters/release-notes/release-note.worker';
+import { buildReleaseNoteSource } from './adapters/release-notes/release-note-source';
+import { buildReleaseNoteNotifier } from './outbound/release-note-notifier';
+import {
+  claimReleaseNoteNotification,
+  finalizeReleaseNoteNotification,
+  resolvePrimaryChannel,
+} from './outbound/release-note-repo';
+import { enqueueDraft } from './outbound/outbound-repo';
+import { recordReleaseNoteDraftDecision } from './decisions/decisions';
+import { loadCustomerConfig } from './triage/context-loader';
+import { buildLlmRouter } from './adapters/llm/factory';
 import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
 import { buildInternalDocSource } from './adapters/knowledge/internal-doc-source';
 import { buildEmbeddingAdapter } from './adapters/knowledge/openai-embeddings.client';
@@ -36,6 +48,8 @@ import type { FounderNotifierPort } from './ports/founder-notifier.port';
 const KNOWLEDGE_SYNC_LOCK_KEY = 0x6b6e6f77;
 // MI: advisory-lock namespace for the internal knowledge-sync reconcile ('intk').
 const INTERNAL_SYNC_LOCK_KEY = 0x696e746b;
+// M2(e): advisory-lock namespace for the release-note notify tick ('rlnt').
+const RELEASE_NOTE_LOCK_KEY = 0x726c6e74;
 
 /** No-op notifier so the drainer can register even when Telegram is unconfigured
  *  (D-M / clean fallback). Its alerts silently drop — a loud WARN is emitted at
@@ -334,6 +348,75 @@ async function main(): Promise<void> {
     logger.info('internal knowledge-sync worker registered (KNOWLEDGE_INTERNAL_ENABLED=true)');
   } else {
     logger.info('internal knowledge-sync worker NOT registered (KNOWLEDGE_INTERNAL_ENABLED=false) — Project Brain corpus not ingested; set the flag to enable');
+  }
+
+  // M2(e): release-note → customer notification drafts — registered ONLY when
+  // RELEASE_NOTE_DRAFTS_ENABLED (kill-switch, mirrors OUTBOUND_ENABLED). DORMANT by
+  // default. Requires Telegram (drafts present in customer topics) AND a RELEASE_NOTES_DIR
+  // to scan; the produced drafts are is_draft=true (approved via the existing draft-review
+  // flow, drained by the outbound drainer). Same advisory-lock discipline as knowledge-sync,
+  // on its own key so the reconciles never contend.
+  if (env.RELEASE_NOTE_DRAFTS_ENABLED) {
+    const tg = notifier;
+    if (!tg) {
+      logger.warn('⚠️  RELEASE_NOTE_DRAFTS_ENABLED=true but Telegram is unconfigured — release-note drafts have nowhere to present; NOT registering.');
+    } else if (!env.RELEASE_NOTES_DIR?.trim()) {
+      logger.warn('⚠️  RELEASE_NOTE_DRAFTS_ENABLED=true but RELEASE_NOTES_DIR is unset — no release-note source to scan; NOT registering.');
+    } else {
+      if (!tryResolveCredential('OPENAI_API_KEY')) {
+        logger.warn('⚠️  RELEASE_NOTE_DRAFTS_ENABLED=true but OPENAI_API_KEY is UNSET — release-note matching/embedding will fail until it is set.');
+      }
+      const releaseNoteNotifier = buildReleaseNoteNotifier({
+        embedding: buildEmbeddingAdapter(
+          () => tryResolveCredential('OPENAI_API_KEY'),
+          env.OPENAI_BASE_URL,
+          { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+        ),
+        matchCustomers: (embedding, opts) => memoryRepo.matchCustomersByHistory(embedding, opts),
+        claimNotification: claimReleaseNoteNotification,
+        finalizeNotification: finalizeReleaseNoteNotification,
+        loadCustomerConfig,
+        resolvePrimaryChannel,
+        llm: buildLlmRouter({ notifyAdmin: (msg) => tg.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }) }),
+        enqueueDraft,
+        recordDraftDecision: recordReleaseNoteDraftDecision,
+        notifier: tg,
+        config: {
+          matchMaxDistance: env.RELEASE_NOTE_MATCH_MAX_DISTANCE,
+          maxCustomers: env.RELEASE_NOTE_MAX_CUSTOMERS,
+          memoryTypes: ['task', 'conversation'],
+        },
+      });
+      const rnWorker = buildReleaseNoteWorker({
+        source: buildReleaseNoteSource(env.RELEASE_NOTES_DIR),
+        notifier: releaseNoteNotifier,
+        log: logger,
+        intervalMs: env.RELEASE_NOTE_SYNC_INTERVAL_MS,
+      });
+      knowledgeWorkers.push({
+        ...rnWorker,
+        run: async () => {
+          await withClient(async (client) => {
+            const { rows } = await client.query<{ locked: boolean }>(
+              'SELECT pg_try_advisory_lock($1) AS locked',
+              [RELEASE_NOTE_LOCK_KEY],
+            );
+            if (!rows[0]?.locked) {
+              logger.warn('release-notes: another instance holds the advisory lock — skipping this tick');
+              return;
+            }
+            try {
+              await rnWorker.run();
+            } finally {
+              await client.query('SELECT pg_advisory_unlock($1)', [RELEASE_NOTE_LOCK_KEY]);
+            }
+          });
+        },
+      });
+      logger.info('release-note drafts worker registered (RELEASE_NOTE_DRAFTS_ENABLED=true)');
+    }
+  } else {
+    logger.info('release-note drafts worker NOT registered (RELEASE_NOTE_DRAFTS_ENABLED=false) — nothing drafts customer notifications');
   }
 
   const app = buildApp(appDeps);

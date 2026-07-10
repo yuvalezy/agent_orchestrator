@@ -105,6 +105,38 @@ export interface FeedbackMemoryRepo {
   insertFeedbackMemory(input: FeedbackMemoryInput): Promise<void>;
 }
 
+/** One customer whose task/conversation history semantically matches a release note
+ *  (M2(e)). `distance` is the cosine distance of that customer's NEAREST history row
+ *  to the release-note embedding (smaller = closer); `excerpt` is that row's content
+ *  (the "your original request" the notification personalizes on). */
+export interface CustomerHistoryMatch {
+  customerId: string;
+  distance: number;
+  excerpt: string;
+}
+
+/** Options for the release-note → customer match. */
+export interface HistoryMatchOptions {
+  /** ⚠︎ cosine-distance ceiling — a customer whose NEAREST history row is beyond it is
+   *  NOT a match (no draft). This is the confidence gate, tight by design. */
+  maxDistance: number;
+  /** Cap on how many customers to return (nearest-first). */
+  limit: number;
+  /** Which memory_types count as "history" (default ['task','conversation']). */
+  memoryTypes: string[];
+}
+
+/** Cross-customer release-note matcher (M2(e)). Kept OFF KnowledgeRepo (that interface
+ *  is the customer-SCOPED doc mirror + search); this is the ONE query that spans
+ *  customers — intersected onto the concrete `memoryRepo`. */
+export interface ReleaseNoteMatchRepo {
+  /** Find the customers whose task/conversation history is semantically nearest a
+   *  release-note embedding, one row per customer (its nearest), within maxDistance,
+   *  nearest-first, capped at `limit`. Shared (customer_id IS NULL) rows are EXCLUDED
+   *  — a notification is always personalized to a real customer. NEVER logs vectors. */
+  matchCustomersByHistory(embedding: number[], opts: HistoryMatchOptions): Promise<CustomerHistoryMatch[]>;
+}
+
 /** ⚠︎ PURE SQL builder — extracted so scope-isolation (customer_id=$ vs IS NULL,
  *  maxDistance filter, k limits) is unit-testable WITHOUT a DB. Returns the
  *  parameterized text + values; the caller runs it via query(). */
@@ -162,6 +194,35 @@ export function buildSearchSql(input: BuildSearchSqlInput): { text: string; valu
   return { text, values: [vec, customerId, maxDistance, kCustomer, kShared] };
 }
 
+/** ⚠︎ PURE SQL builder for the release-note → customer match (M2(e)) — extracted so the
+ *  scope rule (customer_id IS NOT NULL, one row per customer via DISTINCT ON, the
+ *  maxDistance confidence gate, the memory-type filter) is unit-testable WITHOUT a DB.
+ *  Returns the nearest history row PER customer, then orders those by distance and caps
+ *  at `limit`. Shared rows (customer_id IS NULL) can never appear (WHERE excludes them). */
+export function buildReleaseNoteMatchSql(input: {
+  embedding: number[];
+  maxDistance: number;
+  limit: number;
+  memoryTypes: string[];
+}): { text: string; values: unknown[] } {
+  const vec = toVectorLiteral(input.embedding);
+  const text = `SELECT customer_id, content, distance
+      FROM (
+        SELECT DISTINCT ON (customer_id)
+               customer_id,
+               content,
+               (embedding <=> $1::vector) AS distance
+          FROM agent_memory
+         WHERE customer_id IS NOT NULL
+           AND memory_type = ANY($3::text[])
+           AND (embedding <=> $1::vector) <= $2
+         ORDER BY customer_id, embedding <=> $1::vector
+      ) nearest
+     ORDER BY distance ASC
+     LIMIT $4`;
+  return { text, values: [vec, input.maxDistance, input.memoryTypes, input.limit] };
+}
+
 interface DocumentDbRow {
   id: string;
   source_id: string;
@@ -185,7 +246,7 @@ interface SearchDbRow {
 
 /** Concrete repo bound to the shared pool via query()/withClient. NEVER logs content
  *  or vectors. */
-export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo = {
+export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRepo = {
   async listDocuments(): Promise<KnowledgeDocumentRow[]> {
     const { rows } = await query<DocumentDbRow>(
       `SELECT id, source_id, doc_key, module, locale, title, route, scope, customer_id,
@@ -318,5 +379,19 @@ export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo = {
       memoryType: r.memory_type,
       distance: Number(r.distance),
     }));
+  },
+
+  async matchCustomersByHistory(
+    embedding: number[],
+    opts: HistoryMatchOptions,
+  ): Promise<CustomerHistoryMatch[]> {
+    const { text, values } = buildReleaseNoteMatchSql({
+      embedding,
+      maxDistance: opts.maxDistance,
+      limit: opts.limit,
+      memoryTypes: opts.memoryTypes,
+    });
+    const { rows } = await query<{ customer_id: string; content: string; distance: number | string }>(text, values);
+    return rows.map((r) => ({ customerId: r.customer_id, excerpt: r.content, distance: Number(r.distance) }));
   },
 };

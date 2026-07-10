@@ -5,6 +5,7 @@ import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/group-summary.port';
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
 import type { ResponseDrafter } from './response-drafter';
+import type { CrossChannelDedup } from './cross-channel-dedup';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
@@ -85,6 +86,14 @@ export interface TriageDeps {
    *  truly dormant). Requires the knowledgeRetriever too (drafts only when
    *  knowledge.length > 0), so both flags must be on to draft. */
   responseDrafter?: ResponseDrafter;
+  /** M2(f): cross-channel semantic dedup (R52). Optional + gated
+   *  (CROSS_CHANNEL_DEDUP_ENABLED) — when absent, dedup runs exactly as before
+   *  (same-thread + title similarity). When present, a NEW intent that semantically
+   *  matches a recent task for the SAME customer folds into it (a comment) instead of a
+   *  second task; below the confidence gate it stays a separate task, and different
+   *  customers are never merged. Best-effort: an embed/search miss degrades to the
+   *  normal path (never blocks triage). */
+  crossChannelDedup?: CrossChannelDedup;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -427,11 +436,28 @@ export class TriageService {
       return; // answerable question → cited draft, NOT a task (the drafter records its own draft_reply decision)
     }
 
+    // M2(f): embed this intent ONCE (title+summary) when cross-channel dedup is wired —
+    // reused for the semantic match below AND, on create, the stored fingerprint (no
+    // double embed). Best-effort: null when off or the embed failed → the pre-M2f flow.
+    const ccDedup = this.deps.crossChannelDedup;
+    const matchEmbedding = ccDedup ? await ccDedup.embed(`${intent.suggested_title}\n${intent.summary}`) : null;
+
     const source = resolveTaskSource(row, threadKey, config);
     const dedup = await decideDedup(
       intent,
-      { source, projectRef, openTasks: ctx.openTasks, excludeTaskRefs: createdThisRun },
-      { taskTarget: this.deps.taskTarget, llm: this.deps.llm },
+      {
+        source,
+        projectRef,
+        openTasks: ctx.openTasks,
+        excludeTaskRefs: createdThisRun,
+        customerId,
+        matchEmbedding,
+      },
+      {
+        taskTarget: this.deps.taskTarget,
+        llm: this.deps.llm,
+        crossChannel: ccDedup ? (input) => ccDedup.match(input) : undefined,
+      },
     );
 
     if (dedup.action === 'comment') {
@@ -457,6 +483,12 @@ export class TriageService {
       tags: [intent.category],
     });
     createdThisRun.add(task.ref); // exclude from sibling intents' thread dedup (code-review #2)
+    // M2(f): store this task's intent fingerprint so a later same-topic message on
+    // ANOTHER channel folds into it (best-effort — a miss only risks a future duplicate,
+    // never the row). Reuses the embedding computed for the match above (no double embed).
+    if (ccDedup && matchEmbedding) {
+      await ccDedup.record({ customerId, taskRef: task.ref, channelType: row.channel_type, embedding: matchEmbedding });
+    }
     await recordTaskBridge({ taskRef: task.ref, customerId, inboxMessageId: inboxId, relationship: 'created_from' });
     await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'accepted', taskRef: task.ref });
     await this.deps.notifier.notifyCustomerEvent(

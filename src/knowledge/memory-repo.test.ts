@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSearchSql } from './memory-repo';
+import { buildSearchSql, buildReleaseNoteMatchSql } from './memory-repo';
 
 // PURE unit tests for the scoped-search SQL builder — NO DB (the DB round-trip test for
 // memoryRepo is DEFERRED to post-Gate-0, since agent_memory / pgvector aren't installed).
@@ -73,4 +73,27 @@ test('scope isolation: the customer id never appears in the shared query text', 
     maxDistance: 1,
   });
   assert.ok(!text.includes('secret-tenant'), 'tenant id is only a bound value, never in SQL text');
+});
+
+// ── M2(e): release-note → customer match SQL (cross-customer, confidence-gated) ────
+test('release-note match: excludes shared rows, one row per customer, gated by maxDistance', () => {
+  const { text, values } = buildReleaseNoteMatchSql({
+    embedding: [0.4, 0.5, 0.6],
+    maxDistance: 0.35,
+    limit: 50,
+    memoryTypes: ['task', 'conversation'],
+  });
+  const sql = collapse(text);
+
+  // ⚠︎ Shared rows (customer_id IS NULL) can NEVER be a personalized-notification match.
+  assert.match(sql, /customer_id IS NOT NULL/, 'only real customers, never shared');
+  // One row per customer (its nearest), then ordered by distance and capped.
+  assert.match(sql, /DISTINCT ON \(customer_id\)/, 'nearest history row per customer');
+  // The confidence gate is the bound maxDistance ceiling.
+  assert.match(sql, /<= \$2/, 'maxDistance gate present');
+  assert.match(sql, /memory_type = ANY\(\$3::text\[\]\)/, 'history memory-type filter');
+  // Embedding + params bound, never interpolated.
+  assert.equal(values[0], '[0.4,0.5,0.6]');
+  assert.deepEqual(values[2], ['task', 'conversation']);
+  assert.ok(!text.includes('0.4,0.5,0.6') || text.includes('$1::vector'), 'embedding cast $1::vector');
 });

@@ -9,9 +9,21 @@ import type { TargetTask, TaskTargetPort } from '../ports/task-target.port';
 
 export const SIMILARITY_THRESHOLD = 0.8;
 
+/** (f/R52) Cross-channel semantic match: given the intent's precomputed embedding +
+ *  customer, return a SAME-customer task to fold into (confidence-gated) or null. Injected
+ *  + optional — when absent (flag off) dedup behaves exactly as pre-M2f. NEVER returns a
+ *  different customer's task (the underlying search is scoped to customerId). */
+export type CrossChannelFinder = (input: {
+  embedding: number[];
+  customerId: string;
+  excludeTaskRefs?: Set<string>;
+}) => Promise<{ taskRef: string } | null>;
+
 export interface DedupPorts {
   taskTarget: Pick<TaskTargetPort, 'findTasksBySource'>;
   llm: Pick<AgentLlmPort, 'judgeSimilarity'>;
+  /** (f/R52) optional cross-channel semantic matcher — see CrossChannelFinder. */
+  crossChannel?: CrossChannelFinder;
 }
 
 export type DedupResult = { action: 'comment'; taskRef: string } | { action: 'create' };
@@ -37,6 +49,12 @@ export async function decideDedup(
      *  the thread match so a second distinct intent doesn't merge into intent #1's
      *  just-created task (code-review #2: multi-intent collapse). */
     excludeTaskRefs?: Set<string>;
+    /** (f/R52) the resolved customer for this intent — scopes the cross-channel match. */
+    customerId?: string;
+    /** (f/R52) the intent's precomputed embedding (title+summary). Present only when
+     *  cross-channel dedup is enabled AND the embed succeeded; null/absent → the step is
+     *  skipped and the pre-M2f flow runs unchanged. */
+    matchEmbedding?: number[] | null;
   },
   ports: DedupPorts,
 ): Promise<DedupResult> {
@@ -55,7 +73,21 @@ export async function decideDedup(
     return { action: 'comment', taskRef: mostRecent.ref };
   }
 
-  // 2. Title similarity against the project's open tasks.
+  // 2. (f/R52) Cross-channel semantic match — a stronger, embedding-based signal than
+  // title similarity, so it runs FIRST. Gated + best-effort: only when the matcher is
+  // wired (CROSS_CHANNEL_DEDUP_ENABLED) AND an embedding + customer are present. Scoped
+  // to the customer → a different customer is never merged; below the confidence gate it
+  // returns null and we fall through to title similarity / create.
+  if (ports.crossChannel && ctx.matchEmbedding && ctx.customerId) {
+    const x = await ports.crossChannel({
+      embedding: ctx.matchEmbedding,
+      customerId: ctx.customerId,
+      excludeTaskRefs: ctx.excludeTaskRefs,
+    });
+    if (x) return { action: 'comment', taskRef: x.taskRef };
+  }
+
+  // 3. Title similarity against the project's open tasks.
   if (ctx.openTasks.length) {
     const scores = await ports.llm.judgeSimilarity(intent.suggested_title, ctx.openTasks.map((t) => t.title));
     let best = -1;
@@ -71,6 +103,6 @@ export async function decideDedup(
     }
   }
 
-  // 3. New work.
+  // 4. New work.
   return { action: 'create' };
 }

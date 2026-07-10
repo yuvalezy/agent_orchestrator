@@ -206,6 +206,54 @@ const envSchema = z.object({
   // A touch looser than the customer default (0.5) — the internal corpus is broader
   // prose than the tightly-authored customer guides.
   KNOWLEDGE_INTERNAL_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.6),
+
+  // ── M2(e): release-note → customer notification drafts. On ingest of a release note
+  // the notifier semantically matches it against each customer's task/conversation
+  // history and drafts ONE personalized, cited notification per matched customer
+  // (is_draft=true → founder approves/edits/rejects; NEVER auto-sent). Kill-switch
+  // (mirrors OUTBOUND_ENABLED strict-bool): the worker is registered ONLY when the
+  // literal "true"; unset/"false"/else → false. DORMANT by default so a boot never
+  // drafts customer notifications by surprise.
+  //
+  // DEPENDENCIES: embedding needs OPENAI_API_KEY (a credential, resolveCredential); the
+  // approved draft is drained by the outbound drainer (OUTBOUND_ENABLED, + email needs
+  // OUTBOUND_EMAIL_ENABLED). Matching finds customers only where task/conversation
+  // memories exist in agent_memory — with none present nothing drafts (a safe no-op).
+  RELEASE_NOTE_DRAFTS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  RELEASE_NOTE_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000), // 1h
+  // Directory of *.md release notes to scan (its per-file path is the idempotency key).
+  RELEASE_NOTES_DIR: z.string().optional(),
+  // ⚠︎ Confidence gate: a customer whose NEAREST history row is beyond this cosine
+  // distance (0..2) is NOT notified. Tighter than the retrieval default (0.5) — a
+  // spurious proactive notification erodes trust, so only strong matches draft.
+  RELEASE_NOTE_MATCH_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.35),
+  // Cap on customers drafted per note (nearest-first) — a blast-radius guard.
+  RELEASE_NOTE_MAX_CUSTOMERS: z.coerce.number().int().positive().default(50),
+
+  // ── M2(f): cross-channel conversation dedup (R52). A WhatsApp + email message on the
+  // same topic can create TWO tasks; when enabled, triage folds a NEW message into an
+  // existing task for the SAME customer when their semantic content matches within a
+  // time window AND clears a CONFIDENCE gate. A false-merge across unrelated threads is
+  // WORSE than a duplicate, so this ships behind a tight confidence gate (not a lowered
+  // similarity threshold); below-confidence stays two tasks, and different customers are
+  // NEVER merged (the match SQL filters customer_id = $). Kill-switch (strict-bool):
+  // wired into triage ONLY when the literal "true"; DORMANT by default → the pre-M2f
+  // dedup (same-thread + title similarity) runs unchanged.
+  //
+  // DEPENDENCY: embedding needs OPENAI_API_KEY; a missing key degrades to no
+  // cross-channel match (the message just takes the normal path) — never a triage failure.
+  CROSS_CHANNEL_DEDUP_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // How far back (minutes) a prior task's fingerprint stays a dedup candidate.
+  CROSS_CHANNEL_DEDUP_WINDOW_MINUTES: z.coerce.number().int().positive().default(4320), // 72h
+  // ⚠︎ Confidence gate (0..2): a candidate whose cosine distance exceeds this is NOT a
+  // merge — it stays a separate task. TIGHT by design (false-merge > duplicate).
+  CROSS_CHANNEL_DEDUP_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.15),
 });
 
 const parsed = envSchema.safeParse(process.env);
