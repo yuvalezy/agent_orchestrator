@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reconcileInternalKnowledge, type InternalReconcileDeps } from './internal-sync';
-import type { InternalDocSourcePort, InternalScannedDoc } from '../ports/internal-doc-source.port';
+import { reconcileInternalKnowledge, reconcileInternalDoc, type InternalReconcileDeps } from './internal-sync';
+import type { InternalDocSourcePort, InternalScannedDoc, InternalPathScan } from '../ports/internal-doc-source.port';
 import type { EmbeddingPort } from '../ports/embedding.port';
 import type { InternalChunkRow, InternalKnowledgeRepo, InternalManifestRow } from './internal-repo';
 import type { Chunk } from './chunker';
@@ -68,7 +68,20 @@ function makeEmbedding(): { port: EmbeddingPort; calls: string[][] } {
   };
 }
 
-const docSourceOf = (docs: InternalScannedDoc[]): InternalDocSourcePort => ({ listDocs: async () => docs });
+const docSourceOf = (docs: InternalScannedDoc[]): InternalDocSourcePort => ({
+  listDocs: async () => docs,
+  scanPath: async () => {
+    throw new Error('scanPath must not be called by the full reconcile');
+  },
+});
+
+/** A doc-source whose scanPath returns a fixed result (for reconcileInternalDoc tests). */
+const docSourceWithScan = (scan: InternalPathScan): InternalDocSourcePort => ({
+  listDocs: async () => {
+    throw new Error('listDocs must not be called by the targeted resync');
+  },
+  scanPath: async () => scan,
+});
 
 const oneChunk = (d: { title: string; content: string }): Chunk[] => [
   { content: d.content, section: 'Overview', chunkIndex: 0 },
@@ -222,6 +235,7 @@ test('scan IO error aborts the reconcile before any write', async () => {
     listDocs: async () => {
       throw new Error('scan failed');
     },
+    scanPath: async () => ({ status: 'out-of-scope' }),
   };
   await assert.rejects(reconcileInternalKnowledge(baseDeps({ docSource: badSource, repo: repo.repo })), /scan failed/);
   assert.equal(repo.tombstoned.length, 0, 'no diff on a failed scan');
@@ -235,4 +249,86 @@ test('emits a per-run summary log (counts only)', async () => {
   const summaryLog = log.infos.find((o) => (o as { created?: number }).created !== undefined) as Record<string, unknown>;
   assert.ok(summaryLog, 'summary info log present');
   assert.deepEqual(summaryLog, { created: 1, updated: 0, skipped: 0, tombstoned: 0, failed: 0 });
+});
+
+// ── reconcileInternalDoc: the TARGETED single-doc resync (MCP resync with a path) ──
+
+test('resync found+new → created, re-embeds, touches only that doc', async () => {
+  const emb = makeEmbedding();
+  const repo = makeRepo([]); // empty manifest
+  const res = await reconcileInternalDoc(
+    baseDeps({
+      docSource: docSourceWithScan({ status: 'found', doc: doc({ docKey: 's:plan/a.md', path: 'plan/a.md' }) }),
+      embedding: emb.port,
+      repo: repo.repo,
+    }),
+    '/abs/plan/a.md',
+  );
+  assert.deepEqual(res, { docKey: 's:plan/a.md', action: 'created' });
+  assert.equal(emb.calls.length, 1);
+  assert.deepEqual(repo.replaced.map((r) => r.docKey), ['s:plan/a.md']);
+});
+
+test('resync found + hash-same → skipped with ZERO embed calls', async () => {
+  const emb = makeEmbedding();
+  const repo = makeRepo([man({ docKey: 's:plan/a.md', contentHash: 'h1' })]);
+  const res = await reconcileInternalDoc(
+    baseDeps({
+      docSource: docSourceWithScan({ status: 'found', doc: doc({ docKey: 's:plan/a.md', contentHash: 'h1' }) }),
+      embedding: emb.port,
+      repo: repo.repo,
+    }),
+    's:plan/a.md',
+  );
+  assert.deepEqual(res, { docKey: 's:plan/a.md', action: 'skipped' });
+  assert.equal(emb.calls.length, 0, 'unchanged doc → no embed');
+  assert.equal(repo.replaced.length, 0);
+});
+
+test('resync found + hash-changed → updated (re-embed)', async () => {
+  const emb = makeEmbedding();
+  const repo = makeRepo([man({ docKey: 's:plan/a.md', contentHash: 'OLD' })]);
+  const res = await reconcileInternalDoc(
+    baseDeps({
+      docSource: docSourceWithScan({ status: 'found', doc: doc({ docKey: 's:plan/a.md', contentHash: 'NEW' }) }),
+      embedding: emb.port,
+      repo: repo.repo,
+    }),
+    's:plan/a.md',
+  );
+  assert.deepEqual(res, { docKey: 's:plan/a.md', action: 'updated' });
+  assert.equal(emb.calls.length, 1);
+});
+
+test('resync missing + was active → tombstone (only that doc)', async () => {
+  const repo = makeRepo([man({ docKey: 's:plan/gone.md', status: 'active' })]);
+  const res = await reconcileInternalDoc(
+    baseDeps({ docSource: docSourceWithScan({ status: 'missing', docKey: 's:plan/gone.md' }), repo: repo.repo }),
+    '/abs/plan/gone.md',
+  );
+  assert.deepEqual(res, { docKey: 's:plan/gone.md', action: 'tombstoned' });
+  assert.deepEqual(repo.tombstoned, ['s:plan/gone.md']);
+});
+
+test('resync missing + not in manifest → noop (nothing to tombstone)', async () => {
+  const repo = makeRepo([]);
+  const res = await reconcileInternalDoc(
+    baseDeps({ docSource: docSourceWithScan({ status: 'missing', docKey: 's:plan/never.md' }), repo: repo.repo }),
+    '/abs/plan/never.md',
+  );
+  assert.deepEqual(res, { docKey: 's:plan/never.md', action: 'noop' });
+  assert.equal(repo.tombstoned.length, 0);
+});
+
+test('resync out-of-scope path → out-of-scope, no reads/writes', async () => {
+  const emb = makeEmbedding();
+  const repo = makeRepo([man({ docKey: 's:plan/a.md' })]);
+  const res = await reconcileInternalDoc(
+    baseDeps({ docSource: docSourceWithScan({ status: 'out-of-scope' }), embedding: emb.port, repo: repo.repo }),
+    '/etc/passwd',
+  );
+  assert.deepEqual(res, { docKey: null, action: 'out-of-scope' });
+  assert.equal(emb.calls.length, 0);
+  assert.equal(repo.replaced.length, 0);
+  assert.equal(repo.tombstoned.length, 0);
 });

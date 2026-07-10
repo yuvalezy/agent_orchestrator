@@ -88,14 +88,16 @@ through `resolveCredential` (sealed store or env) or read directly from
 ### Database
 
 `DATABASE_URL` wins when present and non-empty; otherwise a libpq URL is built
-from the discrete `PG*` vars. Defaults target the shared ops-dev `ezy-postgres`
-host-published on `42016`.
+from the discrete `PG*` vars. Defaults target the dedicated `ao-postgres`
+(`pgvector/pgvector:pg18`, `docker-compose.db.yml`) host-published on `55432` —
+separate from the shared ops-dev `ezy-postgres` so the vector RAG never bounces
+the portal stack.
 
 | Variable | Secret? | Default | Purpose |
 |---|---|---|---|
 | `DATABASE_URL` | | *(unset)* | Full libpq connection string; overrides the `PG*` vars when set. |
 | `PGHOST` | | `localhost` | Postgres host. |
-| `PGPORT` | | `42016` | Postgres port (shared `ezy-postgres`). |
+| `PGPORT` | | `55432` | Postgres port (dedicated `ao-postgres`, pgvector). |
 | `PGUSER` | | `postgres` | Postgres user. |
 | `PGPASSWORD` | | `postgres` | Postgres password (dev default; treat as secret in prod). |
 | `PGDATABASE` | | `agent_orchestrator` | The service's own database (never the whatsapp_manager DB). |
@@ -155,6 +157,43 @@ in `src/adapters/llm/factory.ts`, not the zod schema (too many combinations).
 | `LLM_MODEL_<PROVIDER>_<ROLE>` | `LLM_MODEL_OPENAI_TRIAGE=gpt-4.1` | Override the model for one provider+role. Defaults: anthropic `triage`/`draft`=`claude-sonnet-5`, `classify`=`claude-haiku-4-5`; openai `triage`/`draft`=`gpt-4.1`, `classify`=`gpt-4.1-mini`; deepseek all=`deepseek-chat`. |
 | `LLM_<PROVIDER>_EFFORT` | `LLM_ANTHROPIC_EFFORT=low` | Provider-level reasoning effort (`low`\|`medium`\|`high`\|`xhigh`\|`max`). Applies to `triage`/`draft` only — **not** `classify` (its default model has no adaptive thinking and would 400). |
 | `LLM_EFFORT_<PROVIDER>_<ROLE>` | `LLM_EFFORT_ANTHROPIC_TRIAGE=low` | Fine-grained effort for one provider+role. **Overrides** `LLM_<PROVIDER>_EFFORT`, and unlike it *can* target `classify`. |
+
+### Outbound delivery & response drafting
+
+The outbound drainer and the draft→approve loop. All kill-switches are strict
+string→bool (only the literal `"true"` enables) and default **off** so nothing
+sends or drafts by surprise. `OPENAI_API_KEY` (a credential) is needed wherever
+embeddings are involved (retrieval, drafting, feedback).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OUTBOUND_ENABLED` | `false` | Register the outbound drainer (WhatsApp send). Master switch for all delivery. |
+| `OUTBOUND_EMAIL_ENABLED` | `false` | Second switch **under** `OUTBOUND_ENABLED`: also claim + send approved **email** drafts, threaded into the original thread from the originating account (work/personal never cross). See [channels/gmail.md](./channels/gmail.md). |
+| `KNOWLEDGE_SYNC_ENABLED` | `false` | Register the customer knowledge-sync worker (folder-sourced docs → `agent_memory`). |
+| `KNOWLEDGE_RETRIEVAL_ENABLED` | `false` | Inject scoped RAG retrieval into triage (best-effort; degrades to no-knowledge). |
+| `KNOWLEDGE_DRAFT_ENABLED` | `false` | Enable the response drafter — `question_existing` → cited draft parked in Telegram for approve / ✏️edit / reject. Drafts **never** auto-send. Needs `KNOWLEDGE_RETRIEVAL_ENABLED`; the ✏️edit capture needs BotFather privacy mode OFF. |
+| `FEEDBACK_LEARNING_ENABLED` | `false` | On a **modified/rejected** draft, embed a customer-scoped feedback memory so a later similar question retrieves the correction. |
+| `ACCEPTANCE_REPORT_ENABLED` | `false` | Post a daily draft-acceptance report (24h/7d/30d, per customer + overall) to the Telegram Admin topic. One post/day. |
+
+Interval / tuning knobs (all optional, sensible defaults) live in `.env.example`:
+`OUTBOUND_*` rate/gap/failure windows, `KNOWLEDGE_SYNC_INTERVAL_MS`,
+`KNOWLEDGE_RETRIEVAL_K_*` / `_MAX_DISTANCE`, `KNOWLEDGE_TOMBSTONE_MAX_RATIO`,
+`FEEDBACK_LEARNING_INTERVAL_MS` / `_BATCH`, `ACCEPTANCE_REPORT_INTERVAL_MS` / `_TZ`.
+
+### Project Brain — internal knowledge (isolated)
+
+A **separate** internal-only knowledge base (table `internal_knowledge`) for founder/dev
+recall via an MCP server — structurally unreachable from customer replies. Full setup,
+the MCP registration command, and its tools (`search` / `get` / `resync`) are in
+[project-brain.md](./project-brain.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `KNOWLEDGE_INTERNAL_ENABLED` | `false` | Register the hourly internal re-sync worker. (The MCP server reads the corpus regardless.) |
+| `KNOWLEDGE_INTERNAL_SYNC_INTERVAL_MS` | `3600000` | Internal re-scan cadence (1h). |
+| `KNOWLEDGE_INTERNAL_K` | `8` | Default top-k chunks per internal search. |
+| `KNOWLEDGE_INTERNAL_MAX_DISTANCE` | `0.6` | Cosine-distance ceiling for internal search. |
+| `OPENAI_EMBEDDING_MODEL` / `OPENAI_EMBEDDING_DIM` | `text-embedding-3-small` / `1536` | Shared embedding model + dim (must match the `vector(N)` columns). |
 
 ### Telegram
 
