@@ -23,6 +23,10 @@ import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
 import { buildEmbeddingAdapter } from './adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from './knowledge/memory-repo';
 import { dbContactResolutionQueries } from './customers/contact-resolution';
+import { fetchUnprocessedFeedbackDecisions, fetchResolvedDraftDecisions } from './decisions/decisions';
+import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learning.worker';
+import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
+import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
 
 // M2a: advisory-lock namespace for the knowledge-sync reconcile ('know' as int32).
@@ -223,6 +227,57 @@ async function main(): Promise<void> {
     logger.info('knowledge-sync worker NOT registered (KNOWLEDGE_SYNC_ENABLED=false) — set it once corpus customers are onboarded, nothing ingests meanwhile');
   }
 
+  // M3(c): feedback-learning worker — registered ONLY when FEEDBACK_LEARNING_ENABLED
+  // (kill-switch, mirrors KNOWLEDGE_SYNC_ENABLED). DORMANT by default. Reads resolved
+  // modified/rejected drafts and writes a customer-scoped feedback memory (embedded),
+  // so a later similar question retrieves the correction. Embedding needs OPENAI_API_KEY.
+  // M3(d): daily acceptance report — registered ONLY when ACCEPTANCE_REPORT_ENABLED AND
+  // Telegram is configured (it notifies the founder). Idempotent per calendar day.
+  const feedbackWorkers: WorkerDefinition[] = [];
+  if (env.FEEDBACK_LEARNING_ENABLED) {
+    if (!tryResolveCredential('OPENAI_API_KEY')) {
+      logger.warn('⚠️  FEEDBACK_LEARNING_ENABLED=true but OPENAI_API_KEY is UNSET — feedback embeddings will fail until it is set (decisions are re-picked next run).');
+    }
+    feedbackWorkers.push(
+      buildFeedbackLearningWorker({
+        fetchDecisions: fetchUnprocessedFeedbackDecisions,
+        embedding: buildEmbeddingAdapter(
+          () => tryResolveCredential('OPENAI_API_KEY'),
+          env.OPENAI_BASE_URL,
+          { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+        ),
+        writeFeedback: (input) => memoryRepo.insertFeedbackMemory(input),
+        log: logger,
+        intervalMs: env.FEEDBACK_LEARNING_INTERVAL_MS,
+        batch: env.FEEDBACK_LEARNING_BATCH,
+      }),
+    );
+    logger.info('feedback-learning worker registered (FEEDBACK_LEARNING_ENABLED=true)');
+  } else {
+    logger.info('feedback-learning worker NOT registered (FEEDBACK_LEARNING_ENABLED=false) — corrections resolve as before, nothing is embedded');
+  }
+
+  if (env.ACCEPTANCE_REPORT_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  ACCEPTANCE_REPORT_ENABLED=true but Telegram is unconfigured — the daily report has nowhere to post; NOT registering.');
+    } else {
+      feedbackWorkers.push(
+        buildAcceptanceReportWorker({
+          fetchDecisions: fetchResolvedDraftDecisions,
+          notifier,
+          readLastRun: () => getAppState('acceptance_report:last_run_day'),
+          writeLastRun: (day) => setAppState('acceptance_report:last_run_day', day),
+          tz: env.ACCEPTANCE_REPORT_TZ,
+          log: logger,
+          intervalMs: env.ACCEPTANCE_REPORT_INTERVAL_MS,
+        }),
+      );
+      logger.info('acceptance-report worker registered (ACCEPTANCE_REPORT_ENABLED=true)');
+    }
+  } else {
+    logger.info('acceptance-report worker NOT registered (ACCEPTANCE_REPORT_ENABLED=false)');
+  }
+
   const app = buildApp(appDeps);
   const server = app.listen(env.PORT, () => {
     logger.info(`agent-orchestrator listening on http://localhost:${env.PORT}`);
@@ -231,7 +286,13 @@ async function main(): Promise<void> {
   // M1.3 ingestion pollers + M1.5b money-loop workers. (Heartbeat retired at M1.5b —
   // the inbox processor is the first real worker.) M1.8 adds the outbound drainer;
   // M2a adds the (gated) knowledge-sync worker.
-  const workers = [...ingestionWorkers, ...triageWorkers, ...outboundWorkers, ...knowledgeWorkers].map(startWorker);
+  const workers = [
+    ...ingestionWorkers,
+    ...triageWorkers,
+    ...outboundWorkers,
+    ...knowledgeWorkers,
+    ...feedbackWorkers,
+  ].map(startWorker);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

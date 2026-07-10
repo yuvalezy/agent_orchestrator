@@ -142,6 +142,34 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+
+  // ── M3(c): feedback learning — write a customer-scoped feedback memory when the
+  // founder MODIFIES or REJECTS a drafted reply, so a later similar question retrieves
+  // the correction. Kill-switch (mirrors OUTBOUND_ENABLED strict-bool): the worker is
+  // registered ONLY when the literal "true"; unset/"false"/else → false. DORMANT by
+  // default → corrections resolve as before, nothing is embedded by surprise.
+  // DEPENDENCY: embedding needs OPENAI_API_KEY (a credential, resolveCredential); a
+  // missing key fails the embed for that tick (the decision is re-picked next run).
+  FEEDBACK_LEARNING_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  FEEDBACK_LEARNING_INTERVAL_MS: z.coerce.number().int().positive().default(300_000), // 5 min
+  FEEDBACK_LEARNING_BATCH: z.coerce.number().int().positive().default(50), // decisions per tick
+
+  // ── M3(d): daily acceptance report — aggregate resolved draft outcomes (24h/7d/30d,
+  // per customer + overall) and post to the Telegram Admin topic. Kill-switch (mirrors
+  // OUTBOUND_ENABLED strict-bool): registered ONLY when the literal "true". DORMANT by
+  // default. Idempotent per calendar day (an app_state last-run-day key) so the sub-
+  // daily interval posts EXACTLY ONCE per day. Requires Telegram (the report notifies
+  // the founder) — the worker is skipped if Telegram is unconfigured.
+  ACCEPTANCE_REPORT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  ACCEPTANCE_REPORT_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
+  // Timezone for the day boundary so "daily" is the founder's local day (not UTC).
+  ACCEPTANCE_REPORT_TZ: z.string().default('America/Panama'),
 });
 
 const parsed = envSchema.safeParse(process.env);
