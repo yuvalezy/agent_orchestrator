@@ -44,11 +44,14 @@ function extractTitle(body: string): string | null {
   return null;
 }
 
-/** Normalize a markdown body: strip a leading BOM, CRLF→LF, then trim. Matches the
- *  hash's normalizeBody so the stored content and the hashed body agree. */
+/** Normalize a markdown body: strip a leading BOM, drop NUL bytes, CRLF→LF, then trim.
+ *  NUL (0x00) is corruption in a text doc AND unstorable in a Postgres TEXT column
+ *  ("invalid byte sequence for encoding UTF8: 0x00"), so it is stripped before both
+ *  hashing and storage. Matches the hash's normalizeBody so content and hash agree. */
 function normalizeBody(raw: string): string {
   let b = raw;
   if (b.charCodeAt(0) === 0xfeff) b = b.slice(1);
+  b = b.replace(new RegExp(String.fromCharCode(0), 'g'), '');
   b = b.replace(/\r\n/g, '\n');
   return b.trim();
 }

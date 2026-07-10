@@ -115,6 +115,15 @@ test('content hash is stable across runs for unchanged content', async () => {
   assert.equal(h1, h2);
 });
 
+test('strips NUL bytes from content (unstorable in a Postgres TEXT column)', async () => {
+  const NUL = String.fromCharCode(0);
+  const fs = makeFs({ '/root/plan/a.md': { type: 'file', content: `# A${NUL}\nbo${NUL}dy` } });
+  const ds = buildInternalDocSource({ sources: [source({ include: ['plan/a.md'] })], repoRoots: REPO_ROOTS, ...fs });
+  const docs = await ds.listDocs();
+  assert.ok(!docs[0].content.includes(NUL), 'no NUL byte survives into the scanned content');
+  assert.equal(docs[0].title, 'A', 'NUL cleaned from the derived title too');
+});
+
 // ── scanPath: single-path resolution for the targeted resync ──────────────────
 
 function scanFixture() {
