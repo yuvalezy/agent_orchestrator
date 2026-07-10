@@ -165,9 +165,15 @@ async function main(): Promise<void> {
         failureWindowMin: env.OUTBOUND_FAILURE_WINDOW_MIN,
         defaultTz: env.OUTBOUND_DEFAULT_TZ,
         stuckMinutes: env.OUTBOUND_STUCK_MINUTES,
+        emailEnabled: env.OUTBOUND_EMAIL_ENABLED, // M2(d): arm email claim+threaded send (default off)
       }),
     );
-    logger.info('outbound drainer registered (OUTBOUND_ENABLED=true)');
+    logger.info(
+      { emailEnabled: env.OUTBOUND_EMAIL_ENABLED },
+      env.OUTBOUND_EMAIL_ENABLED
+        ? 'outbound drainer registered (OUTBOUND_ENABLED=true; email threaded send ARMED)'
+        : 'outbound drainer registered (OUTBOUND_ENABLED=true; email send dormant — OUTBOUND_EMAIL_ENABLED=false)',
+    );
   } else {
     logger.info('outbound drainer NOT registered (OUTBOUND_ENABLED=false) — approved rows sit in the queue, nothing sends');
   }

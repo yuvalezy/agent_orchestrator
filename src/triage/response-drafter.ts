@@ -121,14 +121,22 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
       });
 
       // (5) Enqueue as a DRAFT (status='pending', is_draft=true) — NEVER auto-drained.
-      //     in_reply_to = the inbound provider id → an approved WhatsApp send quotes it (must-fix #2).
+      //     in_reply_to is PER-CHANNEL (matches OutboundMessage.inReplyTo, channel.port):
+      //       • WhatsApp → the inbound channel_message_id (wamid) → an approved send QUOTES it (must-fix #2).
+      //       • email    → the inbound RFC-2822 Message-ID header → the M2(d) drainer sets
+      //         In-Reply-To/References so the reply threads (falls back to channel_message_id
+      //         if the header is absent). subject carries the inbound subject (Re:-prefixed)
+      //         so the send lands in the SAME Gmail thread; channel_instance_id (below) pins
+      //         the reply to the SAME account it arrived on (work/personal never cross).
+      const isEmail = row.channel_type === 'email';
       const queueId = await deps.enqueueDraft({
         channelInstanceId: row.channel_instance_id,
         channelType: row.channel_type,
         recipientAddress: row.sender_address,
         body: result.body,
         threadKey,
-        inReplyTo: row.channel_message_id,
+        inReplyTo: isEmail ? row.message_id_header ?? row.channel_message_id : row.channel_message_id,
+        subject: isEmail ? emailReplySubject(row.subject) : undefined,
         customerId,
         decisionId,
       });
@@ -155,6 +163,15 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
 
 /** Title on every draft-approval presentation. */
 const PRESENT_TITLE = '📝 Draft reply — needs approval';
+
+/** The reply subject for an email draft: the inbound subject with a single `Re:`
+ *  prefix (case-insensitive, not doubled). A matching subject keeps the send in the
+ *  SAME Gmail thread alongside the threadId. Null/blank inbound → a bare 'Re:'. */
+export function emailReplySubject(inboundSubject: string | null): string {
+  const s = inboundSubject?.trim() ?? '';
+  if (!s) return 'Re:';
+  return /^re:/i.test(s) ? s : `Re: ${s}`;
+}
 
 /** Assemble the customer question (subject + body) the drafter answers. Trims + drops
  *  empty parts; both may be null (e.g. a WhatsApp message has no subject). */

@@ -17,6 +17,12 @@ export interface ClaimedInbox {
    *  M2(c) drafter sets in_reply_to = this so an approved WhatsApp send is a QUOTED
    *  reply (reuses the M2 Milestone B quoted-reply path — blueprint must-fix #2). */
   channel_message_id: string;
+  /** The inbound email's RFC-2822 `Message-ID` header (raw_metadata->>'messageIdHeader',
+   *  set by the Gmail adapter). For an email reply the M2(d) drainer must thread on
+   *  the RFC header — NOT the provider's opaque message id — so the drafter stores
+   *  THIS (falling back to channel_message_id) in the queue's in_reply_to. null for
+   *  WhatsApp / any row without the header (→ the drafter falls back). */
+  message_id_header: string | null;
   channel_thread_id: string | null;
   sender_address: string | null;
   sender_name: string | null;
@@ -56,7 +62,8 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
         )
         RETURNING id, channel_instance_id, channel_message_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients, raw_metadata
      )
-     SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_message_id, c.channel_thread_id,
+     SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_message_id,
+            c.raw_metadata->>'messageIdHeader' AS message_id_header, c.channel_thread_id,
             c.sender_address, c.sender_name, c.subject, c.body, c.received_at,
             c.recipients, ci.config->>'accountEmail' AS account_email,
             c.raw_metadata->>'ticketNumber' AS ticket_number,

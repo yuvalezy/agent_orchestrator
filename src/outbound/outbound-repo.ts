@@ -29,14 +29,18 @@ export interface ClaimedOutbound {
 }
 
 /**
- * Claim a batch of due, approved, non-draft WhatsApp rows → 'sending'. WhatsApp
- * ONLY in M1.8 (D-B): the claim restricts to channel_type='whatsapp' so email
- * (canSend=true) is not armed on gate day. retry_count is NOT touched on claim
- * (D-C); updated_at is left to the trigger. Joins channel_instances (channel_type),
- * LEFT JOINs agent_customers (tz/faith) and agent_customer_contacts on
- * (channel_type, recipient_address) (is_group → group routing, R37).
+ * Claim a batch of due, approved, non-draft rows → 'sending', restricted to the
+ * caller's allowed `channelTypes` so a channel is only ever drained when its
+ * kill-switch is on (M1.8 armed WhatsApp; M2(d) arms email behind
+ * OUTBOUND_EMAIL_ENABLED). The default caller passes ['whatsapp'] → identical to
+ * the M1.8 WhatsApp-only claim (D-B: email not armed on gate day). retry_count is
+ * NOT touched on claim (D-C); updated_at is left to the trigger. Joins
+ * channel_instances (channel_type), LEFT JOINs agent_customers (tz/faith) and
+ * agent_customer_contacts on (channel_type, recipient_address) (is_group → group
+ * routing, R37). An empty `channelTypes` claims nothing.
  */
-export async function claimDue(limit: number): Promise<ClaimedOutbound[]> {
+export async function claimDue(limit: number, channelTypes: string[]): Promise<ClaimedOutbound[]> {
+  if (channelTypes.length === 0) return [];
   const { rows } = await query<ClaimedOutbound>(
     `WITH claimed AS (
        UPDATE agent_outbound_queue
@@ -47,7 +51,7 @@ export async function claimDue(limit: number): Promise<ClaimedOutbound[]> {
              AND is_draft = false
              AND (send_after IS NULL OR send_after <= now())
              AND channel_instance_id IN (
-               SELECT id FROM channel_instances WHERE channel_type = 'whatsapp'
+               SELECT id FROM channel_instances WHERE channel_type = ANY($2::text[])
              )
            ORDER BY id ASC
            FOR UPDATE SKIP LOCKED
@@ -65,7 +69,7 @@ export async function claimDue(limit: number): Promise<ClaimedOutbound[]> {
        LEFT JOIN agent_customer_contacts cc
               ON cc.channel_type = ci.channel_type AND cc.address = c.recipient_address
       ORDER BY c.id ASC`,
-    [limit],
+    [limit, channelTypes],
   );
   return rows;
 }
