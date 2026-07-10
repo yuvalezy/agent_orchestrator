@@ -1,5 +1,7 @@
 import type { PoolClient } from 'pg';
 import { query } from '../db';
+import type { FeedbackDecisionRow } from './feedback-learning';
+import type { ResolvedDecision } from './acceptance-report';
 
 // Audit + bridge writes (tasks 6.5/7.2, core — db only). agent_decisions records
 // every triage outcome + human override; agent_tasks bridges an inbox message to
@@ -110,6 +112,85 @@ export async function resolveDraftDecisionTx(
       input.humanOverride !== undefined ? JSON.stringify(input.humanOverride) : null,
     ],
   );
+}
+
+// ── M3(c): feedback-learning source rows ──────────────────────────────────────
+// A draft_reply decision that the founder MODIFIED or REJECTED is a correction the
+// agent should learn (change 03, feedback-learning). The feedback worker reads the
+// unprocessed ones here and writes a customer-scoped feedback memory. Idempotency
+// is a NOT-EXISTS anti-join on agent_memory (metadata->>'decision_id') — no cursor,
+// no schema change: a decision that already produced a feedback row is never re-picked
+// (so a re-run, or a late-resolving low-id decision, is handled correctly). Never
+// selects/logs the raw inbound body (agent_output holds the structured draft only).
+
+/**
+ * The oldest-first batch of resolved draft decisions (outcome modified/rejected) that
+ * have NOT yet produced a feedback memory. `agentOutput` = { intent, draft_body,
+ * citations, language }; `humanOverride` = { action, by, edited_body? }. customer_id is
+ * NEVER null here (filtered) — feedback is customer-scoped.
+ */
+export async function fetchUnprocessedFeedbackDecisions(limit: number): Promise<FeedbackDecisionRow[]> {
+  const { rows } = await query<{
+    id: string;
+    customer_id: string;
+    outcome: 'modified' | 'rejected';
+    agent_output: unknown;
+    human_override: unknown;
+  }>(
+    `SELECT d.id, d.customer_id, d.outcome, d.agent_output, d.human_override
+       FROM agent_decisions d
+      WHERE d.decision_type = 'draft_reply'
+        AND d.outcome IN ('modified', 'rejected')
+        AND d.resolved_at IS NOT NULL
+        AND d.customer_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_memory m
+           WHERE m.memory_type = 'feedback'
+             AND m.metadata->>'decision_id' = d.id::text
+        )
+      ORDER BY d.resolved_at ASC
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    decisionId: r.id,
+    customerId: r.customer_id,
+    outcome: r.outcome,
+    agentOutput: r.agent_output,
+    humanOverride: r.human_override,
+  }));
+}
+
+// ── M3(d): acceptance-report source rows ───────────────────────────────────────
+// The daily report aggregates resolved draft_reply outcomes in the 30-day window
+// (24h/7d/30d are sliced in core from these). Returns the customer display name via a
+// LEFT JOIN so the per-customer breakdown is readable. Counts/metadata only — no body.
+
+/** Resolved draft decisions (accepted/modified/rejected) with resolved_at >= sinceIso,
+ *  oldest-first. `customerName` is the joined display_name (null for a null customer). */
+export async function fetchResolvedDraftDecisions(sinceIso: string): Promise<ResolvedDecision[]> {
+  const { rows } = await query<{
+    customer_id: string | null;
+    customer_name: string | null;
+    outcome: 'accepted' | 'modified' | 'rejected';
+    resolved_at: Date;
+  }>(
+    `SELECT d.customer_id, c.display_name AS customer_name, d.outcome, d.resolved_at
+       FROM agent_decisions d
+       LEFT JOIN agent_customers c ON c.id = d.customer_id
+      WHERE d.decision_type = 'draft_reply'
+        AND d.outcome IN ('accepted', 'modified', 'rejected')
+        AND d.resolved_at IS NOT NULL
+        AND d.resolved_at >= $1
+      ORDER BY d.resolved_at ASC`,
+    [sinceIso],
+  );
+  return rows.map((r) => ({
+    customerId: r.customer_id,
+    customerName: r.customer_name,
+    outcome: r.outcome,
+    resolvedAt: r.resolved_at,
+  }));
 }
 
 /**

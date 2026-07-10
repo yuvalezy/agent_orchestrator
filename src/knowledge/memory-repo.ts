@@ -55,6 +55,18 @@ export interface SearchOptions {
   maxDistance: number;
 }
 
+/** One append-only Layer-A memory (document_id NULL, chunk_index 0). Used by the
+ *  M3(c) feedback-learning worker to persist a founder-correction lesson — always
+ *  customer-scoped (feedback belongs to the customer whose draft was corrected). */
+export interface FeedbackMemoryInput {
+  customerId: string;
+  content: string;
+  embedding: number[];
+  /** {source:'draft_feedback', decision_id, outcome, language} — decision_id is the
+   *  idempotency key the fetch anti-join checks (metadata->>'decision_id'). */
+  metadata: Record<string, unknown>;
+}
+
 export interface SearchResult {
   content: string;
   metadata: Record<string, unknown> | null;
@@ -81,6 +93,16 @@ export interface KnowledgeRepo {
     customerId: string | null,
     opts: SearchOptions,
   ): Promise<Array<{ content: string; metadata: Record<string, unknown> | null; memoryType: string; distance: number }>>;
+}
+
+/** Layer-A feedback writer (M3(c)). Kept OFF KnowledgeRepo (that interface is the
+ *  Layer-B doc mirror) — a distinct concern, intersected onto the concrete `memoryRepo`
+ *  so callers get it without every KnowledgeRepo test fake having to implement it. */
+export interface FeedbackMemoryRepo {
+  /** Append one Layer-A feedback memory (memory_type='feedback', document_id NULL,
+   *  chunk_index 0). Append-only — the sync reconcile NEVER touches Layer A. NEVER
+   *  logs content or the vector. */
+  insertFeedbackMemory(input: FeedbackMemoryInput): Promise<void>;
 }
 
 /** ⚠︎ PURE SQL builder — extracted so scope-isolation (customer_id=$ vs IS NULL,
@@ -163,7 +185,7 @@ interface SearchDbRow {
 
 /** Concrete repo bound to the shared pool via query()/withClient. NEVER logs content
  *  or vectors. */
-export const memoryRepo: KnowledgeRepo = {
+export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo = {
   async listDocuments(): Promise<KnowledgeDocumentRow[]> {
     const { rows } = await query<DocumentDbRow>(
       `SELECT id, source_id, doc_key, module, locale, title, route, scope, customer_id,
@@ -258,6 +280,23 @@ export const memoryRepo: KnowledgeRepo = {
 
   async deleteChunksForDocument(documentId: number): Promise<void> {
     await query('DELETE FROM agent_memory WHERE document_id = $1', [documentId]);
+  },
+
+  async insertFeedbackMemory(input: FeedbackMemoryInput): Promise<void> {
+    // Layer-A row: document_id NULL (never reconciled), memory_type 'feedback', a
+    // single chunk (chunk_index 0). The embedding is bound + cast $::vector (no
+    // interpolation). Idempotency is the CALLER's (fetch anti-join on decision_id).
+    await query(
+      `INSERT INTO agent_memory
+          (customer_id, memory_type, document_id, content, embedding, metadata, chunk_index)
+       VALUES ($1, 'feedback', NULL, $2, $3::vector, $4::jsonb, 0)`,
+      [
+        input.customerId,
+        input.content,
+        toVectorLiteral(input.embedding),
+        JSON.stringify(input.metadata),
+      ],
+    );
   },
 
   async search(
