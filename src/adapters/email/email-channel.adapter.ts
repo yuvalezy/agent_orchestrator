@@ -66,12 +66,18 @@ export class EmailChannelAdapter implements ChannelAdapter {
   }
 
   async send(msg: OutboundMessage): Promise<{ providerMessageId: string }> {
+    // Threaded reply (M2(d)): msg.inReplyTo is the inbound RFC-2822 Message-ID header
+    // (channel.port contract for email) → set BOTH In-Reply-To and References so the
+    // reply threads in RFC-compliant clients, alongside threadId for Gmail-native
+    // threading. The instance this adapter is bound to IS the sending account, so a
+    // reply can only ever leave on the account it arrived on (isolation by construction).
     const res = await this.client.send({
       to: msg.recipientAddress,
       subject: msg.subject,
       bodyText: msg.body,
       threadId: msg.threadKey,
       inReplyTo: msg.inReplyTo,
+      references: msg.inReplyTo ? [msg.inReplyTo] : undefined,
     });
     return { providerMessageId: res.messageId };
   }

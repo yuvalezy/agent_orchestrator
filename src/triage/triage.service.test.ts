@@ -135,6 +135,7 @@ async function seedInbox(msgId: string, body: string | null): Promise<ClaimedInb
   return {
     id: rows[0].id, channel_instance_id: waInstanceId, channel_type: 'whatsapp',
     channel_message_id: msgId,
+    message_id_header: null,
     channel_thread_id: '50900000001', sender_address: '50900000001', sender_name: null,
     subject: null, body, received_at: rows[0].received_at, recipients: null, account_email: null,
     ticket_number: null, is_group: null, chat_muted: null, mentions_me: null,
@@ -157,6 +158,7 @@ async function seedGroupInbox(
   return {
     id: rows[0].id, channel_instance_id: waInstanceId, channel_type: 'whatsapp',
     channel_message_id: msgId,
+    message_id_header: null,
     channel_thread_id: groupId, sender_address: '50761111111', sender_name: 'Author',
     subject: null, body: 'hey @founder can you check this', received_at: rows[0].received_at,
     recipients: null, account_email: null, ticket_number: null,
@@ -173,6 +175,7 @@ async function seedServiceDeskInbox(msgId: string, body: string, ticketId: strin
   return {
     id: rows[0].id, channel_instance_id: sdInstanceId, channel_type: 'service_desk',
     channel_message_id: msgId,
+    message_id_header: null,
     channel_thread_id: ticketId, sender_address: 'bp-triage-sd', sender_name: null,
     subject: null, body, received_at: rows[0].received_at, recipients: null, account_email: null,
     ticket_number: ticketNumber, is_group: null, chat_muted: null, mentions_me: null,

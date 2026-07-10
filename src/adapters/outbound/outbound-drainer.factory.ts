@@ -26,7 +26,7 @@ const DAY_MS = 86_400_000;
 /** The outbound-repo surface the drainer depends on (injectable for tests). */
 export interface OutboundRepo {
   reclaimStuck(stuckMinutes: number): Promise<string[]>;
-  claimDue(limit: number): Promise<ClaimedOutbound[]>;
+  claimDue(limit: number, channelTypes: string[]): Promise<ClaimedOutbound[]>;
   markSent(id: string, providerMessageId: string): Promise<void>;
   retryLater(id: string, err: string, maxAttempts: number, backoffMs: number): Promise<{ failed: boolean }>;
   deferUntil(id: string, sendAfter: Date): Promise<void>;
@@ -49,6 +49,10 @@ export interface OutboundDrainerConfig {
   failureWindowMin: number;
   defaultTz: string;
   stuckMinutes: number;
+  /** M2(d) kill-switch (OUTBOUND_EMAIL_ENABLED, default false). When false the claim
+   *  stays WhatsApp-only (M1.8 behaviour, byte-identical); when true, email rows are
+   *  ALSO claimed + routed to the Gmail adapter. Dormant until flipped. */
+  emailEnabled?: boolean;
   /** Defaults to the real outbound-repo module; overridden in tests. */
   repo?: OutboundRepo;
 }
@@ -60,6 +64,11 @@ function isoDate(ms: number): string {
 export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDefinition {
   const repo: OutboundRepo = cfg.repo ?? outboundRepo;
   const { registry, notifier } = cfg;
+
+  // The channels this drainer is allowed to CLAIM. WhatsApp is always armed (M1.8);
+  // email is armed only behind OUTBOUND_EMAIL_ENABLED (M2(d), default off). A row on
+  // any other/unflagged channel is never claimed → nothing sends by surprise.
+  const claimChannelTypes: string[] = ['whatsapp', ...(cfg.emailEnabled ? ['email'] : [])];
 
   const alertAdmin = (body: string, severity: Notification['severity'] = 'warning'): Promise<void> =>
     notifier
@@ -108,6 +117,23 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       await repo.failReview(row.id, 'no send-capable adapter for instance');
       logger.info({ worker: NAME, id: row.id, status: 'failReview' }, 'outbound: no send-capable adapter');
       await alertAdmin(`#${row.id} to ${row.recipient_address}: no send-capable adapter for its instance — needs review.`);
+      return;
+    }
+
+    // (a2) ACCOUNT-ISOLATION guard. A reply MUST leave on the SAME instance it arrived
+    // on — a work-account thread can never egress a personal account (and vice-versa),
+    // nor an email row through a WhatsApp adapter. registry.get(id) returns the adapter
+    // bound to THAT instance, so this defends against a registry mis-wire: if the
+    // resolved adapter's instance id / channel_type disagrees with the row, we refuse
+    // to send (failReview) rather than cross-contaminate. NEVER logs addresses/bodies.
+    const inst = adapter.instance;
+    if (inst.id !== row.channel_instance_id || inst.channelType !== row.channel_type) {
+      await repo.failReview(row.id, 'account-isolation mismatch: resolved adapter instance/channel differs from row');
+      logger.error(
+        { worker: NAME, id: row.id, status: 'failReview', rowInstance: row.channel_instance_id, rowChannel: row.channel_type, adapterInstance: inst.id, adapterChannel: inst.channelType },
+        'outbound: account-isolation mismatch — refusing to send',
+      );
+      await alertAdmin(`#${row.id}: account-isolation mismatch (row instance ${row.channel_instance_id}/${row.channel_type} ≠ adapter ${inst.id}/${inst.channelType}) — refused, needs review.`);
       return;
     }
 
@@ -194,7 +220,7 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
         await alertAdmin(`${stuck.length} outbound row(s) stuck in 'sending' beyond ${cfg.stuckMinutes}m → marked failed for manual review (possibly delivered).`);
       }
 
-      const rows = await repo.claimDue(CLAIM_BATCH);
+      const rows = await repo.claimDue(CLAIM_BATCH, claimChannelTypes);
       if (!rows.length) return;
 
       // Load the gating config ONCE per tick (global in Phase 1).

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResponseDrafter, renderCitations, type ResponseDrafterDeps } from './response-drafter';
+import { buildResponseDrafter, emailReplySubject, renderCitations, type ResponseDrafterDeps } from './response-drafter';
 import type { ClaimedInbox } from '../inbox/inbox-repo';
 import type { KnowledgeChunk, DraftRequest, DraftResult } from '../ports/llm.port';
 import type { Notification } from '../ports/founder-notifier.port';
@@ -27,6 +27,7 @@ const row = (over: Partial<ClaimedInbox> = {}): ClaimedInbox => ({
   channel_instance_id: 'ci-wa-1',
   channel_type: 'whatsapp',
   channel_message_id: 'wamid.ABC123',
+  message_id_header: null,
   channel_thread_id: 'thr-1',
   sender_address: '+15551230000',
   sender_name: 'Ada',
@@ -292,4 +293,56 @@ test('renderCitations: empty usedSourceIndexes → fallback to ALL chunk labels'
 test('renderCitations: null title → "Untitled", missing section/route degrade gracefully', () => {
   const k = [chunk({ title: null, section: null, route: null })];
   assert.deepEqual(renderCitations(k, [0]), ['Untitled']);
+});
+
+// ── M2(d): email draft carries the thread/account fields the drainer needs ───────
+test('email draft: in_reply_to = inbound RFC Message-ID header, subject Re:-prefixed, same instance (isolation)', async () => {
+  const { deps, cap } = makeDeps();
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row({
+      channel_instance_id: 'ci-email-work',
+      channel_type: 'email',
+      channel_message_id: 'gmail-msg-1', // provider (Gmail) id — NOT what threads a reply
+      message_id_header: '<CAF=orig@mail.gmail.com>', // the RFC header the reply must reference
+      sender_address: 'cust@acme.com',
+      subject: 'Nightly export question',
+    }),
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 'gmail-thread-1',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  const e = cap.enqueues[0];
+  assert.equal(e.channelType, 'email');
+  assert.equal(e.channelInstanceId, 'ci-email-work', 'reply pinned to the arriving instance — no cross-account');
+  assert.equal(e.threadKey, 'gmail-thread-1');
+  assert.equal(e.inReplyTo, '<CAF=orig@mail.gmail.com>', 'email threads on the RFC header, not the provider id');
+  assert.equal(e.subject, 'Re: Nightly export question');
+  assert.equal(e.recipientAddress, 'cust@acme.com');
+});
+
+test('email draft: missing Message-ID header falls back to the provider channel_message_id', async () => {
+  const { deps, cap } = makeDeps();
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row({ channel_type: 'email', channel_message_id: 'gmail-msg-2', message_id_header: null, sender_address: 'c@x.com', subject: null }),
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 't',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  const e = cap.enqueues[0];
+  assert.equal(e.inReplyTo, 'gmail-msg-2', 'graceful fallback keeps in_reply_to non-null');
+  assert.equal(e.subject, 'Re:', 'blank inbound subject → bare Re:');
+});
+
+test('emailReplySubject: prefixes once, not doubled, case-insensitive; blank → bare Re:', () => {
+  assert.equal(emailReplySubject('Order status'), 'Re: Order status');
+  assert.equal(emailReplySubject('Re: Order status'), 'Re: Order status');
+  assert.equal(emailReplySubject('RE: Order status'), 'RE: Order status');
+  assert.equal(emailReplySubject('   '), 'Re:');
+  assert.equal(emailReplySubject(null), 'Re:');
 });

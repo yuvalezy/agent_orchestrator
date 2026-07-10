@@ -50,18 +50,25 @@ test('claimDue: claims due WA rows; excludes drafts, not-yet-due, and non-whatsa
   const futureId = await insertRow(inst.wa, { recipient: `${PREFIX}0003`, sendAfter: new Date(Date.now() + 3_600_000) });
   const emailId = await insertRow(inst.email, { recipient: `${PREFIX}0004` });
 
-  const claimed = await repo.claimDue(200);
+  const claimed = await repo.claimDue(200, ['whatsapp']);
   const ids = new Set(claimed.map((r) => r.id));
 
   assert.equal(ids.has(dueId), true, 'due WA row is claimed');
   assert.equal(ids.has(draftId), false, 'draft excluded');
   assert.equal(ids.has(futureId), false, 'not-yet-due excluded');
-  assert.equal(ids.has(emailId), false, 'non-whatsapp excluded');
+  assert.equal(ids.has(emailId), false, 'email excluded when only whatsapp is armed (M1.8 default)');
 
   const claimedDue = claimed.find((r) => r.id === dueId)!;
   assert.equal(claimedDue.channel_type, 'whatsapp');
   const after = await query(`SELECT status FROM agent_outbound_queue WHERE id = $1`, [dueId]);
   assert.equal(after.rows[0].status, 'sending', 'claimed row moved to sending');
+
+  // M2(d): with email ARMED, the email row is claimed too (the WA row already went to
+  // 'sending' above, so this second claim only picks up the still-approved email row).
+  const claimedEmail = await repo.claimDue(200, ['whatsapp', 'email']);
+  const emailIds = new Set(claimedEmail.map((r) => r.id));
+  assert.equal(emailIds.has(emailId), true, 'email row claimed when email is armed');
+  assert.equal(claimedEmail.find((r) => r.id === emailId)!.channel_type, 'email');
 });
 
 test('deferUntil: parks the row without bumping retry_count', async (t) => {
@@ -175,7 +182,7 @@ test('enqueueOutbound → claimDue round-trips attachment_ref (JSONB) + in_reply
     attachmentRef,
   });
 
-  const claimed = await repo.claimDue(200);
+  const claimed = await repo.claimDue(200, ['whatsapp']);
   const row = claimed.find((r) => r.id === id);
   assert.ok(row, 'enqueued row is claimed');
   // JSONB comes back PARSED (a JS object), not a string / double-encoded (guards the
@@ -195,7 +202,7 @@ test('enqueueOutbound: attachment_ref defaults to null when omitted', async (t) 
     recipientAddress: `${PREFIX}7002`,
     body: 'plain text',
   });
-  const row = (await repo.claimDue(200)).find((r) => r.id === id);
+  const row = (await repo.claimDue(200, ['whatsapp'])).find((r) => r.id === id);
   assert.ok(row);
   assert.equal(row!.attachment_ref, null);
 });

@@ -42,3 +42,42 @@ test('self-sent skip is case-insensitive on the account address', async () => {
   const { messages } = await adapter.fetchSince(null);
   assert.equal(messages.length, 0);
 });
+
+test('send: threaded reply sets threadId + In-Reply-To + References (M2(d))', async () => {
+  let captured: Parameters<EmailProviderClient['send']>[0] | null = null;
+  const capturing: EmailProviderClient = {
+    listChanges: async () => ({ messages: [], nextCursor: 'c' }),
+    getThread: async () => [],
+    send: async (input) => { captured = input; return { messageId: 'gmail-sent-1' }; },
+  };
+  const adapter = new EmailChannelAdapter(INSTANCE, capturing, ACCOUNT);
+  const res = await adapter.send({
+    instanceId: INSTANCE.id,
+    recipientAddress: 'cust@x.com',
+    threadKey: 't-1',
+    inReplyTo: '<abc@mail.gmail.com>',
+    subject: 'Re: Question',
+    body: 'the answer',
+  });
+  assert.equal(res.providerMessageId, 'gmail-sent-1');
+  assert.equal(captured!.to, 'cust@x.com');
+  assert.equal(captured!.threadId, 't-1');
+  assert.equal(captured!.inReplyTo, '<abc@mail.gmail.com>');
+  assert.deepEqual(captured!.references, ['<abc@mail.gmail.com>']);
+  assert.equal(captured!.subject, 'Re: Question');
+  assert.equal(captured!.bodyText, 'the answer');
+});
+
+test('send: a fresh email (no inbound reference) omits In-Reply-To/References', async () => {
+  let captured: Parameters<EmailProviderClient['send']>[0] | null = null;
+  const capturing: EmailProviderClient = {
+    listChanges: async () => ({ messages: [], nextCursor: 'c' }),
+    getThread: async () => [],
+    send: async (input) => { captured = input; return { messageId: 'gmail-new-1' }; },
+  };
+  const adapter = new EmailChannelAdapter(INSTANCE, capturing, ACCOUNT);
+  await adapter.send({ instanceId: INSTANCE.id, recipientAddress: 'cust@x.com', subject: 'Hello', body: 'hi' });
+  assert.equal(captured!.inReplyTo, undefined);
+  assert.equal(captured!.references, undefined);
+  assert.equal(captured!.threadId, undefined);
+});

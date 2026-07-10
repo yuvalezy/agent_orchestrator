@@ -85,6 +85,16 @@ const envSchema = z.object({
   OUTBOUND_STUCK_MINUTES: z.coerce.number().int().positive().default(10),
   HOLIDAY_COUNTRY: z.string().default('PA'),
 
+  // ── M2(d): email threaded/isolated send. Second kill-switch UNDER OUTBOUND_ENABLED
+  // (the drainer must be running): when this is the literal "true" the drainer ALSO
+  // claims approved EMAIL rows and routes them to the Gmail adapter (threaded reply,
+  // same-account isolation). Strict string→bool (NOT z.coerce.boolean). DORMANT by
+  // default so email never sends by surprise on gate day (D-B).
+  OUTBOUND_EMAIL_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── M1.9 (§9.5): early-warning alert when triage rows start failing (a
   // dependency is down — portal/LLM/DB). After this many CONSECUTIVE row failures
   // the founder gets ONE admin Telegram notice (re-armed on recovery), instead of
