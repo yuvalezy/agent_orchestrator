@@ -83,13 +83,18 @@ function buildResponseDrafterGated(
   if (!env.KNOWLEDGE_RETRIEVAL_ENABLED) {
     logger.warn('⚠️  KNOWLEDGE_DRAFT_ENABLED=true but KNOWLEDGE_RETRIEVAL_ENABLED=false — the drafter is DORMANT (no retrieved knowledge → question_existing keeps creating tasks). Enable retrieval too.');
   }
-  logger.info({ retrieval: env.KNOWLEDGE_RETRIEVAL_ENABLED }, 'response drafter wired (KNOWLEDGE_DRAFT_ENABLED=true)');
+  logger.info(
+    { retrieval: env.KNOWLEDGE_RETRIEVAL_ENABLED, revise: env.DRAFT_REVISE_ENABLED },
+    'response drafter wired (KNOWLEDGE_DRAFT_ENABLED=true)',
+  );
   return buildResponseDrafter({
     llm,
     notifier,
     enqueueDraft,
     recordDraftDecision,
     findOpenDraftByInbox,
+    // Draft correction loop: append the 🔁 Revise button on presented drafts when enabled.
+    reviseEnabled: env.DRAFT_REVISE_ENABLED,
   });
 }
 

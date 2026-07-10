@@ -26,6 +26,9 @@ export interface ResponseDrafterDeps {
   enqueueDraft: typeof enqueueDraft;
   recordDraftDecision: typeof recordDraftDecision;
   findOpenDraftByInbox: typeof findOpenDraftByInbox;
+  /** Append the 🔁 Revise button under presented drafts (Draft correction loop). Set by the
+   *  composition root from DRAFT_REVISE_ENABLED (default false → the original three buttons). */
+  reviseEnabled?: boolean;
 }
 
 export interface DraftAndPresentInput {
@@ -66,7 +69,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
     await deps.notifier.notifyCustomerEvent(
       customerId,
       buildPresentation(body, citations, language),
-      draftButtons(queueId),
+      draftButtons(queueId, { revise: deps.reviseEnabled }),
     );
   }
 
@@ -117,6 +120,9 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
           draft_body: result.body,
           citations,
           language: config.preferredLanguage,
+          // Carried so the 🔁 Revise loop can regenerate with the same salutation/tone
+          // without a customer lookup (never the raw customer body — just the display name).
+          customer_name: config.displayName,
         },
       });
 

@@ -6,6 +6,7 @@ import {
   DRAFT_APPROVE,
   DRAFT_EDIT,
   DRAFT_REJECT,
+  DRAFT_REVISE,
   draftButtons,
   isDraftOption,
   buildDraftDecisionHandler,
@@ -276,4 +277,83 @@ test('draftButtons carries the three option:queueId callback ids; isDraftOption 
   assert.deepEqual(btns.map((b) => b.id), ['da:q9', 'de:q9', 'dr:q9']);
   assert.ok(isDraftOption(DRAFT_APPROVE) && isDraftOption(DRAFT_EDIT) && isDraftOption(DRAFT_REJECT));
   assert.equal(isDraftOption('x'), false); // the ❌-cancel option is NOT a draft option
+});
+
+// ── 🔁 Revise (Draft correction loop) ────────────────────────────────────────
+
+test('draftButtons appends the 🔁 Revise button ONLY with { revise: true }; isDraftOption matches it', () => {
+  assert.deepEqual(draftButtons('q9').map((b) => b.id), ['da:q9', 'de:q9', 'dr:q9'], 'off by default');
+  assert.deepEqual(
+    draftButtons('q9', { revise: true }).map((b) => b.id),
+    ['da:q9', 'de:q9', 'dr:q9', 'dv:q9'],
+    'revise appended last',
+  );
+  assert.ok(isDraftOption(DRAFT_REVISE));
+});
+
+test('revise tap → getDraftForEdit(open check) + armRevise(threadId,queueId) + "send instruction" notify (does NOT resolve)', async () => {
+  const armed: Array<[string, string]> = [];
+  const { notifier, notifies } = notifierStub();
+  const handler = buildDraftDecisionHandler({
+    approveDraft: async () => { throw new Error('unexpected'); },
+    cancelDraft: async () => { throw new Error('unexpected'); },
+    getDraftForEdit: async () => res(),
+    notifier,
+    armEdit: async () => { throw new Error('unexpected'); },
+    armRevise: async (threadId, queueId) => { armed.push([threadId, queueId]); },
+  });
+
+  await handler({ notificationRef: 'q1', optionId: DRAFT_REVISE, by: 'u', threadId: '77' });
+
+  assert.deepEqual(armed, [['77', 'q1']]);
+  assert.equal(notifies.length, 1);
+  assert.match(notifies[0].n.title, /revise/i);
+  assert.match(notifies[0].n.body, /instruction/i);
+});
+
+test('revise tap on a NON-open draft (getDraftForEdit null) → no arm, no notify', async () => {
+  let armedCalled = false;
+  const { notifier, notifies } = notifierStub();
+  const handler = buildDraftDecisionHandler({
+    approveDraft: async () => null,
+    cancelDraft: async () => null,
+    getDraftForEdit: async () => null,
+    notifier,
+    armEdit: async () => {},
+    armRevise: async () => { armedCalled = true; },
+  });
+  await handler({ notificationRef: 'q1', optionId: DRAFT_REVISE, by: 'u', threadId: '77' });
+  assert.equal(armedCalled, false);
+  assert.equal(notifies.length, 0);
+});
+
+test('revise tap with NO threadId → warning notify, marker NOT armed', async () => {
+  let armedCalled = false;
+  const { notifier, notifies } = notifierStub();
+  const handler = buildDraftDecisionHandler({
+    approveDraft: async () => null,
+    cancelDraft: async () => null,
+    getDraftForEdit: async () => res(),
+    notifier,
+    armEdit: async () => {},
+    armRevise: async () => { armedCalled = true; },
+  });
+  await handler({ notificationRef: 'q1', optionId: DRAFT_REVISE, by: 'u' }); // no threadId
+  assert.equal(armedCalled, false);
+  assert.equal(notifies.length, 1);
+  assert.equal(notifies[0].n.severity, 'warning');
+});
+
+test('revise tap with armRevise UNWIRED (flag off) → warn no-op, nothing armed/notified', async () => {
+  const { notifier, notifies } = notifierStub();
+  const handler = buildDraftDecisionHandler({
+    approveDraft: async () => { throw new Error('unexpected'); },
+    cancelDraft: async () => { throw new Error('unexpected'); },
+    getDraftForEdit: async () => { throw new Error('unexpected'); },
+    notifier,
+    armEdit: async () => {},
+    // armRevise omitted → revise loop not wired
+  });
+  await handler({ notificationRef: 'q1', optionId: DRAFT_REVISE, by: 'u', threadId: '77' });
+  assert.equal(notifies.length, 0);
 });

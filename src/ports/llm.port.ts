@@ -146,6 +146,64 @@ export interface AnswerSynthesizerPort {
   synthesizeAnswer(input: AnswerRequest): Promise<AnswerResult>;
 }
 
+/**
+ * Request to REGENERATE a draft per the founder's correction (🔁 Revise, role 'draft').
+ * Mirrors DraftRequest but adds the PRIOR draft + the founder's authoritative correction
+ * `instruction`. The reviser applies the instruction faithfully (the founder is the
+ * human-in-the-loop source of truth) while staying grounded in `knowledge` for customer
+ * facts — it NEVER invents a NEW capability/integration beyond the sources AND the
+ * instruction. `knowledge` MAY be empty (retrieval is best-effort; the instruction still
+ * governs). `customerName` is optional (revise reads it from the stored draft when known).
+ */
+export interface ReviseRequest {
+  question: string;
+  language: string;
+  customerName?: string;
+  knowledge: KnowledgeChunk[];
+  /** The prior draft body being corrected. */
+  priorDraft: string;
+  /** The founder's free-text correction directive (authoritative). */
+  instruction: string;
+}
+
+/** Structured revise result — identical shape to DraftResult (the reviser reuses the
+ *  draft schema); the caller renders citations from OUR chunks at `usedSourceIndexes`. */
+export interface ReviseResult {
+  body: string;
+  usedSourceIndexes: number[];
+}
+
+/**
+ * Draft regeneration (🔁 Revise). SEPARATE from AgentLlmPort (interface segregation, like
+ * AnswerSynthesizerPort): the revise orchestrator depends only on this, and existing triage
+ * fakes (AgentLlmPort) are untouched. Implemented by the LlmRouter. NEVER logs bodies.
+ */
+export interface DraftReviserPort {
+  reviseReply(input: ReviseRequest): Promise<ReviseResult>;
+}
+
+/**
+ * A founder correction classified into a learning SCOPE (Phase 2). `scope`:
+ *  • 'shared'   — a GLOBAL product/company fact true for EVERY customer (e.g. a capability
+ *                 or integration that does / does not exist). Persisted with customer_id
+ *                 NULL so the drafter reads it for everyone.
+ *  • 'customer' — specific to THIS customer's preference / context. Persisted on that
+ *                 customer's rows only. This is the SAFE DEFAULT when uncertain — a
+ *                 mis-scoped customer secret leaking to the shared store is the bad case.
+ * `fact` is a normalized one-line statement of the lesson (embedded so a similar future
+ * question retrieves it).
+ */
+export interface CorrectionClass {
+  scope: 'shared' | 'customer';
+  fact: string;
+}
+
+/** Correction-scope classifier (Phase 2). SEPARATE from AgentLlmPort (interface
+ *  segregation). Implemented by the LlmRouter (role 'classify'). NEVER logs bodies. */
+export interface CorrectionClassifierPort {
+  classifyCorrection(input: { instruction: string; priorDraft: string; language?: string }): Promise<CorrectionClass>;
+}
+
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */
 export interface LlmProviderClient {
   readonly provider: string; // 'anthropic' | 'openai' | 'deepseek' | future

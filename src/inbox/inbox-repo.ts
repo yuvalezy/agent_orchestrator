@@ -102,6 +102,18 @@ export async function setInboxCustomer(id: string, customerId: string): Promise<
   await query(`UPDATE agent_inbox SET customer_id = $2 WHERE id = $1`, [id, customerId]);
 }
 
+/** The subject + body of one inbox message (for the 🔁 Revise loop: re-read the ORIGINAL
+ *  inbound message so regeneration re-retrieves the SAME knowledge the first draft used —
+ *  not a triage paraphrase). Returns null when the id is unknown. Transient use only —
+ *  never stored on a decision or logged. */
+export async function getInboxSubjectBody(id: string): Promise<{ subject: string | null; body: string | null } | null> {
+  const { rows } = await query<{ subject: string | null; body: string | null }>(
+    `SELECT subject, body FROM agent_inbox WHERE id = $1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
 /** Last N inbound text messages on a thread (for TriageContext). Body only. */
 export async function loadThreadMessages(threadId: string, limit: number): Promise<Array<{ body: string; received_at: string }>> {
   const { rows } = await query<{ body: string; received_at: string }>(

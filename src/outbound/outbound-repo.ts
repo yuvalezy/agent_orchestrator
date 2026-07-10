@@ -1,6 +1,6 @@
 import { query, withClient } from '../db';
 import { normalizeEmailAddress, normalizeWhatsappAddress } from '../customers/onboarding';
-import { resolveDraftDecisionTx } from '../decisions/decisions';
+import { insertRevisedDraftDecisionTx, resolveDraftDecisionTx } from '../decisions/decisions';
 import type { OutboundAttachmentRef } from '../ports/channel.port';
 import type { BusinessHour, Holiday } from './send-window';
 
@@ -459,6 +459,132 @@ export async function findOpenDraftByInbox(inboxMessageId: string): Promise<Open
     body: rows[0].body,
     agentOutput: rows[0].agent_output,
   };
+}
+
+// ── Draft correction loop: 🔁 Revise ──────────────────────────────────────────
+// Revise regenerates a draft per the founder's correction while it stays is_draft=true,
+// status='pending' (NEVER drained). Unlike approve/edit/reject, revise does NOT flip status
+// out of 'pending' — so a real idempotency GUARD lives at the message-capture layer
+// (clear-marker-BEFORE-work; see draft-revise.ts) rather than on the status flip. The guarded
+// UPDATE here (WHERE is_draft=true AND status='pending') still protects against revising a
+// draft that was approved/rejected between the 🔁 tap and the instruction message.
+
+/** An open draft re-found for revision: prior body + the linked decision's agent_output +
+ *  inbox_message_id (to re-read the original inbound message for faithful re-retrieval). */
+export interface DraftForRevise {
+  queueId: string;
+  decisionId: string | null;
+  customerId: string | null;
+  /** The prior draft reply text (agent_outbound_queue.body). */
+  priorBody: string;
+  /** The originating inbox message id (NULL for a founder-initiated release-note draft). */
+  inboxMessageId: string | null;
+  /** The linked decision's agent_output JSONB ({ intent, draft_body, citations, language,
+   *  customer_name? }) — the revise orchestrator reads intent/language/customer_name from it. */
+  agentOutput: unknown;
+}
+
+/**
+ * Read an OPEN draft (status='pending', is_draft=true) for revision — does NOT mutate.
+ * Joins the linked decision for agent_output + inbox_message_id. Returns null when the row is
+ * not an open draft (already approved/cancelled → the 🔁 tap / instruction is a no-op).
+ */
+export async function getDraftForRevise(queueId: string): Promise<DraftForRevise | null> {
+  const { rows } = await query<{
+    id: string;
+    decision_id: string | null;
+    customer_id: string | null;
+    body: string;
+    inbox_message_id: string | null;
+    agent_output: unknown;
+  }>(
+    `SELECT q.id, q.decision_id, q.customer_id, q.body, d.inbox_message_id, d.agent_output
+       FROM agent_outbound_queue q
+       LEFT JOIN agent_decisions d ON d.id = q.decision_id
+      WHERE q.id = $1 AND q.is_draft = true AND q.status = 'pending'`,
+    [queueId],
+  );
+  if (rows.length === 0) return null;
+  return {
+    queueId: rows[0].id,
+    decisionId: rows[0].decision_id,
+    customerId: rows[0].customer_id,
+    priorBody: rows[0].body,
+    inboxMessageId: rows[0].inbox_message_id,
+    agentOutput: rows[0].agent_output,
+  };
+}
+
+/** The result of a revise: the same queue id (re-presented) + the OLD decision (now
+ *  'revised') and the NEW pending decision the queue row now FKs to. `null` = the guarded
+ *  UPDATE matched 0 rows (the draft was approved/rejected first → no-op). */
+export interface RevisedDraft {
+  queueId: string;
+  oldDecisionId: string | null;
+  newDecisionId: string | null;
+  customerId: string | null;
+}
+
+/**
+ * Regenerate a draft in place (🔁 Revise) — ONE transaction:
+ *  1. guarded UPDATE queue SET body=newBody WHERE id AND is_draft=true AND status='pending'
+ *     RETURNING id, decision_id, customer_id; 0 rows → ROLLBACK + null (the draft was
+ *     approved/rejected between the 🔁 tap and the instruction — no-op).
+ *  2. resolve the OLD decision → outcome='revised' (human_override { action:'revise', by,
+ *     instruction }) — excluded from the M3(c) feedback anti-join + M3(d) acceptance report,
+ *     so an intermediate revise never mis-counts.
+ *  3. open a NEW pending draft_reply decision (copies customer_id + inbox_message_id) with
+ *     `newAgentOutput`.
+ *  4. re-point queue.decision_id → the new decision.
+ * The draft STAYS is_draft=true, status='pending' → never drained; approve/reject later
+ * resolves the NEW decision. Iterative (revise again reads the new decision's agent_output).
+ * If the row had a NULL decision_id (defensive — enqueueDraft always links one) the body is
+ * still updated and { oldDecisionId:null, newDecisionId:null } is returned (no audit juggling).
+ * Never logs the body.
+ */
+export async function reviseDraft(
+  queueId: string,
+  newBody: string,
+  newAgentOutput: unknown,
+  revision: { instruction: string; by: string },
+): Promise<RevisedDraft | null> {
+  return withClient(async (client) => {
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<FlippedDraftRow>(
+        `UPDATE agent_outbound_queue
+            SET body = $2
+          WHERE id = $1 AND is_draft = true AND status = 'pending'
+          RETURNING id, decision_id, customer_id`,
+        [queueId, newBody],
+      );
+      if (rows.length === 0) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const row = rows[0];
+      if (row.decision_id === null) {
+        // Defensive: no linked decision → just keep the body update, skip audit juggling.
+        await client.query('COMMIT');
+        return { queueId: row.id, oldDecisionId: null, newDecisionId: null, customerId: row.customer_id };
+      }
+      await resolveDraftDecisionTx(client, {
+        decisionId: row.decision_id,
+        outcome: 'revised',
+        humanOverride: { action: 'revise', by: revision.by, instruction: revision.instruction },
+      });
+      const { decisionId: newDecisionId } = await insertRevisedDraftDecisionTx(client, {
+        fromDecisionId: row.decision_id,
+        agentOutput: newAgentOutput,
+      });
+      await client.query(`UPDATE agent_outbound_queue SET decision_id = $2 WHERE id = $1`, [row.id, newDecisionId]);
+      await client.query('COMMIT');
+      return { queueId: row.id, oldDecisionId: row.decision_id, newDecisionId, customerId: row.customer_id };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
+  });
 }
 
 /** Global business-hours schedule (Phase 1: not per-customer). Read-only config. */

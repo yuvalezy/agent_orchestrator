@@ -1,12 +1,14 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, DraftRequest, DraftResult, Intent, LlmMessage, LlmProviderClient, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, TokenUsage, TriageContext } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
 import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draft-prompt';
 import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './answer-prompt';
+import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
+import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
 
@@ -35,7 +37,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftReviserPort, CorrectionClassifierPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -195,6 +197,46 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort {
       // thinking + output combined (R44) — a tight budget could truncate the JSON.
       maxTokens: 1500,
       validate: parseAnswer,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Regenerate a draft per the founder's correction (🔁 Revise, role 'draft'). Reuses the
+   * golden structured-call path — cost accounting, ordered failover, daily cap — with the
+   * REVISE_SCHEMA (== draft envelope). The model applies the founder's authoritative
+   * instruction and stays grounded in `input.knowledge`; the reviser renders citations from
+   * those same chunks at `usedSourceIndexes`. Never logs the body.
+   */
+  async reviseReply(input: ReviseRequest): Promise<ReviseResult> {
+    return this.callStructured<ReviseResult>({
+      role: 'draft',
+      schema: REVISE_SCHEMA,
+      system: REVISE_SYSTEM,
+      messages: [{ role: 'user', content: reviseUserMessage(input) }],
+      // Ample headroom: sonnet-5 runs adaptive thinking ON and max_tokens caps
+      // thinking + output combined (R44) — a tight budget could truncate the JSON.
+      maxTokens: 1024,
+      validate: parseRevise,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Classify a founder correction into a learning SCOPE (Phase 2, role 'classify'). Reuses
+   * the golden structured-call path with CORRECTION_CLASS_SCHEMA. The classifier is a
+   * BEST-EFFORT enrichment: a throw here (all providers failed / schema-invalid) must be
+   * caught by the caller so the regenerated draft is never lost — see draft-revise.ts.
+   * Defaults to 'customer' scope in the prompt when uncertain. Never logs the body.
+   */
+  async classifyCorrection(input: { instruction: string; priorDraft: string; language?: string }): Promise<CorrectionClass> {
+    return this.callStructured<CorrectionClass>({
+      role: 'classify',
+      schema: CORRECTION_CLASS_SCHEMA,
+      system: CORRECTION_CLASS_SYSTEM,
+      messages: [{ role: 'user', content: correctionClassifyUserMessage(input) }],
+      maxTokens: 256,
+      validate: parseCorrectionClass,
       customerId: null,
     });
   }

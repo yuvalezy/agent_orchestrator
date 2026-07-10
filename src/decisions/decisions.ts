@@ -119,7 +119,7 @@ export async function resolveDraftDecisionTx(
   client: PoolClient,
   input: {
     decisionId: string;
-    outcome: 'accepted' | 'modified' | 'rejected';
+    outcome: 'accepted' | 'modified' | 'rejected' | 'revised';
     humanOverride?: unknown;
   },
 ): Promise<void> {
@@ -133,6 +133,29 @@ export async function resolveDraftDecisionTx(
       input.humanOverride !== undefined ? JSON.stringify(input.humanOverride) : null,
     ],
   );
+}
+
+/**
+ * Open the NEW pending draft_reply decision for a REVISE (Draft correction loop), WITHIN the
+ * caller's transaction (the outbound-repo reviseDraft passes its PoolClient) so it commits
+ * atomically with resolving the OLD decision to 'revised' and re-pointing the queue row. The
+ * new row COPIES customer_id + inbox_message_id from `fromDecisionId` (an inbound draft's
+ * inbox_message_id is preserved; a founder-initiated release-note draft's NULL is preserved
+ * too) so the M3(c)/M3(d) queries keep working unchanged. `agentOutput` = { intent,
+ * draft_body, citations, language, customer_name, revised_from }. Returns the new decision id.
+ */
+export async function insertRevisedDraftDecisionTx(
+  client: PoolClient,
+  input: { fromDecisionId: string; agentOutput: unknown },
+): Promise<{ decisionId: string }> {
+  const { rows } = await client.query<{ id: string }>(
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, outcome)
+     SELECT customer_id, inbox_message_id, 'draft_reply', $2::jsonb, 'pending'
+       FROM agent_decisions WHERE id = $1
+     RETURNING id`,
+    [input.fromDecisionId, JSON.stringify(input.agentOutput ?? null)],
+  );
+  return { decisionId: rows[0].id };
 }
 
 // ── M3(c): feedback-learning source rows ──────────────────────────────────────
