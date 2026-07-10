@@ -8,10 +8,14 @@ import { dbContactResolutionQueries } from '../../customers/contact-resolution';
 import { TriageService } from '../../triage/triage.service';
 import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
+import { buildResponseDrafter, type ResponseDrafter } from '../../triage/response-drafter';
 import { memoryRepo } from '../../knowledge/memory-repo';
 import { claimBatch, failStuck } from '../../inbox/inbox-repo';
+import { enqueueDraft, findOpenDraftByInbox } from '../../outbound/outbound-repo';
+import { recordDraftDecision } from '../../decisions/decisions';
 import { buildEzyPortalGateway } from '../ezy-portal';
 import { buildLlmRouter } from '../llm/factory';
+import type { AgentLlmPort } from '../../ports/llm.port';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildGroupSummaryAdapter } from '../whatsapp-manager/factory';
 
@@ -56,6 +60,37 @@ function buildTriageKnowledgeRetriever(): KnowledgeRetriever | undefined {
   });
 }
 
+/**
+ * M2a(c): build the cited-draft responder wired into triage — the composition root
+ * where the core drafter meets the LLM router + notifier + the draft queue/decision
+ * repo fns (D1: core never imports adapters). Gated by KNOWLEDGE_DRAFT_ENABLED
+ * (mirrors the retrieval kill-switch) so it stays dormant → question_existing keeps
+ * creating tasks. Returns undefined when off. Logs wired/not-wired INCLUDING whether
+ * retrieval is on — the drafter only fires when knowledge.length > 0, so
+ * KNOWLEDGE_DRAFT_ENABLED without KNOWLEDGE_RETRIEVAL_ENABLED is dormant-but-enabled
+ * (diagnosable via this log).
+ */
+function buildResponseDrafterGated(
+  llm: Pick<AgentLlmPort, 'draftReply'>,
+  notifier: FounderNotifierPort,
+): ResponseDrafter | undefined {
+  if (!env.KNOWLEDGE_DRAFT_ENABLED) {
+    logger.info('response drafter NOT wired (KNOWLEDGE_DRAFT_ENABLED=false)');
+    return undefined;
+  }
+  if (!env.KNOWLEDGE_RETRIEVAL_ENABLED) {
+    logger.warn('⚠️  KNOWLEDGE_DRAFT_ENABLED=true but KNOWLEDGE_RETRIEVAL_ENABLED=false — the drafter is DORMANT (no retrieved knowledge → question_existing keeps creating tasks). Enable retrieval too.');
+  }
+  logger.info({ retrieval: env.KNOWLEDGE_RETRIEVAL_ENABLED }, 'response drafter wired (KNOWLEDGE_DRAFT_ENABLED=true)');
+  return buildResponseDrafter({
+    llm,
+    notifier,
+    enqueueDraft,
+    recordDraftDecision,
+    findOpenDraftByInbox,
+  });
+}
+
 export function buildInboxProcessorWorker(notifier: FounderNotifierPort): WorkerDefinition {
   const taskTarget = buildEzyPortalGateway();
   const llm = buildLlmRouter({
@@ -74,6 +109,8 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     groupSummary: buildGroupSummaryAdapter(),
     // M2a(b): scoped RAG retrieval into the triage context (gated; see below).
     knowledgeRetriever: buildTriageKnowledgeRetriever(),
+    // M2a(c): cited-draft responder for answerable questions (gated; dormant by default).
+    responseDrafter: buildResponseDrafterGated(llm, notifier),
   });
 
   // Early-warning tracker (§9.5): raises ONE admin alert as soon as triage failures

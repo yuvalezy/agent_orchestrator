@@ -66,9 +66,41 @@ export interface TokenUsage {
   outputTokens: number;
 }
 
+/**
+ * Request to draft a cited customer reply (change 02 sub-milestone c, LLM role
+ * 'draft'). The model answers `question` STRICTLY from the numbered `knowledge`
+ * sources, in `language`, and reports which sources it relied on by index — it
+ * never emits free-text citations (those are rendered by us from the same chunks).
+ * `knowledge` is always non-empty (the drafter is gated on `knowledge.length > 0`).
+ */
+export interface DraftRequest {
+  /** The customer message to answer (subject + body, already assembled). */
+  question: string;
+  /** Preferred reply language (agent_customers.preferred_language, e.g. 'es'). */
+  language: string;
+  /** Customer display name (salutation / tone context). */
+  customerName: string;
+  /** Retrieved cited chunks the reply must be grounded in (length >= 1). */
+  knowledge: KnowledgeChunk[];
+}
+
+/**
+ * Structured draft result. `body` is the reply text IN `DraftRequest.language`.
+ * `usedSourceIndexes` are 0-based indexes into `DraftRequest.knowledge` the model
+ * actually relied on — the drafter renders the human-readable "Based on:" list from
+ * OUR chunks at those indexes (validated/clamped), so a hallucinated citation is
+ * impossible.
+ */
+export interface DraftResult {
+  body: string;
+  usedSourceIndexes: number[];
+}
+
 export interface AgentLlmPort {
   extractIntents(input: TriageContext): Promise<Intent[]>; // structured output
   judgeSimilarity(a: string, candidates: string[]): Promise<number[]>; // task dedup scores
+  /** Draft a cited reply (role 'draft'). Grounded ONLY in `input.knowledge`. */
+  draftReply(input: DraftRequest): Promise<DraftResult>;
 }
 
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */

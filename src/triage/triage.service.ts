@@ -4,6 +4,7 @@ import type { TargetTask, TaskTargetPort } from '../ports/task-target.port';
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/group-summary.port';
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
+import type { ResponseDrafter } from './response-drafter';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
@@ -78,6 +79,12 @@ export interface TriageDeps {
    *  when absent (or on any retrieval error) triage runs with NO injected knowledge
    *  (the pre-M2a behavior). The retriever swallows its own errors (returns []). */
   knowledgeRetriever?: KnowledgeRetriever;
+  /** M2a(c): the cited-draft responder for ANSWERABLE 'question_existing' intents.
+   *  Optional + gated (KNOWLEDGE_DRAFT_ENABLED) — when absent, question_existing
+   *  keeps creating a task (byte-for-byte the M1.5b behavior; the kill-switch is
+   *  truly dormant). Requires the knowledgeRetriever too (drafts only when
+   *  knowledge.length > 0), so both flags must be on to draft. */
+  responseDrafter?: ResponseDrafter;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -143,18 +150,29 @@ export class TriageService {
    */
   private async tryR49Reconfirm(inboxId: string): Promise<boolean> {
     const existing = await findTaskByInbox(inboxId);
-    if (!existing) return false;
-    logger.info({ inboxId, taskRef: existing }, 'triage: task exists (R49) — re-notifying');
-    const customerId = await findCustomerByTaskRef(existing);
-    if (customerId) {
-      await this.deps.notifier.notifyCustomerEvent(
-        customerId,
-        { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing) },
-        cancelButton(existing),
-      );
+    if (existing) {
+      logger.info({ inboxId, taskRef: existing }, 'triage: task exists (R49) — re-notifying');
+      const customerId = await findCustomerByTaskRef(existing);
+      if (customerId) {
+        await this.deps.notifier.notifyCustomerEvent(
+          customerId,
+          { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing) },
+          cancelButton(existing),
+        );
+      }
+      await markProcessed(inboxId);
+      return true;
     }
-    await markProcessed(inboxId);
-    return true;
+    // M2a(c): a prior attempt may have produced an OPEN cited DRAFT (answerable
+    // question → no task). Re-present it and finish rather than re-drafting — the
+    // reclaim-idempotency guard (blueprint must-fix #1), applied BEFORE the LLM
+    // re-extract so a reclaimed answerable question never mints a second draft.
+    if (this.deps.responseDrafter && (await this.deps.responseDrafter.reconfirmOpenDraft(inboxId))) {
+      logger.info({ inboxId }, 'triage: open draft exists (R49) — re-presented');
+      await markProcessed(inboxId);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -197,7 +215,7 @@ export class TriageService {
     const createdThisRun = new Set<string>();
     const ccOnly = isCcOnly(row);
     for (const intent of intents) {
-      await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly }, createdThisRun);
+      await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly, knowledge }, createdThisRun);
     }
     await markProcessed(inboxId);
   }
@@ -356,7 +374,7 @@ export class TriageService {
 
   private async act(
     intent: Intent,
-    ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[]; ccOnly: boolean },
+    ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[]; ccOnly: boolean; knowledge: KnowledgeChunk[] },
     createdThisRun: Set<string>,
   ): Promise<void> {
     const { row, config, customerId, threadKey } = ctx;
@@ -384,6 +402,29 @@ export class TriageService {
         severity: 'action',
       });
       return;
+    }
+
+    // M2a(c): ANSWERABLE 'question_existing' → a cited DRAFT reply (no task). Gated:
+    // requires the drafter wired (KNOWLEDGE_DRAFT_ENABLED) AND retrieved knowledge
+    // (knowledge.length > 0, which needs KNOWLEDGE_RETRIEVAL_ENABLED) — so the
+    // kill-switch is truly dormant by default. Excludes CC-only mail (must-fix #8):
+    // a message the founder was merely copied on must not auto-draft a reply. When
+    // any condition is false, the existing task path below runs unchanged.
+    if (
+      intent.category === 'question_existing' &&
+      this.deps.responseDrafter &&
+      ctx.knowledge.length > 0 &&
+      !ctx.ccOnly
+    ) {
+      await this.deps.responseDrafter.draftAndPresent({
+        row,
+        customerId,
+        config,
+        threadKey,
+        knowledge: ctx.knowledge,
+        intent,
+      });
+      return; // answerable question → cited draft, NOT a task (the drafter records its own draft_reply decision)
     }
 
     const source = resolveTaskSource(row, threadKey, config);

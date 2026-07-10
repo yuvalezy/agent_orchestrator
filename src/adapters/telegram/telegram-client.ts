@@ -122,11 +122,14 @@ export class TelegramClient {
     return this.call('sendMessage', params);
   }
 
-  /** Poll for updates (M1.5b callback routing). `timeout: 0` = short poll — the
-   *  callback-poller worker owns the cadence, so the fetch never long-hangs.
-   *  `offset` acks everything below it (persist it to stop restart re-delivery). */
+  /** Poll for updates (M1.5b callback routing + M2c edit-text capture). `timeout: 0`
+   *  = short poll — the callback-poller worker owns the cadence, so the fetch never
+   *  long-hangs. `offset` acks everything below it (persist it to stop restart
+   *  re-delivery). `message` is requested for the ✏️ Edit flow (change 02 sub-c) —
+   *  NOTE: the bot's Telegram group privacy mode MUST be OFF (BotFather /setprivacy)
+   *  or plain topic messages are never delivered here (blueprint must-fix #4). */
   async getUpdates(offset: number): Promise<TelegramUpdate[]> {
-    return this.call('getUpdates', { offset, timeout: 0, allowed_updates: ['callback_query'] });
+    return this.call('getUpdates', { offset, timeout: 0, allowed_updates: ['callback_query', 'message'] });
   }
 
   /** Acknowledge a tapped inline button (stops the client spinner). Best-effort —
@@ -140,9 +143,23 @@ export interface TelegramCallbackQuery {
   id: string;
   from: { id: number };
   data?: string;
+  /** The message the button is attached to — carries the forum topic thread id so a
+   *  handler can arm a thread-scoped follow-up (the ✏️ Edit marker) without a
+   *  customer→topic lookup (blueprint fix #5). */
+  message?: { message_thread_id?: number; chat?: { id: number } };
+}
+
+/** A plain message update (M2c ✏️ Edit-text capture). */
+export interface TelegramMessage {
+  message_id: number;
+  message_thread_id?: number;
+  text?: string;
+  from?: { id: number; is_bot?: boolean };
+  chat: { id: number };
 }
 
 export interface TelegramUpdate {
   update_id: number;
   callback_query?: TelegramCallbackQuery;
+  message?: TelegramMessage;
 }

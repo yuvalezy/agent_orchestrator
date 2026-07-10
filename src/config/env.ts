@@ -123,6 +123,25 @@ const envSchema = z.object({
   // Cosine-distance ceiling (embedding <=> query, 0..2 for normalized vectors);
   // chunks beyond it are dropped as too weak to cite. Lower = stricter.
   KNOWLEDGE_RETRIEVAL_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.5),
+
+  // ── M2a(c): response drafter — cited DRAFT replies for ANSWERABLE
+  // 'question_existing' intents. Kill-switch (mirrors OUTBOUND_ENABLED /
+  // KNOWLEDGE_SYNC_ENABLED): the drafter is injected into triage ONLY when the
+  // literal "true"; unset/"false"/anything else → false. DORMANT by default →
+  // question_existing keeps creating a task (the M1.5b behavior), so nothing drafts
+  // by surprise. NO draft is ever auto-sent — approve/edit/reject is founder-only.
+  //
+  // DEPENDENCY: the drafter only fires when knowledge.length > 0, which requires
+  // KNOWLEDGE_RETRIEVAL_ENABLED=true (the retriever). Enabling THIS flag alone
+  // (retrieval off) means question_existing silently keeps creating tasks — set BOTH.
+  //
+  // PRECONDITION (Telegram): the ✏️ Edit-capture reads `message` updates, so the
+  // bot's group privacy mode MUST be OFF (BotFather /setprivacy) or free-text edits
+  // are never delivered and the edit flow hangs (blueprint must-fix #4).
+  KNOWLEDGE_DRAFT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

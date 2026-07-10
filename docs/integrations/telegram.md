@@ -94,6 +94,25 @@ This value is `TELEGRAM_SUPERGROUP_CHAT_ID` (non-secret env).
 This value is `TELEGRAM_ADMIN_TOPIC_ID` (non-secret env, optional). If you skip
 it, admin notices land in the supergroup's **General** topic.
 
+### 6. Disable the bot's privacy mode — required for the response drafter's ✏️edit
+
+The **response drafter** (M2c) lets you **✏️edit** a draft by typing the replacement
+text as a plain message in the customer's topic. By default a bot's **privacy mode**
+is **ON**, so a bot in a group only receives commands, @mentions, and replies *to the
+bot* — it would **never see** your free-text edit. The drafter's edit capture
+(`onMessage`) therefore needs privacy mode **OFF**:
+
+1. Open **@BotFather → `/setprivacy` →** select your bot **→ Disable**.
+2. ⚠️ **Re-add the bot to the supergroup.** Telegram applies the privacy setting
+   only to groups the bot joins *after* the change — if the bot is **already** in
+   your supergroup, the new setting does **not** take effect until you **remove it
+   and add it back**, then **re-grant the "Manage Topics" admin** (step 3). Existing
+   customer topics survive (they belong to the group, not the bot).
+
+Skip this only if you never enable `KNOWLEDGE_DRAFT_ENABLED` — the ❌-cancel and
+approve/reject **buttons** work with privacy mode on (they arrive as
+`callback_query`, not messages); **only the free-text ✏️edit** needs it off.
+
 ## Configuration
 
 Verified against `src/config/env.ts` and `src/adapters/telegram/factory.ts`.

@@ -1,4 +1,4 @@
-import { FounderNotifierPort, Notification } from '../../ports';
+import { FounderNotifierPort, Notification, DecisionEvent, MessageEvent } from '../../ports';
 import { logger } from '../../logger';
 import { TelegramClient } from './telegram-client';
 
@@ -24,10 +24,12 @@ function render(n: Notification): string {
   return parts.join('\n');
 }
 
-type DecisionHandler = (d: { notificationRef: string; optionId: string; by: string }) => Promise<void>;
+type DecisionHandler = (d: DecisionEvent) => Promise<void>;
+type MessageHandler = (m: MessageEvent) => Promise<void>;
 
 export class TelegramNotifier implements FounderNotifierPort {
   private decisionHandler: DecisionHandler | null = null;
+  private messageHandler: MessageHandler | null = null;
 
   constructor(
     private readonly client: TelegramClient,
@@ -94,12 +96,19 @@ export class TelegramNotifier implements FounderNotifierPort {
     this.decisionHandler = handler;
   }
 
+  /** Register the free-text handler (M2c ✏️ Edit capture). The poller dispatches
+   *  `message` updates here (thread-scoped). */
+  onMessage(handler: MessageHandler): void {
+    this.messageHandler = handler;
+  }
+
   /**
    * Route one callback_query's data to the registered handler (M1.5b). callback_data
    * is `<optionId>:<notificationRef>` (e.g. 'x:<taskRef>') — split on the FIRST ':'.
-   * Returns silently when no handler is registered.
+   * `threadId` (M2c) is the notification's own forum topic, surfaced so a handler can
+   * arm a thread-scoped follow-up. Returns silently when no handler is registered.
    */
-  async dispatchCallback(data: string, by: string): Promise<void> {
+  async dispatchCallback(data: string, by: string, threadId?: string): Promise<void> {
     if (!this.decisionHandler) {
       logger.warn('TelegramNotifier.dispatchCallback: no onDecision handler registered');
       return;
@@ -107,7 +116,7 @@ export class TelegramNotifier implements FounderNotifierPort {
     const i = data.indexOf(':');
     const optionId = i < 0 ? data : data.slice(0, i);
     const notificationRef = i < 0 ? '' : data.slice(i + 1);
-    await this.decisionHandler({ notificationRef, optionId, by });
+    await this.decisionHandler({ notificationRef, optionId, by, threadId });
   }
 
   /**
@@ -123,7 +132,8 @@ export class TelegramNotifier implements FounderNotifierPort {
       const cq = u.callback_query;
       if (cq?.data) {
         try {
-          await this.dispatchCallback(cq.data, String(cq.from.id));
+          const threadId = cq.message?.message_thread_id !== undefined ? String(cq.message.message_thread_id) : undefined;
+          await this.dispatchCallback(cq.data, String(cq.from.id), threadId);
         } catch (err) {
           // Do NOT advance the offset past a FAILED dispatch (code-review #1):
           // getUpdates(offset) never re-delivers anything below `offset`, and there
@@ -135,6 +145,25 @@ export class TelegramNotifier implements FounderNotifierPort {
         }
         await this.client.answerCallbackQuery(cq.id).catch(() => undefined);
       }
+
+      // M2c: a free-text founder message in a customer topic → the ✏️ Edit handler.
+      // Ignore the bot's own messages, threadless (General-topic) messages, and empty
+      // text; the handler ignores UNARMED threads. Same hold-offset-on-error discipline
+      // as callbacks: a failed dispatch must not silently lose the founder's edit.
+      const msg = u.message;
+      if (this.messageHandler && msg?.text && msg.message_thread_id !== undefined && !msg.from?.is_bot) {
+        try {
+          await this.messageHandler({
+            threadId: String(msg.message_thread_id),
+            text: msg.text,
+            by: msg.from ? String(msg.from.id) : 'unknown',
+          });
+        } catch (err) {
+          logger.error({ reason: (err as Error)?.message }, 'Telegram message dispatch failed — holding offset for retry');
+          return next;
+        }
+      }
+
       next = u.update_id + 1; // advance ONLY after this update is fully handled
     }
     return next;

@@ -38,6 +38,34 @@ export interface FounderNotifierPort {
     options: Array<{ id: string; label: string }>,
   ): Promise<void>; // inline buttons
   onDecision(
-    handler: (d: { notificationRef: string; optionId: string; by: string }) => Promise<void>,
+    handler: (d: DecisionEvent) => Promise<void>,
   ): void;
+  /**
+   * Register a handler for free-text founder messages in a customer thread (change
+   * 02 sub-milestone c — the ✏️ Edit capture). Optional in the port so notifier
+   * adapters that don't surface messages (a future web-push adapter) need not
+   * implement it as more than a no-op registration. The Telegram adapter dispatches
+   * `message` updates (thread-scoped) here. Handlers MUST ignore unarmed threads.
+   */
+  onMessage?(handler: (m: MessageEvent) => Promise<void>): void;
+}
+
+/**
+ * A tapped inline button routed back from the notifier. `threadId` (change 02
+ * sub-milestone c) is the notification's own thread — surfaced so a handler can arm
+ * a thread-scoped follow-up (the ✏️ Edit marker) WITHOUT a customer→topic lookup.
+ * Undefined for adapters/updates that carry no thread context.
+ */
+export interface DecisionEvent {
+  notificationRef: string;
+  optionId: string;
+  by: string;
+  threadId?: string;
+}
+
+/** A free-text founder message in a customer thread (the ✏️ Edit reply). */
+export interface MessageEvent {
+  threadId: string;
+  text: string;
+  by: string;
 }

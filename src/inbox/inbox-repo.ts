@@ -13,6 +13,10 @@ export interface ClaimedInbox {
   id: string;
   channel_instance_id: string;
   channel_type: string;
+  /** The provider's own message id (agent_inbox.channel_message_id, NOT NULL). The
+   *  M2(c) drafter sets in_reply_to = this so an approved WhatsApp send is a QUOTED
+   *  reply (reuses the M2 Milestone B quoted-reply path — blueprint must-fix #2). */
+  channel_message_id: string;
   channel_thread_id: string | null;
   sender_address: string | null;
   sender_name: string | null;
@@ -50,9 +54,9 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
            FOR UPDATE SKIP LOCKED
            LIMIT $1
         )
-        RETURNING id, channel_instance_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients, raw_metadata
+        RETURNING id, channel_instance_id, channel_message_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients, raw_metadata
      )
-     SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_thread_id,
+     SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_message_id, c.channel_thread_id,
             c.sender_address, c.sender_name, c.subject, c.body, c.received_at,
             c.recipients, ci.config->>'accountEmail' AS account_email,
             c.raw_metadata->>'ticketNumber' AS ticket_number,

@@ -1,5 +1,6 @@
-import { query } from '../db';
+import { query, withClient } from '../db';
 import { normalizeEmailAddress, normalizeWhatsappAddress } from '../customers/onboarding';
+import { resolveDraftDecisionTx } from '../decisions/decisions';
 import type { OutboundAttachmentRef } from '../ports/channel.port';
 import type { BusinessHour, Holiday } from './send-window';
 
@@ -238,6 +239,222 @@ export async function enqueueOutbound(input: EnqueueOutboundInput): Promise<stri
     ],
   );
   return rows[0].id;
+}
+
+// ── M2(c): response-drafter draft rows ────────────────────────────────────────
+// A DRAFT parks as (status='pending', is_draft=true) → the drainer's claimDue NEVER
+// claims it (it filters is_draft=false), so NO draft is ever auto-sent. Approve/edit
+// flip it to (status='approved', is_draft=false) → the SAME drainer delivers it,
+// channel-correct + threaded, with ZERO drainer change. Every mutating call is a
+// GUARDED conditional UPDATE (WHERE id=$1 AND is_draft=true AND status='pending')
+// that RETURNS the row: a re-delivered Telegram callback (0 rows) is a null no-op
+// (idempotent, mirrors claimOverride). The queue-flip AND the linked decision
+// resolution happen in ONE transaction (via decision_id) so the audit outcome can
+// never diverge from the queue state (blueprint must-fix #6). Never logs the body.
+
+export interface EnqueueDraftInput {
+  channelInstanceId: string;
+  channelType: string; // to normalize the recipient (R37 contact join must hit)
+  recipientAddress: string;
+  body: string;
+  threadKey?: string | null;
+  inReplyTo?: string | null; // quoted-reply reuse: the inbound channel_message_id (decision #8)
+  subject?: string | null;
+  customerId?: string | null;
+  decisionId: string; // FK to the audit decision (mig 015) — resolved on approve/edit/reject
+}
+
+/**
+ * Insert a DRAFT row: status='pending', is_draft=true, linked to its audit decision.
+ * Never drained (the drainer filters is_draft=false). Recipient normalized per
+ * channel (R37). Returns the new queue id.
+ */
+export async function enqueueDraft(input: EnqueueDraftInput): Promise<string> {
+  const recipient = normalizeRecipient(input.channelType, input.recipientAddress);
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_outbound_queue
+        (customer_id, channel_instance_id, recipient_address, thread_key, in_reply_to, subject, body,
+         status, is_draft, decision_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', true, $8)
+     RETURNING id`,
+    [
+      input.customerId ?? null,
+      input.channelInstanceId,
+      recipient,
+      input.threadKey ?? null,
+      input.inReplyTo ?? null,
+      input.subject ?? null,
+      input.body,
+      input.decisionId,
+    ],
+  );
+  return rows[0].id;
+}
+
+/** A guarded-flip row shape: only these three columns are RETURNed by the draft
+ *  mutations (never the body — never logged). */
+interface FlippedDraftRow {
+  id: string;
+  decision_id: string | null;
+  customer_id: string | null;
+}
+
+/**
+ * Shared engine for every guarded draft mutation (approve / edit+approve / reject).
+ * ONE transaction: the guarded conditional UPDATE (WHERE id=$1 AND is_draft=true AND
+ * status='pending' RETURNING …) AND — only when a row actually flipped — the linked
+ * decision's outcome resolution, so the audit outcome can never diverge from the queue
+ * state (must-fix #6). A replayed tap matches 0 rows → ROLLBACK + null no-op (no
+ * double-flip, no double-resolve — mirrors claimOverride). Never selects/logs the body.
+ *
+ * `setSql` uses $1=id and then $2.. from `extraParams` (so the caller may thread
+ * approved_by / body). The decision resolution is skipped only if the flipped row has a
+ * NULL decision_id (defensive — enqueueDraft always links one).
+ */
+async function flipDraftAndResolve(
+  id: string,
+  setSql: string,
+  extraParams: unknown[],
+  outcome: 'accepted' | 'modified' | 'rejected',
+  humanOverride?: unknown,
+): Promise<DraftResolution | null> {
+  return withClient(async (client) => {
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<FlippedDraftRow>(
+        `UPDATE agent_outbound_queue
+            SET ${setSql}
+          WHERE id = $1 AND is_draft = true AND status = 'pending'
+          RETURNING id, decision_id, customer_id`,
+        [id, ...extraParams],
+      );
+      if (rows.length === 0) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const row = rows[0];
+      if (row.decision_id !== null) {
+        await resolveDraftDecisionTx(client, { decisionId: row.decision_id, outcome, humanOverride });
+      }
+      await client.query('COMMIT');
+      return { queueId: row.id, decisionId: row.decision_id, customerId: row.customer_id };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
+  });
+}
+
+/** The queue row + its decision, returned by every guarded draft mutation. `null`
+ *  return = the row was already resolved (a replayed tap → no-op, no double). */
+export interface DraftResolution {
+  queueId: string;
+  decisionId: string | null;
+  customerId: string | null;
+}
+
+/**
+ * Approve a draft: flip (status='approved', is_draft=false, approved_by/at set) so
+ * the drainer picks it up, AND resolve the linked decision outcome='accepted' — in
+ * ONE transaction. Guarded → idempotent; returns null if already resolved.
+ */
+export async function approveDraft(id: string, by: string): Promise<DraftResolution | null> {
+  return flipDraftAndResolve(
+    id,
+    `status = 'approved', is_draft = false, approved_by = $2, approved_at = now()`,
+    [by],
+    'accepted',
+  );
+}
+
+/**
+ * Edit + approve: also SET body=$2 (the founder's replacement), flip to approved,
+ * and resolve the decision outcome='modified' with human_override
+ * { action:'edit', by, edited_body } — ONE transaction. The caller MUST reject
+ * empty/whitespace `body` BEFORE calling (blueprint must-fix #3). Guarded/idempotent.
+ */
+export async function replaceDraftBodyAndApprove(
+  id: string,
+  body: string,
+  by: string,
+): Promise<DraftResolution | null> {
+  return flipDraftAndResolve(
+    id,
+    `status = 'approved', is_draft = false, approved_by = $2, approved_at = now(), body = $3`,
+    [by, body],
+    'modified',
+    { action: 'edit', by, edited_body: body },
+  );
+}
+
+/**
+ * Reject a draft: flip status='cancelled' (never drained) and resolve the decision
+ * outcome='rejected' with human_override { action:'reject', by } — ONE transaction.
+ * Guarded/idempotent.
+ */
+export async function cancelDraft(id: string, by: string): Promise<DraftResolution | null> {
+  return flipDraftAndResolve(id, `status = 'cancelled'`, [], 'rejected', { action: 'reject', by });
+}
+
+/**
+ * Read an OPEN draft (status='pending', is_draft=true) for arming the ✏️ Edit
+ * marker — does NOT mutate. Returns null when the row is not an open draft (already
+ * approved/cancelled → the edit tap is a no-op).
+ */
+export async function getDraftForEdit(id: string): Promise<DraftResolution | null> {
+  const { rows } = await query<FlippedDraftRow>(
+    `SELECT id, decision_id, customer_id FROM agent_outbound_queue
+      WHERE id = $1 AND is_draft = true AND status = 'pending'`,
+    [id],
+  );
+  if (rows.length === 0) return null;
+  return { queueId: rows[0].id, decisionId: rows[0].decision_id, customerId: rows[0].customer_id };
+}
+
+/** An open draft re-found by its originating inbox message, for re-presentation. */
+export interface OpenDraftForInbox {
+  queueId: string;
+  decisionId: string;
+  customerId: string | null;
+  /** The draft reply text (agent_outbound_queue.body). */
+  body: string;
+  /** The linked decision's agent_output JSONB ({ intent, draft_body, citations,
+   *  language }) — used to re-render the presentation without re-drafting. */
+  agentOutput: unknown;
+}
+
+/**
+ * Reclaim idempotency (blueprint must-fix #1): find the OPEN draft that a prior
+ * attempt already created for this inbox message (a draft that failed AT/AFTER the
+ * founder notify is reclaimed → without this it would mint a SECOND customer-facing
+ * draft + a second audit row). Joins the queue to its decision on decision_id and
+ * filters the decision's inbox_message_id. Returns null when no open draft exists.
+ */
+export async function findOpenDraftByInbox(inboxMessageId: string): Promise<OpenDraftForInbox | null> {
+  const { rows } = await query<{
+    id: string;
+    decision_id: string;
+    customer_id: string | null;
+    body: string;
+    agent_output: unknown;
+  }>(
+    `SELECT q.id, q.decision_id, q.customer_id, q.body, d.agent_output
+       FROM agent_outbound_queue q
+       JOIN agent_decisions d ON d.id = q.decision_id
+      WHERE d.inbox_message_id = $1 AND d.decision_type = 'draft_reply'
+        AND q.is_draft = true AND q.status = 'pending'
+      ORDER BY q.id DESC
+      LIMIT 1`,
+    [inboxMessageId],
+  );
+  if (rows.length === 0) return null;
+  return {
+    queueId: rows[0].id,
+    decisionId: rows[0].decision_id,
+    customerId: rows[0].customer_id,
+    body: rows[0].body,
+    agentOutput: rows[0].agent_output,
+  };
 }
 
 /** Global business-hours schedule (Phase 1: not per-customer). Read-only config. */

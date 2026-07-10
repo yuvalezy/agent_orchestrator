@@ -17,6 +17,12 @@ export async function setAppState(key: string, value: string): Promise<void> {
   );
 }
 
+/** Delete a key (M2c: clearing the per-thread ✏️ Edit marker after an edit resolves
+ *  or is abandoned). No-op when the key is absent. */
+export async function clearAppState(key: string): Promise<void> {
+  await query(`DELETE FROM app_state WHERE key = $1`, [key]);
+}
+
 /** Atomic counter bump (skipped-sender tally). */
 export async function incrementCounter(key: string): Promise<void> {
   await query(

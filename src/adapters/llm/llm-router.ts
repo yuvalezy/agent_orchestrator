@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, Intent, LlmMessage, LlmProviderClient, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, DraftRequest, DraftResult, Intent, LlmMessage, LlmProviderClient, TokenUsage, TriageContext } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
+import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draft-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft';
 
@@ -153,6 +154,26 @@ export class LlmRouter implements AgentLlmPort {
       maxTokens: 4096,
       validate: parseIntents,
       customerId,
+    });
+  }
+
+  /**
+   * Draft a cited reply (role 'draft'). Reuses the golden structured-call path — cost
+   * accounting, ordered failover, daily cap — with the strict DRAFT_SCHEMA. The model
+   * answers ONLY from `input.knowledge`; the drafter renders citations from those same
+   * chunks at `usedSourceIndexes` (never a free-text citation). Never logs the body.
+   */
+  async draftReply(input: DraftRequest): Promise<DraftResult> {
+    return this.callStructured<DraftResult>({
+      role: 'draft',
+      schema: DRAFT_SCHEMA,
+      system: DRAFT_SYSTEM,
+      messages: [{ role: 'user', content: draftUserMessage(input) }],
+      // Ample headroom: sonnet-5 runs adaptive thinking ON and max_tokens caps
+      // thinking + output combined (R44) — a tight budget could truncate the JSON.
+      maxTokens: 1024,
+      validate: parseDraft,
+      customerId: null,
     });
   }
 
