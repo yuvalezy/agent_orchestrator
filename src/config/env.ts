@@ -170,6 +170,32 @@ const envSchema = z.object({
   ACCEPTANCE_REPORT_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
   // Timezone for the day boundary so "daily" is the founder's local day (not UTC).
   ACCEPTANCE_REPORT_TZ: z.string().default('America/Panama'),
+
+  // ── MI "Project Brain": internal (founder/dev-facing) knowledge RAG over OUR own
+  // planning/decision/architecture/risk docs, reachable via a stdio MCP server (and,
+  // optionally, Telegram /ask). Kill-switch (mirrors KNOWLEDGE_SYNC_ENABLED): the
+  // internal-sync worker is registered ONLY when the literal "true". DORMANT by
+  // default so a boot never embeds the internal corpus by surprise. The MCP server
+  // (scripts/mcp-project-brain.ts) is a SEPARATE process and does NOT read this flag
+  // — it only searches whatever is already ingested.
+  //
+  // ⚠︎ ISOLATION: internal docs live in a SEPARATE table (internal_knowledge, mig 016)
+  // with its OWN search fn; the customer-drafting path (memoryRepo.search over
+  // agent_memory) is structurally incapable of returning an internal row.
+  // OPENAI_EMBEDDING_MODEL / _DIM (above) are shared; DIM MUST equal the vector(N)
+  // column in migration 016. The refuse-to-tombstone guard reuses
+  // KNOWLEDGE_TOMBSTONE_MAX_RATIO.
+  KNOWLEDGE_INTERNAL_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  KNOWLEDGE_INTERNAL_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000), // 1h
+  // Top-k nearest internal chunks returned by a search (MCP / Telegram default).
+  KNOWLEDGE_INTERNAL_K: z.coerce.number().int().positive().default(8),
+  // Cosine-distance ceiling (0..2); chunks beyond it are dropped as too weak to cite.
+  // A touch looser than the customer default (0.5) — the internal corpus is broader
+  // prose than the tightly-authored customer guides.
+  KNOWLEDGE_INTERNAL_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.6),
 });
 
 const parsed = envSchema.safeParse(process.env);

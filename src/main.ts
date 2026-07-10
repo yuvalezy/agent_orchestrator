@@ -19,9 +19,12 @@ import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.fac
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
 import { seedHolidays } from './adapters/outbound/holiday-seeder';
 import { buildKnowledgeSyncWorker } from './adapters/knowledge/knowledge-sync.worker';
+import { buildInternalSyncWorker } from './adapters/knowledge/internal-sync.worker';
 import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
+import { buildInternalDocSource } from './adapters/knowledge/internal-doc-source';
 import { buildEmbeddingAdapter } from './adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from './knowledge/memory-repo';
+import { internalKnowledgeRepo } from './knowledge/internal-repo';
 import { dbContactResolutionQueries } from './customers/contact-resolution';
 import { fetchUnprocessedFeedbackDecisions, fetchResolvedDraftDecisions } from './decisions/decisions';
 import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learning.worker';
@@ -31,6 +34,8 @@ import type { FounderNotifierPort } from './ports/founder-notifier.port';
 
 // M2a: advisory-lock namespace for the knowledge-sync reconcile ('know' as int32).
 const KNOWLEDGE_SYNC_LOCK_KEY = 0x6b6e6f77;
+// MI: advisory-lock namespace for the internal knowledge-sync reconcile ('intk').
+const INTERNAL_SYNC_LOCK_KEY = 0x696e746b;
 
 /** No-op notifier so the drainer can register even when Telegram is unconfigured
  *  (D-M / clean fallback). Its alerts silently drop — a loud WARN is emitted at
@@ -276,6 +281,53 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('acceptance-report worker NOT registered (ACCEPTANCE_REPORT_ENABLED=false)');
+  }
+
+  // MI "Project Brain": internal knowledge-sync worker — registered ONLY when
+  // KNOWLEDGE_INTERNAL_ENABLED (kill-switch, mirrors KNOWLEDGE_SYNC_ENABLED). DORMANT
+  // by default. Ingests OUR planning/decision/architecture docs into the SEPARATE
+  // internal_knowledge table (mig 016) — structurally isolated from the customer
+  // corpus. Same advisory-lock discipline as knowledge-sync, on its own key so the
+  // two reconciles never contend. The stdio MCP server is a separate process.
+  if (env.KNOWLEDGE_INTERNAL_ENABLED) {
+    if (!tryResolveCredential('OPENAI_API_KEY')) {
+      logger.warn('⚠️  KNOWLEDGE_INTERNAL_ENABLED=true but OPENAI_API_KEY is UNSET — internal embedding calls will fail until it is set.');
+    }
+    const internalWorker = buildInternalSyncWorker({
+      docSource: buildInternalDocSource(),
+      embedding: buildEmbeddingAdapter(
+        () => tryResolveCredential('OPENAI_API_KEY'),
+        env.OPENAI_BASE_URL,
+        { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+      ),
+      repo: internalKnowledgeRepo,
+      log: logger,
+      intervalMs: env.KNOWLEDGE_INTERNAL_SYNC_INTERVAL_MS,
+      tombstoneMaxRatio: env.KNOWLEDGE_TOMBSTONE_MAX_RATIO,
+    });
+    knowledgeWorkers.push({
+      ...internalWorker,
+      run: async () => {
+        await withClient(async (client) => {
+          const { rows } = await client.query<{ locked: boolean }>(
+            'SELECT pg_try_advisory_lock($1) AS locked',
+            [INTERNAL_SYNC_LOCK_KEY],
+          );
+          if (!rows[0]?.locked) {
+            logger.warn('internal knowledge sync: another instance holds the advisory lock — skipping this tick');
+            return;
+          }
+          try {
+            await internalWorker.run();
+          } finally {
+            await client.query('SELECT pg_advisory_unlock($1)', [INTERNAL_SYNC_LOCK_KEY]);
+          }
+        });
+      },
+    });
+    logger.info('internal knowledge-sync worker registered (KNOWLEDGE_INTERNAL_ENABLED=true)');
+  } else {
+    logger.info('internal knowledge-sync worker NOT registered (KNOWLEDGE_INTERNAL_ENABLED=false) — Project Brain corpus not ingested; set the flag to enable');
   }
 
   const app = buildApp(appDeps);
