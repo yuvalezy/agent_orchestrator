@@ -35,8 +35,8 @@ function fakeClient(
 }
 
 const models: Record<string, Record<LlmRole, string>> = {
-  anthropic: { triage: 'claude-sonnet-5', classify: 'claude-haiku-4-5', draft: 'claude-sonnet-5' },
-  openai: { triage: 'gpt-4.1', classify: 'gpt-4.1-mini', draft: 'gpt-4.1' },
+  anthropic: { triage: 'claude-sonnet-5', classify: 'claude-haiku-4-5', draft: 'claude-sonnet-5', answer: 'claude-sonnet-5' },
+  openai: { triage: 'gpt-4.1', classify: 'gpt-4.1-mini', draft: 'gpt-4.1', answer: 'gpt-4.1' },
 };
 
 function buildRouter(providers: Record<string, LlmProviderClient>, capUsd = 10, notify: (m: string) => Promise<void> = async () => {}) {
@@ -99,6 +99,28 @@ test('failover: primary auth-fails → fallback succeeds → one admin notice, c
   const { rows } = await query<{ provider: string }>(`SELECT provider FROM llm_costs WHERE created_at > now() - interval '1 min'`);
   // auth-fail never returned usage → only openai billed
   assert.deepEqual([...new Set(rows.map((r) => r.provider))], ['openai']);
+});
+
+test('synthesizeAnswer (role answer): returns grounded body + used indexes, records a cost row', async (t) => {
+  if (!(await ensureDb())) return t.skip('no db');
+  await query(`DELETE FROM llm_costs WHERE created_at > now() - interval '1 min'`);
+  const answerClient: LlmProviderClient = {
+    provider: 'anthropic',
+    complete: async () => ({ text: '', usage: { inputTokens: 50, outputTokens: 10 } }),
+    completeStructured: async <T>() => ({
+      value: { answer: 'The nightly export runs at 02:00 UTC.', used_sources: [0, 5, 0] } as unknown as T,
+      usage: { inputTokens: 50, outputTokens: 10 },
+    }),
+  };
+  const router = buildRouter({ anthropic: answerClient });
+  const out = await router.synthesizeAnswer({
+    question: 'When does the export run?',
+    sources: [{ content: 'Export at 02:00 UTC', label: 'ao › ops.md' }],
+  });
+  assert.equal(out.body, 'The nightly export runs at 02:00 UTC.');
+  assert.deepEqual(out.usedSourceIndexes, [0, 5, 0]); // router returns raw; the query service clamps/dedupes
+  const { rows } = await query<{ role: string }>(`SELECT role FROM llm_costs WHERE created_at > now() - interval '1 min'`);
+  assert.ok(rows.some((r) => r.role === 'answer'), 'billed under role answer');
 });
 
 test('all providers fail → LlmAllProvidersFailed + final admin notice', async (t) => {

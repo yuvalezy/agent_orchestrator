@@ -22,6 +22,7 @@ const RULE = 'import/no-restricted-paths';
 const FIXTURES = [
   'src/inbox/__illegal_import_fixture__.ts',
   'src/knowledge/__illegal_import_fixture__.ts',
+  'src/query/__illegal_import_fixture__.ts',
 ];
 
 const r = spawnSync(eslintBin, ['--no-ignore', '-f', 'json', ...FIXTURES], {

@@ -14,9 +14,9 @@ import { LlmRouter, type LlmRole } from './llm-router';
 // Per-(provider,role) model defaults (DA B1). Overridable via
 // LLM_MODEL_<PROVIDER>_<ROLE> — a fallback provider uses ITS OWN valid model.
 const MODEL_DEFAULTS: Record<string, Record<LlmRole, string>> = {
-  anthropic: { triage: 'claude-sonnet-5', classify: 'claude-haiku-4-5', draft: 'claude-sonnet-5' },
-  openai: { triage: 'gpt-4.1', classify: 'gpt-4.1-mini', draft: 'gpt-4.1' },
-  deepseek: { triage: 'deepseek-chat', classify: 'deepseek-chat', draft: 'deepseek-chat' },
+  anthropic: { triage: 'claude-sonnet-5', classify: 'claude-haiku-4-5', draft: 'claude-sonnet-5', answer: 'claude-sonnet-5' },
+  openai: { triage: 'gpt-4.1', classify: 'gpt-4.1-mini', draft: 'gpt-4.1', answer: 'gpt-4.1' },
+  deepseek: { triage: 'deepseek-chat', classify: 'deepseek-chat', draft: 'deepseek-chat', answer: 'deepseek-chat' },
 };
 
 function modelFor(provider: string, role: LlmRole): string {

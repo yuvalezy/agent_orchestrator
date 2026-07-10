@@ -1,6 +1,8 @@
 import { env } from '../../config/env';
+import { logger } from '../../logger';
 import { getAppState, setAppState, clearAppState } from '../../db/app-state';
 import type { WorkerDefinition } from '../../workers/worker-runner';
+import type { MessageEvent } from '../../ports/founder-notifier.port';
 import type { TelegramNotifier } from '../telegram/telegram-notifier';
 import { buildEzyPortalGateway } from '../ezy-portal';
 import { buildCancelHandler, CANCEL_OPTION } from '../../triage/decision-handler';
@@ -15,6 +17,8 @@ import {
   getDraftForEdit,
   replaceDraftBodyAndApprove,
 } from '../../outbound/outbound-repo';
+import { buildAskMessageHandler } from '../../query/ask-command';
+import { buildQueryEngineService } from '../query/factory';
 
 // Composition: register the callback handlers on the notifier and drive its poll from
 // a persisted offset (app_state). The notifier owns the Telegram I/O
@@ -50,17 +54,44 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
     if (draft && isDraftOption(d.optionId)) return draft(d);
   });
 
-  // M2c: the free-text edit capture (consumes the founder's next message in an ARMED
-  // thread as the draft replacement). Registered ONLY when the drafter is on.
-  if (env.KNOWLEDGE_DRAFT_ENABLED) {
-    notifier.onMessage(
-      buildDraftEditMessageHandler({
+  // COMPOSITE free-text router on onMessage (the notifier holds ONE message handler,
+  // so the M2c ✏️ Edit capture and the M5(a) `/ask` command MUST compose, not fork):
+  //   1. `/ask <question>` (M5(a)) — the founder Project Brain channel. It CONSUMES the
+  //      message (returns true) only when the text is an /ask command; otherwise it
+  //      returns false and we fall through.
+  //   2. the ✏️ Edit capture (M2c) — consumes the founder's next message in an ARMED
+  //      thread as the draft replacement (ignores unarmed threads).
+  // Each half is gated by its own kill-switch; the composite registers only if either
+  // is on. Order matters: an explicit `/ask` command wins over the edit capture.
+  const ask = env.QUERY_ENGINE_ENABLED
+    ? (() => {
+        const service = buildQueryEngineService((msg) =>
+          notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
+        );
+        return service
+          ? buildAskMessageHandler({
+              query: service,
+              postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+              log: logger,
+            })
+          : null;
+      })()
+    : null;
+
+  const draftEdit = env.KNOWLEDGE_DRAFT_ENABLED
+    ? buildDraftEditMessageHandler({
         readArmedEdit: (threadId) => getAppState(editMarkerKey(threadId)),
         clearArmedEdit: (threadId) => clearAppState(editMarkerKey(threadId)),
         replaceDraftBodyAndApprove,
         notifier,
-      }),
-    );
+      })
+    : null;
+
+  if (ask || draftEdit) {
+    notifier.onMessage(async (m: MessageEvent) => {
+      if (ask && (await ask(m))) return; // /ask consumed it
+      if (draftEdit) await draftEdit(m); // else the ✏️ Edit capture (ignores unarmed threads)
+    });
   }
 
   return {
