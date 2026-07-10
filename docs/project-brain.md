@@ -8,6 +8,32 @@ instead of grepping markdown, and it can be queried from Telegram too.
 It reuses the same RAG engine as the customer knowledge base (embeddings + pgvector
 cosine search), but over a **separate, isolated corpus**.
 
+## Add the MCP server (copy one line)
+
+Prereq (once): embed the corpus — `npm run migrate && OPENAI_API_KEY=… npm run internal:reconcile:once` — and keep `OPENAI_API_KEY` resolvable. The `cd` wrapper is required so `.env` loads.
+
+**Claude Code** — user scope (drop `-s user` to scope to the current repo):
+
+```bash
+claude mcp add project-brain -s user -- bash -lc 'cd /mnt/dev/tools/agent_orchestrator && exec npx tsx scripts/mcp-project-brain.ts'
+```
+
+**Codex** — one-liner (recent CLIs):
+
+```bash
+codex mcp add project-brain -- bash -lc 'cd /mnt/dev/tools/agent_orchestrator && exec npx tsx scripts/mcp-project-brain.ts'
+```
+
+…or add this block to `~/.codex/config.toml` (works on every Codex version):
+
+```toml
+[mcp_servers.project-brain]
+command = "bash"
+args = ["-lc", "cd /mnt/dev/tools/agent_orchestrator && exec npx tsx scripts/mcp-project-brain.ts"]
+```
+
+Verify with `claude mcp list` / `codex mcp list` (expect `project-brain … ✔`); it shows up in your **next** session. Remove with `claude mcp remove project-brain -s user`. Details on scope, tools, and how it works are below.
+
 ```mermaid
 flowchart TD
   subgraph disk[On-disk internal docs]
@@ -85,22 +111,16 @@ OPENAI_API_KEY=… npm run internal:reconcile:once
 Embedding uses `text-embedding-3-small` (1536 dims); the whole internal corpus is a few
 hundred chunks — cents, not dollars. Each embed request writes one `llm_costs` row.
 
-## Registering the MCP server in Claude Code
+## About the MCP server
 
-The MCP server (`scripts/mcp-project-brain.ts`) speaks **stdio JSON-RPC** — no network
-listener. It must run with the repo as its working directory so `.env` (and thus
-`OPENAI_API_KEY`) loads, so wrap it in a `cd`:
+The command to register it is at the [top of this doc](#add-the-mcp-server-copy-one-line)
+(Claude Code + Codex). A few notes on how it runs:
 
-```bash
-claude mcp add project-brain -s user -- \
-  bash -lc 'cd /mnt/dev/tools/agent_orchestrator && exec npx tsx scripts/mcp-project-brain.ts'
-```
-
-- `-s user` registers it for all your projects; drop it (or use `-s local`) to scope it
-  to the current repo only.
-- Verify: `claude mcp list` should show `project-brain … ✔ Connected`.
-- It appears in your **next** Claude Code session. Remove with
-  `claude mcp remove project-brain -s user`.
+- It speaks **stdio JSON-RPC** — no network listener. The `cd …` wrapper is required so
+  the repo's `.env` (hence `OPENAI_API_KEY`) loads; without it embeds fail.
+- `-s user` registers it for all your projects; use `-s local` (or drop the flag) to
+  scope it to the current repo only.
+- It appears in your **next** session; verify with `claude mcp list` / `codex mcp list`.
 
 > The MCP server only *reads* whatever is already ingested — it does not depend on
 > `KNOWLEDGE_INTERNAL_ENABLED` (that flag controls the in-process background re-sync
