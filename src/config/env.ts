@@ -108,6 +108,21 @@ const envSchema = z.object({
   // tombstone ratio exceeds this, the reconciler WARNs and skips (probable IO glitch,
   // not a real deletion). 0..1; 0.5 = never tombstone more than half a source at once.
   KNOWLEDGE_TOMBSTONE_MAX_RATIO: z.coerce.number().min(0).max(1).default(0.5),
+
+  // ── M2a(b): scoped RAG retrieval INTO the triage context. Kill-switch (mirrors
+  // KNOWLEDGE_SYNC_ENABLED): the retriever is injected into triage ONLY when the
+  // literal "true". Additive + best-effort — a missing OPENAI_API_KEY, an empty RAG,
+  // or a search error degrades to NO injected knowledge, never a triage failure.
+  KNOWLEDGE_RETRIEVAL_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Top-k nearest chunks pulled from the customer's own rows / from shared rows.
+  KNOWLEDGE_RETRIEVAL_K_CUSTOMER: z.coerce.number().int().nonnegative().default(5),
+  KNOWLEDGE_RETRIEVAL_K_SHARED: z.coerce.number().int().nonnegative().default(3),
+  // Cosine-distance ceiling (embedding <=> query, 0..2 for normalized vectors);
+  // chunks beyond it are dropped as too weak to cite. Lower = stricter.
+  KNOWLEDGE_RETRIEVAL_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.5),
 });
 
 const parsed = envSchema.safeParse(process.env);

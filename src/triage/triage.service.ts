@@ -1,8 +1,9 @@
 import { logger } from '../logger';
-import type { AgentLlmPort, Intent } from '../ports/llm.port';
+import type { AgentLlmPort, Intent, KnowledgeChunk } from '../ports/llm.port';
 import type { TargetTask, TaskTargetPort } from '../ports/task-target.port';
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/group-summary.port';
+import type { KnowledgeRetriever } from '../knowledge/retrieval';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
@@ -73,6 +74,10 @@ export interface TriageDeps {
   /** M2: the muted-group @-mention path (summarize + media). Optional — when absent
    *  a group-mention row is safely skipped rather than crashing the batch. */
   groupSummary?: GroupSummaryPort;
+  /** M2a(b): scoped RAG retrieval into the triage context. Optional + best-effort —
+   *  when absent (or on any retrieval error) triage runs with NO injected knowledge
+   *  (the pre-M2a behavior). The retriever swallows its own errors (returns []). */
+  knowledgeRetriever?: KnowledgeRetriever;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -175,7 +180,10 @@ export class TriageService {
     const address = row.sender_address ?? '';
     const threadKey = row.channel_thread_id ?? address;
     const openTasks = await this.deps.taskTarget.findOpenTasks({ projectRef: config.projectRef });
-    const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks);
+    // M2a(b): scope RAG retrieval to THIS customer (customerId is the resolved,
+    // known customer — never null here). Additive: [] when disabled or on error.
+    const knowledge = await this.retrieveKnowledge(row, customerId);
+    const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks, knowledge);
     const intents = await this.deps.llm.extractIntents(context);
 
     if (intents.length === 0) {
@@ -192,6 +200,21 @@ export class TriageService {
       await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly }, createdThisRun);
     }
     await markProcessed(inboxId);
+  }
+
+  /**
+   * M2a(b): scoped, best-effort knowledge retrieval for the triage context. The
+   * query is the message subject+body; the customer scope is the EXACT resolved
+   * customerId (never null for a known customer). Returns [] when no retriever is
+   * wired (feature off) or the message has no text. The retriever swallows its own
+   * errors (returns []), so triage is never blocked by a retrieval miss.
+   */
+  private async retrieveKnowledge(row: ClaimedInbox, customerId: string): Promise<KnowledgeChunk[]> {
+    const retriever = this.deps.knowledgeRetriever;
+    if (!retriever) return [];
+    const queryText = [row.subject, row.body].filter((s): s is string => !!s && s.trim().length > 0).join('\n');
+    if (!queryText) return [];
+    return retriever.retrieve(queryText, customerId);
   }
 
   /**

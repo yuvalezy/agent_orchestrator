@@ -1,14 +1,18 @@
 import { env } from '../../config/env';
 import { logger } from '../../logger';
 import { incrementCounter } from '../../db/app-state';
+import { tryResolveCredential } from '../../config/credentials';
 import type { WorkerDefinition } from '../../workers/worker-runner';
 import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import { dbContactResolutionQueries } from '../../customers/contact-resolution';
 import { TriageService } from '../../triage/triage.service';
 import { FailureEpisodeTracker } from '../../triage/failure-episode';
+import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
+import { memoryRepo } from '../../knowledge/memory-repo';
 import { claimBatch, failStuck } from '../../inbox/inbox-repo';
 import { buildEzyPortalGateway } from '../ezy-portal';
 import { buildLlmRouter } from '../llm/factory';
+import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildGroupSummaryAdapter } from '../whatsapp-manager/factory';
 
 // Composition (imports adapters + core): build the TriageService with the real
@@ -17,6 +21,40 @@ import { buildGroupSummaryAdapter } from '../whatsapp-manager/factory';
 
 const SKIPPED_COUNTER_KEY = 'skipped_unknown_senders';
 const BATCH = 5;
+
+/**
+ * M2a(b): build the scoped-RAG retriever wired into triage — the ONLY place the
+ * embedding ADAPTER + core memoryRepo are composed for the triage path (D1: core
+ * never imports adapters). Gated by KNOWLEDGE_RETRIEVAL_ENABLED (mirrors the sync
+ * kill-switch) so it stays dormant until a corpus is ingested. Returns undefined
+ * when off → triage runs with no injected knowledge. When on without an
+ * OPENAI_API_KEY it still wires (the key resolves lazily; the retriever degrades to
+ * [] on the failed embed) but WARNs loudly at boot.
+ */
+function buildTriageKnowledgeRetriever(): KnowledgeRetriever | undefined {
+  if (!env.KNOWLEDGE_RETRIEVAL_ENABLED) {
+    logger.info('triage knowledge retrieval NOT wired (KNOWLEDGE_RETRIEVAL_ENABLED=false)');
+    return undefined;
+  }
+  if (!tryResolveCredential('OPENAI_API_KEY')) {
+    logger.warn('⚠️  KNOWLEDGE_RETRIEVAL_ENABLED=true but OPENAI_API_KEY is UNSET — triage retrieval degrades to no knowledge until it is set.');
+  }
+  const embedding = buildEmbeddingAdapter(
+    () => tryResolveCredential('OPENAI_API_KEY'),
+    env.OPENAI_BASE_URL,
+    { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+  );
+  logger.info('triage knowledge retrieval wired (KNOWLEDGE_RETRIEVAL_ENABLED=true)');
+  return buildKnowledgeRetriever({
+    embedding,
+    search: memoryRepo.search.bind(memoryRepo),
+    options: {
+      kCustomer: env.KNOWLEDGE_RETRIEVAL_K_CUSTOMER,
+      kShared: env.KNOWLEDGE_RETRIEVAL_K_SHARED,
+      maxDistance: env.KNOWLEDGE_RETRIEVAL_MAX_DISTANCE,
+    },
+  });
+}
 
 export function buildInboxProcessorWorker(notifier: FounderNotifierPort): WorkerDefinition {
   const taskTarget = buildEzyPortalGateway();
@@ -34,6 +72,8 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     // M2: the muted-group @-mention path (summarize over write key + media over
     // read key). Lazily-keyed adapter — no secret resolved at build.
     groupSummary: buildGroupSummaryAdapter(),
+    // M2a(b): scoped RAG retrieval into the triage context (gated; see below).
+    knowledgeRetriever: buildTriageKnowledgeRetriever(),
   });
 
   // Early-warning tracker (§9.5): raises ONE admin alert as soon as triage failures

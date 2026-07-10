@@ -1,5 +1,5 @@
 import { query } from '../db';
-import type { TriageContext } from '../ports/llm.port';
+import type { KnowledgeChunk, TriageContext } from '../ports/llm.port';
 import type { TargetTask } from '../ports/task-target.port';
 
 // Context loader (task 6.2, core — db + port TYPES only, no adapter). Builds the
@@ -45,11 +45,13 @@ export async function loadCustomerConfig(customerId: string): Promise<CustomerCo
   };
 }
 
-/** Assemble the TriageContext from the message, customer, and open tasks. */
+/** Assemble the TriageContext from the message, customer, open tasks, and any
+ *  retrieved RAG knowledge (change 02 §2.2 — additive, defaults to none). */
 export function buildTriageContext(
   message: { subject: string | null; body: string | null },
   config: CustomerConfig,
   openTasks: TargetTask[],
+  knowledge: KnowledgeChunk[] = [],
 ): TriageContext {
   return {
     message: { subject: message.subject ?? undefined, body: message.body },
@@ -59,5 +61,6 @@ export function buildTriageContext(
       preferredLanguage: config.preferredLanguage,
     },
     recentTasks: openTasks.map((t) => ({ ref: t.ref, title: t.title })),
+    knowledge,
   };
 }

@@ -77,6 +77,12 @@ export const TRIAGE_SYSTEM = [
   '  "unclear" when the message is ambiguous or not actionable.',
   '- related_open_task_ref: an open-task ref from context this clearly relates to, else null.',
   '',
+  'The context may include a "Relevant knowledge" section — chunks retrieved from the',
+  'product guides/docs (customer-specific + shared), each with a [n] citation. Use it',
+  'to judge whether the message is already answered by an existing guide: prefer',
+  '"question_existing" (often lower priority) when the ask is covered there. Treat it',
+  'as reference only — never invent an intent just because a guide exists.',
+  '',
   'One message may yield multiple intents, or none (return an empty array). Do not',
   'invent tasks for greetings/acknowledgements — use "compliment" or "info_provided".',
 ].join('\n');
@@ -93,5 +99,19 @@ export function triageUserMessage(ctx: TriageContext): string {
   }
   if (ctx.message.subject) parts.push(`Subject: ${ctx.message.subject}`);
   parts.push(`Message: ${ctx.message.body ?? '(no text)'}`);
+
+  // Cited RAG knowledge (change 02 §2.2). Always render the header — an explicit
+  // "(none)" tells the model the corpus had nothing relevant (vs. a forgotten field).
+  parts.push('', 'Relevant knowledge (may be empty):');
+  if (ctx.knowledge?.length) {
+    ctx.knowledge.forEach((k, i) => {
+      const cite = [k.title, k.section].filter((s): s is string => !!s).join(' › ') || 'untitled';
+      const route = k.route ? ` (${k.route})` : '';
+      parts.push(`[${i + 1}] ${cite}${route}`);
+      parts.push(k.content);
+    });
+  } else {
+    parts.push('(none)');
+  }
   return parts.join('\n');
 }

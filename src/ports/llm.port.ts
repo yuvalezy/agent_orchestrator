@@ -3,6 +3,21 @@
 // the gateway (project invariant #8).
 
 /**
+ * One retrieved knowledge chunk injected into the triage context (change 02
+ * §2.2, sub-milestone b). Carries the citation fields (title / route / section)
+ * plus the cosine distance so a later drafter (sub-milestone c) can cite the
+ * source it came from. `content` is the chunk text the extractor reads.
+ */
+export interface KnowledgeChunk {
+  content: string;
+  title: string | null;
+  route: string | null;
+  section: string | null;
+  /** Cosine distance to the query (embedding <=> query); smaller = closer. */
+  distance: number;
+}
+
+/**
  * Triage input assembled for the extractor. Placeholder shape (blueprint
  * decision #4) — design.md references `TriageContext` without defining it;
  * refine when the triage agent lands (M1.5b). Not schema-authoritative.
@@ -11,6 +26,9 @@ export interface TriageContext {
   message: { subject?: string; body: string | null; language?: string };
   customer?: { ref: string; displayName: string; preferredLanguage?: string };
   recentTasks?: Array<{ ref: string; title: string }>;
+  /** Scoped RAG knowledge (customer-scoped + shared), cited. May be empty/absent
+   *  (retrieval is additive — it never blocks triage). See src/knowledge/retrieval.ts. */
+  knowledge?: KnowledgeChunk[];
 }
 
 /**

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { INTENTS_SCHEMA, parseIntents } from './triage-prompt';
+import { INTENTS_SCHEMA, parseIntents, triageUserMessage } from './triage-prompt';
+import type { TriageContext } from '../../ports/llm.port';
 
 // DA B3: the WIRE schema must be strict-output-clean or it 400s OpenAI/Anthropic
 // strict modes. Assert it contains NONE of the banned keywords, additionalProperties
@@ -73,4 +74,36 @@ test('parseIntents rejects an unknown category', () => {
 
 test('parseIntents accepts an empty intents array', () => {
   assert.deepEqual(parseIntents({ intents: [] }), []);
+});
+
+// ── M2a(b): the injected "Relevant knowledge" section (cited RAG chunks) ──
+const baseCtx = (over: Partial<TriageContext> = {}): TriageContext => ({
+  message: { body: 'the export button is broken' },
+  customer: { ref: 'bp1', displayName: 'Acme', preferredLanguage: 'en' },
+  recentTasks: [],
+  ...over,
+});
+
+test('triageUserMessage renders cited knowledge chunks (title › section (route) + content) when present', () => {
+  const msg = triageUserMessage(
+    baseCtx({
+      knowledge: [
+        { content: 'To export, open Reports → Export.', title: 'Exporting', section: 'CSV export', route: '/reports', distance: 0.1 },
+        { content: 'Invoices live under Settings.', title: 'Billing', section: null, route: null, distance: 0.3 },
+      ],
+    }),
+  );
+  assert.match(msg, /Relevant knowledge \(may be empty\):/);
+  assert.match(msg, /\[1\] Exporting › CSV export \(\/reports\)/, 'chunk 1 cites title/section/route');
+  assert.match(msg, /To export, open Reports → Export\./, 'chunk 1 content is included');
+  assert.match(msg, /\[2\] Billing/, 'chunk 2 cites the title (no section/route)');
+  assert.match(msg, /Invoices live under Settings\./, 'chunk 2 content is included');
+});
+
+test('triageUserMessage renders an explicit (none) when knowledge is empty or absent', () => {
+  const withEmpty = triageUserMessage(baseCtx({ knowledge: [] }));
+  const withAbsent = triageUserMessage(baseCtx());
+  for (const m of [withEmpty, withAbsent]) {
+    assert.match(m, /Relevant knowledge \(may be empty\):\n\(none\)/, 'header + (none) so the model knows nothing matched');
+  }
 });
