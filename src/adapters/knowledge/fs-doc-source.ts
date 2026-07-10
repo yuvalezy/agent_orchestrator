@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DocSourcePort, ScannedDoc } from '../../ports/doc-source.port';
 import { KNOWLEDGE_SOURCES, type KnowledgeSource } from './sources';
@@ -33,6 +33,8 @@ export interface FsDocSourceDeps {
   readDir?: (absPath: string) => string[];
   /** Existence seam (default: node:fs existsSync). */
   exists?: (absPath: string) => boolean;
+  /** Directory-test seam (default: node:fs statSync().isDirectory()) — locale-tree recursion. */
+  isDir?: (absPath: string) => boolean;
   /** Hash function seam (default: computeContentHash). */
   hash?: typeof computeContentHash;
 }
@@ -40,6 +42,7 @@ export interface FsDocSourceDeps {
 const DEFAULT_REPO_ROOTS: Record<KnowledgeSource['repo'], string> = {
   portal: '/mnt/dev/portal',
   'ai-agent': '/mnt/dev/ai-agent',
+  wms: '/mnt/dev/wms',
 };
 
 interface ParsedFrontmatter {
@@ -157,12 +160,16 @@ function scanFile(args: {
   module: string;
   locale: string;
   hash: typeof computeContentHash;
+  /** Path-derived slug used when the file carries no `slug` frontmatter (locale-tree). */
+  derivedSlug?: string;
 }): ScannedDoc {
-  const { path, raw, source, module, locale, hash } = args;
+  const { path, raw, source, module, locale, hash, derivedSlug } = args;
   const { fmText, body } = splitFrontmatter(raw, path);
   const fm = parseFrontmatter(fmText);
 
-  const slug = fm.slug?.trim() ?? '';
+  // Frontmatter slug wins when present; otherwise fall back to the path-derived slug
+  // (locale-tree corpora authored without DocArticle frontmatter). Still kebab-validated.
+  const slug = fm.slug?.trim() || derivedSlug?.trim() || '';
   if (!slug) {
     throw new Error(`${path}: frontmatter field 'slug' is required`);
   }
@@ -203,6 +210,7 @@ export function buildFsDocSource(deps?: FsDocSourceDeps): DocSourcePort {
   const readFile = deps?.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
   const readDir = deps?.readDir ?? ((p: string) => readdirSync(p));
   const exists = deps?.exists ?? ((p: string) => existsSync(p));
+  const isDir = deps?.isDir ?? ((p: string) => statSync(p).isDirectory());
   const hash = deps?.hash ?? computeContentHash;
 
   /** Scan one `{localeDir}/*.md` directory into the accumulator, enforcing docKey
@@ -233,6 +241,52 @@ export function buildFsDocSource(deps?: FsDocSourceDeps): DocSourcePort {
     }
   }
 
+  /** Recursively scan a `{locale}/**` tree (locale-first layout). The module is the
+   *  top sub-dir under the locale; a file directly under the locale uses the source's
+   *  moduleName. The slug is DERIVED from the path below the module dir (kebab-joined),
+   *  since these corpora carry no `slug` frontmatter. */
+  function scanLocaleTree(args: {
+    localeBase: string;
+    source: KnowledgeSource;
+    locale: string;
+    seen: Set<string>;
+    out: ScannedDoc[];
+  }): void {
+    const { localeBase, source, locale, seen, out } = args;
+    if (!exists(localeBase)) return;
+    const topModule = source.moduleName === 'from-dir' ? source.id : source.moduleName;
+
+    const walk = (absDir: string, relParts: string[]): void => {
+      const entries = readDir(absDir);
+      entries.sort(); // deterministic order
+      for (const name of entries) {
+        const abs = join(absDir, name);
+        if (isDir(abs)) {
+          walk(abs, [...relParts, name]);
+          continue;
+        }
+        if (!name.endsWith('.md')) continue;
+        const base = name.slice(0, -'.md'.length);
+        // top-level file → module = source module, slug = basename;
+        // nested file → module = first dir, slug = the path below that dir, kebab-joined.
+        const module = relParts.length === 0 ? topModule : relParts[0];
+        const slugParts = relParts.length === 0 ? [base] : [...relParts.slice(1), base];
+        const derivedSlug = slugParts.join('-').toLowerCase();
+        const raw = readFile(abs);
+        const doc = scanFile({ path: abs, raw, source, module, locale, hash, derivedSlug });
+        if (seen.has(doc.docKey)) {
+          throw new Error(
+            `${abs}: duplicate slug for (source=${source.id}, module=${module}, locale=${locale}) → docKey ${doc.docKey}`,
+          );
+        }
+        seen.add(doc.docKey);
+        out.push(doc);
+      }
+    };
+
+    walk(localeBase, []);
+  }
+
   async function listDocs(): Promise<ScannedDoc[]> {
     const out: ScannedDoc[] = [];
     const seen = new Set<string>();
@@ -249,6 +303,10 @@ export function buildFsDocSource(deps?: FsDocSourceDeps): DocSourcePort {
         const module = source.moduleName === 'from-dir' ? source.id : source.moduleName;
         for (const locale of ingestLocales) {
           scanLocaleDir({ localeDir: join(absRoot, locale), source, module, locale, seen, out });
+        }
+      } else if (source.layout === 'locale-tree') {
+        for (const locale of ingestLocales) {
+          scanLocaleTree({ localeBase: join(absRoot, locale), source, locale, seen, out });
         }
       } else {
         // module-tree: <root>/<moduleDir>/docs/{locale}/*.md, module = <dir>App (or fixed).

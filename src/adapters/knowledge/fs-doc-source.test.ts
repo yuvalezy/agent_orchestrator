@@ -9,13 +9,14 @@ import type { KnowledgeSource } from './sources';
 // slug rejection, per-(source,module,locale) slug uniqueness, and ⚠︎ IO/scan errors
 // propagating as a THROW (so the reconciler aborts rather than diffing a partial set).
 
-const REPO_ROOTS = { portal: '/repo', 'ai-agent': '/ai' } as const;
+const REPO_ROOTS = { portal: '/repo', 'ai-agent': '/ai', wms: '/wms' } as const;
 
 /** Build fs seams from a flat { absPath: content } file map. */
-function mockFs(files: Record<string, string>): Pick<FsDocSourceDeps, 'readFile' | 'readDir' | 'exists'> {
+function mockFs(files: Record<string, string>): Pick<FsDocSourceDeps, 'readFile' | 'readDir' | 'exists' | 'isDir'> {
   const paths = Object.keys(files);
   const isDir = (p: string): boolean => paths.some((f) => f.startsWith(p.endsWith('/') ? p : p + '/'));
   return {
+    isDir,
     exists: (p) => Object.prototype.hasOwnProperty.call(files, p) || isDir(p),
     readFile: (p) => {
       if (!Object.prototype.hasOwnProperty.call(files, p)) {
@@ -39,6 +40,24 @@ function mockFs(files: Record<string, string>): Pick<FsDocSourceDeps, 'readFile'
 
 const doc = (slug: string, extra = ''): string =>
   `---\nslug: ${slug}\ntitle: T ${slug}\nroute: /r/${slug}\norder: 10\ntags: [a, b]\n---\n\nBody for ${slug}.${extra}\n`;
+
+/** A doc WITHOUT a slug (title/description only) — the WMS locale-tree corpus form. */
+const noSlugDoc = (title: string): string => `---\ntitle: ${title}\ndescription: d\n---\n\nBody ${title}.\n`;
+
+const wmsSource = (over: Partial<KnowledgeSource> = {}): KnowledgeSource => ({
+  id: 'wms',
+  repo: 'wms',
+  root: 'ezy-wms-backend/Service/Docs/Content/wms',
+  layout: 'locale-tree',
+  moduleName: 'wms',
+  locales: ['en'],
+  ingestLocales: ['en'],
+  primaryLocale: 'en',
+  scope: 'shared',
+  bpRef: null,
+  ...over,
+});
+const WROOT = '/wms/ezy-wms-backend/Service/Docs/Content/wms';
 
 const flatSource = (over: Partial<KnowledgeSource> = {}): KnowledgeSource => ({
   id: 'pos',
@@ -109,6 +128,46 @@ test('module-tree: derives module `<dir>App` and skips webhooks', async () => {
     'portal-business:commerceApp:es:orders',
   ]);
   assert.ok(!docs.some((d) => d.module === 'webhooksApp'), 'webhooks module is skipped');
+});
+
+test('locale-tree: recursive walk — module = top dir, slug path-derived (no frontmatter slug)', async () => {
+  const src = wmsSource();
+  const files = {
+    [`${WROOT}/en/index.md`]: noSlugDoc('WMS'),
+    [`${WROOT}/en/counting/index.md`]: noSlugDoc('Counting'),
+    [`${WROOT}/en/goods-receipt/index.md`]: noSlugDoc('Goods Receipt'),
+    [`${WROOT}/en/getting-started/backend-configuration/appsettings.md`]: noSlugDoc('App Settings'),
+  };
+  const port = buildFsDocSource({ sources: [src], repoRoots: REPO_ROOTS, ...mockFs(files) });
+  const docs = await port.listDocs();
+  const keys = docs.map((d) => d.docKey).sort();
+  // top-level file → module 'wms'; nested → module = top dir; deeper path flattens into the slug.
+  // the three separate `index.md` files stay UNIQUE because their modules differ.
+  assert.deepEqual(keys, [
+    'wms:counting:en:index',
+    'wms:getting-started:en:backend-configuration-appsettings',
+    'wms:goods-receipt:en:index',
+    'wms:wms:en:index',
+  ]);
+  const app = docs.find((d) => d.module === 'getting-started');
+  assert.ok(app, 'the deeply-nested doc is ingested');
+  assert.equal(app!.scope, 'shared');
+  assert.equal(app!.content, 'Body App Settings.');
+});
+
+test('locale-tree: frontmatter slug still overrides the path-derived slug', async () => {
+  const src = wmsSource();
+  const files = { [`${WROOT}/en/counting/process.md`]: doc('custom-slug') };
+  const port = buildFsDocSource({ sources: [src], repoRoots: REPO_ROOTS, ...mockFs(files) });
+  const docs = await port.listDocs();
+  assert.equal(docs[0].docKey, 'wms:counting:en:custom-slug');
+});
+
+test('locale-tree: a non-kebab derived slug (bad filename) THROWS', async () => {
+  const src = wmsSource();
+  const files = { [`${WROOT}/en/counting/Bad_File.md`]: noSlugDoc('Bad') };
+  const port = buildFsDocSource({ sources: [src], repoRoots: REPO_ROOTS, ...mockFs(files) });
+  await assert.rejects(port.listDocs(), /kebab-case/);
 });
 
 test('rejects a non-kebab slug (THROWS)', async () => {

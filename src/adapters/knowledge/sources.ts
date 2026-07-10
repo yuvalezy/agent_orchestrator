@@ -8,20 +8,25 @@
 //
 //   layout 'flat-locale'  → <root>/{locale}/*.md              (one module = this source)
 //   layout 'module-tree'  → <root>/<moduleDir>/docs/{locale}/*.md  (module per dir)
+//   layout 'locale-tree'  → <root>/{locale}/**/*.md           (locale-first, recursive:
+//                            module = the top sub-dir under the locale (files directly
+//                            under the locale use `moduleName`); slug is DERIVED from the
+//                            path below the module dir when the file has no `slug`
+//                            frontmatter — for doc sets not authored in the DocArticle form)
 //
 // ⚠︎ Customer scope carries the BP-ref UUID (NOT the friendly code) so it resolves
 // via findCustomerByBpRef (contact-resolution.ts). A customer source with an
 // unresolved/absent bpRef MUST fail closed (skipped by sync) — it must NEVER fall
 // back to shared (customer_id NULL = visible to every customer = data leak).
 
-export type DocLayout = 'flat-locale' | 'module-tree';
+export type DocLayout = 'flat-locale' | 'module-tree' | 'locale-tree';
 export type DocScope = 'shared' | 'customer';
 
 export interface KnowledgeSource {
   /** Stable source id — the first segment of every docKey it produces. */
   id: string;
   /** Checkout the root is relative to. */
-  repo: 'portal' | 'ai-agent';
+  repo: 'portal' | 'ai-agent' | 'wms';
   /** Repo-relative directory. flat-locale: contains {locale}/. module-tree: contains <mod>/docs/{locale}/. */
   root: string;
   layout: DocLayout;
@@ -148,6 +153,24 @@ export const KNOWLEDGE_SOURCES = [
     moduleName: 'ai-platform',
     locales: ['en', 'es'],
     primaryLocale: 'es',
+    scope: 'shared',
+    bpRef: null,
+  },
+
+  // ── EZY WMS — the PUBLIC product knowledge base (locale-first, category subdirs;
+  //    docs carry title/description only, so slugs are path-derived). SHARED knowledge
+  //    used to answer customer questions about WMS. This is DISTINCT from the WMS
+  //    entries in Project Brain (internal-sources.ts: wms-plan/backend/frontend →
+  //    internal_knowledge), which point at plan/ + code docs, NOT this Service/Docs
+  //    content — so there is no double-index and no isolation crossover. ─────────────
+  {
+    id: 'wms',
+    repo: 'wms',
+    root: 'ezy-wms-backend/Service/Docs/Content/wms',
+    layout: 'locale-tree',
+    moduleName: 'wms', // module for files directly under the locale (index/dashboard/…)
+    locales: ['en', 'es'],
+    primaryLocale: 'en', // WMS docs are authored English-first (es is the translation)
     scope: 'shared',
     bpRef: null,
   },

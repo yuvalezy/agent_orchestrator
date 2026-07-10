@@ -14,6 +14,7 @@
     "db:create": "tsx scripts/create-db.ts",
     "onboard": "tsx scripts/onboard-customer.ts --",
     "reconcile:once": "tsx scripts/reconcile-once.ts",
+    "knowledge:reconcile:once": "tsx scripts/knowledge-reconcile-once.ts",
     "internal:reconcile:once": "tsx scripts/internal-reconcile-once.ts",
     "mcp:project-brain": "tsx scripts/mcp-project-brain.ts",
     "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
