@@ -88,6 +88,27 @@ export async function recordDraftDecision(input: {
 }
 
 /**
+ * Open a draft_reply audit row for a FOUNDER-INITIATED release-note notification
+ * (M2(e)) — no inbound message, so inbox_message_id is NULL (nullable, mig 007). The
+ * resolve/approve/edit/reject path (resolveDraftDecisionTx, via the queue flip) is
+ * IDENTICAL to an inbound draft — a release-note draft is just a draft_reply whose
+ * agent_output carries { kind:'release_note', release_note_key, title, draft_body,
+ * citations, language }. Returns the new decision id (the queue draft row FKs to it).
+ */
+export async function recordReleaseNoteDraftDecision(input: {
+  customerId: string;
+  agentOutput: unknown;
+}): Promise<{ decisionId: string }> {
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, outcome)
+     VALUES ($1, NULL, 'draft_reply', $2::jsonb, 'pending')
+     RETURNING id`,
+    [input.customerId, JSON.stringify(input.agentOutput ?? null)],
+  );
+  return { decisionId: rows[0].id };
+}
+
+/**
  * Resolve a draft decision WITHIN the caller's transaction (the outbound-repo draft
  * flip passes its PoolClient) so the outcome commits atomically with the queue-row
  * flip (blueprint must-fix #6). Idempotent: `WHERE id=$1 AND outcome='pending'` — a

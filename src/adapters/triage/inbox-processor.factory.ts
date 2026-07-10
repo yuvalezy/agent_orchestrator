@@ -9,6 +9,8 @@ import { TriageService } from '../../triage/triage.service';
 import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildResponseDrafter, type ResponseDrafter } from '../../triage/response-drafter';
+import { buildCrossChannelDedup, type CrossChannelDedup } from '../../triage/cross-channel-dedup';
+import { searchConversationLinks, insertConversationLink } from '../../triage/conversation-link-repo';
 import { memoryRepo } from '../../knowledge/memory-repo';
 import { claimBatch, failStuck } from '../../inbox/inbox-repo';
 import { enqueueDraft, findOpenDraftByInbox } from '../../outbound/outbound-repo';
@@ -91,6 +93,40 @@ function buildResponseDrafterGated(
   });
 }
 
+/**
+ * M2(f): build the cross-channel dedup matcher wired into triage — the composition root
+ * where the embedding ADAPTER meets the core conversation-link repo (D1: core never
+ * imports adapters). Gated by CROSS_CHANNEL_DEDUP_ENABLED so it stays dormant → dedup
+ * runs as before (same-thread + title similarity). Returns undefined when off. When on
+ * without an OPENAI_API_KEY it still wires (the key resolves lazily; embed degrades to
+ * no cross-channel match) but WARNs loudly at boot.
+ */
+function buildCrossChannelDedupGated(): CrossChannelDedup | undefined {
+  if (!env.CROSS_CHANNEL_DEDUP_ENABLED) {
+    logger.info('cross-channel dedup NOT wired (CROSS_CHANNEL_DEDUP_ENABLED=false)');
+    return undefined;
+  }
+  if (!tryResolveCredential('OPENAI_API_KEY')) {
+    logger.warn('⚠️  CROSS_CHANNEL_DEDUP_ENABLED=true but OPENAI_API_KEY is UNSET — cross-channel dedup degrades to no match until it is set.');
+  }
+  const embedding = buildEmbeddingAdapter(
+    () => tryResolveCredential('OPENAI_API_KEY'),
+    env.OPENAI_BASE_URL,
+    { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+  );
+  logger.info('cross-channel dedup wired (CROSS_CHANNEL_DEDUP_ENABLED=true)');
+  return buildCrossChannelDedup({
+    embedding,
+    search: searchConversationLinks,
+    record: insertConversationLink,
+    options: {
+      windowMinutes: env.CROSS_CHANNEL_DEDUP_WINDOW_MINUTES,
+      maxDistance: env.CROSS_CHANNEL_DEDUP_MAX_DISTANCE,
+      limit: 5,
+    },
+  });
+}
+
 export function buildInboxProcessorWorker(notifier: FounderNotifierPort): WorkerDefinition {
   const taskTarget = buildEzyPortalGateway();
   const llm = buildLlmRouter({
@@ -111,6 +147,8 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     knowledgeRetriever: buildTriageKnowledgeRetriever(),
     // M2a(c): cited-draft responder for answerable questions (gated; dormant by default).
     responseDrafter: buildResponseDrafterGated(llm, notifier),
+    // M2(f): cross-channel semantic dedup (gated; dormant by default).
+    crossChannelDedup: buildCrossChannelDedupGated(),
   });
 
   // Early-warning tracker (§9.5): raises ONE admin alert as soon as triage failures
