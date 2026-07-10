@@ -105,6 +105,43 @@ export interface FeedbackMemoryRepo {
   insertFeedbackMemory(input: FeedbackMemoryInput): Promise<void>;
 }
 
+/** One Layer-A correction memory (Draft correction loop Phase 2). A founder correction learned
+ *  from a 🔁 Revise, embedded so a similar future question retrieves it. Scope is carried by
+ *  `customerId`: NULL = SHARED (the drafter's shared leg reads it for EVERY customer); a value
+ *  = that ONE customer's rows. ⚠︎ ISOLATION: these ALWAYS land in agent_memory (customer-
+ *  readable), NEVER internal_knowledge. */
+export interface CorrectionMemoryInput {
+  /** Target scope: null = shared (every customer); a value = that customer only. */
+  customerId: string | null;
+  content: string;
+  embedding: number[];
+  /** {source:'draft_revision', decision_id, scope, fact, language?, origin_customer_id?} —
+   *  `fact` is the dedup key (within-scope), `origin_customer_id` is the customer to re-attach
+   *  to if the founder flips a shared correction back to customer-only. */
+  metadata: Record<string, unknown>;
+}
+
+/** Correction-memory writer + scope-flip (Phase 2). Kept OFF KnowledgeRepo (the Layer-B doc
+ *  mirror) — intersected onto the concrete `memoryRepo`. NEVER logs content or vectors. */
+export interface CorrectionMemoryRepo {
+  /**
+   * Append one correction memory (memory_type='correction', document_id NULL, chunk_index 0),
+   * DEDUPED within its scope: a correction whose `metadata->>'fact'` already exists for the
+   * SAME scope (customer_id IS NOT DISTINCT FROM the target) is NOT re-inserted. Returns the
+   * new row id, or null on a dedup hit (idempotent — no double-embed-write, and the caller
+   * skips the "🧠 Learned" post because it was already learned).
+   */
+  insertCorrectionMemory(input: CorrectionMemoryInput): Promise<{ id: string } | null>;
+  /**
+   * Flip a correction's SCOPE by ABSOLUTELY setting its customer_id (idempotent under a
+   * re-delivered callback — the target is encoded, not toggled): 'shared' → customer_id NULL;
+   * 'customer' → customer_id = metadata->>'origin_customer_id'. Also stamps metadata.scope.
+   * Returns { fact, scope, originCustomerId } for the re-posted confirmation, or null when the
+   * row is missing / not a correction (or a to-customer flip with no origin_customer_id).
+   */
+  flipCorrectionScope(memoryId: string, target: 'shared' | 'customer'): Promise<{ fact: string; scope: string; originCustomerId: string | null } | null>;
+}
+
 /** One customer whose task/conversation history semantically matches a release note
  *  (M2(e)). `distance` is the cosine distance of that customer's NEAREST history row
  *  to the release-note embedding (smaller = closer); `excerpt` is that row's content
@@ -246,7 +283,7 @@ interface SearchDbRow {
 
 /** Concrete repo bound to the shared pool via query()/withClient. NEVER logs content
  *  or vectors. */
-export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRepo = {
+export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRepo & CorrectionMemoryRepo = {
   async listDocuments(): Promise<KnowledgeDocumentRow[]> {
     const { rows } = await query<DocumentDbRow>(
       `SELECT id, source_id, doc_key, module, locale, title, route, scope, customer_id,
@@ -358,6 +395,52 @@ export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRe
         JSON.stringify(input.metadata),
       ],
     );
+  },
+
+  async insertCorrectionMemory(input: CorrectionMemoryInput): Promise<{ id: string } | null> {
+    // Layer-A row (document_id NULL, never reconciled), memory_type 'correction'. DEDUP within
+    // scope: `customer_id IS NOT DISTINCT FROM $1` treats NULL (shared) and a value (customer)
+    // uniformly, so a shared correction dedups against shared rows and a customer correction
+    // against that customer's rows only. 0 rows returned = dedup hit → null. The embedding is
+    // bound + cast $::vector (no interpolation). NEVER logs content or the vector.
+    const fact = String((input.metadata as Record<string, unknown>)['fact'] ?? '');
+    const { rows } = await query<{ id: string }>(
+      `INSERT INTO agent_memory
+          (customer_id, memory_type, document_id, content, embedding, metadata, chunk_index)
+       SELECT $1, 'correction', NULL, $2, $3::vector, $4::jsonb, 0
+        WHERE NOT EXISTS (
+          SELECT 1 FROM agent_memory
+           WHERE memory_type = 'correction'
+             AND metadata->>'fact' = $5
+             AND customer_id IS NOT DISTINCT FROM $1
+        )
+       RETURNING id`,
+      [input.customerId, input.content, toVectorLiteral(input.embedding), JSON.stringify(input.metadata), fact],
+    );
+    return rows[0] ? { id: rows[0].id } : null;
+  },
+
+  async flipCorrectionScope(
+    memoryId: string,
+    target: 'shared' | 'customer',
+  ): Promise<{ fact: string; scope: string; originCustomerId: string | null } | null> {
+    // ABSOLUTE set (idempotent under callback replay — the target is encoded, never toggled):
+    // shared → customer_id NULL; customer → the stored origin_customer_id. A to-customer flip
+    // with no origin_customer_id matches 0 rows (the guard in WHERE) → null (nothing to attach).
+    const { rows } = await query<{ fact: string | null; scope: string | null; origin: string | null }>(
+      `UPDATE agent_memory
+          SET customer_id = CASE WHEN $2 = 'shared' THEN NULL
+                                 ELSE (metadata->>'origin_customer_id')::uuid END,
+              metadata = jsonb_set(metadata, '{scope}', to_jsonb($2::text))
+        WHERE id = $1
+          AND memory_type = 'correction'
+          AND ($2 = 'shared' OR metadata->>'origin_customer_id' IS NOT NULL)
+        RETURNING metadata->>'fact' AS fact, metadata->>'scope' AS scope,
+                  metadata->>'origin_customer_id' AS origin`,
+      [memoryId, target],
+    );
+    if (rows.length === 0) return null;
+    return { fact: rows[0].fact ?? '', scope: rows[0].scope ?? target, originCustomerId: rows[0].origin };
   },
 
   async search(

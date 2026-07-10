@@ -18,18 +18,35 @@ import type {
 export const DRAFT_APPROVE = 'da';
 export const DRAFT_EDIT = 'de';
 export const DRAFT_REJECT = 'dr';
+/** 🔁 Revise (Draft correction loop). Wired ONLY when DRAFT_REVISE_ENABLED. */
+export const DRAFT_REVISE = 'dv';
 
-/** The Approve/Edit/Reject inline buttons presented under a draft (queueId = the
- *  draft's agent_outbound_queue id). */
-export const draftButtons = (queueId: string): Array<{ id: string; label: string }> => [
-  { id: `${DRAFT_APPROVE}:${queueId}`, label: '✅ Approve' },
-  { id: `${DRAFT_EDIT}:${queueId}`, label: '✏️ Edit' },
-  { id: `${DRAFT_REJECT}:${queueId}`, label: '🚫 Reject' },
-];
+/** The inline buttons presented under a draft (queueId = the draft's agent_outbound_queue
+ *  id). The 🔁 Revise button is appended ONLY when the revise loop is enabled — a draft
+ *  presented while DRAFT_REVISE_ENABLED=false shows the original three, so an unhandled
+ *  revise tap can never appear. */
+export const draftButtons = (
+  queueId: string,
+  opts?: { revise?: boolean },
+): Array<{ id: string; label: string }> => {
+  const btns = [
+    { id: `${DRAFT_APPROVE}:${queueId}`, label: '✅ Approve' },
+    { id: `${DRAFT_EDIT}:${queueId}`, label: '✏️ Edit' },
+    { id: `${DRAFT_REJECT}:${queueId}`, label: '🚫 Reject' },
+  ];
+  if (opts?.revise) btns.push({ id: `${DRAFT_REVISE}:${queueId}`, label: '🔁 Revise' });
+  return btns;
+};
 
-/** True for any of the three draft option ids (composite-router dispatch guard). */
+/** True for any draft option id — Approve/Edit/Reject/Revise (composite-router dispatch
+ *  guard). Revise taps are routed only when the handler is wired (DRAFT_REVISE_ENABLED). */
 export function isDraftOption(optionId: string): boolean {
-  return optionId === DRAFT_APPROVE || optionId === DRAFT_EDIT || optionId === DRAFT_REJECT;
+  return (
+    optionId === DRAFT_APPROVE ||
+    optionId === DRAFT_EDIT ||
+    optionId === DRAFT_REJECT ||
+    optionId === DRAFT_REVISE
+  );
 }
 
 export interface DraftDecisionHandlerDeps {
@@ -39,8 +56,15 @@ export interface DraftDecisionHandlerDeps {
   notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent'>;
   /** Arm the per-thread ✏️ Edit marker (app_state 'draft_edit_pending:<threadId>'
    *  = queueId). Keyed off the callback's OWN thread (DecisionEvent.threadId) — no
-   *  customer→topic lookup needed (blueprint fix #5). */
+   *  customer→topic lookup needed (blueprint fix #5). MUST clear any armed revise
+   *  marker first (the composition wires that) so a thread holds at most one capture. */
   armEdit: (threadId: string, queueId: string) => Promise<void>;
+  /** Arm the per-thread 🔁 Revise marker (app_state 'draft_revise_pending:<threadId>' =
+   *  queueId) — the founder's NEXT free-text message becomes the revision instruction.
+   *  Present ONLY when DRAFT_REVISE_ENABLED (undefined otherwise → a 🔁 tap is a warn
+   *  no-op, and the button isn't even rendered when off). MUST clear any armed edit
+   *  marker first (composition-wired) so the two captures never collide. */
+  armRevise?: (threadId: string, queueId: string) => Promise<void>;
 }
 
 /**
@@ -92,6 +116,44 @@ export function buildDraftDecisionHandler(
           title: '🚫 Draft rejected',
           body: `Rejected by ${by}. Nothing was sent.`,
           severity: 'info',
+        });
+      }
+      return;
+    }
+
+    if (optionId === DRAFT_REVISE) {
+      // 🔁 Revise mirrors ✏️ Edit's arm-then-capture: check the draft is still OPEN, arm the
+      // revise marker on the callback's OWN thread, and prompt for the instruction. Does NOT
+      // resolve — the founder's next free-text message (the correction directive) drives the
+      // regeneration. If armRevise is unwired (flag off) the button was never rendered, so
+      // this is a defensive warn no-op.
+      if (!deps.armRevise) {
+        logger.warn({ queueId }, 'draft revise: tapped but revise loop not wired — ignored');
+        return;
+      }
+      const res = await deps.getDraftForEdit(queueId);
+      if (!res) {
+        logger.info({ queueId }, 'draft revise: not an open draft — no-op');
+        return;
+      }
+      if (!threadId) {
+        logger.warn({ queueId }, 'draft revise: no thread on callback — cannot arm marker');
+        if (res.customerId) {
+          await deps.notifier.notifyCustomerEvent(res.customerId, {
+            title: '🔁 Revise unavailable',
+            body: 'Could not open revision for this draft — please tap 🔁 Revise again.',
+            severity: 'warning',
+          });
+        }
+        return;
+      }
+      await deps.armRevise(threadId, queueId);
+      logger.info({ queueId }, 'draft revise: armed — awaiting correction instruction');
+      if (res.customerId) {
+        await deps.notifier.notifyCustomerEvent(res.customerId, {
+          title: '🔁 Revise draft',
+          body: 'Send your correction instruction as your next message in this topic (e.g. "we have no QuickBooks integration — say so"). I will regenerate the draft.',
+          severity: 'action',
         });
       }
       return;

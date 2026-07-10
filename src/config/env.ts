@@ -279,6 +279,33 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+
+  // ── Draft correction loop (🔁 Revise) + scoped correction memory. When the founder
+  // taps 🔁 Revise on a draft and sends a correction INSTRUCTION, the agent regenerates
+  // the draft (grounded + the founder directive treated as authoritative) and LEARNS the
+  // correction into the RIGHT scope (a shared product fact for EVERY customer, or one
+  // customer's preference) so it never repeats. Kill-switch (mirrors OUTBOUND_ENABLED
+  // strict-bool): the 🔁 button + revise capture + correction learning are wired ONLY
+  // when the literal "true"; unset/"false"/anything else → false. DORMANT by default so a
+  // boot never surfaces the revise loop by surprise. NO draft is ever auto-sent — revise
+  // re-presents a DRAFT the founder still approves/edits/rejects.
+  //
+  // DEPENDENCY: like the drafter, revise regeneration re-retrieves knowledge
+  // (KNOWLEDGE_RETRIEVAL_ENABLED) + embeds the correction fact — both need OPENAI_API_KEY
+  // (a credential, resolveCredential); a missing key degrades gracefully (regeneration
+  // still honors the founder directive with no retrieved sources; the correction memory is
+  // retried next tap). Correction learning writes ONLY to the customer-readable
+  // agent_memory (shared customer_id NULL, or the customer's rows), NEVER the founder-only
+  // internal_knowledge table (isolation invariant) — the classifier defaults to CUSTOMER
+  // scope when uncertain, and the founder can flip scope from the confirmation.
+  //
+  // PRECONDITION (Telegram): the revise-instruction capture reads `message` updates, so the
+  // bot's group privacy mode MUST be OFF (BotFather /setprivacy) — same precondition as the
+  // ✏️ draft-edit capture (KNOWLEDGE_DRAFT_ENABLED).
+  DRAFT_REVISE_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

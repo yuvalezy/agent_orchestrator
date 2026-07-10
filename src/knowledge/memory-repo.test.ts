@@ -75,6 +75,30 @@ test('scope isolation: the customer id never appears in the shared query text', 
   assert.ok(!text.includes('secret-tenant'), 'tenant id is only a bound value, never in SQL text');
 });
 
+// ── ISOLATION INVARIANT (Draft correction loop Phase 2) ──────────────────────────
+// A shared correction is a memory_type='correction' row with customer_id NULL in agent_memory.
+// It must be (a) readable by EVERY customer's drafter — the shared leg has NO memory_type
+// filter, so it returns correction rows too — and (b) UNREACHABLE from any internal table. The
+// customer-drafting search touches ONLY agent_memory, so it can never surface an internal row.
+
+test('customer search reaches the shared leg (a shared correction is readable by any customer) and NEVER internal_knowledge', () => {
+  const { text } = buildSearchSql({ embedding: [0.1], customerId: 'cust-A', kCustomer: 5, kShared: 3, maxDistance: 0.5 });
+  const sql = collapse(text);
+  // The shared leg (customer_id IS NULL) is unioned in for a known customer → a shared
+  // correction (customer_id NULL) surfaces for cust-A just like every other customer.
+  assert.match(sql, /customer_id IS NULL/, 'shared leg present for a known customer');
+  // No memory_type filter → the shared leg returns 'correction' rows alongside 'guide' etc.
+  assert.ok(!sql.includes('memory_type ='), 'no memory_type filter excludes corrections');
+  // Structural isolation: the customer-drafting search touches ONLY agent_memory.
+  assert.ok(sql.includes('agent_memory'), 'reads agent_memory');
+  assert.ok(!sql.includes('internal_knowledge'), 'customer search can NEVER reach internal_knowledge');
+});
+
+test('shared-only search (no customer) also never references internal_knowledge', () => {
+  const { text } = buildSearchSql({ embedding: [0.1], customerId: null, kCustomer: 5, kShared: 3, maxDistance: 0.5 });
+  assert.ok(text.includes('agent_memory') && !text.includes('internal_knowledge'));
+});
+
 // ── M2(e): release-note → customer match SQL (cross-customer, confidence-gated) ────
 test('release-note match: excludes shared rows, one row per customer, gated by maxDistance', () => {
   const { text, values } = buildReleaseNoteMatchSql({
