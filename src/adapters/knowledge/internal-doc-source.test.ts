@@ -111,3 +111,59 @@ test('content hash is stable across runs for unchanged content', async () => {
   const h2 = (await mk().listDocs())[0].contentHash;
   assert.equal(h1, h2);
 });
+
+// ── scanPath: single-path resolution for the targeted resync ──────────────────
+
+function scanFixture() {
+  const fs = makeFs({
+    '/root/plan/EXECUTION-PLAN.md': { type: 'file', content: '# Execution Plan\nbody' },
+    '/root/plan/blueprints/M2a.md': { type: 'file', content: '# M2a\nx' },
+  });
+  return buildInternalDocSource({
+    sources: [source({ include: ['plan/EXECUTION-PLAN.md', 'plan/blueprints'], excludeDirs: ['archive'] })],
+    repoRoots: REPO_ROOTS,
+    ...fs,
+  });
+}
+
+test('scanPath: absolute in-scope + on disk → found with correct docKey', async () => {
+  const res = await scanFixture().scanPath('/root/plan/blueprints/M2a.md');
+  assert.equal(res.status, 'found');
+  if (res.status === 'found') {
+    assert.equal(res.doc.docKey, 's:plan/blueprints/M2a.md');
+    assert.equal(res.doc.title, 'M2a');
+    assert.equal(res.doc.path, 'plan/blueprints/M2a.md');
+  }
+});
+
+test('scanPath: docKey form → found', async () => {
+  const res = await scanFixture().scanPath('s:plan/EXECUTION-PLAN.md');
+  assert.equal(res.status, 'found');
+  if (res.status === 'found') assert.equal(res.doc.docKey, 's:plan/EXECUTION-PLAN.md');
+});
+
+test('scanPath: in-scope include dir but gone from disk → missing with docKey', async () => {
+  const res = await scanFixture().scanPath('/root/plan/blueprints/deleted.md');
+  assert.deepEqual(res, { status: 'missing', docKey: 's:plan/blueprints/deleted.md' });
+});
+
+test('scanPath: under an excludeDirs segment → out-of-scope', async () => {
+  const res = await scanFixture().scanPath('/root/plan/blueprints/archive/old.md');
+  assert.deepEqual(res, { status: 'out-of-scope' });
+});
+
+test('scanPath: outside every configured root → out-of-scope', async () => {
+  const res = await scanFixture().scanPath('/etc/passwd');
+  assert.deepEqual(res, { status: 'out-of-scope' });
+});
+
+test('scanPath: in-scope path but not markdown → out-of-scope', async () => {
+  const res = await scanFixture().scanPath('/root/plan/blueprints/notes.txt');
+  assert.deepEqual(res, { status: 'out-of-scope' });
+});
+
+test('scanPath: a real path but NOT under any include → out-of-scope', async () => {
+  // /root exists as a root but plan/other.md is not under either configured include.
+  const res = await scanFixture().scanPath('/root/plan/other.md');
+  assert.deepEqual(res, { status: 'out-of-scope' });
+});

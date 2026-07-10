@@ -22,6 +22,11 @@ process.env.LOG_LEVEL = process.env.LOG_LEVEL ?? 'silent';
 // Search snippets are truncated for the tool result; get_project_doc returns full text.
 const SNIPPET_CHARS = 900;
 
+// MI: advisory-lock namespace for the internal knowledge-sync reconcile ('intk') —
+// the SAME key main.ts's hourly worker takes, so an MCP-triggered resync and the
+// in-process worker can never run two reconciles at once (a resync waits its turn).
+const INTERNAL_SYNC_LOCK_KEY = 0x696e746b;
+
 /** MCP tool error result (surfaced to the client, not thrown). */
 function errorResult(message: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
   return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
@@ -39,12 +44,24 @@ async function main(): Promise<void> {
   const { internalKnowledgeRepo } = await import('../src/knowledge/internal-repo');
   const { buildInternalKnowledgeSearch } = await import('../src/knowledge/internal-search');
   const { INTERNAL_REPO_ROOTS } = await import('../src/adapters/knowledge/internal-sources');
+  const { buildInternalDocSource } = await import('../src/adapters/knowledge/internal-doc-source');
+  const { chunkMarkdown } = await import('../src/knowledge/chunker');
+  const { reconcileInternalKnowledge, reconcileInternalDoc } = await import('../src/knowledge/internal-sync');
+  const { withClient } = await import('../src/db');
+  const { logger } = await import('../src/logger');
 
-  // Read-only: a no-op cost sink (no llm_costs writes for query-time embeds).
+  // Read-only QUERY embed: a no-op cost sink (no llm_costs writes for query-time embeds).
   const embedding = buildEmbeddingAdapter(() => tryResolveCredential('OPENAI_API_KEY'), env.OPENAI_BASE_URL, {
     model: env.OPENAI_EMBEDDING_MODEL,
     dim: env.OPENAI_EMBEDDING_DIM,
     recordCost: async () => {},
+  });
+
+  // RESYNC embed: default cost sink (records one llm_costs row per request) — a resync
+  // is real ingestion spend, same as the internal:reconcile:once script + the worker.
+  const resyncEmbedding = buildEmbeddingAdapter(() => tryResolveCredential('OPENAI_API_KEY'), env.OPENAI_BASE_URL, {
+    model: env.OPENAI_EMBEDDING_MODEL,
+    dim: env.OPENAI_EMBEDDING_DIM,
   });
 
   const knowledgeSearch = buildInternalKnowledgeSearch({
@@ -55,6 +72,17 @@ async function main(): Promise<void> {
     snippetChars: SNIPPET_CHARS,
   });
 
+  // Reconcile deps (targeted single-doc + full resync). Same wiring as the main.ts
+  // worker; the cost-recording embed above so a resync's spend is auditable.
+  const reconcileDeps = {
+    docSource: buildInternalDocSource(),
+    embedding: resyncEmbedding,
+    repo: internalKnowledgeRepo,
+    chunk: chunkMarkdown,
+    log: logger,
+    config: { tombstoneMaxRatio: env.KNOWLEDGE_TOMBSTONE_MAX_RATIO },
+  };
+
   const server = new Server(
     { name: 'project-brain', version: '0.1.0' },
     {
@@ -63,7 +91,8 @@ async function main(): Promise<void> {
         'Project Brain: semantic memory over the founder\'s internal project docs ' +
         '(Agent Orchestrator planning, decisions, architecture, risk register, backlog, specs). ' +
         'Call search_project_knowledge to recall WHY/HOW a decision was made; ' +
-        'call get_project_doc to read a matched doc in full.',
+        'call get_project_doc to read a matched doc in full; after you EDIT an internal ' +
+        'doc, call resync_project_knowledge with its path so the index reflects the change.',
     },
   );
 
@@ -104,6 +133,28 @@ async function main(): Promise<void> {
           additionalProperties: false,
         },
       },
+      {
+        name: 'resync_project_knowledge',
+        description:
+          'Re-index the internal knowledge base after docs change on disk. With `path` ' +
+          '(a full or repo-relative path, or a docKey): re-embed just THAT doc if its ' +
+          'content changed, tombstone it if it was deleted, or no-op if unchanged/out of ' +
+          'scope — cheap, use it right after you edit an internal doc. WITHOUT `path`: run ' +
+          'a full hash-controlled reconcile of the whole corpus (only changed docs re-embed). ' +
+          'Returns a JSON summary. Serialized with the background sync (may report busy).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description:
+                'The doc that changed — absolute path, repo-relative path, or docKey ' +
+                '(e.g. "ao-plan:plan/EXECUTION-PLAN.md"). Omit to resync the entire corpus.',
+            },
+          },
+          additionalProperties: false,
+        },
+      },
     ],
   }));
 
@@ -135,6 +186,32 @@ async function main(): Promise<void> {
         if (!root) return errorResult(`internal doc "${docKey}" has an unknown repo "${loc.repo}"`);
         const markdown = readFileSync(join(root, loc.path), 'utf8');
         return textResult(markdown);
+      }
+
+      if (name === 'resync_project_knowledge') {
+        if (!tryResolveCredential('OPENAI_API_KEY')) {
+          return errorResult('OPENAI_API_KEY is not resolvable — cannot embed for a resync');
+        }
+        const path = typeof args.path === 'string' ? args.path.trim() : '';
+        // Take the SAME advisory lock the hourly worker uses so two reconciles never race.
+        return await withClient(async (client) => {
+          const { rows } = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1) AS locked', [
+            INTERNAL_SYNC_LOCK_KEY,
+          ]);
+          if (!rows[0]?.locked) {
+            return errorResult('a knowledge sync is already running — try again in a moment');
+          }
+          try {
+            if (path) {
+              const result = await reconcileInternalDoc(reconcileDeps, path);
+              return textResult(JSON.stringify(result, null, 2));
+            }
+            const summary = await reconcileInternalKnowledge(reconcileDeps);
+            return textResult(JSON.stringify({ scope: 'all', ...summary }, null, 2));
+          } finally {
+            await client.query('SELECT pg_advisory_unlock($1)', [INTERNAL_SYNC_LOCK_KEY]);
+          }
+        });
       }
 
       return errorResult(`unknown tool "${name}"`);

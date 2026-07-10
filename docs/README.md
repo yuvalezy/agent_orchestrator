@@ -20,7 +20,7 @@ A sender is only actioned if it **resolves to a known customer contact** (`agent
 
 | # | Requirement | Notes |
 |---|-------------|-------|
-| 1 | **PostgreSQL** | Shared ops-dev `ezy-postgres`, host-published on `localhost:42016`. The `agent_orchestrator` DB is created by `npm run db:create`. |
+| 1 | **PostgreSQL + pgvector** | Dedicated `ao-postgres` (`pgvector/pgvector:pg18`), host-published on `localhost:55432` — `docker compose -f docker-compose.db.yml up -d`. Separate from the shared ops-dev `ezy-postgres` so the vector RAG never bounces the portal stack. The `agent_orchestrator` DB is created by `npm run db:create`. |
 | 2 | **whatsapp_manager service** | The WhatsApp bridge, default `http://localhost:3000`. Provides the webhook + the pull/reconcile directory API. |
 | 3 | **EZY Portal tenant + scoped key** | Default `http://localhost:5040`. A scoped `ten_…` API key (`EZY_PORTAL_API_KEY`) with task write rights. |
 | 4 | **Telegram bot + forum supergroup** | A BotFather token (`TELEGRAM_BOT_TOKEN`) and a **forum-enabled** supergroup (`TELEGRAM_SUPERGROUP_CHAT_ID`); the loop notifies you there and creates a topic per customer. |
@@ -80,3 +80,4 @@ Verify it is alive with `curl -s http://localhost:3100/health | jq`. Full run/op
 | [integrations/telegram.md](./integrations/telegram.md) | Telegram notifier — founder topics, admin topic, the ❌-undo callback. |
 | [integrations/ezy-portal.md](./integrations/ezy-portal.md) | EZY Portal task target — create/find/comment/status and the dedup contract. |
 | [integrations/llm.md](./integrations/llm.md) | LLM gateway — providers, routing, model/effort overrides, cost cap. |
+| [project-brain.md](./project-brain.md) | Project Brain — the internal-knowledge RAG, its stdio MCP server (search / get / resync), and how to register it in Claude Code. |

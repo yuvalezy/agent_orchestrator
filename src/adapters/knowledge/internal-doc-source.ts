@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
-import { join, basename, relative } from 'node:path';
-import type { InternalDocSourcePort, InternalScannedDoc } from '../../ports/internal-doc-source.port';
+import { join, basename, relative, isAbsolute, sep } from 'node:path';
+import type { InternalDocSourcePort, InternalScannedDoc, InternalPathScan } from '../../ports/internal-doc-source.port';
 import { INTERNAL_SOURCES, INTERNAL_REPO_ROOTS, type InternalSource, type InternalRepo } from './internal-sources';
 import { computeContentHash } from './doc-hash';
 
@@ -142,5 +142,66 @@ export function buildInternalDocSource(deps?: InternalDocSourceDeps): InternalDo
     return out;
   }
 
-  return { listDocs };
+  /** Candidate (source, absPath, repo-relative path) pairs the input could resolve to.
+   *  Absolute → tested under every root; a `sourceId:relpath` docKey → that source;
+   *  a bare repo-relative path → tried under every root. */
+  function candidatesFor(inputPath: string): Array<{ source: InternalSource; abs: string; rel: string }> {
+    const raw = inputPath.trim();
+    const out: Array<{ source: InternalSource; abs: string; rel: string }> = [];
+    if (isAbsolute(raw)) {
+      for (const source of sources) {
+        const base = repoRoots[source.repo];
+        const rel = relative(base, raw);
+        // Outside this root → relative() escapes with '..' or stays absolute.
+        if (rel.startsWith('..') || isAbsolute(rel)) continue;
+        out.push({ source, abs: raw, rel });
+      }
+      return out;
+    }
+    // `sourceId:relpath` docKey form (a search-result citation). An absolute path was
+    // already handled above; the sourceId is validated against source.id below, so a
+    // non-matching prefix (e.g. a stray colon) harmlessly falls through to repo-relative.
+    const colon = raw.indexOf(':');
+    if (colon > 0) {
+      const sid = raw.slice(0, colon);
+      const relKey = raw.slice(colon + 1);
+      for (const source of sources) {
+        if (source.id !== sid) continue;
+        out.push({ source, abs: join(repoRoots[source.repo], relKey), rel: relKey });
+      }
+      if (out.length > 0) return out;
+    }
+    // Bare repo-relative path — try under each root.
+    for (const source of sources) {
+      out.push({ source, abs: join(repoRoots[source.repo], raw), rel: raw });
+    }
+    return out;
+  }
+
+  /** True when `abs` is the included file itself or lives beneath an included directory. */
+  function withinAnInclude(source: InternalSource, base: string, abs: string): boolean {
+    return source.include.some((inc) => {
+      const incAbs = join(base, inc);
+      return abs === incAbs || abs.startsWith(incAbs + sep);
+    });
+  }
+
+  async function scanPath(inputPath: string): Promise<InternalPathScan> {
+    for (const { source, abs, rel } of candidatesFor(inputPath)) {
+      if (!abs.toLowerCase().endsWith('.md')) continue;
+      const relN = rel.split('\\').join('/');
+      // An excludeDirs segment anywhere in the path → out of scope (matches walkDir).
+      const excludes = new Set(source.excludeDirs ?? []);
+      if (relN.split('/').some((segment) => excludes.has(segment))) continue;
+      const base = repoRoots[source.repo];
+      if (!withinAnInclude(source, base, abs)) continue;
+      const docKey = `${source.id}:${relN}`;
+      // In scope. On disk → scan+hash for an upsert; gone → signal a tombstone.
+      if (!exists(abs)) return { status: 'missing', docKey };
+      return { status: 'found', doc: scanFile({ absPath: abs, base, source }) };
+    }
+    return { status: 'out-of-scope' };
+  }
+
+  return { listDocs, scanPath };
 }

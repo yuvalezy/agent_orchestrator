@@ -45,8 +45,84 @@ export interface InternalSyncSummary {
 
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** Deps needed to persist ONE doc (chunk → embed → replaceDoc). A subset of
+ *  InternalReconcileDeps, so both the full reconcile and the targeted single-doc
+ *  resync share the exact same write path (SOLID/DRY — one embed+persist recipe). */
+type WriteDocDeps = Pick<InternalReconcileDeps, 'embedding' | 'repo' | 'chunk'>;
+
+/** Persist one scanned doc: chunk → embed → replaceDoc (delete+insert fresh chunks).
+ *  An empty doc yields zero chunks → replaceDoc([]) just clears any stale rows. */
+export async function writeInternalDoc(doc: InternalScannedDoc, deps: WriteDocDeps): Promise<void> {
+  const { chunk, embedding, repo } = deps;
+  const chunks = chunk({ title: doc.title ?? '', content: doc.content });
+  const rows: InternalChunkRow[] = [];
+  if (chunks.length > 0) {
+    const vectors = await embedding.embed(chunks.map((c) => c.content));
+    for (let i = 0; i < chunks.length; i += 1) {
+      const c = chunks[i];
+      rows.push({
+        sourceId: doc.sourceId,
+        docKey: doc.docKey,
+        chunkIndex: c.chunkIndex,
+        repo: doc.repo,
+        path: doc.path,
+        title: doc.title,
+        section: c.section || null,
+        content: c.content,
+        embedding: vectors[i],
+        contentHash: doc.contentHash,
+      });
+    }
+  }
+  await repo.replaceDoc(doc.docKey, rows);
+}
+
+/** One targeted resync outcome (MCP `resync_project_knowledge` with a path). */
+export interface InternalDocResync {
+  /** Manifest identity, or null when the path resolved to no configured source. */
+  docKey: string | null;
+  action: 'created' | 'updated' | 'skipped' | 'tombstoned' | 'out-of-scope' | 'noop';
+}
+
+/** Resync ONE doc by path/docKey — the incremental counterpart to the full reconcile.
+ *  Reads just that file (docSource.scanPath), diffs it against the manifest, and:
+ *    found + new/changed → writeInternalDoc (re-embed)   found + hash-same → skip
+ *    in scope but gone   → tombstone (if it was active)  not in any source → out-of-scope
+ *  Touches NO other doc and runs NO removed-set sweep, so it can never mass-tombstone. */
+export async function reconcileInternalDoc(deps: InternalReconcileDeps, inputPath: string): Promise<InternalDocResync> {
+  const { docSource, repo, log } = deps;
+  const res = await docSource.scanPath(inputPath);
+
+  if (res.status === 'out-of-scope') {
+    log.info({ inputPath }, 'internal resync: path is not under any configured internal source — no-op');
+    return { docKey: null, action: 'out-of-scope' };
+  }
+
+  const manifest = await repo.listManifest();
+
+  if (res.status === 'missing') {
+    const existing = manifest.find((r) => r.docKey === res.docKey);
+    if (existing?.status === 'active') {
+      await repo.tombstoneDoc(res.docKey);
+      log.info({ docKey: res.docKey }, 'internal resync: doc gone from disk — tombstoned');
+      return { docKey: res.docKey, action: 'tombstoned' };
+    }
+    return { docKey: res.docKey, action: 'noop' };
+  }
+
+  const { doc } = res;
+  const existing = manifest.find((r) => r.docKey === doc.docKey);
+  // hash-same + active → SKIP (zero embed cost).
+  if (existing && existing.status === 'active' && existing.contentHash === doc.contentHash) {
+    return { docKey: doc.docKey, action: 'skipped' };
+  }
+  await writeInternalDoc(doc, deps);
+  log.info({ docKey: doc.docKey }, 'internal resync: doc re-embedded');
+  return { docKey: doc.docKey, action: existing ? 'updated' : 'created' };
+}
+
 export async function reconcileInternalKnowledge(deps: InternalReconcileDeps): Promise<InternalSyncSummary> {
-  const { docSource, embedding, repo, chunk, log, config } = deps;
+  const { docSource, repo, log, config } = deps;
 
   const summary: InternalSyncSummary = { created: 0, updated: 0, skipped: 0, tombstoned: 0, failed: 0 };
 
@@ -64,31 +140,6 @@ export async function reconcileInternalKnowledge(deps: InternalReconcileDeps): P
     return summary;
   }
 
-  // Persist one scanned doc: chunk → embed → replaceDoc (delete+insert fresh chunks).
-  const writeDoc = async (doc: InternalScannedDoc): Promise<void> => {
-    const chunks = chunk({ title: doc.title ?? '', content: doc.content });
-    const rows: InternalChunkRow[] = [];
-    if (chunks.length > 0) {
-      const vectors = await embedding.embed(chunks.map((c) => c.content));
-      for (let i = 0; i < chunks.length; i += 1) {
-        const c = chunks[i];
-        rows.push({
-          sourceId: doc.sourceId,
-          docKey: doc.docKey,
-          chunkIndex: c.chunkIndex,
-          repo: doc.repo,
-          path: doc.path,
-          title: doc.title,
-          section: c.section || null,
-          content: c.content,
-          embedding: vectors[i],
-          contentHash: doc.contentHash,
-        });
-      }
-    }
-    await repo.replaceDoc(doc.docKey, rows);
-  };
-
   // ── Upserts: new / hash-change / resurrect / skip ─────────────────────────────
   for (const doc of scanned) {
     try {
@@ -102,7 +153,7 @@ export async function reconcileInternalKnowledge(deps: InternalReconcileDeps): P
         continue;
       }
 
-      await writeDoc(doc);
+      await writeInternalDoc(doc, deps);
       if (!existing) summary.created += 1;
       else summary.updated += 1; // hash-change | resurrect
     } catch (err) {
