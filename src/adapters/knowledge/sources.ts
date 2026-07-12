@@ -26,7 +26,7 @@ export interface KnowledgeSource {
   /** Stable source id — the first segment of every docKey it produces. */
   id: string;
   /** Checkout the root is relative to. */
-  repo: 'portal' | 'ai-agent' | 'wms';
+  repo: 'portal' | 'ai-agent' | 'wms' | 'ezy-integration';
   /** Repo-relative directory. flat-locale: contains {locale}/. module-tree: contains <mod>/docs/{locale}/. */
   root: string;
   layout: DocLayout;
@@ -171,6 +171,23 @@ export const KNOWLEDGE_SOURCES = [
     moduleName: 'wms', // module for files directly under the locale (index/dashboard/…)
     locales: ['en', 'es'],
     primaryLocale: 'en', // WMS docs are authored English-first (es is the translation)
+    scope: 'shared',
+    bpRef: null,
+  },
+
+  // ── EZY Integrations — the PUBLIC product knowledge base (same locale-first shape as
+  //    WMS: title/description only, no DocArticle slug → path-derived slugs). SHARED,
+  //    drives customer replies. DISTINCT from the internal Project Brain `ezy-integration`
+  //    source (internal-sources.ts → docs/plan/bootstrap → internal_knowledge), which does
+  //    NOT include this Documentation/Content tree — no double-index, no isolation cross. ──
+  {
+    id: 'ezy-integration',
+    repo: 'ezy-integration',
+    root: 'src/EzyIntegration.Api/Documentation/Content',
+    layout: 'locale-tree',
+    moduleName: 'ezy-integration', // module for files directly under the locale
+    locales: ['en', 'es'],
+    primaryLocale: 'en', // authored English-first (es is the translation)
     scope: 'shared',
     bpRef: null,
   },

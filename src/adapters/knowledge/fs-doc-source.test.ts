@@ -9,7 +9,7 @@ import type { KnowledgeSource } from './sources';
 // slug rejection, per-(source,module,locale) slug uniqueness, and ⚠︎ IO/scan errors
 // propagating as a THROW (so the reconciler aborts rather than diffing a partial set).
 
-const REPO_ROOTS = { portal: '/repo', 'ai-agent': '/ai', wms: '/wms' } as const;
+const REPO_ROOTS = { portal: '/repo', 'ai-agent': '/ai', wms: '/wms', 'ezy-integration': '/ezyint' } as const;
 
 /** Build fs seams from a flat { absPath: content } file map. */
 function mockFs(files: Record<string, string>): Pick<FsDocSourceDeps, 'readFile' | 'readDir' | 'exists' | 'isDir'> {

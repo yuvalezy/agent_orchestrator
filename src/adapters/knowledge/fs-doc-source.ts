@@ -43,6 +43,7 @@ const DEFAULT_REPO_ROOTS: Record<KnowledgeSource['repo'], string> = {
   portal: '/mnt/dev/portal',
   'ai-agent': '/mnt/dev/ai-agent',
   wms: '/mnt/dev/wms',
+  'ezy-integration': '/mnt/dev/ezy/ezy-integration',
 };
 
 interface ParsedFrontmatter {
