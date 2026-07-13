@@ -17,6 +17,7 @@
     "knowledge:reconcile:once": "tsx scripts/knowledge-reconcile-once.ts",
     "internal:reconcile:once": "tsx scripts/internal-reconcile-once.ts",
     "task-inventory:reconcile:once": "tsx scripts/task-inventory-reconcile-once.ts",
+    "backfill:dry": "tsx scripts/backfill-dry.ts",
     "mcp:project-brain": "tsx scripts/mcp-project-brain.ts",
     "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
     "triage:sample": "tsx scripts/triage-sample.ts --",
