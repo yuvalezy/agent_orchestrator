@@ -5,6 +5,7 @@ import { WhatsAppHttp } from './http';
 import { WhatsAppDirectoryClient } from './directory-client';
 import { WhatsAppManagerAdapter } from './whatsapp-manager.adapter';
 import { GroupSummaryAdapter } from './group-summary.adapter';
+import { WaHistoryClient, type WaHistoryClientOptions } from './wa-history-client';
 
 /**
  * Build the whatsapp_manager directory client from non-secret env + the lazily-
@@ -17,6 +18,18 @@ export function buildWhatsAppDirectoryClient(): WhatsAppDirectoryClient {
     resolveApiKey: () => resolveCredential('WHATSAPP_MANAGER_API_KEY'),
   });
   return new WhatsAppDirectoryClient(http);
+}
+
+/**
+ * Build the read-only WhatsApp history client (backfill). Same read key as the directory client;
+ * drains `GET /messages` from epoch. HTTP-only — never the whatsapp_manager DB (invariant #5).
+ */
+export function buildWaHistoryClient(opts?: WaHistoryClientOptions): WaHistoryClient {
+  const http = new WhatsAppHttp({
+    baseUrl: env.WHATSAPP_MANAGER_BASE_URL,
+    resolveApiKey: () => resolveCredential('WHATSAPP_MANAGER_API_KEY'),
+  });
+  return new WaHistoryClient(http, opts);
 }
 
 /**

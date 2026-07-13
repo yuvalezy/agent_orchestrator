@@ -147,6 +147,17 @@ const envSchema = z.object({
   BACKFILL_MATCH_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.65),
   BACKFILL_JUDGE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6), // LLM-judge confirm gate
   BACKFILL_MATCH_K: z.coerce.number().int().positive().default(5), // candidate fan-out
+  // WhatsApp history leg: drains the whatsapp_manager archive, windows each chat, and reconciles.
+  BACKFILL_WA_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  BACKFILL_WA_IDLE_GAP_MS: z.coerce.number().int().positive().default(21_600_000), // 6h → new window
+  BACKFILL_WA_MAX_PER_WINDOW: z.coerce.number().int().positive().default(40), // msgs per window
+  BACKFILL_WA_MAX_WINDOWS: z.coerce.number().int().positive().default(60), // windows/customer cap
+  // Sweep-wide collapse: the strict "explicit request" confidence floor + the near-duplicate ceiling.
+  BACKFILL_PROPOSE_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.7),
+  BACKFILL_COLLAPSE_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.2),
 
   // ── M2a(b): scoped RAG retrieval INTO the triage context. Kill-switch (mirrors
   // KNOWLEDGE_SYNC_ENABLED): the retriever is injected into triage ONLY when the

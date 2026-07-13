@@ -267,9 +267,37 @@ test('live run: a non-retryable skip IS marked (settled)', async () => {
 test('live run: proposals recorded + marked', async () => {
   const { deps, writes } = orchDeps({
     dryRun: false,
-    reconcile: async (): Promise<BackfillOutcome> => ({ kind: 'propose', title: 'X', description: 'd', priority: 'high', summary: 'd' }),
+    reconcile: async (): Promise<BackfillOutcome> => ({ kind: 'propose', title: 'X', description: 'd', priority: 'high', summary: 'd', confidence: 0.9 }),
   });
   const report = await runBackfill('cust-1', deps);
   assert.equal(report.proposed, 2);
+  assert.equal(report.proposalsConsidered, 2);
   assert.deepEqual(writes, ['proposal', 'proposal']);
+});
+
+test('collapseProposals: only survivors are recorded, but EVERY considered thread is marked processed', async () => {
+  // Both threads propose; the collapser merges them into ONE survivor (thread 'a').
+  const { deps, writes, marks } = orchDeps({
+    dryRun: false,
+    reconcile: async (): Promise<BackfillOutcome> => ({ kind: 'propose', title: 'X', description: 'd', priority: 'high', summary: 'd', confidence: 0.9 }),
+    collapseProposals: async (pending) => [{ thread: pending[0].thread, outcome: pending[0].outcome, mergedThreadKeys: pending.map((p) => p.thread.threadKey) }],
+  });
+  const report = await runBackfill('cust-1', deps);
+  assert.equal(report.proposalsConsidered, 2, 'both raw proposals counted');
+  assert.equal(report.proposed, 1, 'collapsed to one card');
+  assert.deepEqual(writes, ['proposal'], 'only the survivor is recorded');
+  assert.deepEqual(marks.sort(), ['a', 'b'], 'both threads marked so a re-run resurfaces neither');
+});
+
+test('collapseProposals runs in dry-run too (real card count) but records/marks nothing', async () => {
+  const { deps, writes, marks } = orchDeps({
+    dryRun: true,
+    reconcile: async (): Promise<BackfillOutcome> => ({ kind: 'propose', title: 'X', description: 'd', priority: 'high', summary: 'd', confidence: 0.9 }),
+    collapseProposals: async (pending) => [{ thread: pending[0].thread, outcome: pending[0].outcome, mergedThreadKeys: pending.map((p) => p.thread.threadKey) }],
+  });
+  const report = await runBackfill('cust-1', deps);
+  assert.equal(report.proposed, 1);
+  assert.equal(report.proposalsConsidered, 2);
+  assert.equal(writes.length, 0);
+  assert.equal(marks.length, 0);
 });

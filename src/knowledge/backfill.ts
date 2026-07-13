@@ -55,7 +55,7 @@ export interface HistoricalThread {
 export type BackfillOutcome =
   | { kind: 'link-open'; taskRef: string; code: string | null; status: string; distance: number; judged: number; summary: string }
   | { kind: 'link-resolved'; taskRef: string; code: string | null; status: string; distance: number; judged: number; summary: string }
-  | { kind: 'propose'; title: string; description: string; priority: Intent['priority']; summary: string }
+  | { kind: 'propose'; title: string; description: string; priority: Intent['priority']; summary: string; confidence: number }
   | { kind: 'skip'; reason: string; retryable?: boolean };
 
 export interface BackfillReconcileConfig {
@@ -175,7 +175,7 @@ export async function reconcileThread(thread: HistoricalThread, deps: BackfillRe
 
   // No confident match. A work-request intent → a task proposal; anything else is conversation.
   if (PROPOSE_CATEGORIES.has(intent.category)) {
-    return { kind: 'propose', title: intent.suggested_title, description: intent.summary, priority: intent.priority, summary: intent.summary };
+    return { kind: 'propose', title: intent.suggested_title, description: intent.summary, priority: intent.priority, summary: intent.summary, confidence: intent.confidence };
   }
   return { kind: 'skip', reason: `unmatched ${intent.category} — no task warranted` };
 }
@@ -200,10 +200,27 @@ export interface BackfillReport {
   alreadyProcessed: number;
   linkedOpen: number;
   linkedResolved: number;
+  /** Cards actually emitted (post-collapse, post-strict-gate). */
   proposed: number;
+  /** Raw `propose` outcomes before collapse/gate (≥ proposed). Present when collapsing. */
+  proposalsConsidered: number;
   skipped: number;
   retryable: number;
   items: BackfillReportItem[];
+}
+
+/** One raw proposal awaiting the sweep-wide collapse/gate phase. */
+export interface PendingProposal {
+  thread: HistoricalThread;
+  outcome: Extract<BackfillOutcome, { kind: 'propose' }>;
+}
+
+/** A survivor of the collapse phase — the representative proposal plus every thread it absorbed
+ *  (all must be marked processed so a re-run neither re-proposes a dropped dup nor the rep). */
+export interface CollapsedProposal {
+  thread: HistoricalThread;
+  outcome: Extract<BackfillOutcome, { kind: 'propose' }>;
+  mergedThreadKeys: string[];
 }
 
 export interface BackfillOrchestratorDeps {
@@ -215,6 +232,11 @@ export interface BackfillOrchestratorDeps {
   writeLink: (thread: HistoricalThread, outcome: Extract<BackfillOutcome, { kind: 'link-open' | 'link-resolved' }>) => Promise<void>;
   /** LIVE-only: record a draft task proposal for founder approval. */
   recordProposal: (thread: HistoricalThread, outcome: Extract<BackfillOutcome, { kind: 'propose' }>) => Promise<void>;
+  /** OPTIONAL sweep-wide post-processor. When provided, `propose` outcomes are collected across all
+   *  threads, passed here to dedupe/collapse/strict-gate, and only the returned survivors are
+   *  recorded. Runs in dry-run too (read-only) so the report reflects the true card count. Absent →
+   *  every proposal is emitted 1:1 (unchanged behavior). */
+  collapseProposals?: (pending: PendingProposal[], customerId: string) => Promise<CollapsedProposal[]>;
   /** Idempotency: has this (customer, thread) already been reconciled in a prior run? */
   isProcessed: (customerId: string, threadKey: string) => Promise<boolean>;
   /** LIVE-only: mark a thread processed (called for terminal outcomes only). */
@@ -232,6 +254,7 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
     linkedOpen: 0,
     linkedResolved: 0,
     proposed: 0,
+    proposalsConsidered: 0,
     skipped: 0,
     retryable: 0,
     items: [],
@@ -239,6 +262,10 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
 
   const threads = await deps.readThreads(customerId);
   report.threads = threads.length;
+
+  // Proposals are collected, not emitted inline, so the sweep-wide collapse/gate can dedupe them
+  // before any card is posted. (When no collapser is injected, they still flow through 1:1 below.)
+  const pending: PendingProposal[] = [];
 
   for (const thread of threads) {
     // Idempotency — a thread reconciled in a prior LIVE run is skipped (dry-run ignores the
@@ -267,11 +294,8 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
         }
         break;
       case 'propose':
-        report.proposed += 1;
-        if (!deps.dryRun) {
-          await deps.recordProposal(thread, outcome);
-          await deps.markProcessed(customerId, thread.threadKey, outcome.kind);
-        }
+        // Deferred to the post-loop collapse phase (see below).
+        pending.push({ thread, outcome });
         break;
       case 'skip':
         if (outcome.retryable) report.retryable += 1;
@@ -282,6 +306,24 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
     }
   }
 
+  // ── Proposal collapse/gate phase ────────────────────────────────────────────────────────────
+  // With a collapser: dedupe near-duplicate proposals + drop low-confidence/non-request ones, then
+  // emit only the survivors. Without: each proposal survives 1:1 (unchanged behavior). The collapse
+  // runs in dry-run too so the reported card count is the real one.
+  report.proposalsConsidered = pending.length;
+  const survivors: CollapsedProposal[] =
+    deps.collapseProposals && pending.length > 0
+      ? await deps.collapseProposals(pending, customerId)
+      : pending.map((p) => ({ thread: p.thread, outcome: p.outcome, mergedThreadKeys: [p.thread.threadKey] }));
+  report.proposed = survivors.length;
+
+  if (!deps.dryRun) {
+    for (const s of survivors) await deps.recordProposal(s.thread, s.outcome);
+    // Mark EVERY considered proposal thread processed — the survivors AND the ones the collapser
+    // dropped (merged dups, low-confidence, gated out) — so a re-run doesn't resurface any of them.
+    for (const p of pending) await deps.markProcessed(customerId, p.thread.threadKey, 'propose');
+  }
+
   deps.log?.info(
     {
       customerId,
@@ -290,6 +332,7 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
       linkedOpen: report.linkedOpen,
       linkedResolved: report.linkedResolved,
       proposed: report.proposed,
+      proposalsConsidered: report.proposalsConsidered,
       skipped: report.skipped,
       retryable: report.retryable,
       alreadyProcessed: report.alreadyProcessed,
