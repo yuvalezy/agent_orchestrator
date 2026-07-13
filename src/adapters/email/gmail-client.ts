@@ -176,6 +176,27 @@ export class GmailClient implements EmailProviderClient {
     return this.mapIds((t?.messages ?? []).map((m) => m.id));
   }
 
+  /**
+   * READ-ONLY search → the unique thread ids matching a Gmail query (e.g.
+   * `from:acme.com OR to:acme.com`), capped at `maxThreads`. Gmail's messages.list
+   * returns `threadId` per hit, so no per-message fetch is needed to group. Used by the
+   * backfill history reader; NEVER mutates. Drains nextPageToken until the cap.
+   */
+  async searchThreadIds(query: string, maxThreads = 100): Promise<string[]> {
+    const threadIds = new Set<string>();
+    let pageToken: string | undefined;
+    do {
+      const qs = new URLSearchParams({ q: query, maxResults: '100' });
+      if (pageToken) qs.set('pageToken', pageToken);
+      const page = await this.get<{ messages?: Array<{ id: string; threadId: string }>; nextPageToken?: string }>(
+        `/messages?${qs.toString()}`,
+      );
+      for (const m of page?.messages ?? []) threadIds.add(m.threadId);
+      pageToken = page?.nextPageToken;
+    } while (pageToken && threadIds.size < maxThreads);
+    return [...threadIds].slice(0, maxThreads);
+  }
+
   async send(input: { to: string; subject?: string; bodyText: string; threadId?: string; inReplyTo?: string; references?: string[] }): Promise<{ messageId: string }> {
     const lines = [`To: ${input.to}`, `Subject: ${input.subject ?? ''}`, 'Content-Type: text/plain; charset="UTF-8"', 'MIME-Version: 1.0'];
     if (input.inReplyTo) lines.push(`In-Reply-To: ${input.inReplyTo}`);

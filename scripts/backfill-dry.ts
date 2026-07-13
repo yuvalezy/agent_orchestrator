@@ -7,7 +7,10 @@ import { buildLlmRouter } from '../src/adapters/llm/factory';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from '../src/knowledge/memory-repo';
 import { buildInboxHistorySource } from '../src/knowledge/inbox-history-source';
-import { reconcileThread, runBackfill } from '../src/knowledge/backfill';
+import { buildGmailHistorySource } from '../src/adapters/email/gmail-history-source';
+import { GmailClient } from '../src/adapters/email/gmail-client';
+import { getCustomerEmailIdentity } from '../src/customers/email-identity';
+import { reconcileThread, runBackfill, type HistoricalThread } from '../src/knowledge/backfill';
 
 // DRY-RUN backfill for ONE customer (default HolaDoc) — reads agent_inbox history, reconciles each
 // thread against the live task inventory, and prints a REPORT. Writes NOTHING, posts NOTHING.
@@ -29,7 +32,28 @@ async function main(): Promise<void> {
     env.OPENAI_BASE_URL,
     { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
   );
-  const reader = buildInboxHistorySource();
+  const inboxReader = buildInboxHistorySource();
+  const gmailReader = buildGmailHistorySource({
+    accounts: [
+      { name: 'email:gmail:work', client: new GmailClient(() => tryResolveCredential('GMAIL_WORK_OAUTH') ?? '') },
+      { name: 'email:gmail:personal', client: new GmailClient(() => tryResolveCredential('GMAIL_PERSONAL_OAUTH') ?? '') },
+    ],
+    getIdentity: getCustomerEmailIdentity,
+    maxThreadsPerAccount: 50,
+  });
+  // Merge both sources — agent_inbox (already-ingested) + Gmail history (read-only search).
+  const reader = {
+    readThreads: async (cid: string): Promise<HistoricalThread[]> => {
+      const [inbox, gmail] = await Promise.all([
+        inboxReader.readThreads(cid).catch(() => [] as HistoricalThread[]),
+        gmailReader.readThreads(cid).catch((e) => {
+          logger.warn({ reason: (e as Error)?.message }, 'gmail history unavailable — inbox only');
+          return [] as HistoricalThread[];
+        }),
+      ]);
+      return [...inbox, ...gmail];
+    },
+  };
 
   const reconcile = (thread: Parameters<typeof reconcileThread>[0]) =>
     reconcileThread(thread, {

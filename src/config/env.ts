@@ -140,7 +140,11 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
-  BACKFILL_MATCH_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.5), // cosine ceiling for a candidate
+  // Vector distance is the RECALL gate (loose — let candidates through); the LLM judge is the
+  // PRECISION gate (confirms/rejects). Calibrated on HolaDoc email backfill: true matches sit at
+  // 0.53–0.62 (email thread vs terse task title), so 0.5 starved the judge → 0 links. 0.65 lets
+  // real matches reach the judge while it rejects the false ones.
+  BACKFILL_MATCH_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.65),
   BACKFILL_JUDGE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6), // LLM-judge confirm gate
   BACKFILL_MATCH_K: z.coerce.number().int().positive().default(5), // candidate fan-out
 
