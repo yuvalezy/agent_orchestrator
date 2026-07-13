@@ -164,3 +164,100 @@ test('LOOP PROOF: a correction written for a customer is retrieved for a later s
   const forB = await retriever.retrieve('How long do refunds take?', 'CUST-B');
   assert.equal(forB.length, 0, 'another customer never sees CUST-A feedback (scope isolation)');
 });
+
+test('LOOP PROOF (rejected): a REJECTED draft yields a customer-scoped lesson retrieved for a later similar question — and isolated', async () => {
+  // Parity with the modified LOOP PROOF, for the REJECT branch: a rejected draft must
+  // (1) persist a customer-scoped feedback memory embedded on the rejected answer text,
+  // and (2) surface for the SAME customer on a topically-similar later question, while
+  // remaining invisible to any other customer. Locks that reject is a first-class
+  // correction, not only modified.
+  const table: FeedbackMemoryInput[] = [];
+  const embedding = fakeEmbedding();
+  const dist = (a: number[], b: number[]): number =>
+    Math.sqrt(a.reduce((s, x, i) => s + (x - (b[i] ?? 0)) ** 2, 0));
+
+  await runFeedbackLearning({
+    fetchDecisions: async () => [
+      {
+        decisionId: 'dec-r1',
+        customerId: 'CUST-A',
+        outcome: 'rejected',
+        agentOutput: { draft_body: 'We ship internationally to every country.', language: 'en' },
+        humanOverride: { action: 'reject', by: 'founder' },
+      },
+    ],
+    embedding,
+    writeFeedback: async (input) => {
+      table.push(input);
+    },
+    log: silentLog,
+    batch: 50,
+  });
+  assert.equal(table.length, 1, 'a rejected draft persists exactly one feedback memory');
+  assert.equal(table[0].customerId, 'CUST-A', 'the rejection lesson is scoped to its own customer');
+  assert.equal(table[0].metadata.outcome, 'rejected');
+  assert.equal(table[0].metadata.decision_id, 'dec-r1');
+
+  const search = async (
+    vec: number[],
+    customerId: string | null,
+  ): Promise<Array<{ content: string; metadata: Record<string, unknown> | null; memoryType: string; distance: number }>> =>
+    table
+      .filter((r) => r.customerId === customerId) // ← scope isolation
+      .map((r) => ({ content: r.content, metadata: r.metadata, memoryType: 'feedback', distance: dist(vec, r.embedding) }))
+      .sort((a, b) => a.distance - b.distance);
+
+  const retriever = buildKnowledgeRetriever({ embedding, search, options: { kCustomer: 5, kShared: 3, maxDistance: 100_000 } });
+
+  const forA = await retriever.retrieve('Do you ship internationally to every country?', 'CUST-A');
+  assert.equal(forA.length, 1, 'CUST-A retrieves its own rejection lesson on a similar question');
+  assert.match(forA[0].content, /rejected and NOT sent/);
+  assert.match(forA[0].content, /We ship internationally to every country\./);
+
+  const forB = await retriever.retrieve('Do you ship internationally to every country?', 'CUST-B');
+  assert.equal(forB.length, 0, 'another customer never sees CUST-A rejection lesson (scope isolation)');
+});
+
+test('IDEMPOTENT LOOP: re-processing the same decision writes the lesson exactly once (fetch anti-join contract)', async () => {
+  // Idempotency is by design the fetch's job: fetchUnprocessedFeedbackDecisions anti-joins on
+  // agent_memory.metadata->>'decision_id', so a decision that already produced a feedback row is
+  // NEVER re-fetched. This locks that contract at the loop level: a fetch that honors the anti-join
+  // yields exactly one memory across repeated ticks — no double-embed, no double-write — even
+  // though the underlying resolved decision persists between runs.
+  const table: FeedbackMemoryInput[] = [];
+  const embedding = fakeEmbedding();
+  let embedCalls = 0;
+  const countingEmbedding: EmbeddingPort = {
+    embed: async (texts) => {
+      embedCalls += 1;
+      return embedding.embed(texts);
+    },
+  };
+
+  // The single resolved decision, always present in the source of truth (agent_decisions).
+  const resolved: FeedbackDecisionRow[] = [modifiedRow({ decisionId: 'dec-idem', customerId: 'CUST-A' })];
+  // Faithful anti-join: only return decisions that have NOT yet produced a feedback memory.
+  const fetchWithAntiJoin = async (): Promise<FeedbackDecisionRow[]> => {
+    const learned = new Set(table.map((r) => String(r.metadata.decision_id)));
+    return resolved.filter((d) => !learned.has(d.decisionId));
+  };
+  const deps = {
+    fetchDecisions: fetchWithAntiJoin,
+    embedding: countingEmbedding,
+    writeFeedback: async (input: FeedbackMemoryInput) => {
+      table.push(input);
+    },
+    log: silentLog,
+    batch: 50,
+  };
+
+  const first = await runFeedbackLearning(deps);
+  const second = await runFeedbackLearning(deps);
+  const third = await runFeedbackLearning(deps);
+
+  assert.deepEqual(first, { written: 1, skipped: 0, failed: 0 }, 'first tick learns the decision');
+  assert.deepEqual(second, { written: 0, skipped: 0, failed: 0 }, 'second tick re-picks nothing (already learned)');
+  assert.deepEqual(third, { written: 0, skipped: 0, failed: 0 });
+  assert.equal(table.length, 1, 'exactly one feedback memory persists across repeated runs');
+  assert.equal(embedCalls, 1, 'the answer text is embedded only once — no wasted re-embedding on re-processing');
+});

@@ -154,6 +154,27 @@ export async function getBackfillProposal(decisionId: string): Promise<{
 }
 
 /**
+ * All PENDING backfill proposals already carded for a customer (title/summary pulled out of the
+ * stored agent_output). Used by the sweep-wide collapser to drop a fresh survivor that a PRIOR run
+ * already posted a card for — cross-run dedup, so a re-sweep (esp. the WhatsApp leg) doesn't
+ * re-card a subject that's still awaiting approval. title/summary hold structured intent text, not
+ * the raw inbound body.
+ */
+export async function getPendingBackfillProposals(
+  customerId: string,
+): Promise<{ decisionId: string; title: string; summary: string }[]> {
+  const { rows } = await query<{ id: string; title: string | null; summary: string | null }>(
+    `SELECT id, agent_output->>'title' AS title, agent_output->>'summary' AS summary
+       FROM agent_decisions
+      WHERE decision_type = 'backfill_task_proposal'
+        AND outcome = 'pending'
+        AND customer_id = $1`,
+    [customerId],
+  );
+  return rows.map((r) => ({ decisionId: r.id, title: r.title ?? '', summary: r.summary ?? '' }));
+}
+
+/**
  * Resolve a backfill proposal (approve → 'accepted' + task_ref of the created task; reject →
  * 'rejected'). Idempotent: `WHERE outcome='pending'` — a replayed tap is a 0-row no-op. Returns
  * true if THIS call resolved it (so the caller posts the one-time confirmation), false otherwise.

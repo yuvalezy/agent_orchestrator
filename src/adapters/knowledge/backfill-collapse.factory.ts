@@ -1,5 +1,5 @@
 import type { PendingProposal, CollapsedProposal } from '../../knowledge/backfill';
-import { clusterByEmbedding, type EmbeddedItem } from '../../knowledge/proposal-collapse';
+import { clusterByEmbedding, cosineDistance, type EmbeddedItem } from '../../knowledge/proposal-collapse';
 import type { SyncLogger } from '../../knowledge/sync';
 
 // Sweep-wide proposal collapser (ADAPTER composition of the core clustering with an embedder). Two
@@ -22,11 +22,17 @@ export interface ProposalCollapserConfig {
 export interface ProposalCollapserDeps {
   /** Best-effort single-text embed (null on failure — the item then can't be clustered, kept alone). */
   embedOne: (text: string) => Promise<number[] | null>;
+  /** OPTIONAL cross-run dedup source: proposals ALREADY carded (outcome='pending') for the customer
+   *  from a PRIOR sweep. When present, a within-sweep survivor whose embedding is within
+   *  `clusterMaxDistance` of any of these is DROPPED — it's already awaiting approval, so a re-sweep
+   *  must not post a second card. Absent → behavior is unchanged (within-sweep collapse only). */
+  findPendingProposals?: (customerId: string) => Promise<{ title: string; summary: string }[]>;
   config: ProposalCollapserConfig;
   log?: SyncLogger;
 }
 
 const proposalText = (p: PendingProposal): string => `${p.outcome.title}. ${p.outcome.summary}`.trim();
+const pendingText = (p: { title: string; summary: string }): string => `${p.title}. ${p.summary}`.trim();
 
 export function buildProposalCollapser(
   deps: ProposalCollapserDeps,
@@ -61,6 +67,31 @@ export function buildProposalCollapser(
     });
     for (const o of orphans) survivors.push({ thread: o.thread, outcome: o.outcome, mergedThreadKeys: [o.thread.threadKey] });
 
+    // 3. CROSS-RUN dedup (optional). A within-sweep survivor whose subject was ALREADY carded by a
+    //    prior run (still outcome='pending') is dropped — a re-sweep must not double-card it. We
+    //    reuse the survivors' representative embeddings (computed above) and embed each prior
+    //    pending proposal; an embed miss on either side simply can't match (keep the survivor).
+    let survivorsOut = survivors;
+    let droppedCrossRun = 0;
+    if (deps.findPendingProposals) {
+      const pendingPrior = await deps.findPendingProposals(customerId);
+      const priorEmbeddings: number[][] = [];
+      for (const pp of pendingPrior) {
+        const v = await deps.embedOne(pendingText(pp));
+        if (v) priorEmbeddings.push(v);
+      }
+      if (priorEmbeddings.length > 0) {
+        const embByKey = new Map(embedded.map((e) => [e.key, e.embedding]));
+        survivorsOut = survivors.filter((s) => {
+          const emb = embByKey.get(s.thread.threadKey);
+          if (!emb) return true; // orphan / no embedding → can't compare, keep it
+          const isDup = priorEmbeddings.some((pe) => cosineDistance(emb, pe) <= deps.config.clusterMaxDistance);
+          if (isDup) droppedCrossRun += 1;
+          return !isDup;
+        });
+      }
+    }
+
     deps.log?.info(
       {
         customerId,
@@ -68,10 +99,11 @@ export function buildProposalCollapser(
         droppedByGate,
         clustered: embedded.length,
         orphans: orphans.length,
-        cards: survivors.length,
+        droppedCrossRun,
+        cards: survivorsOut.length,
       },
       'backfill proposal collapse complete',
     );
-    return survivors;
+    return survivorsOut;
   };
 }

@@ -65,6 +65,9 @@ export interface BackfillReconcileConfig {
   judgeThreshold: number;
   /** Candidate fan-out for the vector search. */
   k: number;
+  /** How many times to sample the (non-deterministic) judge per candidate; the MEDIAN score is
+   *  thresholded. Undefined/1 = a single call (current behavior); >1 stabilizes run-to-run links. */
+  judgeVotes?: number;
 }
 
 export interface BackfillReconcileDeps {
@@ -79,6 +82,13 @@ export interface BackfillReconcileDeps {
 }
 
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/** Median of a non-empty sample (stable central tendency — robust to a single outlier vote). */
+function median(xs: number[]): number {
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
 
 /** Flatten a thread into a single body for classification (author-tagged lines). Messages with
  *  an empty body contribute nothing — a thread of only empty messages is treated as empty. */
@@ -148,14 +158,20 @@ export async function reconcileThread(thread: HistoricalThread, deps: BackfillRe
   }
   if (!anyEmbed) return { kind: 'skip', reason: 'embed unavailable', retryable: true };
 
-  // Judge the intent against the unioned candidates; keep the highest-confidence pass.
+  // Judge the intent against the unioned candidates; keep the highest-confidence pass. The judge is
+  // non-deterministic, so with judgeVotes>1 we re-sample it that many times and threshold the MEDIAN
+  // score per candidate (stable central tendency). votes=1 → a single call, identical to before.
   let best: { match: TaskMatch; judged: number } | null = null;
   const candidates = [...candidatesByRef.values()];
   if (candidates.length > 0) {
+    const votes = Math.max(1, deps.config.judgeVotes ?? 1);
     try {
-      const scores = await deps.judge(text, candidates.map((c) => c.content));
+      const rounds: number[][] = [];
+      for (let v = 0; v < votes; v += 1) {
+        rounds.push(await deps.judge(text, candidates.map((c) => c.content)));
+      }
       for (let i = 0; i < candidates.length; i += 1) {
-        const s = scores[i] ?? 0;
+        const s = median(rounds.map((r) => r[i] ?? 0));
         if (s >= deps.config.judgeThreshold && (!best || s > best.judged)) best = { match: candidates[i], judged: s };
       }
     } catch (err) {

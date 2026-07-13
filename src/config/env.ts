@@ -146,6 +146,8 @@ const envSchema = z.object({
   // real matches reach the judge while it rejects the false ones.
   BACKFILL_MATCH_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.65),
   BACKFILL_JUDGE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6), // LLM-judge confirm gate
+  // Judge is non-deterministic run-to-run; >1 re-samples it that many times and takes the MEDIAN score per candidate to stabilize links (1 = single call, current behavior).
+  BACKFILL_JUDGE_VOTES: z.coerce.number().int().positive().default(1),
   BACKFILL_MATCH_K: z.coerce.number().int().positive().default(5), // candidate fan-out
   // WhatsApp history leg: drains the whatsapp_manager archive, windows each chat, and reconciles.
   BACKFILL_WA_ENABLED: z

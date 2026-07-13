@@ -177,6 +177,80 @@ test('best-effort: a judge error is caught → treated as no match → propose',
   assert.equal(out.kind, 'propose');
 });
 
+// ── judge voting (median re-sampling; default 1 = unchanged) ─────────────────────
+test('judgeVotes default (1) → judge is called exactly once (unchanged)', async () => {
+  let calls = 0;
+  const out = await reconcileThread(
+    thread(),
+    deps({
+      searchTasks: async () => [taskMatch({ taskRef: 'TSK-1', status: 'in-progress' })],
+      judge: async (_a, c) => {
+        calls += 1;
+        return c.map(() => 0.9);
+      },
+    }),
+  );
+  assert.equal(calls, 1);
+  assert.equal(out.kind, 'link-open');
+  assert.equal((out as Record<string, unknown>).judged, 0.9);
+});
+
+test('judgeVotes=3 → 3 calls, MEDIAN passes the threshold → link', async () => {
+  const votes = [0.4, 0.9, 0.8]; // median 0.8 ≥ 0.6 gate
+  let calls = 0;
+  const out = await reconcileThread(
+    thread(),
+    deps({
+      searchTasks: async () => [taskMatch({ taskRef: 'TSK-1', status: 'todo' })],
+      judge: async (_a, c) => {
+        const v = votes[calls];
+        calls += 1;
+        return c.map(() => v);
+      },
+      config: { matchMaxDistance: 0.4, judgeThreshold: 0.6, k: 5, judgeVotes: 3 },
+    }),
+  );
+  assert.equal(calls, 3);
+  assert.equal(out.kind, 'link-open');
+  assert.equal((out as Record<string, unknown>).judged, 0.8, 'thresholds the median, not the last vote');
+});
+
+test('judgeVotes=3 → 3 calls, MEDIAN below threshold → no link (propose)', async () => {
+  const votes = [0.9, 0.1, 0.2]; // median 0.2 < 0.6 gate
+  let calls = 0;
+  const out = await reconcileThread(
+    thread(),
+    deps({
+      searchTasks: async () => [taskMatch({ taskRef: 'TSK-1', status: 'todo' })],
+      judge: async (_a, c) => {
+        const v = votes[calls];
+        calls += 1;
+        return c.map(() => v);
+      },
+      config: { matchMaxDistance: 0.4, judgeThreshold: 0.6, k: 5, judgeVotes: 3 },
+    }),
+  );
+  assert.equal(calls, 3);
+  assert.equal(out.kind, 'propose', 'a high outlier vote cannot carry a low-median candidate');
+});
+
+test('judgeVotes: a judge that throws mid-vote degrades to no match → propose', async () => {
+  let calls = 0;
+  const out = await reconcileThread(
+    thread(),
+    deps({
+      searchTasks: async () => [taskMatch({ taskRef: 'TSK-1', status: 'todo' })],
+      judge: async (_a, c) => {
+        calls += 1;
+        if (calls === 2) throw new Error('llm down mid-vote');
+        return c.map(() => 0.9);
+      },
+      config: { matchMaxDistance: 0.4, judgeThreshold: 0.6, k: 5, judgeVotes: 3 },
+    }),
+  );
+  assert.equal(out.kind, 'propose');
+});
+
 test('classify passes language + customer through to the LLM', async () => {
   let seen: TriageContext | null = null;
   await reconcileThread(

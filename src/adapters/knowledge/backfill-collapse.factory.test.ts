@@ -50,3 +50,30 @@ test('an embed failure keeps the proposal as its own card (never silently droppe
   assert.equal(out.length, 2);
   assert.deepEqual(out.map((s) => s.thread.threadKey).sort(), ['t1', 't2']);
 });
+
+test('cross-run: a survivor matching a PENDING prior proposal is dropped; a distinct one is kept', async () => {
+  // Prior run already carded a "pos" subject. This sweep produces a fresh "pos" survivor (dup) and
+  // a "reports" survivor (new) — only the reports card should remain.
+  const findPendingProposals = async (): Promise<{ title: string; summary: string }[]> => [
+    { title: 'pos already carded', summary: 'sum pos' },
+  ];
+  const collapse = buildProposalCollapser({ embedOne, findPendingProposals, config });
+  const out = await collapse([prop('t1', 'pos bug', 0.9), prop('t2', 'reports request', 0.9)], 'c1');
+  assert.equal(out.length, 1, 'the already-carded pos survivor is dropped as a cross-run dup');
+  assert.equal(out[0].thread.threadKey, 't2', 'the distinct reports proposal survives');
+});
+
+test('cross-run: no prior pending proposals → survivors unchanged', async () => {
+  const findPendingProposals = async (): Promise<{ title: string; summary: string }[]> => [];
+  const collapse = buildProposalCollapser({ embedOne, findPendingProposals, config });
+  const out = await collapse([prop('t1', 'pos bug', 0.9), prop('t2', 'reports request', 0.9)], 'c1');
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((s) => s.thread.threadKey).sort(), ['t1', 't2']);
+});
+
+test('cross-run: dep ABSENT → behavior identical (no dedup against prior runs)', async () => {
+  const collapse = buildProposalCollapser({ embedOne, config });
+  const out = await collapse([prop('t1', 'pos bug', 0.9), prop('t2', 'reports request', 0.9)], 'c1');
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((s) => s.thread.threadKey).sort(), ['t1', 't2']);
+});

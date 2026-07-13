@@ -13,6 +13,7 @@ import { buildWaHistorySource } from '../src/adapters/whatsapp-manager/wa-histor
 import { getCustomerDirectoryInfo } from '../src/customers/customer-directory';
 import { buildProposalCollapser } from '../src/adapters/knowledge/backfill-collapse.factory';
 import { reconcileThread, type HistoricalThread, type BackfillOrchestratorDeps } from '../src/knowledge/backfill';
+import { getPendingBackfillProposals } from '../src/decisions/decisions';
 
 // Shared backfill composition root for the dry-run + live scripts (DRY). Wires the three history
 // legs (agent_inbox + Gmail + WhatsApp), the reconcile-against-task-inventory closure, and the
@@ -84,6 +85,7 @@ export function createBackfillCore(): BackfillCore {
       config: {
         matchMaxDistance: env.BACKFILL_MATCH_MAX_DISTANCE,
         judgeThreshold: env.BACKFILL_JUDGE_THRESHOLD,
+        judgeVotes: env.BACKFILL_JUDGE_VOTES,
         k: env.BACKFILL_MATCH_K,
       },
       log: logger,
@@ -91,6 +93,7 @@ export function createBackfillCore(): BackfillCore {
 
   const collapseProposals = buildProposalCollapser({
     embedOne,
+    findPendingProposals: getPendingBackfillProposals,
     config: {
       minConfidence: env.BACKFILL_PROPOSE_MIN_CONFIDENCE,
       clusterMaxDistance: env.BACKFILL_COLLAPSE_MAX_DISTANCE,
