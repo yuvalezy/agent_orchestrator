@@ -119,6 +119,18 @@ const envSchema = z.object({
   // not a real deletion). 0..1; 0.5 = never tombstone more than half a source at once.
   KNOWLEDGE_TOMBSTONE_MAX_RATIO: z.coerce.number().min(0).max(1).default(0.5),
 
+  // ── Task-Inventory sync (Layer-1 backfill groundwork): mirror each onboarded
+  // customer's portal project tasks (ALL statuses) into agent_memory as
+  // memory_type='task', hash-controlled by the SAME reconciler as knowledge-sync (a
+  // status/priority change re-embeds). Unlocks "status of X" answers + a content-keyed
+  // inventory for backfill matching. Kill-switch, DORMANT by default (mirrors
+  // KNOWLEDGE_SYNC_ENABLED). Reuses OPENAI_API_KEY + the embedding model/dim.
+  TASK_INVENTORY_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  TASK_INVENTORY_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(1_200_000), // 20m
+
   // ── M2a(b): scoped RAG retrieval INTO the triage context. Kill-switch (mirrors
   // KNOWLEDGE_SYNC_ENABLED): the retriever is injected into triage ONLY when the
   // literal "true". Additive + best-effort — a missing OPENAI_API_KEY, an empty RAG,

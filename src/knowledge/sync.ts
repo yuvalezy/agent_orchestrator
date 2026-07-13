@@ -118,7 +118,10 @@ export async function reconcileKnowledge(deps: ReconcileKnowledgeDeps): Promise<
           chunkIndex: c.chunkIndex,
           content: c.content,
           embedding: vectors[i],
+          // Source-supplied extras (e.g. task_ref/status) first, so the reconciler's
+          // own doc metadata always wins on a key collision.
           metadata: {
+            ...doc.extraMetadata,
             title: doc.title,
             section: c.section,
             chunkIndex: c.chunkIndex,
@@ -127,6 +130,7 @@ export async function reconcileKnowledge(deps: ReconcileKnowledgeDeps): Promise<
             locale: doc.locale,
           },
           customerId,
+          memoryType: doc.memoryType,
         });
       }
     }

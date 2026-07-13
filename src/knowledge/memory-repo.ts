@@ -46,6 +46,9 @@ export interface ChunkRow {
   metadata: Record<string, unknown>;
   /** Re-stamped from the manifest every pass; null = shared. */
   customerId: string | null;
+  /** agent_memory.memory_type for this row. Defaults to 'guide' (the Layer-B
+   *  product-doc mirror) when unset; the portal task-inventory source sets 'task'. */
+  memoryType?: string;
 }
 
 export interface SearchOptions {
@@ -348,7 +351,9 @@ export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRe
 
   async replaceChunks(documentId: number, rows: ChunkRow[]): Promise<void> {
     // delete-then-insert in one transaction; UNIQUE(document_id, chunk_index) guards
-    // against dupes on a concurrent re-sync. Layer-B rows are memory_type='guide'.
+    // against dupes on a concurrent re-sync. Layer-B rows default to memory_type
+    // 'guide' (product-doc mirror); a source may override per row (e.g. 'task' for the
+    // portal task inventory) — the value is bound (CHECK-constrained server-side).
     await withClient(async (client) => {
       await client.query('BEGIN');
       try {
@@ -357,9 +362,10 @@ export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRe
           await client.query(
             `INSERT INTO agent_memory
                 (customer_id, memory_type, document_id, content, embedding, metadata, chunk_index)
-             VALUES ($1, 'guide', $2, $3, $4::vector, $5::jsonb, $6)`,
+             VALUES ($1, $2, $3, $4, $5::vector, $6::jsonb, $7)`,
             [
               row.customerId,
+              row.memoryType ?? 'guide',
               documentId,
               row.content,
               toVectorLiteral(row.embedding),

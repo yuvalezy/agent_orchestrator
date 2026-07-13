@@ -33,6 +33,9 @@ import { recordReleaseNoteDraftDecision } from './decisions/decisions';
 import { loadCustomerConfig } from './triage/context-loader';
 import { buildLlmRouter } from './adapters/llm/factory';
 import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
+import { buildPortalTaskSource } from './adapters/knowledge/portal-task-source';
+import { buildEzyPortalGateway } from './adapters/ezy-portal/factory';
+import { listTaskInventoryCustomers } from './customers/task-inventory-customers';
 import { buildInternalDocSource } from './adapters/knowledge/internal-doc-source';
 import { buildEmbeddingAdapter } from './adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from './knowledge/memory-repo';
@@ -50,6 +53,9 @@ const KNOWLEDGE_SYNC_LOCK_KEY = 0x6b6e6f77;
 const INTERNAL_SYNC_LOCK_KEY = 0x696e746b;
 // M2(e): advisory-lock namespace for the release-note notify tick ('rlnt').
 const RELEASE_NOTE_LOCK_KEY = 0x726c6e74;
+// Task-inventory reconcile advisory-lock namespace ('tskv') — its own key so it never
+// contends with the doc knowledge-sync or the internal reconcile.
+const TASK_INVENTORY_LOCK_KEY = 0x74736b76;
 
 /** No-op notifier so the drainer can register even when Telegram is unconfigured
  *  (D-M / clean fallback). Its alerts silently drop — a loud WARN is emitted at
@@ -250,6 +256,61 @@ async function main(): Promise<void> {
     logger.info('knowledge-sync worker registered (KNOWLEDGE_SYNC_ENABLED=true)');
   } else {
     logger.info('knowledge-sync worker NOT registered (KNOWLEDGE_SYNC_ENABLED=false) — set it once corpus customers are onboarded, nothing ingests meanwhile');
+  }
+
+  // Task-inventory sync (Layer-1 backfill groundwork): mirror each onboarded customer's
+  // portal project tasks (ALL statuses) into agent_memory as memory_type='task' via the
+  // SAME reconciler (buildKnowledgeSyncWorker with the portal task source). Kill-switch
+  // TASK_INVENTORY_ENABLED, DORMANT by default. Own advisory-lock key so it never contends
+  // with the doc/internal reconciles. Reuses the shared memoryRepo manifest — task rows are
+  // sourceId 'task-inventory:<customerId>', customer-scoped, fail-closed on unresolved bpRef.
+  if (env.TASK_INVENTORY_ENABLED) {
+    if (!tryResolveCredential('OPENAI_API_KEY')) {
+      logger.warn('⚠️  TASK_INVENTORY_ENABLED=true but OPENAI_API_KEY is UNSET — task-inventory embeddings will fail until it is set.');
+    }
+    const portal = buildEzyPortalGateway();
+    const taskInventoryWorker = buildKnowledgeSyncWorker({
+      name: 'task-inventory:sync',
+      docSource: buildPortalTaskSource({
+        taskTarget: portal,
+        listCustomers: listTaskInventoryCustomers,
+        log: logger,
+      }),
+      embedding: buildEmbeddingAdapter(
+        () => tryResolveCredential('OPENAI_API_KEY'),
+        env.OPENAI_BASE_URL,
+        { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+      ),
+      repo: memoryRepo,
+      resolveCustomerId: async (bpRef) =>
+        (await dbContactResolutionQueries.findCustomerByBpRef(bpRef))?.customerId ?? null,
+      log: logger,
+      intervalMs: env.TASK_INVENTORY_SYNC_INTERVAL_MS,
+      tombstoneMaxRatio: env.KNOWLEDGE_TOMBSTONE_MAX_RATIO,
+    });
+    knowledgeWorkers.push({
+      ...taskInventoryWorker,
+      run: async () => {
+        await withClient(async (client) => {
+          const { rows } = await client.query<{ locked: boolean }>(
+            'SELECT pg_try_advisory_lock($1) AS locked',
+            [TASK_INVENTORY_LOCK_KEY],
+          );
+          if (!rows[0]?.locked) {
+            logger.warn('task-inventory sync: another instance holds the advisory lock — skipping this tick');
+            return;
+          }
+          try {
+            await taskInventoryWorker.run();
+          } finally {
+            await client.query('SELECT pg_advisory_unlock($1)', [TASK_INVENTORY_LOCK_KEY]);
+          }
+        });
+      },
+    });
+    logger.info('task-inventory sync worker registered (TASK_INVENTORY_ENABLED=true)');
+  } else {
+    logger.info('task-inventory sync worker NOT registered (TASK_INVENTORY_ENABLED=false)');
   }
 
   // M3(c): feedback-learning worker — registered ONLY when FEEDBACK_LEARNING_ENABLED

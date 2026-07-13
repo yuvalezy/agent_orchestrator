@@ -79,6 +79,7 @@ function fakes(
       findOpenTasks: async () => openTasks.map((t) => ({ ref: t.ref, title: t.title, status: t.status })),
       findTasksBySource: async (q) =>
         openTasks.filter((t) => t.entityId === q.sourceEntity.id).map((t) => ({ ref: t.ref, title: t.title, status: t.status })),
+      listAllTasks: async () => openTasks.map((t) => ({ ref: t.ref, title: t.title, status: t.status })),
       setStatus: async () => {},
       listWorkItemTypes: async () => [],
       attachFileToTask: async (t, bytes, filename, contentType) => {

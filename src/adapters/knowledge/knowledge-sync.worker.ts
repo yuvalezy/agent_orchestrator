@@ -25,12 +25,15 @@ export interface KnowledgeSyncWorkerDeps {
   tombstoneMaxRatio: number;
   /** Chunker seam (default chunkMarkdown). */
   chunk?: typeof chunkMarkdown;
+  /** Worker display name (default 'knowledge:sync'). The task-inventory sync reuses this
+   *  builder with a different docSource + name so both flow through one reconcile path. */
+  name?: string;
 }
 
 export function buildKnowledgeSyncWorker(deps: KnowledgeSyncWorkerDeps): WorkerDefinition {
   const chunk = deps.chunk ?? chunkMarkdown;
   return {
-    name: 'knowledge:sync',
+    name: deps.name ?? 'knowledge:sync',
     intervalMs: deps.intervalMs,
     runImmediately: true, // startup catch-up: sync the corpus at boot, not one interval later
     // ⚠︎ Advisory lock: the composition root (main.ts, post-Gate-0) is expected to

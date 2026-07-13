@@ -74,10 +74,23 @@ interface EzyTask {
   status: string;
   projectId?: string;
   updatedAt?: string;
+  code?: string;
+  priority?: string;
+  description?: string;
 }
 
 interface Paged<T> {
   data: T[];
+}
+
+/** The projects/tasks list envelope: {data, total, page, pageSize, totalPages}
+ *  (⚠ distinct from the service-desk EzyTicketList's totalCount/pageNumber shape). */
+interface PagedTasks<T> {
+  data: T[];
+  total?: number;
+  page?: number;
+  pageSize?: number;
+  totalPages?: number;
 }
 
 // ── Service-desk raw shapes (recon §2; camelCase JSON, only fields we read) ──
@@ -162,6 +175,9 @@ function mapTask(t: EzyTask): TargetTask {
     status: t.status,
     projectRef: t.projectId,
     updatedAt: t.updatedAt ? new Date(t.updatedAt) : undefined,
+    code: t.code,
+    priority: t.priority,
+    description: t.description,
   };
 }
 
@@ -342,6 +358,35 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
       status: ALL_STATUSES,
     });
     return res.data.map(mapTask);
+  }
+
+  /**
+   * Every task for a project across ALL statuses, paginated to completion — the
+   * content-keyed inventory for the task-inventory sync (Layer 1). Unlike
+   * findOpenTasks (page-1, open-only) this walks `page` 1..totalPages so a project
+   * with >pageSize tasks is fully drained. pageSize is capped high (200) to minimize
+   * round-trips; the envelope is {data, total, page, pageSize, totalPages}. List rows
+   * carry NO description (a per-task detail read) — only title/code/status/priority.
+   */
+  async listAllTasks(projectRef: string): Promise<TargetTask[]> {
+    const pageSize = 200;
+    const out: TargetTask[] = [];
+    let page = 1;
+    // Bound the loop by the reported totalPages; fall back to "stop when a page is
+    // short" if the envelope omits it (never loop forever).
+    for (;;) {
+      const res = await this.http.get<PagedTasks<EzyTask>>('/api/projects/tasks', {
+        projectId: projectRef,
+        status: ALL_STATUSES,
+        page: String(page),
+        pageSize: String(pageSize),
+      });
+      out.push(...res.data.map(mapTask));
+      const totalPages = res.totalPages ?? (res.data.length < pageSize ? page : page + 1);
+      if (page >= totalPages || res.data.length === 0) break;
+      page += 1;
+    }
+    return out;
   }
 
   async setStatus(task: TaskRef, status: string): Promise<void> {

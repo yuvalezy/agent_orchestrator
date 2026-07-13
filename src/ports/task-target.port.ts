@@ -19,6 +19,12 @@ export interface TargetTask {
   url?: string;
   projectRef?: string;
   updatedAt?: Date;
+  /** Human task code (e.g. 'TSK-00214'); present on list reads. */
+  code?: string;
+  /** Task priority (low|medium|high|urgent); present on list reads. */
+  priority?: string;
+  /** Full description — only on a per-task detail read (absent from list rows). */
+  description?: string;
 }
 
 /** A task's source-triple identity (D5) — (service, entityType, entityId) is the
@@ -52,6 +58,11 @@ export interface TaskTargetPort {
    *  source uniqueness, so a closed task still blocks a new create) — used by the
    *  money-loop's thread dedup. At most one for a source-unique target. */
   findTasksBySource(q: { projectRef?: string; sourceEntity: SourceEntityRef }): Promise<TargetTask[]>;
+  /** Every task for a project across EVERY status, paginated to completion — the
+   *  content-keyed source for the task-inventory sync (distinct from findOpenTasks,
+   *  which is page-1 + open-only). Includes code/priority so a status/priority change
+   *  re-embeds. Does NOT fetch descriptions (a per-task detail read). */
+  listAllTasks(projectRef: string): Promise<TargetTask[]>;
   listWorkItemTypes(projectRef: string): Promise<Array<{ ref: string; name: string }>>;
   setStatus(task: TaskRef, status: string): Promise<void>; // used from change 04
   /** Attach a binary file to a task (M2 group-mention media path). Best-effort at

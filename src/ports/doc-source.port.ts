@@ -27,6 +27,15 @@ export interface ScannedDoc {
   content: string;
   /** sha256 hex over the portal normalized recipe (doc-hash.ts). */
   contentHash: string;
+  /** agent_memory.memory_type to persist the chunks as. Default 'guide' (Layer-B
+   *  product-doc mirror). A non-doc source (e.g. the portal task inventory) sets
+   *  'task' so the drafter's history retrieval surfaces it — the reconciler threads
+   *  this straight into replaceChunks, otherwise unchanged. */
+  memoryType?: string;
+  /** Extra key/values merged into EVERY chunk's metadata (e.g. a task's
+   *  {task_ref, code, status, project_ref}). The reconciler's own doc metadata
+   *  (title/section/module/route/locale) always wins on key collision. NEVER logged. */
+  extraMetadata?: Record<string, unknown>;
 }
 
 export interface DocSourcePort {

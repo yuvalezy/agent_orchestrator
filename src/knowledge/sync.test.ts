@@ -180,6 +180,34 @@ test('hash same + active → SKIP with ZERO embed calls', async () => {
   assert.equal(repo.replaced.length, 0);
 });
 
+test('memoryType + extraMetadata thread into the chunk rows (task source); default stays guide', async () => {
+  const emb = makeEmbedding();
+  const repo = makeRepo([]);
+  await reconcileKnowledge(
+    baseDeps({
+      docSource: docSourceOf([
+        doc({ sourceId: 's', docKey: 's:m:es:doc' }), // no memoryType → default (undefined → 'guide' at repo)
+        doc({
+          sourceId: 't',
+          docKey: 't:tasks:es:TSK-1',
+          memoryType: 'task',
+          extraMetadata: { task_ref: 'r1', status: 'in-progress' },
+        }),
+      ]),
+      embedding: emb.port,
+      repo: repo.repo,
+    }),
+  );
+  const guideRow = repo.replaced.find((r) => r.rows[0]?.metadata['title'] === 't' && r.rows[0]?.memoryType === undefined);
+  const taskRow = repo.replaced.find((r) => r.rows[0]?.memoryType === 'task');
+  assert.ok(guideRow, 'a doc without memoryType leaves it unset (repo defaults to guide)');
+  assert.ok(taskRow, 'the task doc carries memoryType=task');
+  assert.equal(taskRow!.rows[0].metadata['task_ref'], 'r1', 'extraMetadata is merged into chunk metadata');
+  assert.equal(taskRow!.rows[0].metadata['status'], 'in-progress');
+  // The reconciler's own doc metadata still wins on collision (title/section/locale present).
+  assert.equal(taskRow!.rows[0].metadata['locale'], 'es');
+});
+
 test('tombstoned + back on disk → resurrect (re-embed, counted as updated)', async () => {
   const emb = makeEmbedding();
   const repo = makeRepo([row({ id: 9, sourceId: 's', docKey: 's:m:es:a', contentHash: 'h1', status: 'tombstoned' })]);
