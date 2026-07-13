@@ -1,6 +1,6 @@
 import { type FormEvent, type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, RefreshCw, Send, ShieldCheck } from 'lucide-react';
+import { Activity, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, RefreshCw, Send, ShieldCheck, Users } from 'lucide-react';
 import { api, type ApiError, setCsrfToken } from './lib/api';
 import { cn } from './lib/utils';
 
@@ -20,6 +20,7 @@ const nav = [
   ['workers', 'Worker health', Activity],
   ['inbox', 'Inbox', ClipboardList],
   ['outbound', 'Outbound', Send],
+  ['customers', 'Customers', Users],
   ['decisions', 'Decisions', ShieldCheck],
 ] as const;
 type View = typeof nav[number][0];
@@ -83,7 +84,7 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">
       <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-zinc-800 bg-zinc-950/85 px-5 backdrop-blur"><button onClick={() => setMenuOpen(true)} className="md:hidden"><Menu /></button><div className="text-sm text-zinc-400">Founder-only · Tailscale protected</div><button onClick={() => client.invalidateQueries()} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900 hover:text-white" title="Refresh"><RefreshCw size={17} /></button></header>
-      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'decisions' && <DecisionsView />}</div>
+      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}</div>
     </main>
   </div>;
 }
@@ -130,6 +131,22 @@ function OutboundView(): ReactElement {
   if (outbound.isError) return <ErrorState message={(outbound.error as Error).message} />;
   if (!outbound.data) return <Loading title="Loading outbound queue…" />;
   return <section><PageTitle eyebrow="Delivery safety" title="Outbound queue" description="This console cannot send or resend messages. Cancellation is restricted to approved, unsent, non-draft rows." /><div className="mt-6 flex gap-2 overflow-x-auto">{['', 'pending', 'approved', 'sending', 'sent', 'failed', 'cancelled'].map((value) => <button key={value || 'all'} onClick={() => setStatus(value)} className={cn('rounded-full border px-3 py-1.5 text-sm capitalize', status === value ? 'border-emerald-400 bg-emerald-400 text-zinc-950' : 'border-zinc-700 text-zinc-300')}>{value || 'all'}</button>)}</div><div className="mt-6 grid gap-5 xl:grid-cols-[1fr_440px]"><Panel title={`${outbound.data.data.length} records`}><div className="divide-y divide-zinc-800">{outbound.data.data.map((row) => <button key={String(row.id)} onClick={() => setSelected(String(row.id))} className="block w-full px-1 py-4 text-left hover:bg-zinc-900/50"><div className="flex items-center justify-between gap-3"><span className="font-medium">{display(row.customer_name)}</span><Badge value={display(row.status)} /></div><p className="mt-1 truncate text-sm text-zinc-400">{display(row.subject)}</p><p className="mt-2 text-xs text-zinc-500">{display(row.channel_name)} · {row.is_draft === true ? 'draft' : 'non-draft'} · {displayDate(row.created_at)}</p></button>)}</div></Panel><Detail title="Outbound detail" loading={detail.isLoading} error={detail.error as Error | null} data={detail.data?.data} action={detail.data?.data.status === 'approved' && detail.data?.data.is_draft === false ? <button onClick={() => { if (window.confirm('Cancel this approved outbound item? It cannot be restored from the console.')) cancel.mutate(String(detail.data?.data.id)); }} className="rounded-lg bg-red-300 px-3 py-2 text-sm font-semibold text-zinc-950">Cancel approved send</button> : undefined} /></div></section>;
+}
+
+function CustomersView(): ReactElement {
+  const [searchInput, setSearchInput] = useState(''); const [search, setSearch] = useState(''); const [selected, setSelected] = useState<string | null>(null);
+  const customers = useQuery({ queryKey: ['customers', search], queryFn: () => api<Page>(`/customers${search ? `?search=${encodeURIComponent(search)}` : ''}`) });
+  const detail = useQuery({ queryKey: ['customer', selected], queryFn: () => api<{ data: Row }>(`/customers/${selected}`), enabled: Boolean(selected) });
+  const timeline = useQuery({ queryKey: ['customer-timeline', selected], queryFn: () => api<{ data: Row[] }>(`/customers/${selected}/timeline`), enabled: Boolean(selected) });
+  if (customers.isLoading) return <Loading title="Loading local customers…" />;
+  if (customers.isError) return <ErrorState message={(customers.error as Error).message} />;
+  if (!customers.data) return <Loading title="Loading local customers…" />;
+  return <section><PageTitle eyebrow="Local customer record" title="Customers" description="A bounded timeline built only from orchestrator records. It contains event metadata, never inbox bodies or agent output." />
+    <form onSubmit={(event) => { event.preventDefault(); setSearch(searchInput.trim()); setSelected(null); }} className="mt-6 flex max-w-xl gap-2"><input value={searchInput} onChange={(event) => setSearchInput(event.target.value)} placeholder="Search customer name or BP reference" className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm outline-none ring-emerald-400 focus:ring-2" /><button className="rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-emerald-300">Search</button></form>
+    <div className="mt-6 grid gap-5 xl:grid-cols-[minmax(280px,0.8fr)_minmax(0,1.5fr)]"><Panel title={`${customers.data.data.length} local customers`}><div className="divide-y divide-zinc-800">{customers.data.data.length === 0 && <p className="py-4 text-sm text-zinc-500">No local customer records match this search.</p>}{customers.data.data.map((row) => <button key={String(row.id)} onClick={() => setSelected(String(row.id))} className={cn('block w-full px-1 py-4 text-left hover:bg-zinc-900/50', selected === String(row.id) && 'bg-zinc-800/60')}><div className="flex items-center justify-between gap-3"><span className="truncate font-medium">{display(row.display_name)}</span><span className="text-xs text-zinc-500">{String(row.inbox_count ?? 0)} inbox</span></div><p className="mt-1 text-xs text-zinc-500">{display(row.bp_ref)} · added {displayDate(row.created_at)}</p></button>)}</div></Panel>
+      <div className="space-y-5"><Detail title="Customer record" loading={detail.isLoading} error={detail.error as Error | null} data={detail.data?.data} /><Panel title="Activity timeline">{!selected && <p className="text-sm text-zinc-500">Select a customer to see local activity.</p>}{timeline.isLoading && <p className="text-sm text-zinc-400">Loading timeline…</p>}{timeline.isError && <ErrorState message={(timeline.error as Error).message} />}{timeline.data && <div className="space-y-4">{timeline.data.data.length === 0 && <p className="text-sm text-zinc-500">No local activity recorded for this customer.</p>}{timeline.data.data.map((event) => <article key={`${String(event.event_type)}-${String(event.entity_id)}`} className="border-l border-zinc-700 pl-4"><div className="flex flex-wrap items-center gap-2"><Badge value={display(event.event_type)} /><span className="text-sm font-medium">{display(event.status)}</span></div><p className="mt-1 text-xs text-zinc-500">{displayDate(event.created_at)}</p>{Boolean(event.metadata) && <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-2 text-xs text-zinc-400">{JSON.stringify(event.metadata, null, 2)}</pre>}</article>)}</div>}</Panel></div>
+    </div>
+  </section>;
 }
 
 function DecisionsView(): ReactElement {

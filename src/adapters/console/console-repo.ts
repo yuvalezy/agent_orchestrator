@@ -151,6 +151,67 @@ export async function decisionDetail(id: string): Promise<Record<string, unknown
   return rows[0] ?? null;
 }
 
+export async function listCustomers(input: { search?: unknown; cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
+  const limit = parseLimit(input.limit);
+  const cursor = decodeCursor(input.cursor);
+  const search = typeof input.search === 'string' ? input.search.trim() || null : input.search === undefined ? null : undefined;
+  if (limit === null || search === undefined || (input.cursor !== undefined && !cursor)) return null;
+  const { rows } = await query<Record<string, unknown>>(
+    `SELECT c.id::text, c.created_at, c.display_name, c.bp_ref, c.timezone, c.preferred_language,
+            c.backfill_status, c.project_ref, c.telegram_topic_id,
+            (SELECT count(*)::int FROM agent_inbox i WHERE i.customer_id = c.id) AS inbox_count
+       FROM agent_customers c
+      WHERE ($1::text IS NULL OR c.display_name ILIKE '%' || $1 || '%' OR c.bp_ref ILIKE '%' || $1 || '%')
+        AND ($2::timestamptz IS NULL OR (c.created_at, c.id) < ($2::timestamptz, $3::uuid))
+   ORDER BY c.created_at DESC, c.id DESC
+      LIMIT $4`,
+    [search, cursor?.at ?? null, cursor?.id ?? null, limit + 1],
+  );
+  const hasMore = rows.length > limit;
+  const data = rows.slice(0, limit);
+  const last = data[data.length - 1] as { created_at: string; id: string } | undefined;
+  return { data, nextCursor: hasMore && last ? encodeCursor(last) : null };
+}
+
+export async function customerDetail(id: string): Promise<Record<string, unknown> | null> {
+  const { rows } = await query<Record<string, unknown>>(
+    `SELECT id::text, display_name, bp_ref, project_ref, timezone, preferred_language,
+            backfill_status, backfill_cutoff, telegram_topic_id, created_at, updated_at
+       FROM agent_customers WHERE id = $1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
+/** Local-only chronological metadata stream. Message bodies and decision output stay detail-only. */
+export async function customerTimeline(id: string, input: { limit?: unknown }): Promise<{ data: Record<string, unknown>[] } | null> {
+  const limit = parseLimit(input.limit);
+  if (limit === null) return null;
+  const { rows } = await query<Record<string, unknown>>(
+    `SELECT * FROM (
+       SELECT i.created_at, i.id::text AS entity_id, 'inbox'::text AS event_type, i.status,
+              jsonb_build_object('channel_instance_id', i.channel_instance_id, 'subject', i.subject, 'retry_count', i.retry_count) AS metadata
+         FROM agent_inbox i WHERE i.customer_id = $1
+       UNION ALL
+       SELECT d.created_at, d.id::text, 'decision', COALESCE(d.outcome, 'pending'),
+              jsonb_build_object('decision_type', d.decision_type, 'task_ref', d.task_ref, 'inbox_message_id', d.inbox_message_id)
+         FROM agent_decisions d WHERE d.customer_id = $1
+       UNION ALL
+       SELECT o.created_at, o.id::text, 'outbound', o.status,
+              jsonb_build_object('channel_instance_id', o.channel_instance_id, 'subject', o.subject, 'is_draft', o.is_draft)
+         FROM agent_outbound_queue o WHERE o.customer_id = $1
+       UNION ALL
+       SELECT t.created_at, t.id::text, 'task_link', COALESCE(t.relationship, 'linked'),
+              jsonb_build_object('task_ref', t.task_ref, 'inbox_message_id', t.inbox_message_id)
+         FROM agent_tasks t WHERE t.customer_id = $1
+     ) events
+     ORDER BY created_at DESC, entity_id DESC
+     LIMIT $2`,
+    [id, limit],
+  );
+  return { data: rows };
+}
+
 type MutationResult = 'ok' | 'not_found' | 'conflict';
 
 async function audit(client: PoolClient, action: string, entityType: string, entityId: string, before: string, after: string): Promise<void> {

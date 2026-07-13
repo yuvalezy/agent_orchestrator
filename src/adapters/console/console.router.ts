@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { ConsoleConfig } from '../../config/console';
 import { getHealth } from '../../health/health.service';
 import { logger } from '../../logger';
-import { cancelOutbound, decisionDetail, inboxDetail, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox } from './console-repo';
+import { cancelOutbound, customerDetail, customerTimeline, decisionDetail, inboxDetail, listCustomers, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox } from './console-repo';
 import { ConsoleSessionStore } from './console-session';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -19,6 +19,7 @@ function attemptKey(req: Request): string {
 function validId(value: string): boolean {
   return /^\d+$/.test(value) && Number(value) > 0;
 }
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): Router {
   const router = Router();
@@ -158,6 +159,30 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
     } catch (err) {
       next(err);
     }
+  });
+
+  router.get('/api/customers', async (req, res, next) => {
+    try {
+      const page = await listCustomers(req.query);
+      if (!page) return void res.status(400).json({ error: 'invalid search or cursor' });
+      res.json(page);
+    } catch (err) { next(err); }
+  });
+  router.get('/api/customers/:id', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid customer id' });
+    try {
+      const data = await customerDetail(req.params.id);
+      if (!data) return void res.status(404).json({ error: 'not found' });
+      res.json({ data });
+    } catch (err) { next(err); }
+  });
+  router.get('/api/customers/:id/timeline', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid customer id' });
+    try {
+      const timeline = await customerTimeline(req.params.id, req.query);
+      if (!timeline) return void res.status(400).json({ error: 'invalid limit' });
+      res.json(timeline);
+    } catch (err) { next(err); }
   });
 
   router.use('/api', (req, res, next) => {

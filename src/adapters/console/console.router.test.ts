@@ -50,5 +50,10 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     const cookiePair = cookie.split(';')[0];
     const rejected = await fetch(`${baseUrl}/console/api/inbox/1/requeue`, { method: 'POST', headers: { cookie: cookiePair } });
     assert.equal(rejected.status, 403);
+
+    const invalidCustomer = await fetch(`${baseUrl}/console/api/customers/not-a-uuid`, { headers: { cookie: cookiePair } });
+    assert.equal(invalidCustomer.status, 400);
+    const invalidTimeline = await fetch(`${baseUrl}/console/api/customers/not-a-uuid/timeline`, { headers: { cookie: cookiePair } });
+    assert.equal(invalidTimeline.status, 400);
   });
 });
