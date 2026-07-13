@@ -1,5 +1,5 @@
 import { logger } from '../logger';
-import { recordRun, registerWorker, getWorkerStatuses } from './worker-registry';
+import { recordRun, recordRunStart, registerWorker, getWorkerStatuses } from './worker-registry';
 
 export interface WorkerDefinition {
   name: string;
@@ -12,16 +12,7 @@ export interface WorkerDefinition {
   runImmediately?: boolean;
 }
 
-export interface WorkerStatus {
-  name: string;
-  intervalMs: number;
-  lastRunAt: Date | null;
-  lastSuccessAt: Date | null;
-  lastDurationMs: number | null;
-  /** Safe, allowlisted failure category — never a raw upstream error message. */
-  lastError: string | null;
-  consecutiveFailures: number;
-}
+export type { WorkerStatus } from './worker-registry';
 
 const NETWORK_ERROR_CODES = new Set([
   'ECONNABORTED',
@@ -77,6 +68,7 @@ export function startWorker(def: WorkerDefinition): { stop(): void } {
 
   const tick = async (): Promise<void> => {
     const startedAt = Date.now();
+    recordRunStart(def.name);
     let ok = false;
     let errMessage: string | null = null;
     try {
