@@ -214,15 +214,20 @@ export async function customerTimeline(id: string, input: { limit?: unknown }): 
 
 type MutationResult = 'ok' | 'not_found' | 'conflict';
 
-async function audit(client: PoolClient, action: string, entityType: string, entityId: string, before: string, after: string): Promise<void> {
+export interface ConsoleAuditContext {
+  actor: 'founder';
+  requestId: string;
+}
+
+async function audit(client: PoolClient, context: ConsoleAuditContext, action: string, entityType: string, entityId: string, before: string, after: string): Promise<void> {
   await client.query(
-    `INSERT INTO console_audit_events (actor, action, entity_type, entity_id, safe_metadata)
-     VALUES ('founder', $1, $2, $3, jsonb_build_object('before_status', $4, 'after_status', $5))`,
-    [action, entityType, entityId, before, after],
+    `INSERT INTO console_audit_events (actor, action, entity_type, entity_id, request_id, safe_metadata)
+     VALUES ($1, $2, $3, $4, $5, jsonb_build_object('before_status', $6::text, 'after_status', $7::text))`,
+    [context.actor, action, entityType, entityId, context.requestId, before, after],
   );
 }
 
-export async function requeueInbox(id: string): Promise<MutationResult> {
+export async function requeueInbox(id: string, context: ConsoleAuditContext): Promise<MutationResult> {
   return withClient(async (client) => {
     await client.query('BEGIN');
     try {
@@ -236,7 +241,7 @@ export async function requeueInbox(id: string): Promise<MutationResult> {
         return 'conflict';
       }
       await client.query(`UPDATE agent_inbox SET status = 'pending', retry_count = 0, last_error = NULL, processed_at = NULL WHERE id = $1`, [id]);
-      await audit(client, 'inbox.requeue', 'agent_inbox', id, 'failed', 'pending');
+      await audit(client, context, 'inbox.requeue', 'agent_inbox', id, 'failed', 'pending');
       await client.query('COMMIT');
       return 'ok';
     } catch (err) {
@@ -246,7 +251,7 @@ export async function requeueInbox(id: string): Promise<MutationResult> {
   });
 }
 
-export async function cancelOutbound(id: string): Promise<MutationResult> {
+export async function cancelOutbound(id: string, context: ConsoleAuditContext): Promise<MutationResult> {
   return withClient(async (client) => {
     await client.query('BEGIN');
     try {
@@ -264,7 +269,7 @@ export async function cancelOutbound(id: string): Promise<MutationResult> {
         return 'conflict';
       }
       await client.query(`UPDATE agent_outbound_queue SET status = 'cancelled' WHERE id = $1`, [id]);
-      await audit(client, 'outbound.cancel', 'agent_outbound_queue', id, 'approved', 'cancelled');
+      await audit(client, context, 'outbound.cancel', 'agent_outbound_queue', id, 'approved', 'cancelled');
       await client.query('COMMIT');
       return 'ok';
     } catch (err) {

@@ -1,10 +1,11 @@
 import express, { Router, type NextFunction, type Request, type Response } from 'express';
+import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { ConsoleConfig } from '../../config/console';
 import { getHealth } from '../../health/health.service';
 import { logger } from '../../logger';
-import { cancelOutbound, customerDetail, customerTimeline, decisionDetail, inboxDetail, listCustomers, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox } from './console-repo';
+import { cancelOutbound, customerDetail, customerTimeline, decisionDetail, inboxDetail, listCustomers, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox, type ConsoleAuditContext } from './console-repo';
 import { ConsoleSessionStore } from './console-session';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -51,6 +52,13 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
       return;
     }
     res.locals.consoleSession = session;
+    next();
+  });
+
+  router.use('/api', (_req, res, next) => {
+    const auditContext: ConsoleAuditContext = { actor: 'founder', requestId: crypto.randomUUID() };
+    res.locals.consoleAuditContext = auditContext;
+    res.set('X-Request-ID', auditContext.requestId);
     next();
   });
 
@@ -200,7 +208,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
       return;
     }
     try {
-      const result = await requeueInbox(req.params.id);
+      const result = await requeueInbox(req.params.id, res.locals.consoleAuditContext as ConsoleAuditContext);
       if (result === 'not_found') return void res.status(404).json({ error: 'not found' });
       if (result === 'conflict') return void res.status(409).json({ error: 'state changed; refresh and review' });
       res.status(200).json({ data: { id: req.params.id, status: 'pending' } });
@@ -215,7 +223,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
       return;
     }
     try {
-      const result = await cancelOutbound(req.params.id);
+      const result = await cancelOutbound(req.params.id, res.locals.consoleAuditContext as ConsoleAuditContext);
       if (result === 'not_found') return void res.status(404).json({ error: 'not found' });
       if (result === 'conflict') return void res.status(409).json({ error: 'state changed; refresh and review' });
       res.status(200).json({ data: { id: req.params.id, status: 'cancelled' } });
