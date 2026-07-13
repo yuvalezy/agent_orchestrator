@@ -82,7 +82,7 @@ through `resolveCredential` (sealed store or env) or read directly from
 | Variable | Secret? | Default | Purpose |
 |---|---|---|---|
 | `NODE_ENV` | | `development` | `development` \| `production` \| `test`. |
-| `PORT` | | `3100` | HTTP listen port (`/health`, webhooks, `/admin`). |
+| `PORT` | | `3100` | HTTP listen port (`/health`, webhooks, `/admin`, and the fail-closed `/console`). |
 | `LOG_LEVEL` | | `info` | pino level: `fatal` \| `error` \| `warn` \| `info` \| `debug` \| `trace` \| `silent`. |
 
 ### Database
@@ -101,6 +101,21 @@ the portal stack.
 | `PGUSER` | | `postgres` | Postgres user. |
 | `PGPASSWORD` | | `postgres` | Postgres password (dev default; treat as secret in prod). |
 | `PGDATABASE` | | `agent_orchestrator` | The service's own database (never the whatsapp_manager DB). |
+
+### Founder console
+
+The console is disabled unless **both** secrets below are set and valid. It is
+for a single founder session and must be served only behind Tailscale Serve / a
+MagicDNS HTTPS name — never a public port-forward or tunnel. It queries only the
+orchestrator database and does not replace Telegram's draft-approval authority.
+
+| Variable | Secret? | Default | Purpose |
+|---|---|---|---|
+| `CONSOLE_PASSWORD_HASH` | yes | *(unset)* | bcrypt hash for the founder password. Invalid/missing → `/console` is not mounted. |
+| `CONSOLE_SESSION_SECRET` | yes | *(unset)* | At least 32 random characters; signs the process-local console session boundary. |
+| `CONSOLE_SESSION_TTL_MS` | | `43200000` | Session lifetime (12h); restart always invalidates sessions. |
+| `CONSOLE_LOGIN_WINDOW_MS` | | `900000` | Login rate-limit window (15 min). |
+| `CONSOLE_LOGIN_MAX_ATTEMPTS` | | `5` | Failed login attempts allowed per source address/window. |
 
 ### Channels — WhatsApp, Gmail, EZY Portal
 

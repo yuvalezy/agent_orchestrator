@@ -11,6 +11,8 @@ export interface AppDeps {
   /** Admin API (M1.4 — credential management). Mounted AFTER express.json() (needs
    *  the JSON body) and before the 404. Present only when ADMIN_API_KEY is set. */
   adminRouter?: Router;
+  /** Founder console API + static app. Present only when both console secrets are valid. */
+  consoleRouter?: Router;
 }
 
 /**
@@ -65,6 +67,10 @@ export function buildApp(deps: AppDeps = {}) {
 
   // Admin API (M1.4) — after express.json(), before the 404 catch-all.
   if (deps.adminRouter) app.use('/admin', deps.adminRouter);
+
+  // Founder operations console — also after JSON parsing and before the 404. The
+  // router is created only when its independent application-auth secrets validate.
+  if (deps.consoleRouter) app.use('/console', deps.consoleRouter);
 
   // 404
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));

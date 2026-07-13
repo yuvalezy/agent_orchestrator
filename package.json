@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc && npm run copy:sql",
     "copy:sql": "node -e \"const fs=require('fs'),p=require('path');const s='src/db/migrations',d='dist/db/migrations';fs.mkdirSync(d,{recursive:true});for(const f of fs.readdirSync(s))if(f.endsWith('.sql'))fs.copyFileSync(p.join(s,f),p.join(d,f));\"",
+    "build:console": "npm --prefix web run build",
     "start": "node dist/main.js",
     "dev": "tsx watch src/main.ts",
     "migrate": "tsx src/db/migrate.ts",
@@ -25,6 +26,7 @@
     "contract:ezy": "tsx scripts/contract-ezy-tasks.ts",
     "gmail:oauth": "tsx scripts/gmail-oauth.ts --",
     "typecheck": "tsc --noEmit",
+    "typecheck:console": "npm --prefix web run typecheck",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
     "lint:boundary": "node scripts/check-boundary.mjs"
@@ -32,6 +34,7 @@
   "dependencies": {
     "@hebcal/core": "^6.6.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "bcryptjs": "^3.0.3",
     "date-holidays": "^3.32.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",

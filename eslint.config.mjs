@@ -17,6 +17,7 @@ export default tseslint.config(
   {
     ignores: [
       'dist/**',
+      'web/**', // independently built Vite application
       'node_modules/**',
       'src/inbox/__illegal_import_fixture__.ts',
       'src/knowledge/__illegal_import_fixture__.ts',

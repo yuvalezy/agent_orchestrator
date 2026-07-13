@@ -18,8 +18,36 @@ export interface WorkerStatus {
   lastRunAt: Date | null;
   lastSuccessAt: Date | null;
   lastDurationMs: number | null;
-  lastError: string | null; // error MESSAGE only — never payload
+  /** Safe, allowlisted failure category — never a raw upstream error message. */
+  lastError: string | null;
   consecutiveFailures: number;
+}
+
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+]);
+
+/**
+ * Error messages are untrusted data: upstream services can put response bodies,
+ * identifiers, or customer content in them. Worker status is served by the public
+ * /health endpoint, so retain only a small diagnostic category.
+ */
+export function projectWorkerError(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const e = err as { code?: unknown; status?: unknown; name?: unknown };
+    if (typeof e.code === 'string' && NETWORK_ERROR_CODES.has(e.code)) return `network:${e.code}`;
+    if (typeof e.status === 'number' && Number.isInteger(e.status) && e.status >= 400 && e.status <= 599) {
+      return `upstream_http:${e.status}`;
+    }
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'timeout';
+  }
+  return 'worker_failed';
 }
 
 /**
@@ -55,7 +83,7 @@ export function startWorker(def: WorkerDefinition): { stop(): void } {
       await def.run();
       ok = true;
     } catch (err) {
-      errMessage = err instanceof Error ? err.message : String(err);
+      errMessage = projectWorkerError(err);
     }
     const durationMs = Date.now() - startedAt;
     const consecutiveFailures = recordRun(def.name, { ok, durationMs, errMessage });
@@ -64,10 +92,9 @@ export function startWorker(def: WorkerDefinition): { stop(): void } {
       logger.debug({ worker: def.name, durationMs, ok }, 'worker tick');
     } else {
       logger.error(
-        // `reason` (not `err`): errMessage is already a projected error-MESSAGE
-        // string, not an Error object; the allowlist `err` serializer (logger.ts)
-        // is for Error objects only. Still a message, never a body — worker log
-        // invariant holds.
+        // `reason` is a projected category, never the raw Error.message. The
+        // health endpoint exposes this status, so customer/provider text must not
+        // cross this boundary.
         { worker: def.name, durationMs, ok, consecutiveFailures, reason: errMessage },
         'worker tick failed',
       );

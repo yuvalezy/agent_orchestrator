@@ -1,0 +1,9 @@
+{
+  "name": "Agent Orchestrator Console",
+  "short_name": "AO Console",
+  "start_url": "/console/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "icons": [{ "src": "/console/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

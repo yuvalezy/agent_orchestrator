@@ -44,7 +44,7 @@ tmux kill-session -t ao-debug       # stop the service
       "intervalMs": 10000,
       "lastRunAt": "…", "lastSuccessAt": "…",
       "lastDurationMs": 42,
-      "lastError": null,        // error MESSAGE only, never a payload
+      "lastError": null,        // allowlisted safe category, never raw upstream text
       "consecutiveFailures": 0
     }
   ]
@@ -56,6 +56,23 @@ curl -s http://localhost:3100/health | jq
 ```
 
 A growing `backlog.inbox.pending` or a rising `consecutiveFailures` on any worker is the first sign something is wedged.
+
+## Founder console
+
+`/console` is a private responsive operations UI, built from `web/` and served
+same-origin by the Express process. It does not mount unless both console secrets
+are configured. The browser gets an HttpOnly Secure SameSite session cookie; every
+mutation also requires the in-memory CSRF token returned at sign-in.
+
+Expose it only through Tailscale Serve/MagicDNS HTTPS, for example:
+
+```bash
+tailscale serve --https=443 http://127.0.0.1:3100
+```
+
+Open `https://<machine>.ts.net/console/` from an enrolled device. Do not expose
+port 3100 through a public tunnel or port-forward. The PWA caches only its static
+shell; it never caches console API responses or customer-message detail data.
 
 ## Background workers
 

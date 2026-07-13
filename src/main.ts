@@ -1,4 +1,6 @@
 import { env } from './config/env';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { logger } from './logger';
 import { runMigrations } from './db/migrate';
 import { closePool, withClient } from './db';
@@ -13,6 +15,8 @@ import { ingestInbound } from './inbox/ingestion';
 import { credentialsStore } from './config/credentials-store';
 import { tryResolveCredential } from './config/credentials';
 import { buildAdminRouter } from './adapters/admin/admin.router';
+import { buildConsoleRouter } from './adapters/console/console.router';
+import { loadConsoleConfig } from './config/console';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
@@ -105,6 +109,18 @@ async function main(): Promise<void> {
     logger.info('admin router mounted at /admin');
   } else {
     logger.info('admin router not mounted (ADMIN_API_KEY unset)');
+  }
+
+  const consoleConfig = loadConsoleConfig();
+  if (consoleConfig) {
+    // Production copies Vite output to dist/web; tsx development serves the
+    // separately built web/dist directory from the repository root.
+    const packagedAssets = path.join(__dirname, 'web');
+    const devAssets = path.join(process.cwd(), 'web', 'dist');
+    appDeps.consoleRouter = buildConsoleRouter(consoleConfig, existsSync(packagedAssets) ? packagedAssets : devAssets);
+    logger.info('founder console router mounted at /console');
+  } else {
+    logger.info('founder console router not mounted (console secrets absent or invalid)');
   }
   const ingestionWorkers: WorkerDefinition[] = [];
   if (wa) {
