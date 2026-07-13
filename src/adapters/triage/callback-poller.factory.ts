@@ -27,6 +27,7 @@ import {
   reviseDraft,
 } from '../../outbound/outbound-repo';
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
+import { buildBackfillApproveHandler } from './backfill-approve.factory';
 import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
 import { memoryRepo } from '../../knowledge/memory-repo';
 import {
@@ -162,10 +163,15 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // Composite router: dispatch by option id. ❌-cancel first (M1.5b), then the draft options
   // (Approve/Edit/Reject/Revise, M2c + revise) when the drafter is wired, then the correction
   // scope-flip (Phase 2) when revise is wired; unknown ids no-op.
+  // Backfill proposal approve/reject (bf:ok:/bf:no:) — only registered when BACKFILL_ENABLED,
+  // so a tap does nothing until the feature is on.
+  const backfill = env.BACKFILL_ENABLED ? buildBackfillApproveHandler({ notifier }) : null;
+
   notifier.onDecision(async (d) => {
     if (d.optionId === CANCEL_OPTION) return cancel(d);
     if (draft && isDraftOption(d.optionId)) return draft(d);
     if (revise && isCorrectionFlipOption(d.optionId)) return revise.flip(d);
+    if (backfill && backfill.isBackfillOption(d.optionId)) return backfill.handle(d);
   });
 
   // COMPOSITE free-text router on onMessage (the notifier holds ONE message handler, so all

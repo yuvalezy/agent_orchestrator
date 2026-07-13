@@ -31,6 +31,8 @@ const ACTIONABLE = new Set<Intent['category']>([
 const PROPOSE_CATEGORIES = new Set<Intent['category']>(['bug_report', 'new_feature_request', 'custom_development']);
 /** Task statuses considered OPEN (a match here is ongoing work; else it's resolved history). */
 const OPEN_STATUSES = new Set(['backlog', 'todo', 'in-progress', 'review']);
+/** Chars of the original thread body used as the second (cross-lingual) match signal. */
+const MATCH_BODY_CHARS = 600;
 
 export interface HistoricalMessage {
   from: string;
@@ -113,32 +115,53 @@ export async function reconcileThread(thread: HistoricalThread, deps: BackfillRe
   if (!intent) return { kind: 'skip', reason: 'no actionable ask' };
 
   const text = `${intent.suggested_title}. ${intent.summary}`.trim();
-  let embedding: number[] | null;
-  try {
-    embedding = await deps.embed(text);
-  } catch (err) {
-    deps.log?.warn({ threadKey: thread.threadKey, reason: errMessage(err) }, 'backfill: embed failed');
-    embedding = null;
-  }
-  if (!embedding) return { kind: 'skip', reason: 'embed unavailable', retryable: true };
 
-  // Vector candidates → LLM-judge confirmation. A miss/error is best-effort (treated as no match).
+  // ⚠︎ Cross-lingual recall: the intent text is the classifier's language (often English), but a
+  // customer's tasks may be terse and in another language (e.g. Spanish) — a single-vector search
+  // then misses true matches, starving the judge. So search with TWO signals and UNION the
+  // candidates: (1) the intent text, (2) the original thread body (the customer's own words/
+  // language). The cross-lingual LLM judge then confirms. Best-effort: if BOTH embeds fail →
+  // retryable skip; if one fails we still search with the other.
+  const queries = Array.from(new Set([text, body.slice(0, MATCH_BODY_CHARS).trim()].filter((q) => q.length > 0)));
+  const candidatesByRef = new Map<string, TaskMatch>();
+  let anyEmbed = false;
+  for (const q of queries) {
+    let emb: number[] | null = null;
+    try {
+      emb = await deps.embed(q);
+    } catch (err) {
+      deps.log?.warn({ threadKey: thread.threadKey, reason: errMessage(err) }, 'backfill: embed failed');
+      emb = null;
+    }
+    if (!emb) continue;
+    anyEmbed = true;
+    try {
+      const found = await deps.searchTasks(emb, thread.customerId, { maxDistance: deps.config.matchMaxDistance, k: deps.config.k });
+      for (const c of found) {
+        const ref = String(c.metadata?.['task_ref'] ?? c.content);
+        const prev = candidatesByRef.get(ref);
+        if (!prev || c.distance < prev.distance) candidatesByRef.set(ref, c); // keep the nearest
+      }
+    } catch (err) {
+      deps.log?.warn({ threadKey: thread.threadKey, reason: errMessage(err) }, 'backfill: search failed — treated as no match');
+    }
+  }
+  if (!anyEmbed) return { kind: 'skip', reason: 'embed unavailable', retryable: true };
+
+  // Judge the intent against the unioned candidates; keep the highest-confidence pass.
   let best: { match: TaskMatch; judged: number } | null = null;
-  try {
-    const candidates = await deps.searchTasks(embedding, thread.customerId, {
-      maxDistance: deps.config.matchMaxDistance,
-      k: deps.config.k,
-    });
-    if (candidates.length > 0) {
+  const candidates = [...candidatesByRef.values()];
+  if (candidates.length > 0) {
+    try {
       const scores = await deps.judge(text, candidates.map((c) => c.content));
       for (let i = 0; i < candidates.length; i += 1) {
         const s = scores[i] ?? 0;
         if (s >= deps.config.judgeThreshold && (!best || s > best.judged)) best = { match: candidates[i], judged: s };
       }
+    } catch (err) {
+      deps.log?.warn({ threadKey: thread.threadKey, reason: errMessage(err) }, 'backfill: judge failed — treated as no match');
+      best = null;
     }
-  } catch (err) {
-    deps.log?.warn({ threadKey: thread.threadKey, reason: errMessage(err) }, 'backfill: match failed — treated as no match');
-    best = null;
   }
 
   if (best) {

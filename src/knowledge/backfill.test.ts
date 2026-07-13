@@ -119,6 +119,34 @@ test('a QUESTION that MATCHES an open task still links (useful context)', async 
   assert.equal(out.kind, 'link-open');
 });
 
+test('cross-lingual: a task found ONLY via the original body query is unioned + linked', async () => {
+  // Intent text is English ("waiting period"); the task is terse Spanish ("periodo de carencia").
+  // The intent-vector search misses it; the body-vector search finds it → union → judge → link.
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'c', body: 'necesitamos quitar el periodo de carencia' }] }),
+    deps({
+      extractIntents: async () => [intentOf({ suggested_title: 'waiting period', summary: 'remove the waiting period' })],
+      embed: async (t: string) => (t.includes('carencia') ? [9, 9, 9] : [1, 1, 1]),
+      searchTasks: async (emb) => (emb[0] === 9 ? [taskMatch({ taskRef: 'TSK-213', status: 'review' })] : []),
+      judge: async (_a, c) => c.map(() => 0.9),
+    }),
+  );
+  assert.equal(out.kind, 'link-open');
+  assert.equal((out as Record<string, unknown>).taskRef, 'TSK-213');
+});
+
+test('one embed failing still searches with the other signal', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'c', body: 'spanish body here' }] }),
+    deps({
+      embed: async (t: string) => (t.startsWith('Build X') ? null : [2, 2, 2]), // intent-text embed fails
+      searchTasks: async () => [taskMatch({ taskRef: 'TSK-7', status: 'todo' })],
+      judge: async (_a, c) => c.map(() => 0.8),
+    }),
+  );
+  assert.equal(out.kind, 'link-open'); // body query still found + linked it
+});
+
 test('no actionable intent → skip', async () => {
   const out = await reconcileThread(thread(), deps({ extractIntents: async () => [intentOf({ category: 'compliment' })] }));
   assert.equal(out.kind, 'skip');

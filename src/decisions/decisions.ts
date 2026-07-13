@@ -136,6 +136,43 @@ export async function recordBackfillProposal(input: {
   return rows[0] ? { decisionId: rows[0].id } : null;
 }
 
+/** Load a backfill proposal decision (agent_output + scope) for the approve/reject handler. */
+export async function getBackfillProposal(decisionId: string): Promise<{
+  decisionId: string;
+  customerId: string;
+  outcome: string | null;
+  agentOutput: Record<string, unknown>;
+} | null> {
+  const { rows } = await query<{ id: string; customer_id: string; outcome: string | null; agent_output: Record<string, unknown> }>(
+    `SELECT id, customer_id, outcome, agent_output
+       FROM agent_decisions
+      WHERE id = $1 AND decision_type = 'backfill_task_proposal'`,
+    [decisionId],
+  );
+  const r = rows[0];
+  return r ? { decisionId: r.id, customerId: r.customer_id, outcome: r.outcome, agentOutput: r.agent_output } : null;
+}
+
+/**
+ * Resolve a backfill proposal (approve → 'accepted' + task_ref of the created task; reject →
+ * 'rejected'). Idempotent: `WHERE outcome='pending'` — a replayed tap is a 0-row no-op. Returns
+ * true if THIS call resolved it (so the caller posts the one-time confirmation), false otherwise.
+ */
+export async function resolveBackfillProposalDecision(input: {
+  decisionId: string;
+  outcome: 'accepted' | 'rejected';
+  taskRef?: string;
+  by?: string;
+}): Promise<boolean> {
+  const { rowCount } = await query(
+    `UPDATE agent_decisions
+        SET outcome = $2, task_ref = $3, human_override = $4::jsonb, resolved_at = now()
+      WHERE id = $1 AND decision_type = 'backfill_task_proposal' AND outcome = 'pending'`,
+    [input.decisionId, input.outcome, input.taskRef ?? null, JSON.stringify({ action: input.outcome, by: input.by ?? null })],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
 /**
  * Resolve a draft decision WITHIN the caller's transaction (the outbound-repo draft
  * flip passes its PoolClient) so the outcome commits atomically with the queue-row
