@@ -79,3 +79,49 @@ export async function insertConversationLink(input: {
     [input.customerId, input.taskRef, input.channelType, toVectorLiteral(input.embedding)],
   );
 }
+
+// ── Live-dedup fingerprint SEED (blueprint §4.3) ────────────────────────────────────────
+// The task-inventory sync re-fingerprints each OPEN manual/portal task so the live triage
+// dedup (decideDedup step-2) folds a NEW inbound message into an existing manual task. Those
+// rows are tagged channel_type='portal' so they are STRUCTURALLY separate from the live
+// triage rows (channel whatsapp/email): the seed only ever refreshes/deletes its OWN
+// 'portal' rows, never a triage fingerprint. Refreshing created_at each pass keeps an
+// old-but-open task inside the read-side time window WITHOUT a read change or a new column
+// (resolves build-time confirmation §9.1: widen-via-refresh, not a source flag). NEVER logs
+// vectors.
+
+/** The channel tag that marks an inventory-seeded fingerprint (vs a live triage row). */
+export const PORTAL_FINGERPRINT_CHANNEL = 'portal';
+
+/** The task_refs a customer currently has an inventory-seeded ('portal') fingerprint for.
+ *  Used by the seed to decide insert (absent) vs refuse re-embed (present) vs prune (stale). */
+export async function listPortalFingerprintTaskRefs(customerId: string): Promise<Set<string>> {
+  const { rows } = await query<{ task_ref: string }>(
+    `SELECT DISTINCT task_ref FROM agent_conversation_links
+      WHERE customer_id = $1 AND channel_type = $2`,
+    [customerId, PORTAL_FINGERPRINT_CHANNEL],
+  );
+  return new Set(rows.map((r) => r.task_ref));
+}
+
+/** Re-stamp created_at on an existing inventory-seeded fingerprint so an unchanged open task
+ *  stays inside the read-side window with ZERO embed cost. Scoped to the 'portal' channel —
+ *  a live triage fingerprint is never touched. */
+export async function refreshPortalFingerprint(customerId: string, taskRef: string): Promise<void> {
+  await query(
+    `UPDATE agent_conversation_links SET created_at = now()
+      WHERE customer_id = $1 AND task_ref = $2 AND channel_type = $3`,
+    [customerId, taskRef, PORTAL_FINGERPRINT_CHANNEL],
+  );
+}
+
+/** Prune inventory-seeded fingerprints for tasks that are no longer open (closed or gone) so
+ *  a new message never folds into a done/cancelled task. Scoped to the 'portal' channel. */
+export async function deletePortalFingerprints(customerId: string, taskRefs: string[]): Promise<void> {
+  if (taskRefs.length === 0) return;
+  await query(
+    `DELETE FROM agent_conversation_links
+      WHERE customer_id = $1 AND channel_type = $2 AND task_ref = ANY($3::text[])`,
+    [customerId, PORTAL_FINGERPRINT_CHANNEL, taskRefs],
+  );
+}

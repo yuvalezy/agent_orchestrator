@@ -40,6 +40,14 @@ import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
 import { buildPortalTaskSource } from './adapters/knowledge/portal-task-source';
 import { buildEzyPortalGateway } from './adapters/ezy-portal/factory';
 import { listTaskInventoryCustomers } from './customers/task-inventory-customers';
+import { seedTaskFingerprints } from './knowledge/task-fingerprint-seed';
+import {
+  PORTAL_FINGERPRINT_CHANNEL,
+  listPortalFingerprintTaskRefs,
+  refreshPortalFingerprint,
+  insertConversationLink,
+  deletePortalFingerprints,
+} from './triage/conversation-link-repo';
 import { buildInternalDocSource } from './adapters/knowledge/internal-doc-source';
 import { buildEmbeddingAdapter } from './adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from './knowledge/memory-repo';
@@ -285,6 +293,11 @@ async function main(): Promise<void> {
       logger.warn('⚠️  TASK_INVENTORY_ENABLED=true but OPENAI_API_KEY is UNSET — task-inventory embeddings will fail until it is set.');
     }
     const portal = buildEzyPortalGateway();
+    const taskEmbedding = buildEmbeddingAdapter(
+      () => tryResolveCredential('OPENAI_API_KEY'),
+      env.OPENAI_BASE_URL,
+      { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+    );
     const taskInventoryWorker = buildKnowledgeSyncWorker({
       name: 'task-inventory:sync',
       docSource: buildPortalTaskSource({
@@ -292,11 +305,7 @@ async function main(): Promise<void> {
         listCustomers: listTaskInventoryCustomers,
         log: logger,
       }),
-      embedding: buildEmbeddingAdapter(
-        () => tryResolveCredential('OPENAI_API_KEY'),
-        env.OPENAI_BASE_URL,
-        { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
-      ),
+      embedding: taskEmbedding,
       repo: memoryRepo,
       resolveCustomerId: async (bpRef) =>
         (await dbContactResolutionQueries.findCustomerByBpRef(bpRef))?.customerId ?? null,
@@ -304,6 +313,17 @@ async function main(): Promise<void> {
       intervalMs: env.TASK_INVENTORY_SYNC_INTERVAL_MS,
       tombstoneMaxRatio: env.KNOWLEDGE_TOMBSTONE_MAX_RATIO,
     });
+    // Live-dedup fingerprint seed (blueprint §4.3) — runs in the SAME tick as the inventory
+    // reconcile (shares the advisory lock + portal cadence), behind its OWN default-false flag
+    // so the live dedup path is unchanged until the founder flips it. Reuses the inventory's
+    // embedding adapter (same model/dim/vector-space as live intents + the dedup search).
+    const seedFingerprints = env.LIVE_DEDUP_FINGERPRINT_ENABLED;
+    logger.info(
+      { LIVE_DEDUP_FINGERPRINT_ENABLED: seedFingerprints },
+      seedFingerprints
+        ? 'live-dedup fingerprint seed wired into task-inventory tick (LIVE_DEDUP_FINGERPRINT_ENABLED=true)'
+        : 'live-dedup fingerprint seed NOT wired (LIVE_DEDUP_FINGERPRINT_ENABLED=false)',
+    );
     knowledgeWorkers.push({
       ...taskInventoryWorker,
       run: async () => {
@@ -318,6 +338,23 @@ async function main(): Promise<void> {
           }
           try {
             await taskInventoryWorker.run();
+            // Seed AFTER the reconcile so the memory + the fingerprint reflect the same scan.
+            // Best-effort + per-customer isolated inside seedTaskFingerprints → a seed error
+            // never fails the inventory tick.
+            if (seedFingerprints) {
+              await seedTaskFingerprints({
+                listCustomers: async () =>
+                  (await listTaskInventoryCustomers()).map((c) => ({ customerId: c.customerId, projectRef: c.projectRef })),
+                listAllTasks: (projectRef) => portal.listAllTasks(projectRef),
+                embedding: taskEmbedding,
+                listExistingRefs: listPortalFingerprintTaskRefs,
+                refresh: refreshPortalFingerprint,
+                insert: insertConversationLink,
+                deleteStale: deletePortalFingerprints,
+                channelType: PORTAL_FINGERPRINT_CHANNEL,
+                log: logger,
+              });
+            }
           } finally {
             await client.query('SELECT pg_advisory_unlock($1)', [TASK_INVENTORY_LOCK_KEY]);
           }
@@ -327,6 +364,11 @@ async function main(): Promise<void> {
     logger.info('task-inventory sync worker registered (TASK_INVENTORY_ENABLED=true)');
   } else {
     logger.info('task-inventory sync worker NOT registered (TASK_INVENTORY_ENABLED=false)');
+    if (env.LIVE_DEDUP_FINGERPRINT_ENABLED) {
+      logger.warn(
+        '⚠️  LIVE_DEDUP_FINGERPRINT_ENABLED=true but TASK_INVENTORY_ENABLED=false — the fingerprint seed runs inside the task-inventory tick, so nothing will seed until TASK_INVENTORY_ENABLED is set.',
+      );
+    }
   }
 
   // M3(c): feedback-learning worker — registered ONLY when FEEDBACK_LEARNING_ENABLED
