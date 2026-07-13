@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { ConsoleConfig } from '../../config/console';
-import { getHealth } from '../../health/health.service';
+import { getConsoleOverview, getHealth } from '../../health/health.service';
 import { logger } from '../../logger';
 import { cancelOutbound, customerDetail, customerTimeline, decisionDetail, inboxDetail, listCustomers, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox, type ConsoleAuditContext } from './console-repo';
 import { ConsoleSessionStore } from './console-session';
@@ -69,7 +69,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
 
   router.get('/api/overview', async (_req, res, next) => {
     try {
-      res.json({ data: await getHealth() });
+      res.json({ data: await getConsoleOverview() });
     } catch (err) {
       next(err);
     }

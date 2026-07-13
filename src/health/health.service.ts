@@ -17,6 +17,36 @@ export interface HealthReport {
   workers: WorkerStatus[];
 }
 
+interface QueueStateCount {
+  status: string;
+  count: number;
+}
+
+interface ActiveChannel {
+  name: string;
+  channelType: string;
+  provider: string;
+}
+
+interface FeatureFlag {
+  name: string;
+  enabled: boolean;
+}
+
+interface Capability {
+  name: string;
+  available: boolean;
+  detail: string;
+}
+
+/** Authenticated-console only. This deliberately extends—not changes—the public health contract. */
+export interface ConsoleOverview extends HealthReport {
+  queueStates: { inbox: QueueStateCount[]; outbound: QueueStateCount[] };
+  activeChannels: ActiveChannel[];
+  featureFlags: FeatureFlag[];
+  capabilities: Capability[];
+}
+
 const EMPTY_BUCKET: BacklogBucket = { pending: 0, failed: 0, oldestPendingAgeSeconds: null };
 
 interface ConfiguredWorker {
@@ -107,6 +137,51 @@ async function backlogFor(table: 'agent_inbox' | 'agent_outbound_queue'): Promis
   };
 }
 
+async function queueStatesFor(table: 'agent_inbox' | 'agent_outbound_queue'): Promise<QueueStateCount[]> {
+  const { rows } = await query<{ status: string; count: string }>(
+    `SELECT status, count(*) AS count
+       FROM ${table}
+      GROUP BY status
+      ORDER BY status`,
+  );
+  return rows.map((row) => ({ status: row.status, count: Number(row.count) }));
+}
+
+async function activeChannels(): Promise<ActiveChannel[]> {
+  const { rows } = await query<{ name: string; channel_type: string; provider: string }>(
+    `SELECT name, channel_type, provider
+       FROM channel_instances
+      WHERE status = 'active'
+      ORDER BY name
+      LIMIT 100`,
+  );
+  return rows.map((row) => ({ name: row.name, channelType: row.channel_type, provider: row.provider }));
+}
+
+function featureFlags(): FeatureFlag[] {
+  return [
+    { name: 'Outbound dispatch', enabled: env.OUTBOUND_ENABLED },
+    { name: 'Outbound email', enabled: env.OUTBOUND_EMAIL_ENABLED },
+    { name: 'Knowledge sync', enabled: env.KNOWLEDGE_SYNC_ENABLED },
+    { name: 'Task inventory', enabled: env.TASK_INVENTORY_ENABLED },
+    { name: 'Feedback learning', enabled: env.FEEDBACK_LEARNING_ENABLED },
+    { name: 'Acceptance report', enabled: env.ACCEPTANCE_REPORT_ENABLED },
+    { name: 'Internal knowledge sync', enabled: env.KNOWLEDGE_INTERNAL_ENABLED },
+    { name: 'Release-note drafts', enabled: env.RELEASE_NOTE_DRAFTS_ENABLED },
+    { name: 'Founder query', enabled: env.QUERY_ENGINE_ENABLED },
+  ];
+}
+
+function capabilities(workers: WorkerStatus[], channels: ActiveChannel[]): Capability[] {
+  const registered = (name: string): boolean => workers.some((worker) => worker.name === name && worker.registration === 'registered');
+  return [
+    { name: 'Inbound processing', available: registered('inbox:processor'), detail: registered('inbox:processor') ? 'Inbox processor registered' : 'Requires the Telegram-enabled money loop' },
+    { name: 'Outbound dispatch', available: registered('outbound:drainer'), detail: registered('outbound:drainer') ? 'Outbound drainer registered' : 'Flag off or worker not registered' },
+    { name: 'Customer channels', available: channels.length > 0, detail: `${channels.length} active database channel${channels.length === 1 ? '' : 's'}` },
+    { name: 'Founder query', available: env.QUERY_ENGINE_ENABLED, detail: env.QUERY_ENGINE_ENABLED ? 'Query engine enabled' : 'Flag off' },
+  ];
+}
+
 /**
  * Build the /health report. The DB probe degrades (→ 503) INDEPENDENTLY: a dead
  * DB reports status:'degraded' and empty backlog buckets rather than throwing.
@@ -135,5 +210,49 @@ export async function getHealth(): Promise<HealthReport> {
     db: 'ok',
     backlog: { inbox, outboundQueue },
     workers,
+  };
+}
+
+/**
+ * Rich operational overview for the authenticated founder console. Its database
+ * reads are bounded aggregates and an allowlisted channel projection; it never
+ * returns channel config, credentials, message content, or raw metadata.
+ */
+export async function getConsoleOverview(): Promise<ConsoleOverview> {
+  const workers = includeUnregisteredConfiguredWorkers(getWorkerStatuses(), configuredWorkers());
+  const flags = featureFlags();
+  const dbOk = await probeDb();
+  if (!dbOk) {
+    const emptyChannels: ActiveChannel[] = [];
+    return {
+      status: 'degraded',
+      uptime: process.uptime(),
+      db: 'down',
+      backlog: { inbox: EMPTY_BUCKET, outboundQueue: EMPTY_BUCKET },
+      workers,
+      queueStates: { inbox: [], outbound: [] },
+      activeChannels: emptyChannels,
+      featureFlags: flags,
+      capabilities: capabilities(workers, emptyChannels),
+    };
+  }
+
+  const [inbox, outboundQueue, inboxStates, outboundStates, channels] = await Promise.all([
+    backlogFor('agent_inbox'),
+    backlogFor('agent_outbound_queue'),
+    queueStatesFor('agent_inbox'),
+    queueStatesFor('agent_outbound_queue'),
+    activeChannels(),
+  ]);
+  return {
+    status: 'ok',
+    uptime: process.uptime(),
+    db: 'ok',
+    backlog: { inbox, outboundQueue },
+    workers,
+    queueStates: { inbox: inboxStates, outbound: outboundStates },
+    activeChannels: channels,
+    featureFlags: flags,
+    capabilities: capabilities(workers, channels),
   };
 }

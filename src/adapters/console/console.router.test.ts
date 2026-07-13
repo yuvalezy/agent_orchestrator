@@ -51,6 +51,14 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     const session = await fetch(`${baseUrl}/console/api/session`, { headers: { cookie: cookiePair } });
     assert.equal(session.status, 200);
     assert.match(session.headers.get('x-request-id') ?? '', /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    const overview = await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie: cookiePair } });
+    assert.equal(overview.status, 200);
+    const overviewBody = await overview.json() as { data: { queueStates: { inbox: unknown; outbound: unknown }; activeChannels: unknown; featureFlags: unknown; capabilities: unknown } };
+    assert.ok(Array.isArray(overviewBody.data.queueStates.inbox));
+    assert.ok(Array.isArray(overviewBody.data.queueStates.outbound));
+    assert.ok(Array.isArray(overviewBody.data.activeChannels));
+    assert.ok(Array.isArray(overviewBody.data.featureFlags));
+    assert.ok(Array.isArray(overviewBody.data.capabilities));
     const rejected = await fetch(`${baseUrl}/console/api/inbox/1/requeue`, { method: 'POST', headers: { cookie: cookiePair } });
     assert.equal(rejected.status, 403);
 
