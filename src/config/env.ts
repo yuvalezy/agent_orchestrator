@@ -131,6 +131,18 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   TASK_INVENTORY_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(1_200_000), // 20m
 
+  // Live-dedup fingerprint seed (blueprint §4.3, Layer-3 enabler). In the task-inventory
+  // sync tick, re-fingerprint each customer's OPEN portal tasks into agent_conversation_links
+  // so the LIVE triage dedup folds a NEW inbound message into an existing manual/portal task
+  // instead of duplicating it. Kill-switch, DORMANT by default — nothing seeds (and live dedup
+  // is unchanged) until the founder flips it. Needs TASK_INVENTORY_ENABLED (the worker that
+  // runs it) + OPENAI_API_KEY (embeddings). Re-stamps created_at each pass so an old-but-open
+  // task stays inside the cross-channel read window with no read-side change.
+  LIVE_DEDUP_FINGERPRINT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── Backfill sweep (Layer-2): reconcile a customer's historical threads against the
   // task inventory → memory-link on match (no portal write), draft task proposal on an
   // unmatched work-request, resolved-history on a done/cancelled match. Kill-switch,
