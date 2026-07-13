@@ -21,6 +21,7 @@
     "customer:identity": "tsx scripts/customer-identity.ts",
     "backfill:dry": "tsx scripts/backfill-dry.ts",
     "backfill:run": "tsx scripts/backfill-run.ts",
+    "backfill:recollapse": "tsx scripts/backfill-recollapse.ts",
     "mcp:project-brain": "tsx scripts/mcp-project-brain.ts",
     "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
     "triage:sample": "tsx scripts/triage-sample.ts --",
