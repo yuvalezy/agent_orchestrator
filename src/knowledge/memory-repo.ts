@@ -263,6 +263,62 @@ export function buildReleaseNoteMatchSql(input: {
   return { text, values: [vec, input.maxDistance, input.memoryTypes, input.limit] };
 }
 
+/** ⚠︎ PURE SQL builder for the task-inventory match (backfill L2) — the CUSTOMER leg
+ *  ONLY (tasks are always customer-scoped; a shared task would be a cross-customer leak),
+ *  filtered to memory_type='task', gated by maxDistance, nearest-first. Extracted so the
+ *  scope + type filter is unit-testable without a DB. */
+export function buildTaskSearchSql(input: {
+  embedding: number[];
+  customerId: string;
+  maxDistance: number;
+  k: number;
+}): { text: string; values: unknown[] } {
+  const vec = toVectorLiteral(input.embedding);
+  const text = `SELECT content, metadata, (embedding <=> $1::vector) AS distance
+      FROM agent_memory
+     WHERE customer_id = $2
+       AND memory_type = 'task'
+       AND (embedding <=> $1::vector) <= $3
+     ORDER BY embedding <=> $1::vector
+     LIMIT $4`;
+  return { text, values: [vec, input.customerId, input.maxDistance, input.k] };
+}
+
+/** One backfill memory-link: a historical thread that maps to an existing task. Persisted as
+ *  a Layer-A conversation memory (document_id NULL, memory_type='conversation', customer-scoped)
+ *  so future retrieval surfaces the customer's own history alongside the task. `resolved` marks a
+ *  match to a done/cancelled task (context only — never reopened). Idempotent on thread_key. */
+export interface BackfillLinkInput {
+  customerId: string;
+  content: string;
+  embedding: number[];
+  /** {source:'backfill', thread_key, channel, linked_task_ref, code, status, resolved} — thread_key
+   *  is the idempotency key (a re-run does NOT duplicate the link). */
+  metadata: Record<string, unknown>;
+}
+
+/** Backfill memory-link writer. Kept OFF KnowledgeRepo — intersected onto memoryRepo. */
+export interface BackfillLinkRepo {
+  /** Append one backfill link memory, DEDUPED on metadata->>'thread_key' for the SAME customer
+   *  (idempotent re-run). Returns the new row id, or null on a dedup hit. NEVER logs content/vectors. */
+  insertBackfillLink(input: BackfillLinkInput): Promise<{ id: string } | null>;
+}
+
+/** One matched task-inventory memory (backfill candidate). */
+export interface TaskMatch {
+  content: string;
+  metadata: Record<string, unknown> | null;
+  distance: number;
+}
+
+/** Task-inventory search (backfill L2). Kept OFF KnowledgeRepo — intersected onto the
+ *  concrete memoryRepo so fakes needn't implement it. NEVER logs content or vectors. */
+export interface TaskSearchRepo {
+  /** Nearest memory_type='task' rows for ONE customer within maxDistance, nearest-first,
+   *  capped at k. Customer-scoped — NEVER another customer, NEVER shared. */
+  searchTasksByCustomer(embedding: number[], customerId: string, opts: { maxDistance: number; k: number }): Promise<TaskMatch[]>;
+}
+
 interface DocumentDbRow {
   id: string;
   source_id: string;
@@ -286,7 +342,39 @@ interface SearchDbRow {
 
 /** Concrete repo bound to the shared pool via query()/withClient. NEVER logs content
  *  or vectors. */
-export const memoryRepo: KnowledgeRepo & FeedbackMemoryRepo & ReleaseNoteMatchRepo & CorrectionMemoryRepo = {
+export const memoryRepo: KnowledgeRepo &
+  FeedbackMemoryRepo &
+  ReleaseNoteMatchRepo &
+  CorrectionMemoryRepo &
+  TaskSearchRepo &
+  BackfillLinkRepo = {
+  async insertBackfillLink(input: BackfillLinkInput): Promise<{ id: string } | null> {
+    // Layer-A row (document_id NULL, never reconciled), memory_type 'conversation'. DEDUP on
+    // thread_key within the customer so a re-run does not duplicate the link. Bound + cast
+    // $::vector (no interpolation). NEVER logs content or the vector.
+    const threadKey = String((input.metadata as Record<string, unknown>)['thread_key'] ?? '');
+    const { rows } = await query<{ id: string }>(
+      `INSERT INTO agent_memory
+          (customer_id, memory_type, document_id, content, embedding, metadata, chunk_index)
+       SELECT $1, 'conversation', NULL, $2, $3::vector, $4::jsonb, 0
+        WHERE NOT EXISTS (
+          SELECT 1 FROM agent_memory
+           WHERE memory_type = 'conversation'
+             AND customer_id IS NOT DISTINCT FROM $1
+             AND metadata->>'thread_key' = $5
+        )
+       RETURNING id`,
+      [input.customerId, input.content, toVectorLiteral(input.embedding), JSON.stringify(input.metadata), threadKey],
+    );
+    return rows[0] ? { id: rows[0].id } : null;
+  },
+
+  async searchTasksByCustomer(embedding: number[], customerId: string, opts: { maxDistance: number; k: number }): Promise<TaskMatch[]> {
+    const { text, values } = buildTaskSearchSql({ embedding, customerId, maxDistance: opts.maxDistance, k: opts.k });
+    const { rows } = await query<SearchDbRow>(text, values);
+    return rows.map((r) => ({ content: r.content, metadata: r.metadata, distance: Number(r.distance) }));
+  },
+
   async listDocuments(): Promise<KnowledgeDocumentRow[]> {
     const { rows } = await query<DocumentDbRow>(
       `SELECT id, source_id, doc_key, module, locale, title, route, scope, customer_id,

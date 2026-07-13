@@ -109,6 +109,34 @@ export async function recordReleaseNoteDraftDecision(input: {
 }
 
 /**
+ * Record a BACKFILL task proposal (Layer 2) — a historical thread that matched no existing
+ * task and carries a work-request ask. decision_type='backfill_task_proposal', outcome='pending';
+ * on approval the callback creates the task (with a source triple so it's dedup-visible), on
+ * reject it drops. DEDUPED on the thread_key stored in agent_output so a re-run of a not-yet-
+ * approved proposal does not double-post. inbox_message_id is NULL (no live inbound). Returns the
+ * decision id, or null on a dedup hit.
+ */
+export async function recordBackfillProposal(input: {
+  customerId: string;
+  threadKey: string;
+  agentOutput: unknown;
+}): Promise<{ decisionId: string } | null> {
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, outcome)
+     SELECT $1, NULL, 'backfill_task_proposal', $2::jsonb, 'pending'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM agent_decisions
+         WHERE decision_type = 'backfill_task_proposal'
+           AND customer_id = $1
+           AND agent_output->>'thread_key' = $3
+      )
+     RETURNING id`,
+    [input.customerId, JSON.stringify(input.agentOutput ?? null), input.threadKey],
+  );
+  return rows[0] ? { decisionId: rows[0].id } : null;
+}
+
+/**
  * Resolve a draft decision WITHIN the caller's transaction (the outbound-repo draft
  * flip passes its PoolClient) so the outcome commits atomically with the queue-row
  * flip (blueprint must-fix #6). Idempotent: `WHERE id=$1 AND outcome='pending'` — a

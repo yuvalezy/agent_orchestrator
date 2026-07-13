@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSearchSql, buildReleaseNoteMatchSql } from './memory-repo';
+import { buildSearchSql, buildReleaseNoteMatchSql, buildTaskSearchSql } from './memory-repo';
 
 // PURE unit tests for the scoped-search SQL builder — NO DB (the DB round-trip test for
 // memoryRepo is DEFERRED to post-Gate-0, since agent_memory / pgvector aren't installed).
@@ -120,4 +120,18 @@ test('release-note match: excludes shared rows, one row per customer, gated by m
   assert.equal(values[0], '[0.4,0.5,0.6]');
   assert.deepEqual(values[2], ['task', 'conversation']);
   assert.ok(!text.includes('0.4,0.5,0.6') || text.includes('$1::vector'), 'embedding cast $1::vector');
+});
+
+test('buildTaskSearchSql: customer leg ONLY, memory_type=task, maxDistance gate, bound params', () => {
+  const { text, values } = buildTaskSearchSql({ embedding: [0.1, 0.2], customerId: 'cust-A', maxDistance: 0.4, k: 5 });
+  const sql = collapse(text);
+  // ⚠︎ Tasks are always customer-scoped — the query must bind customer_id = $2 and NEVER
+  // fall back to a shared (customer_id IS NULL) leg (that would leak one customer's tasks).
+  assert.match(sql, /customer_id = \$2/, 'customer-scoped');
+  assert.ok(!/IS NULL/.test(sql), 'no shared leg — never cross-customer');
+  assert.match(sql, /memory_type = 'task'/, 'task-typed only');
+  assert.match(sql, /<= \$3/, 'maxDistance gate');
+  assert.match(sql, /LIMIT \$4/, 'k cap');
+  assert.equal(values[0], '[0.1,0.2]');
+  assert.equal(values[1], 'cust-A');
 });

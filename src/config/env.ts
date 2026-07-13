@@ -131,6 +131,19 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   TASK_INVENTORY_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(1_200_000), // 20m
 
+  // ── Backfill sweep (Layer-2): reconcile a customer's historical threads against the
+  // task inventory → memory-link on match (no portal write), draft task proposal on an
+  // unmatched work-request, resolved-history on a done/cancelled match. Kill-switch,
+  // DORMANT by default. dryRun (default at the call site) writes NOTHING. A false LINK is
+  // worse than a miss, so a match must clear BOTH the distance gate AND the judge threshold.
+  BACKFILL_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  BACKFILL_MATCH_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.5), // cosine ceiling for a candidate
+  BACKFILL_JUDGE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6), // LLM-judge confirm gate
+  BACKFILL_MATCH_K: z.coerce.number().int().positive().default(5), // candidate fan-out
+
   // ── M2a(b): scoped RAG retrieval INTO the triage context. Kill-switch (mirrors
   // KNOWLEDGE_SYNC_ENABLED): the retriever is injected into triage ONLY when the
   // literal "true". Additive + best-effort — a missing OPENAI_API_KEY, an empty RAG,
