@@ -7,17 +7,31 @@ import { loadCustomerConfig } from '../../triage/context-loader';
 import { approveBackfillProposal, rejectBackfillProposal } from '../../knowledge/backfill-approve';
 
 // Backfill proposal APPROVE/REJECT handler (ADAPTER — composition of the core approve logic with
-// the EZY gateway + decisions repo + notifier). A tapped card option id is `bf:ok:<decisionId>`
-// (create the task) or `bf:no:<decisionId>` (skip). Consumes only bf: options; returns false
+// the EZY gateway + decisions repo + notifier). Consumes only backfill options; returns false
 // otherwise so the composite onDecision router falls through. Idempotent via the core's outcome
 // guard; posts a one-time confirmation in the card's thread.
-
-const OK = 'bf:ok:';
-const NO = 'bf:no:';
+//
+// ⚠︎ callback_data is split by the notifier on the FIRST ':' → optionId=before, notificationRef=
+// after. So the CLEAN encoding is `bfok:<decisionId>` / `bfno:<decisionId>` (optionId='bfok'|
+// 'bfno', ref=<decisionId>). We ALSO accept the legacy `bf:ok:<id>` / `bf:no:<id>` cards (which
+// split to optionId='bf', ref='ok:<id>'|'no:<id>') so already-posted cards work after a restart.
 
 export interface BackfillApproveHandler {
   isBackfillOption(optionId: string): boolean;
   handle(d: DecisionEvent): Promise<void>;
+}
+
+/** Resolve {approve, decisionId} from either the clean or the legacy callback encoding.
+ *  Exported for the encoding round-trip test. */
+export function parseTap(d: DecisionEvent): { approve: boolean; decisionId: string } | null {
+  if (d.optionId === 'bfok') return { approve: true, decisionId: d.notificationRef };
+  if (d.optionId === 'bfno') return { approve: false, decisionId: d.notificationRef };
+  if (d.optionId === 'bf') {
+    // legacy: notificationRef is 'ok:<id>' or 'no:<id>'
+    if (d.notificationRef.startsWith('ok:')) return { approve: true, decisionId: d.notificationRef.slice(3) };
+    if (d.notificationRef.startsWith('no:')) return { approve: false, decisionId: d.notificationRef.slice(3) };
+  }
+  return null;
 }
 
 export function buildBackfillApproveHandler(deps: { notifier: TelegramNotifier }): BackfillApproveHandler {
@@ -27,10 +41,11 @@ export function buildBackfillApproveHandler(deps: { notifier: TelegramNotifier }
   };
 
   return {
-    isBackfillOption: (optionId) => optionId.startsWith(OK) || optionId.startsWith(NO),
+    isBackfillOption: (optionId) => optionId === 'bfok' || optionId === 'bfno' || optionId === 'bf',
     async handle(d: DecisionEvent): Promise<void> {
-      const approve = d.optionId.startsWith(OK);
-      const decisionId = d.optionId.slice((approve ? OK : NO).length);
+      const parsed = parseTap(d);
+      if (!parsed) return; // not a backfill tap (e.g. a different 'bf'-prefixed option) — fall through
+      const { approve, decisionId } = parsed;
       try {
         if (approve) {
           const r = await approveBackfillProposal(decisionId, d.by, {

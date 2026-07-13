@@ -129,9 +129,10 @@ async function main(): Promise<void> {
           body: `${outcome.title}\n_priority: ${outcome.priority} · from ${thread.channel}_\n\n${outcome.description}`,
           severity: 'action',
         },
+        // ⚠︎ callback_data splits on the FIRST ':' → optionId 'bfok'/'bfno', ref=<decisionId>.
         [
-          { id: `bf:ok:${rec.decisionId}`, label: '✅ Create task' },
-          { id: `bf:no:${rec.decisionId}`, label: '❌ Skip' },
+          { id: `bfok:${rec.decisionId}`, label: '✅ Create task' },
+          { id: `bfno:${rec.decisionId}`, label: '❌ Skip' },
         ],
       );
       posted += 1;
