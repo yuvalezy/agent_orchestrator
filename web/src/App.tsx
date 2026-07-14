@@ -1,9 +1,11 @@
 import { type FormEvent, type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, RefreshCw, Send, ShieldCheck, Users } from 'lucide-react';
+import { Activity, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, Plug, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Users } from 'lucide-react';
 import { api, type ApiError, setCsrfToken } from './lib/api';
 import { cn } from './lib/utils';
 import { ApprovalsView } from './ApprovalsView';
+import { SettingsView } from './SettingsView';
+import { ConnectorsView } from './ConnectorsView';
 
 type Overview = {
   data: {
@@ -32,6 +34,8 @@ const nav = [
   ['outbound', 'Outbound', Send],
   ['customers', 'Conversations', Users],
   ['decisions', 'Decisions', ShieldCheck],
+  ['settings', 'Settings', SlidersHorizontal],
+  ['connectors', 'Connectors', Plug],
 ] as const;
 type View = typeof nav[number][0];
 
@@ -94,7 +98,7 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">
       <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-zinc-800 bg-zinc-950/85 px-5 backdrop-blur"><button onClick={() => setMenuOpen(true)} className="md:hidden"><Menu /></button><div className="text-sm text-zinc-400">Founder-only · Tailscale protected</div><button onClick={() => client.invalidateQueries()} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900 hover:text-white" title="Refresh"><RefreshCw size={17} /></button></header>
-      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}</div>
+      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
     </main>
   </div>;
 }
