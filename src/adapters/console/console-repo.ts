@@ -32,10 +32,22 @@ export function parseLimit(value: unknown): number | null {
   return limit >= 1 && limit <= 100 ? limit : null;
 }
 
-export async function listInbox(input: { status?: unknown; cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
+function parseMetadataSearch(value: unknown): string | null | undefined {
+  if (value === undefined) return null;
+  if (typeof value !== 'string') return undefined;
+  const search = value.trim();
+  return search.length <= 100 ? search || null : undefined;
+}
+
+const DECISION_TYPES = ['triage', 'draft_reply', 'backfill_task_proposal', 'human_override'] as const;
+const DECISION_OUTCOMES = ['pending', 'accepted', 'modified', 'rejected', 'revised'] as const;
+
+export async function listInbox(input: { status?: unknown; search?: unknown; cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
   const limit = parseLimit(input.limit);
   const cursor = decodeCursor(input.cursor);
+  const search = parseMetadataSearch(input.search);
   if (limit === null || (input.cursor !== undefined && !cursor)) return null;
+  if (search === undefined) return null;
   const status = typeof input.status === 'string' && ['pending', 'processing', 'processed', 'failed', 'skipped'].includes(input.status)
     ? input.status
     : input.status === undefined ? null : undefined;
@@ -50,10 +62,11 @@ export async function listInbox(input: { status?: unknown; cursor?: unknown; lim
        JOIN channel_instances ci ON ci.id = i.channel_instance_id
   LEFT JOIN agent_customers c ON c.id = i.customer_id
       WHERE ($1::text IS NULL OR i.status = $1)
-        AND ($2::timestamptz IS NULL OR (i.created_at, i.id) < ($2::timestamptz, $3::bigint))
+        AND ($2::text IS NULL OR c.display_name ILIKE '%' || $2 || '%' OR i.sender_name ILIKE '%' || $2 || '%' OR i.subject ILIKE '%' || $2 || '%')
+        AND ($3::timestamptz IS NULL OR (i.created_at, i.id) < ($3::timestamptz, $4::bigint))
    ORDER BY i.created_at DESC, i.id DESC
-      LIMIT $4`,
-    [status, cursor?.at ?? null, cursor?.id ?? null, limit + 1],
+      LIMIT $5`,
+    [status, search, cursor?.at ?? null, cursor?.id ?? null, limit + 1],
   );
   const hasMore = rows.length > limit;
   const data = rows.slice(0, limit);
@@ -118,19 +131,29 @@ export async function outboundDetail(id: string): Promise<Record<string, unknown
   return rows[0] ?? null;
 }
 
-export async function listDecisions(input: { cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
+export async function listDecisions(input: { type?: unknown; outcome?: unknown; search?: unknown; cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
   const limit = parseLimit(input.limit);
   const cursor = decodeCursor(input.cursor);
-  if (limit === null || (input.cursor !== undefined && !cursor)) return null;
+  const search = parseMetadataSearch(input.search);
+  const type = typeof input.type === 'string' && DECISION_TYPES.includes(input.type as typeof DECISION_TYPES[number])
+    ? input.type
+    : input.type === undefined ? null : undefined;
+  const outcome = typeof input.outcome === 'string' && DECISION_OUTCOMES.includes(input.outcome as typeof DECISION_OUTCOMES[number])
+    ? input.outcome
+    : input.outcome === undefined ? null : undefined;
+  if (limit === null || search === undefined || type === undefined || outcome === undefined || (input.cursor !== undefined && !cursor)) return null;
   const { rows } = await query<Record<string, unknown>>(
     `SELECT d.id::text, d.created_at, d.resolved_at, d.decision_type, d.outcome,
             d.customer_id::text, c.display_name AS customer_name, d.inbox_message_id::text
        FROM agent_decisions d
   LEFT JOIN agent_customers c ON c.id = d.customer_id
-      WHERE ($1::timestamptz IS NULL OR (d.created_at, d.id) < ($1::timestamptz, $2::bigint))
+      WHERE ($1::text IS NULL OR d.decision_type = $1)
+        AND ($2::text IS NULL OR d.outcome = $2)
+        AND ($3::text IS NULL OR c.display_name ILIKE '%' || $3 || '%' OR d.decision_type ILIKE '%' || $3 || '%' OR d.task_ref ILIKE '%' || $3 || '%')
+        AND ($4::timestamptz IS NULL OR (d.created_at, d.id) < ($4::timestamptz, $5::bigint))
    ORDER BY d.created_at DESC, d.id DESC
-      LIMIT $3`,
-    [cursor?.at ?? null, cursor?.id ?? null, limit + 1],
+      LIMIT $6`,
+    [type, outcome, search, cursor?.at ?? null, cursor?.id ?? null, limit + 1],
   );
   const hasMore = rows.length > limit;
   const data = rows.slice(0, limit);

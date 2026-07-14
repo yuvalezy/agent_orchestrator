@@ -144,7 +144,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
     try {
       const page = await listDecisions(req.query);
       if (!page) {
-        res.status(400).json({ error: 'invalid cursor' });
+        res.status(400).json({ error: 'invalid filter or cursor' });
         return;
       }
       res.json(page);
