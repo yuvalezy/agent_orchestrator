@@ -3,7 +3,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { tryResolveCredential } from '../src/config/credentials';
+import { buildGoogleAuthUrl, clientFromGmailCred, exchangeGoogleCode } from '../src/adapters/connectors/google-oauth';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Google Calendar OAuth helper (M5(d) prerequisite) — mint a READ-ONLY refresh
@@ -43,22 +43,6 @@ function arg(name: string): string | undefined {
   return process.argv[i + 1];
 }
 
-/** Pull the client_id/client_secret out of a stored Gmail OAuth blob (same GCP project). */
-function clientFromGmailCred(which: string): { clientId: string; clientSecret: string } | undefined {
-  const refs = which === 'work' ? ['GMAIL_WORK_OAUTH'] : which === 'personal' ? ['GMAIL_PERSONAL_OAUTH'] : ['GMAIL_WORK_OAUTH', 'GMAIL_PERSONAL_OAUTH'];
-  for (const ref of refs) {
-    const raw = tryResolveCredential(ref);
-    if (!raw) continue;
-    try {
-      const c = JSON.parse(raw) as { client_id?: string; client_secret?: string };
-      if (c.client_id && c.client_secret) return { clientId: c.client_id, clientSecret: c.client_secret };
-    } catch {
-      /* not JSON — skip */
-    }
-  }
-  return undefined;
-}
-
 function resolveClient(): { clientId: string; clientSecret: string } {
   const path = arg('client');
   if (path) {
@@ -72,7 +56,8 @@ function resolveClient(): { clientId: string; clientSecret: string } {
   if (clientId && clientSecret) return { clientId, clientSecret };
 
   // Default: reuse the client from the existing Gmail OAuth credential (same GCP project).
-  const reused = clientFromGmailCred((arg('from-gmail') ?? 'any').toLowerCase());
+  const which = (arg('from-gmail') ?? 'any').toLowerCase();
+  const reused = clientFromGmailCred(which === 'work' || which === 'personal' ? which : 'any');
   if (reused) {
     process.stdout.write('▶ Reusing the Google OAuth client from your Gmail credential (same GCP project).\n');
     return reused;
@@ -95,17 +80,7 @@ async function main(): Promise<void> {
   const redirectUri = `http://localhost:${port}`;
   const state = crypto.randomBytes(16).toString('hex');
 
-  const authUrl =
-    'https://accounts.google.com/o/oauth2/v2/auth?' +
-    new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      response_type: 'code',
-      scope: SCOPES.join(' '),
-      access_type: 'offline', // → refresh_token
-      prompt: 'consent', // force a refresh_token even on re-auth
-      state,
-    }).toString();
+  const authUrl = buildGoogleAuthUrl({ clientId, redirectUri, scopes: SCOPES, state });
 
   // Wait for the loopback redirect carrying ?code=.
   const code = await new Promise<string>((resolve, reject) => {
@@ -137,14 +112,9 @@ async function main(): Promise<void> {
   });
 
   // Exchange the code for tokens.
-  const tokRes = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' }),
-  });
-  const tok = (await tokRes.json()) as { refresh_token?: string; access_token?: string; error?: string; error_description?: string };
-  if (!tokRes.ok || !tok.refresh_token) {
-    throw new Error(`token exchange failed: ${tok.error ?? tokRes.status} ${tok.error_description ?? ''}${tok.refresh_token ? '' : ' (no refresh_token — revoke prior grant at myaccount.google.com/permissions and retry, or ensure prompt=consent)'}`);
+  const tok = await exchangeGoogleCode({ client: { clientId, clientSecret }, code, redirectUri });
+  if (tok.error || !tok.refresh_token) {
+    throw new Error(`token exchange failed: ${tok.error ?? 'unknown'} ${tok.error_description ?? ''}${tok.refresh_token ? '' : ' (no refresh_token — revoke prior grant at myaccount.google.com/permissions and retry, or ensure prompt=consent)'}`);
   }
 
   // Which account did they authorize? The PRIMARY calendar id IS the account email —
