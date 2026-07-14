@@ -26,11 +26,11 @@ type Page = { data: Row[]; nextCursor: string | null };
 
 const nav = [
   ['overview', 'Overview', Activity],
-  ['approvals', 'Approvals', CheckCircle2],
+  ['approvals', 'Pending actions', CheckCircle2],
   ['workers', 'Worker health', Activity],
   ['inbox', 'Inbox', ClipboardList],
   ['outbound', 'Outbound', Send],
-  ['customers', 'Customers', Users],
+  ['customers', 'Conversations', Users],
   ['decisions', 'Decisions', ShieldCheck],
 ] as const;
 type View = typeof nav[number][0];
