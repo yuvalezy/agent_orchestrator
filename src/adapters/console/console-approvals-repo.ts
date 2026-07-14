@@ -11,6 +11,7 @@ import type { ConsoleAuditContext } from './console-repo';
 export interface PendingDraftRow {
   queue_id: string;
   created_at: string;
+  customer_id: string | null;
   customer_name: string | null;
   channel_name: string | null;
   channel_type: string | null;
@@ -28,6 +29,7 @@ export async function listPendingDrafts(): Promise<PendingDraftRow[]> {
   const { rows } = await query<PendingDraftRow>(
     `SELECT q.id::text                       AS queue_id,
             q.created_at,
+            q.customer_id::text              AS customer_id,
             c.display_name                   AS customer_name,
             ci.name                          AS channel_name,
             ci.channel_type                  AS channel_type,
@@ -50,6 +52,7 @@ export async function listPendingDrafts(): Promise<PendingDraftRow[]> {
 export interface PendingProposalRow {
   decision_id: string;
   created_at: string;
+  customer_id: string | null;
   customer_name: string | null;
   title: string | null;
   description: string | null;
@@ -64,6 +67,7 @@ export async function listPendingBackfillProposals(): Promise<PendingProposalRow
   const { rows } = await query<PendingProposalRow>(
     `SELECT d.id::text                       AS decision_id,
             d.created_at,
+            d.customer_id::text              AS customer_id,
             c.display_name                   AS customer_name,
             d.agent_output->>'title'         AS title,
             d.agent_output->>'description'   AS description,
