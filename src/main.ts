@@ -57,6 +57,7 @@ import { fetchUnprocessedFeedbackDecisions, fetchResolvedDraftDecisions } from '
 import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learning.worker';
 import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
 import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.worker';
+import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
 
@@ -458,6 +459,30 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('weekly-patterns worker NOT registered (WEEKLY_PATTERNS_ENABLED=false)');
+  }
+
+  // M5(b): daily founder briefing — registered ONLY when DAILY_BRIEFING_ENABLED AND
+  // Telegram is configured (it notifies the Admin topic). Read-only aggregation over the
+  // existing pending draft + backfill-proposal queues; idempotent per calendar day.
+  if (env.DAILY_BRIEFING_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  DAILY_BRIEFING_ENABLED=true but Telegram is unconfigured — the daily briefing has nowhere to post; NOT registering.');
+    } else {
+      feedbackWorkers.push(
+        buildDailyBriefingWorker({
+          notifier,
+          readLastRun: () => getAppState('daily_briefing:last_run_day'),
+          writeLastRun: (day) => setAppState('daily_briefing:last_run_day', day),
+          tz: env.DAILY_BRIEFING_TZ,
+          topN: env.DAILY_BRIEFING_TOP_N,
+          log: logger,
+          intervalMs: env.DAILY_BRIEFING_INTERVAL_MS,
+        }),
+      );
+      logger.info('daily-briefing worker registered (DAILY_BRIEFING_ENABLED=true)');
+    }
+  } else {
+    logger.info('daily-briefing worker NOT registered (DAILY_BRIEFING_ENABLED=false)');
   }
 
   // MI "Project Brain": internal knowledge-sync worker — registered ONLY when

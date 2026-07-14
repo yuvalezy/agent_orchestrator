@@ -334,6 +334,25 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
+  // ── M5(b): daily founder briefing — a once-a-day admin digest of what is WAITING on
+  // the founder: pending draft replies + pending backfill task proposals (counts + the
+  // oldest item's age) and a ranked "who needs attention" list. Attacks decision
+  // throughput (who is waiting, how long). Kill-switch (mirrors ACCEPTANCE_REPORT_ENABLED
+  // strict-bool): the worker is registered ONLY when the literal "true"; unset/"false"/
+  // anything else → false. DORMANT by default. Idempotent per calendar day (an app_state
+  // last-run-day key) so the sub-daily interval posts EXACTLY ONCE per day. Requires
+  // Telegram (it notifies the Admin topic) — the worker is skipped if Telegram is
+  // unconfigured. Read-only aggregation (no new table) over the existing pending queues.
+  DAILY_BRIEFING_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  DAILY_BRIEFING_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
+  // Timezone for the day boundary so "daily" is the founder's local day (not UTC).
+  DAILY_BRIEFING_TZ: z.string().default('America/Panama'),
+  // Max customers surfaced in the "needs attention" list (keeps the digest scannable).
+  DAILY_BRIEFING_TOP_N: z.coerce.number().int().positive().default(5),
+
   // ── Draft correction loop (🔁 Revise) + scoped correction memory. When the founder
   // taps 🔁 Revise on a draft and sends a correction INSTRUCTION, the agent regenerates
   // the draft (grounded + the founder directive treated as authoritative) and LEARNS the
