@@ -54,10 +54,15 @@ test('inbox and decision list contracts paginate metadata and reject unsafe filt
      VALUES ($1, $2, $3, $4, $5, $6::jsonb, now(), 'failed') RETURNING id::text`,
     [channel.rows[0].id, `${tag}-lists-${suffix}`, customer.rows[0].id, `Metadata match ${suffix}`, 'full body is detail-only', JSON.stringify({ provider_payload: 'detail-only' })],
   )));
-  await Promise.all(inboxes.map(({ rows }, index) => query(
+  const decisions = await Promise.all(inboxes.map(({ rows }, index) => query<{ id: string }>(
     `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, task_ref, agent_output, human_override, outcome)
-     VALUES ($1, $2, 'draft_reply', $3, $4::jsonb, $5::jsonb, 'pending')`,
+     VALUES ($1, $2, 'draft_reply', $3, $4::jsonb, $5::jsonb, 'pending') RETURNING id::text`,
     [customer.rows[0].id, rows[0].id, `${tag}-task-${index}`, JSON.stringify({ draft_body: 'detail-only' }), JSON.stringify({ edited_body: 'detail-only' })],
+  )));
+  await Promise.all(decisions.map(({ rows }, index) => query(
+    `INSERT INTO agent_outbound_queue (channel_instance_id, customer_id, recipient_address, body, status, is_draft, decision_id)
+     VALUES ($1, $2, $3, $4, 'pending', true, $5)`,
+    [channel.rows[0].id, customer.rows[0].id, `${tag}-decision-${index}@example.test`, 'draft body is detail-only', rows[0].id],
   )));
 
   const inboxPage = await listInbox({ status: 'failed', search: 'metadata list customer', limit: '1' });
@@ -79,9 +84,14 @@ test('inbox and decision list contracts paginate metadata and reject unsafe filt
   assert.ok(decisionPage.nextCursor);
   assert.equal('agent_output' in decisionPage.data[0], false);
   assert.equal('human_override' in decisionPage.data[0], false);
+  assert.match(String(decisionPage.data[0].task_ref), new RegExp(`^${tag}-task-`));
+  assert.equal(decisionPage.data[0].outbound_status, 'pending');
+  assert.ok(decisionPage.data[0].outbound_queue_id);
   const decisionDetailRow = await decisionDetail(String(decisionPage.data[0].id));
   assert.deepEqual(decisionDetailRow?.agent_output, { draft_body: 'detail-only' });
   assert.deepEqual(decisionDetailRow?.human_override, { edited_body: 'detail-only' });
+  assert.equal(decisionDetailRow?.outbound_status, 'pending');
+  assert.ok(decisionDetailRow?.outbound_queue_id);
   assert.equal(await listInbox({ status: 'anything' }), null);
   assert.equal(await listDecisions({ type: 'anything' }), null);
   assert.equal(await listDecisions({ outcome: 'anything' }), null);

@@ -176,9 +176,16 @@ export async function listDecisions(input: { type?: unknown; outcome?: unknown; 
   if (limit === null || search === undefined || type === undefined || outcome === undefined || (input.cursor !== undefined && !cursor)) return null;
   const { rows } = await query<Record<string, unknown>>(
     `SELECT d.id::text, to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, d.resolved_at, d.decision_type, d.outcome,
-            d.customer_id::text, c.display_name AS customer_name, d.inbox_message_id::text
+            d.customer_id::text, c.display_name AS customer_name, d.inbox_message_id::text, d.task_ref,
+            o.id::text AS outbound_queue_id, o.status AS outbound_status, o.is_draft AS outbound_is_draft
        FROM agent_decisions d
   LEFT JOIN agent_customers c ON c.id = d.customer_id
+  LEFT JOIN LATERAL (
+       SELECT id, status, is_draft FROM agent_outbound_queue
+        WHERE decision_id = d.id
+     ORDER BY created_at DESC, id DESC
+        LIMIT 1
+  ) o ON true
       WHERE ($1::text IS NULL OR d.decision_type = $1)
         AND ($2::text IS NULL OR d.outcome = $2)
         AND ($3::text IS NULL OR c.display_name ILIKE '%' || $3 || '%' OR d.decision_type ILIKE '%' || $3 || '%' OR d.task_ref ILIKE '%' || $3 || '%')
@@ -196,10 +203,17 @@ export async function listDecisions(input: { type?: unknown; outcome?: unknown; 
 export async function decisionDetail(id: string): Promise<Record<string, unknown> | null> {
   const { rows } = await query<Record<string, unknown>>(
     `SELECT d.id::text, d.created_at, d.resolved_at, d.decision_type, d.outcome,
-            d.customer_id::text, c.display_name AS customer_name, d.inbox_message_id::text,
+            d.customer_id::text, c.display_name AS customer_name, d.inbox_message_id::text, d.task_ref,
+            o.id::text AS outbound_queue_id, o.status AS outbound_status, o.is_draft AS outbound_is_draft,
             d.agent_output, d.human_override
        FROM agent_decisions d
   LEFT JOIN agent_customers c ON c.id = d.customer_id
+  LEFT JOIN LATERAL (
+       SELECT id, status, is_draft FROM agent_outbound_queue
+        WHERE decision_id = d.id
+     ORDER BY created_at DESC, id DESC
+        LIMIT 1
+  ) o ON true
       WHERE d.id = $1`,
     [id],
   );

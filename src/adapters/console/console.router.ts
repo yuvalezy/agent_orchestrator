@@ -47,6 +47,11 @@ function withPortalTaskLinks(data: Record<string, unknown>[], portalBaseUrl: str
   });
 }
 
+function withPortalTaskLink(data: Record<string, unknown>, portalBaseUrl: string | null): Record<string, unknown> {
+  const url = portalTaskUrl(portalBaseUrl, data.task_ref);
+  return url ? { ...data, portal_task_url: url } : data;
+}
+
 export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): Router {
   const router = Router();
   const sessions = new ConsoleSessionStore(config);
@@ -178,7 +183,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
         res.status(400).json({ error: 'invalid filter or cursor' });
         return;
       }
-      res.json(page);
+      res.json({ ...page, data: page.data.map((decision) => withPortalTaskLink(decision, config.portalBaseUrl)) });
     } catch (err) {
       next(err);
     }
@@ -194,7 +199,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
         res.status(404).json({ error: 'not found' });
         return;
       }
-      res.json({ data });
+      res.json({ data: withPortalTaskLink(data, config.portalBaseUrl) });
     } catch (err) {
       next(err);
     }
