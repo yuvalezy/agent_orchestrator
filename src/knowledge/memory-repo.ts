@@ -336,6 +336,34 @@ export function buildTaskSearchSql(input: {
   return { text, values: [vec, input.customerId, input.maxDistance, input.k] };
 }
 
+/** ⚠︎ PURE SQL builder for the recent-signals read (M3(e) weekly patterns) — extracted so
+ *  the type filter + window + cap are unit-testable without a DB. Returns the stored
+ *  embedding as its pgvector text literal (`embedding::text`); the repo parses it back to a
+ *  number[] for clustering. Read-only; no scope filter (patterns aggregate ACROSS customers). */
+export function buildRecentSignalsSql(input: {
+  sinceIso: string;
+  memoryTypes: string[];
+  limit: number;
+}): { text: string; values: unknown[] } {
+  const text = `SELECT id, memory_type, customer_id, content, metadata,
+                     embedding::text AS embedding, created_at
+                FROM agent_memory
+               WHERE memory_type = ANY($1::text[])
+                 AND created_at >= $2
+               ORDER BY created_at DESC
+               LIMIT $3`;
+  return { text, values: [input.memoryTypes, input.sinceIso, input.limit] };
+}
+
+/** Parse pgvector's textual literal `[a,b,c]` back into a number[] (inverse of
+ *  toVectorLiteral). Empty/degenerate literals yield []. */
+export function parseVectorLiteral(text: string): number[] {
+  const trimmed = text.trim();
+  const inner = trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed.slice(1, -1) : trimmed;
+  if (inner.trim().length === 0) return [];
+  return inner.split(',').map((n) => Number(n));
+}
+
 /** One backfill memory-link: a historical thread that maps to an existing task. Persisted as
  *  a Layer-A conversation memory (document_id NULL, memory_type='conversation', customer-scoped)
  *  so future retrieval surfaces the customer's own history alongside the task. `resolved` marks a
@@ -371,6 +399,29 @@ export interface TaskSearchRepo {
   searchTasksByCustomer(embedding: number[], customerId: string, opts: { maxDistance: number; k: number }): Promise<TaskMatch[]>;
 }
 
+/** One recent Layer-A signal memory with its STORED embedding (M3(e) weekly pattern
+ *  detection input). The embedding is the vector written at ingest — read back and reused
+ *  for clustering so pattern detection makes NO new embed calls. */
+export interface RecentSignalRow {
+  id: string;
+  memoryType: string;
+  customerId: string | null;
+  content: string;
+  metadata: Record<string, unknown> | null;
+  embedding: number[];
+  createdAt: Date;
+}
+
+/** Recent-signal reader (M3(e)). Read-only aggregation input; kept OFF KnowledgeRepo —
+ *  intersected onto the concrete memoryRepo so fakes needn't implement it. NEVER logs
+ *  content or vectors. */
+export interface SignalFetchRepo {
+  /** Layer-A signal memories (memory_type ∈ memoryTypes) with created_at >= sinceIso,
+   *  most-recent-first, capped at `limit`. Returns each row's stored embedding (parsed
+   *  from the pgvector column) for clustering. Read-only — never mutates. */
+  fetchRecentSignals(sinceIso: string, memoryTypes: string[], limit: number): Promise<RecentSignalRow[]>;
+}
+
 interface DocumentDbRow {
   id: string;
   source_id: string;
@@ -400,13 +451,38 @@ export const memoryRepo: KnowledgeRepo &
   CorrectionMemoryRepo &
   StyleLaneRepo &
   TaskSearchRepo &
-  BackfillLinkRepo = {
+  BackfillLinkRepo &
+  SignalFetchRepo = {
   async listStyleCorrections(customerId: string | null, opts: { limit: number }): Promise<StyleCorrection[]> {
     // Always-on style lane: NON-embedding-gated read of the customer's (+ shared) style/tone
     // corrections. Scope isolation lives in buildStyleLaneSql. NEVER logs the directives.
     const { text, values } = buildStyleLaneSql({ customerId, limit: opts.limit });
     const { rows } = await query<{ fact: string; scope: string }>(text, values);
     return rows.map((r) => ({ fact: r.fact, scope: r.scope }));
+  },
+
+  async fetchRecentSignals(sinceIso: string, memoryTypes: string[], limit: number): Promise<RecentSignalRow[]> {
+    // Read-only aggregation input (M3(e)): recent Layer-A signal memories with their stored
+    // embedding parsed back for clustering. NEVER logs content or the vector.
+    const { text, values } = buildRecentSignalsSql({ sinceIso, memoryTypes, limit });
+    const { rows } = await query<{
+      id: string;
+      memory_type: string;
+      customer_id: string | null;
+      content: string;
+      metadata: Record<string, unknown> | null;
+      embedding: string;
+      created_at: Date;
+    }>(text, values);
+    return rows.map((r) => ({
+      id: String(r.id),
+      memoryType: r.memory_type,
+      customerId: r.customer_id,
+      content: r.content,
+      metadata: r.metadata,
+      embedding: parseVectorLiteral(r.embedding),
+      createdAt: r.created_at,
+    }));
   },
 
   async insertBackfillLink(input: BackfillLinkInput): Promise<{ id: string } | null> {

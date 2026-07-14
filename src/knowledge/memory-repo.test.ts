@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSearchSql, buildReleaseNoteMatchSql, buildTaskSearchSql } from './memory-repo';
+import {
+  buildSearchSql,
+  buildReleaseNoteMatchSql,
+  buildTaskSearchSql,
+  buildRecentSignalsSql,
+  parseVectorLiteral,
+} from './memory-repo';
 
 // PURE unit tests for the scoped-search SQL builder — NO DB (the DB round-trip test for
 // memoryRepo is DEFERRED to post-Gate-0, since agent_memory / pgvector aren't installed).
@@ -134,4 +140,27 @@ test('buildTaskSearchSql: customer leg ONLY, memory_type=task, maxDistance gate,
   assert.match(sql, /LIMIT \$4/, 'k cap');
   assert.equal(values[0], '[0.1,0.2]');
   assert.equal(values[1], 'cust-A');
+});
+
+test('buildRecentSignalsSql: type filter + window + cap, reads embedding as text; no scope filter', () => {
+  const { text, values } = buildRecentSignalsSql({
+    sinceIso: '2026-07-06T00:00:00Z',
+    memoryTypes: ['correction', 'feedback', 'conversation', 'task'],
+    limit: 2000,
+  });
+  const sql = collapse(text);
+  assert.match(sql, /embedding::text AS embedding/, 'reads the stored vector back as text');
+  assert.match(sql, /memory_type = ANY\(\$1::text\[\]\)/, 'type filter');
+  assert.match(sql, /created_at >= \$2/, 'window');
+  assert.match(sql, /ORDER BY created_at DESC/, 'most-recent-first (rep = latest phrasing)');
+  assert.match(sql, /LIMIT \$3/, 'blast-radius cap');
+  assert.match(sql, /customer_id, content/, 'projects customer_id for distinct-customer counts');
+  assert.doesNotMatch(sql, /customer_id\s*=|customer_id\s+IS/, 'no scope FILTER — patterns aggregate across customers');
+  assert.deepEqual(values, [['correction', 'feedback', 'conversation', 'task'], '2026-07-06T00:00:00Z', 2000]);
+});
+
+test('parseVectorLiteral: inverse of the [a,b,c] literal; empty/degenerate → []', () => {
+  assert.deepEqual(parseVectorLiteral('[0.1,0.2,0.3]'), [0.1, 0.2, 0.3]);
+  assert.deepEqual(parseVectorLiteral('[]'), []);
+  assert.deepEqual(parseVectorLiteral('  [1,2]  '), [1, 2]);
 });

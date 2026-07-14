@@ -56,6 +56,7 @@ import { dbContactResolutionQueries } from './customers/contact-resolution';
 import { fetchUnprocessedFeedbackDecisions, fetchResolvedDraftDecisions } from './decisions/decisions';
 import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learning.worker';
 import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
+import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
 
@@ -420,6 +421,43 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('acceptance-report worker NOT registered (ACCEPTANCE_REPORT_ENABLED=false)');
+  }
+
+  // M3(e): weekly pattern detection — registered ONLY when WEEKLY_PATTERNS_ENABLED AND
+  // Telegram is configured (it notifies the founder). Idempotent per ISO week. Read-only:
+  // clusters the week's Layer-A signal memories (corrections + conversation/task themes) by
+  // their STORED embeddings (no new embed calls, no OPENAI_API_KEY needed) and posts the top
+  // RECURRING patterns to the Admin topic. DORMANT by default.
+  if (env.WEEKLY_PATTERNS_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  WEEKLY_PATTERNS_ENABLED=true but Telegram is unconfigured — the weekly digest has nowhere to post; NOT registering.');
+    } else {
+      feedbackWorkers.push(
+        buildWeeklyPatternsWorker({
+          fetchSignals: (sinceIso) =>
+            memoryRepo.fetchRecentSignals(
+              sinceIso,
+              ['correction', 'feedback', 'conversation', 'task'],
+              env.WEEKLY_PATTERNS_MAX_SIGNALS,
+            ),
+          notifier,
+          readLastRun: () => getAppState('weekly_patterns:last_run_week'),
+          writeLastRun: (week) => setAppState('weekly_patterns:last_run_week', week),
+          tz: env.WEEKLY_PATTERNS_TZ,
+          windowDays: env.WEEKLY_PATTERNS_WINDOW_DAYS,
+          detect: {
+            maxDistance: env.WEEKLY_PATTERNS_MAX_DISTANCE,
+            minCount: env.WEEKLY_PATTERNS_MIN_COUNT,
+            topK: env.WEEKLY_PATTERNS_TOP_K,
+          },
+          log: logger,
+          intervalMs: env.WEEKLY_PATTERNS_INTERVAL_MS,
+        }),
+      );
+      logger.info('weekly-patterns worker registered (WEEKLY_PATTERNS_ENABLED=true)');
+    }
+  } else {
+    logger.info('weekly-patterns worker NOT registered (WEEKLY_PATTERNS_ENABLED=false)');
   }
 
   // MI "Project Brain": internal knowledge-sync worker — registered ONLY when
