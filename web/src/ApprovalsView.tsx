@@ -10,7 +10,7 @@ import { api, type ApiError } from './lib/api';
 interface DraftRow {
   queue_id: string; created_at: string; customer_name: string | null;
   channel_name: string | null; channel_type: string | null;
-  draft_body: string | null; inbox_subject: string | null; sender_name: string | null;
+  draft_body: string | null; inbox_subject: string | null; inbox_body: string | null; sender_name: string | null;
 }
 interface ProposalRow {
   decision_id: string; created_at: string; customer_name: string | null;
@@ -32,6 +32,28 @@ function PriorityBadge({ value }: { value: string | null }): ReactElement {
   return <span className={`rounded-full px-2 py-1 text-xs font-medium ${tone}`}>{v}</span>;
 }
 const btn = 'rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-40';
+
+interface ConfirmOpts { title: string; message: string; confirmLabel: string; tone?: 'danger' | 'primary'; onConfirm: () => void }
+
+function ConfirmDialog({ title, message, confirmLabel, tone = 'primary', onConfirm, onClose }: ConfirmOpts & { onClose: () => void }): ReactElement {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" onClick={onClose}>
+      <div className="w-full max-w-sm rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-sm font-semibold text-zinc-100">{title}</h3>
+        <p className="mt-2 text-sm leading-6 text-zinc-400">{message}</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button autoFocus onClick={onClose} className={`${btn} bg-zinc-800 text-zinc-300`}>Cancel</button>
+          <button onClick={() => { onConfirm(); onClose(); }} className={`${btn} ${tone === 'danger' ? 'bg-red-400 text-zinc-900' : 'bg-emerald-400 text-zinc-900'}`}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function useConfirm(): { ask: (o: ConfirmOpts) => void; dialog: ReactElement | null } {
+  const [opts, setOpts] = useState<ConfirmOpts | null>(null);
+  return { ask: setOpts, dialog: opts ? <ConfirmDialog {...opts} onClose={() => setOpts(null)} /> : null };
+}
 
 export function ApprovalsView(): ReactElement {
   const [tab, setTab] = useState<'drafts' | 'proposals'>('drafts');
@@ -71,6 +93,7 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   const [revising, setRevising] = useState<{ id: string; text: string } | null>(null);
   const { err, ok, run } = useActionState();
+  const { ask, dialog } = useConfirm();
   const refetch = (): void => void client.invalidateQueries({ queryKey: ['approvals', 'drafts'] });
 
   if (query.isLoading) return <Loading />;
@@ -82,6 +105,7 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
 
   return (
     <div className="space-y-4">
+      {dialog}
       {err && <ErrorState message={err} />}
       {ok && <div className="rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-3 text-sm text-emerald-200">{ok}</div>}
       {rows.map((d) => {
@@ -96,7 +120,10 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
                 <p className="text-xs text-zinc-500">{d.inbox_subject ?? '(no subject)'} · {when(d.created_at)} {stale && <span className="text-amber-300">· waiting {Math.floor(ageDays(d.created_at))}d</span>}</p>
               </div>
             </div>
-            <pre className="mt-3 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 text-xs text-zinc-300">{d.draft_body ?? '—'}</pre>
+            <p className="mt-3 text-xs font-medium uppercase tracking-wide text-zinc-500">Customer's message{d.sender_name ? ` · ${d.sender_name}` : ''}</p>
+            <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border-l-2 border-zinc-700 bg-zinc-950 p-3 text-xs text-zinc-200">{d.inbox_body?.trim() || '(no original message — founder-initiated or history-sourced)'}</pre>
+            <p className="mt-3 text-xs font-medium uppercase tracking-wide text-emerald-300/80">Proposed reply</p>
+            <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 text-xs text-zinc-300">{d.draft_body ?? '—'}</pre>
 
             {isEditing ? (
               <div className="mt-3 space-y-2">
@@ -116,10 +143,10 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
               </div>
             ) : (
               <div className="mt-3 flex flex-wrap gap-2">
-                <button onClick={() => { if (window.confirm('Approve and SEND this reply to the customer?')) void run(post(`/approvals/drafts/${d.queue_id}/approve`).then(refetch), 'Approved — sending.'); }} className={`${btn} bg-emerald-400 text-zinc-900`}><Send size={12} className="mr-1 inline" />Approve &amp; send</button>
+                <button onClick={() => ask({ title: 'Send reply to customer?', message: `This sends the draft to ${d.customer_name ?? 'the customer'} via ${d.channel_name ?? d.channel_type ?? 'the channel'}.`, confirmLabel: 'Approve & send', tone: 'primary', onConfirm: () => void run(post(`/approvals/drafts/${d.queue_id}/approve`).then(refetch), 'Approved — sending.') })} className={`${btn} bg-emerald-400 text-zinc-900`}><Send size={12} className="mr-1 inline" />Approve &amp; send</button>
                 <button onClick={() => setEditing({ id: d.queue_id, text: d.draft_body ?? '' })} className={`${btn} bg-zinc-800 text-zinc-200`}><Pencil size={12} className="mr-1 inline" />Edit</button>
                 {reviseEnabled && <button onClick={() => setRevising({ id: d.queue_id, text: '' })} className={`${btn} bg-zinc-800 text-zinc-200`}><Sparkles size={12} className="mr-1 inline" />Revise</button>}
-                <button onClick={() => { if (window.confirm('Reject this draft? It will not be sent.')) void run(post(`/approvals/drafts/${d.queue_id}/reject`).then(refetch), 'Rejected.'); }} className={`${btn} bg-red-400/15 text-red-300`}><X size={12} className="mr-1 inline" />Reject</button>
+                <button onClick={() => ask({ title: 'Reject this draft?', message: 'The draft will be cancelled and not sent.', confirmLabel: 'Reject', tone: 'danger', onConfirm: () => void run(post(`/approvals/drafts/${d.queue_id}/reject`).then(refetch), 'Rejected.') })} className={`${btn} bg-red-400/15 text-red-300`}><X size={12} className="mr-1 inline" />Reject</button>
               </div>
             )}
           </Panel>
@@ -134,6 +161,7 @@ function ProposalsTab({ query }: { query: ReturnType<typeof useQuery<{ data: Pro
   const [priority, setPriority] = useState<string>('');
   const [customer, setCustomer] = useState<string>('');
   const { err, ok, run } = useActionState();
+  const { ask, dialog } = useConfirm();
   const refetch = (): void => void client.invalidateQueries({ queryKey: ['approvals', 'proposals'] });
 
   if (query.isLoading) return <Loading />;
@@ -150,6 +178,7 @@ function ProposalsTab({ query }: { query: ReturnType<typeof useQuery<{ data: Pro
 
   return (
     <div className="space-y-4">
+      {dialog}
       <div className="flex flex-wrap items-center gap-2 text-xs">
         {['', 'urgent', 'high', 'medium', 'low'].map((p) => (
           <button key={p || 'all'} onClick={() => setPriority(p)} className={`rounded-full px-2.5 py-1 ${priority === p ? 'bg-zinc-700 text-white' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-200'}`}>{p || 'all priorities'}</button>
@@ -172,7 +201,7 @@ function ProposalsTab({ query }: { query: ReturnType<typeof useQuery<{ data: Pro
             </div>
             <div className="flex shrink-0 gap-2">
               <button title="Create task" onClick={() => void run(post(`/approvals/proposals/${p.decision_id}/approve`).then(refetch), 'Task created in the portal.')} className={`${btn} bg-emerald-400 text-zinc-900`}><CheckCircle2 size={12} className="mr-1 inline" />Approve</button>
-              <button title="Skip" onClick={() => { if (window.confirm('Skip this proposal? No task will be created.')) void run(post(`/approvals/proposals/${p.decision_id}/reject`).then(refetch), 'Skipped.'); }} className={`${btn} bg-red-400/15 text-red-300`}><X size={12} className="mr-1 inline" />Reject</button>
+              <button title="Skip" onClick={() => ask({ title: 'Skip this proposal?', message: 'No task will be created.', confirmLabel: 'Reject', tone: 'danger', onConfirm: () => void run(post(`/approvals/proposals/${p.decision_id}/reject`).then(refetch), 'Skipped.') })} className={`${btn} bg-red-400/15 text-red-300`}><X size={12} className="mr-1 inline" />Reject</button>
             </div>
           </div>
         </Panel>

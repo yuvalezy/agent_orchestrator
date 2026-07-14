@@ -65,10 +65,11 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
     body: string,
     citations: string[],
     language: string,
+    original?: string,
   ): Promise<void> {
     await deps.notifier.notifyCustomerEvent(
       customerId,
-      buildPresentation(body, citations, language),
+      buildPresentation(body, citations, language, original),
       draftButtons(queueId, { revise: deps.reviseEnabled }),
     );
   }
@@ -154,7 +155,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
 
       // (6) Present with Approve/Edit/Reject. A failure here throws → the row is reclaimed
       //     and step (1) re-presents this same draft (no double).
-      await present(customerId, queueId, result.body, citations, config.preferredLanguage);
+      await present(customerId, queueId, result.body, citations, config.preferredLanguage, assembleQuestion(row));
     },
 
     async reconfirmOpenDraft(inboxMessageId: string): Promise<boolean> {
@@ -188,10 +189,14 @@ function assembleQuestion(row: ClaimedInbox): string {
     .join('\n\n');
 }
 
-/** Build the founder-facing presentation: draft body + a "Based on:" citation list +
- *  the reply language. Never logged. */
-function buildPresentation(body: string, citations: string[], language: string): Notification {
-  const lines: string[] = [body];
+/** Build the founder-facing presentation: the customer's ORIGINAL message (so the founder can judge
+ *  the reply without digging), then the draft body + a "Based on:" citation list + the reply
+ *  language. Never logged. */
+function buildPresentation(body: string, citations: string[], language: string, original?: string): Notification {
+  const lines: string[] = [];
+  const orig = original?.trim();
+  if (orig) lines.push('📨 They wrote:', orig, '', '✍️ Suggested reply:');
+  lines.push(body);
   if (citations.length > 0) {
     lines.push('', 'Based on:', ...citations.map((c) => `- ${c}`));
   }

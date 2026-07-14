@@ -55,8 +55,8 @@ const REVISE_TITLE = '🔁 Revised draft — needs approval';
 export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
   /** Present (or re-present) the revised draft with the SAME Approve/Edit/Reject/Revise
    *  buttons so the founder can approve, edit, reject, or revise AGAIN. Body never logged. */
-  async function present(customerId: string, queueId: string, body: string, citations: string[], language: string): Promise<void> {
-    await deps.notifier.notifyCustomerEvent(customerId, buildPresentation(body, citations, language), draftButtons(queueId, { revise: true }));
+  async function present(customerId: string, queueId: string, body: string, citations: string[], language: string, original?: string): Promise<void> {
+    await deps.notifier.notifyCustomerEvent(customerId, buildPresentation(body, citations, language, original), draftButtons(queueId, { revise: true }));
   }
 
   return {
@@ -69,6 +69,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
       let meta: DraftMeta;
       let result: { body: string; usedSourceIndexes: number[] };
       let citations: string[];
+      let question = '';
       let revised: Awaited<ReturnType<typeof deps.reviseDraft>>;
       try {
         // (1) Still an open draft? (guards a draft approved/rejected between 🔁 and the message.)
@@ -83,7 +84,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
         // (2) Re-read the ORIGINAL inbound message so re-retrieval matches the first draft's
         // grounding (DA S5). Fall back to the stored intent summary when there is no inbound
         // message (a founder-initiated release-note draft) or it is unavailable.
-        const question = await resolveQuestion(deps, draft, meta.summary);
+        question = await resolveQuestion(deps, draft, meta.summary);
 
         // (3) Best-effort scoped re-retrieval (customer + shared). [] on any error — the
         // founder directive still governs the regeneration.
@@ -138,7 +139,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
       // DA S1). Present + learn are best-effort side effects on an already-committed draft.
       if (revised.customerId) {
         try {
-          await present(revised.customerId, queueId, result.body, citations, meta.language);
+          await present(revised.customerId, queueId, result.body, citations, meta.language, question);
         } catch (err) {
           // The revise committed but the founder didn't see it. Do NOT ask them to re-revise;
           // surface a soft note so they know to refresh (a later approve still targets the draft).
@@ -239,9 +240,13 @@ function readDraftMeta(agentOutput: unknown): DraftMeta {
   return { intent, summary, language, customerName };
 }
 
-/** Founder-facing presentation of the revised draft (body + "Based on:" citations + language). */
-function buildPresentation(body: string, citations: string[], language: string): Notification {
-  const lines: string[] = [body];
+/** Founder-facing presentation of the revised draft: the customer's ORIGINAL message, then the
+ *  regenerated body + "Based on:" citations + language. */
+function buildPresentation(body: string, citations: string[], language: string, original?: string): Notification {
+  const lines: string[] = [];
+  const orig = original?.trim();
+  if (orig) lines.push('📨 They wrote:', orig, '', '✍️ Suggested reply:');
+  lines.push(body);
   if (citations.length > 0) lines.push('', 'Based on:', ...citations.map((c) => `- ${c}`));
   if (language) lines.push('', `Language: ${language}`);
   return { title: REVISE_TITLE, body: lines.join('\n'), severity: 'action' };

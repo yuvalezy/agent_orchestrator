@@ -16,11 +16,14 @@ export interface PendingDraftRow {
   channel_type: string | null;
   draft_body: string | null;
   inbox_subject: string | null;
+  inbox_body: string | null;
   sender_name: string | null;
 }
 
-/** Open drafts (`is_draft=true, status='pending'`) with the founder's own reply body + light
- *  context. The original INBOUND body is deliberately excluded (list-metadata posture). */
+/** Open drafts (`is_draft=true, status='pending'`) with the founder's own reply body PLUS the
+ *  original customer message (subject + full body) so the founder can judge the reply. This is an
+ *  approval/action surface (the founder owns this data) — the "list-metadata only" posture applies
+ *  to the passive Operations views, not here. */
 export async function listPendingDrafts(): Promise<PendingDraftRow[]> {
   const { rows } = await query<PendingDraftRow>(
     `SELECT q.id::text                       AS queue_id,
@@ -30,6 +33,7 @@ export async function listPendingDrafts(): Promise<PendingDraftRow[]> {
             ci.channel_type                  AS channel_type,
             q.body                           AS draft_body,
             i.subject                        AS inbox_subject,
+            i.body                           AS inbox_body,
             i.sender_name                    AS sender_name
        FROM agent_outbound_queue q
        JOIN agent_decisions d      ON d.id = q.decision_id
