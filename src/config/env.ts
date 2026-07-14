@@ -408,6 +408,29 @@ const envSchema = z.object({
   // Max voice directives injected per draft (blast-radius / prompt-size guard), newest-first.
   STYLE_LANE_MAX: z.coerce.number().int().positive().default(12),
 
+  // ── M5(d): Google Calendar READ → upcoming meetings injected into drafts. At draft time the
+  // drafter pulls the drafted customer's UPCOMING meetings (matched by the sender's email) from
+  // the founder's calendar and injects them as draft CONTEXT — a distinct section the reply may
+  // acknowledge ("see you Tuesday"), never a citation source. Kill-switch (mirrors OUTBOUND_ENABLED
+  // strict-bool): the calendar service is wired into the drafter ONLY when the literal "true";
+  // unset/"false"/else → false. DORMANT by default so nothing reads the calendar by surprise.
+  // No poll interval — the read is SYNCHRONOUS at draft time (not a worker). READ-ONLY: no event
+  // creation (a future write follow-up). Best-effort everywhere — a calendar miss never fails a
+  // draft. The OAuth credential is GOOGLE_CALENDAR_OAUTH (scope calendar.readonly), resolved via
+  // resolveCredential — NEVER here. Only affects the drafter when KNOWLEDGE_DRAFT_ENABLED is on.
+  CALENDAR_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Forward window (days) to look ahead for the customer's meetings.
+  CALENDAR_LOOKAHEAD_DAYS: z.coerce.number().int().positive().default(7),
+  // Max meeting lines injected per draft (blast-radius / prompt-size guard).
+  CALENDAR_MAX_EVENTS: z.coerce.number().int().positive().default(5),
+  // Target calendar id; 'primary' = the founder's primary calendar.
+  CALENDAR_ID: z.string().default('primary'),
+  // IANA timezone for rendering meeting date/time lines (the founder's local week).
+  CALENDAR_TZ: z.string().default('America/Panama'),
+
   // ── M3(e): weekly pattern detection — a weekly digest that clusters the week's Layer-A
   // signal memories (founder corrections + customer conversation/task themes) by their
   // ALREADY-STORED embeddings and posts the top RECURRING patterns to the Telegram Admin

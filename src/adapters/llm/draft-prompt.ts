@@ -60,6 +60,12 @@ export const DRAFT_SYSTEM = [
   '(it has no source number). Grounding still comes ONLY from the numbered knowledge',
   'sources; voice guidance shapes phrasing, never content.',
   '',
+  'UPCOMING MEETINGS (when an "Upcoming meetings" section is present): those lines are',
+  'context about meetings this customer already has on the calendar. You MAY naturally',
+  'acknowledge a relevant one ("see you Tuesday") when it fits the reply. They are NOT',
+  'knowledge sources and NOT facts: never cite them, never list their number in used_sources,',
+  'and never invent, move, or promise a meeting that is not listed.',
+  '',
   'Write the reply in the requested language. Return ONLY the structured object',
   '{"reply": "...", "used_sources": [n, ...]} where used_sources lists the 0-based',
   'indexes of the KNOWLEDGE sources you actually relied on (empty if none applied). Do NOT',
@@ -79,6 +85,13 @@ export function draftUserMessage(req: DraftRequest): string {
   if (voice.length > 0) {
     parts.push('', 'Persistent voice & tone guidance (HOW to write — directive, NOT a source, do NOT cite):');
     voice.forEach((g) => parts.push(`- ${g}`));
+  }
+  // Upcoming meetings (M5(d)): calendar CONTEXT the reply may acknowledge. A DISTINCT, UN-numbered
+  // section (not a source) so the model can never cite it or fold it into used_sources.
+  const meetings = (req.upcomingMeetings ?? []).map((m) => m.trim()).filter((m) => m.length > 0);
+  if (meetings.length > 0) {
+    parts.push('', 'Upcoming meetings with this customer (context — NOT a source, do NOT cite):');
+    meetings.forEach((m) => parts.push(`- ${m}`));
   }
   parts.push('', 'Knowledge sources (answer ONLY from these):');
   req.knowledge.forEach((k, i) => {
