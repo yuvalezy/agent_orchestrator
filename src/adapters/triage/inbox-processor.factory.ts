@@ -120,8 +120,11 @@ function buildMeetingContextGated(): MeetingContext | undefined {
     logger.info('meeting context NOT wired (CALENDAR_ENABLED=false)');
     return undefined;
   }
-  if (!tryResolveCredential('GOOGLE_CALENDAR_OAUTH')) {
-    logger.warn('⚠️  CALENDAR_ENABLED=true but GOOGLE_CALENDAR_OAUTH is UNSET — drafts get no meetings context until it is set (calendar reads degrade to []).');
+  const calAccounts = ['GOOGLE_CALENDAR_WORK_OAUTH', 'GOOGLE_CALENDAR_PERSONAL_OAUTH', 'GOOGLE_CALENDAR_OAUTH'].filter((r) => tryResolveCredential(r));
+  if (calAccounts.length === 0) {
+    logger.warn('⚠️  CALENDAR_ENABLED=true but no GOOGLE_CALENDAR_{WORK,PERSONAL,}_OAUTH is set — drafts get no meetings context until one is (calendar reads degrade to []).');
+  } else {
+    logger.info({ accounts: calAccounts.map((r) => r.replace('GOOGLE_CALENDAR_', '').replace('_OAUTH', '').toLowerCase() || 'default') }, 'calendar accounts resolved');
   }
   logger.info(
     { lookaheadDays: env.CALENDAR_LOOKAHEAD_DAYS, maxEvents: env.CALENDAR_MAX_EVENTS, calendar: env.CALENDAR_ID },

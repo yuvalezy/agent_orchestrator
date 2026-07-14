@@ -29,6 +29,7 @@
     "triage:sample": "tsx scripts/triage-sample.ts --",
     "contract:ezy": "tsx scripts/contract-ezy-tasks.ts",
     "gmail:oauth": "tsx scripts/gmail-oauth.ts --",
+    "calendar:oauth": "tsx scripts/calendar-oauth.ts --",
     "typecheck": "tsc --noEmit",
     "typecheck:console": "npm --prefix web run typecheck",
     "test:containers": "RUN_CONTAINERS=true node --import tsx --test src/adapters/console/console-mutations.container.test.ts",

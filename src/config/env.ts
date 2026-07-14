@@ -443,8 +443,14 @@ const envSchema = z.object({
   CALENDAR_LOOKAHEAD_DAYS: z.coerce.number().int().positive().default(7),
   // Max meeting lines injected per draft (blast-radius / prompt-size guard).
   CALENDAR_MAX_EVENTS: z.coerce.number().int().positive().default(5),
-  // Target calendar id; 'primary' = the founder's primary calendar.
+  // Legacy single-account calendar id ('primary' = the account's own calendar). Used only for
+  // the back-compat GOOGLE_CALENDAR_OAUTH fallback when no split WORK/PERSONAL cred is present.
   CALENDAR_ID: z.string().default('primary'),
+  // Per-account target calendar ids for the multi-account read (WORK + PERSONAL). 'primary' =
+  // that account's own calendar. The credentials are GOOGLE_CALENDAR_WORK_OAUTH /
+  // GOOGLE_CALENDAR_PERSONAL_OAUTH (scope calendar.readonly), resolved via resolveCredential.
+  GOOGLE_CALENDAR_WORK_ID: z.string().default('primary'),
+  GOOGLE_CALENDAR_PERSONAL_ID: z.string().default('primary'),
   // IANA timezone for rendering meeting date/time lines (the founder's local week).
   CALENDAR_TZ: z.string().default('America/Panama'),
 
