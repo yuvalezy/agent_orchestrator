@@ -29,6 +29,7 @@ import {
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
 import { buildBackfillApproveHandler } from './backfill-approve.factory';
 import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
+import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
 import { memoryRepo } from '../../knowledge/memory-repo';
 import {
   buildCorrectionFlipHandler,
@@ -124,6 +125,11 @@ export function buildDraftReviserService(
     reviseDraft,
     getInboxSubjectBody,
     learnCorrection,
+    // Style-Correction Always-On lane: re-inject the customer's persistent voice/tone directives on
+    // every regeneration so a revise keeps the learned voice (gated; undefined when off). REUSES the
+    // SAME buildStyleLaneGated the inbox drafter uses (STYLE_LANE_ENABLED) — one gated builder, no
+    // second flag.
+    styleLane: buildStyleLaneGated(),
   });
 }
 

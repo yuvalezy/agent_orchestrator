@@ -173,6 +173,15 @@ export interface ReviseRequest {
   priorDraft: string;
   /** The founder's free-text correction directive (authoritative). */
   instruction: string;
+  /**
+   * Always-on style lane (per-customer voice/tone guidance), mirrored from DraftRequest so a
+   * regeneration keeps the customer's learned voice. Directive lines that shape HOW the reply is
+   * written (warmth, formality, persona) — NOT a knowledge/citation source: the model must apply
+   * them but never cite them, never treat them as facts, and never list them in `usedSourceIndexes`.
+   * Optional (absent/empty when STYLE_LANE_ENABLED is off or the customer has no style corrections).
+   * See src/knowledge/style-lane.ts.
+   */
+  voiceGuidance?: string[];
 }
 
 /** Structured revise result — identical shape to DraftResult (the reviser reuses the

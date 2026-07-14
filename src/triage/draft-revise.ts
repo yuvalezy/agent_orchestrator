@@ -1,6 +1,7 @@
 import type { DraftReviserPort, Intent, ReviseRequest } from '../ports/llm.port';
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
+import type { StyleLane } from '../knowledge/style-lane';
 import type { getDraftForRevise, reviseDraft, DraftForRevise } from '../outbound/outbound-repo';
 import type { getInboxSubjectBody } from '../inbox/inbox-repo';
 import { logger } from '../logger';
@@ -41,6 +42,11 @@ export interface DraftReviserDeps {
   getInboxSubjectBody: typeof getInboxSubjectBody;
   /** Phase 2: learn the correction into the right scope (throw-isolated here). */
   learnCorrection?: LearnCorrection;
+  /** Style-Correction Always-On lane: the customer's persistent voice/tone directives, re-fetched
+   *  on every regeneration so a revise keeps the learned voice (gated; undefined when off). The lane
+   *  is itself best-effort (a miss yields []), and we further isolate its call below — a style-lane
+   *  fault must NEVER break revise. */
+  styleLane?: StyleLane;
 }
 
 export interface DraftReviserService {
@@ -90,7 +96,13 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
         // founder directive still governs the regeneration.
         const knowledge = await deps.retriever.retrieve(question, draft.customerId);
 
-        // (4) Regenerate: founder instruction is authoritative; still grounded in `knowledge`.
+        // (3b) Always-on style lane: re-fetch the customer's persistent voice/tone directives so
+        // the regenerated draft keeps the learned voice. Best-effort → [] (the lane swallows its own
+        // errors; the extra guard here keeps a wiring fault from ever breaking revise).
+        const voiceGuidance = await deps.styleLane?.guidanceFor(draft.customerId).catch(() => []);
+
+        // (4) Regenerate: founder instruction is authoritative; still grounded in `knowledge`;
+        // voiceGuidance shapes HOW it is written (directive, never cited).
         const req: ReviseRequest = {
           question,
           language: meta.language,
@@ -98,6 +110,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
           knowledge,
           priorDraft: draft.priorBody,
           instruction,
+          voiceGuidance,
         };
         result = await deps.reviser.reviseReply(req);
         citations = renderCitations(knowledge, result.usedSourceIndexes);

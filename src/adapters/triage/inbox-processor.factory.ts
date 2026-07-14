@@ -8,7 +8,7 @@ import { dbContactResolutionQueries } from '../../customers/contact-resolution';
 import { TriageService } from '../../triage/triage.service';
 import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
-import { buildStyleLane, type StyleLane } from '../../knowledge/style-lane';
+import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
 import { buildResponseDrafter, type ResponseDrafter } from '../../triage/response-drafter';
 import { buildCrossChannelDedup, type CrossChannelDedup } from '../../triage/cross-channel-dedup';
 import { searchConversationLinks, insertConversationLink } from '../../triage/conversation-link-repo';
@@ -99,24 +99,6 @@ function buildResponseDrafterGated(
     // Style-Correction Always-On lane: inject the customer's persistent voice/tone directives
     // on every draft (gated; undefined when off → no voice guidance).
     styleLane: buildStyleLaneGated(),
-  });
-}
-
-/**
- * Style-Correction Always-On lane (gated STYLE_LANE_ENABLED). Composition root where the core
- * style-lane meets the core memoryRepo's non-gated style reader (a pure DB read — no embedding
- * adapter, no secret). Returns undefined when off → the drafter injects no voice guidance. Best-
- * effort at read time (a fetch miss degrades to [], never a drafting failure).
- */
-function buildStyleLaneGated(): StyleLane | undefined {
-  if (!env.STYLE_LANE_ENABLED) {
-    logger.info('style lane NOT wired (STYLE_LANE_ENABLED=false)');
-    return undefined;
-  }
-  logger.info({ max: env.STYLE_LANE_MAX }, 'style lane wired (STYLE_LANE_ENABLED=true)');
-  return buildStyleLane({
-    list: memoryRepo.listStyleCorrections.bind(memoryRepo),
-    options: { limit: env.STYLE_LANE_MAX },
   });
 }
 

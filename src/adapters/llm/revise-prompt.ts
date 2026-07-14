@@ -52,6 +52,14 @@ export const REVISE_SYSTEM = [
   "does not settle it, abstain — say we don't currently offer that / you'll confirm — do",
   'NOT fabricate to be helpful. Absence of a source is NOT evidence a capability exists.',
   '',
+  'VOICE & TONE GUIDANCE (when a "Persistent voice & tone guidance" section is present):',
+  'those lines are STANDING directives about HOW to write for this customer — warmth,',
+  'formality, greeting, sign-off, length, persona. Apply them to the wording and tone of',
+  'the new draft. They are NOT knowledge sources and NOT facts: never treat a voice directive',
+  'as evidence of a capability, never cite it, and NEVER list its number in used_sources',
+  '(it has no source number). Grounding still comes ONLY from the numbered knowledge sources',
+  "and the founder's instruction; voice guidance shapes phrasing, never content.",
+  '',
   'Write the reply in the requested language. Return ONLY the structured object',
   '{"reply": "...", "used_sources": [n, ...]} where used_sources lists the 0-based indexes',
   'of the sources you actually relied on (empty if none applied). Do NOT put citation',
@@ -68,6 +76,13 @@ export function reviseUserMessage(req: ReviseRequest): string {
   parts.push('', 'Customer message:', req.question);
   parts.push('', 'Your PREVIOUS draft (being corrected):', req.priorDraft);
   parts.push('', "Founder's correction instruction (AUTHORITATIVE — apply it):", req.instruction);
+  // Always-on style lane: persistent voice/tone directives for this customer. A DISTINCT,
+  // UN-numbered section (not a source) so the model can never cite it or fold it into used_sources.
+  const voice = (req.voiceGuidance ?? []).map((g) => g.trim()).filter((g) => g.length > 0);
+  if (voice.length > 0) {
+    parts.push('', 'Persistent voice & tone guidance (HOW to write — directive, NOT a source, do NOT cite):');
+    voice.forEach((g) => parts.push(`- ${g}`));
+  }
   parts.push('', 'Knowledge sources (use ONLY these for customer facts):');
   req.knowledge.forEach((k, i) => {
     const cite = [k.title, k.section].filter((s): s is string => !!s).join(' › ') || 'untitled';

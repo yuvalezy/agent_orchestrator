@@ -8,6 +8,7 @@ import {
 import type { KnowledgeChunk, ReviseRequest, ReviseResult } from '../ports/llm.port';
 import type { Notification } from '../ports/founder-notifier.port';
 import type { DraftForRevise, RevisedDraft } from '../outbound/outbound-repo';
+import type { StyleLane } from '../knowledge/style-lane';
 
 // Pure-mock unit tests for the Draft correction loop CORE (no DB/network — reviser LLM,
 // retriever, outbound repo, inbox read, notifier all mocked). Verifies: regeneration is
@@ -48,6 +49,7 @@ interface Cap {
   reviseDraftCalls: Array<{ queueId: string; body: string; agentOutput: unknown; revision: { instruction: string; by: string } }>;
   notifies: Array<{ customerId: string; n: Notification; buttons?: Array<{ id: string; label: string }> }>;
   learns: unknown[];
+  styleLaneCalls: Array<string | null>;
 }
 
 function makeDeps(over?: {
@@ -58,8 +60,21 @@ function makeDeps(over?: {
   revised?: RevisedDraft | null;
   inbox?: { subject: string | null; body: string | null } | null;
   learn?: DraftReviserDeps['learnCorrection'];
+  /** When set, a StyleLane stub returning these directives (a throw when `styleLaneThrows`). */
+  guidance?: string[];
+  styleLaneThrows?: boolean;
 }): { deps: DraftReviserDeps; cap: Cap } {
-  const cap: Cap = { reviseReqs: [], retrieveCalls: [], inboxReads: [], reviseDraftCalls: [], notifies: [], learns: [] };
+  const cap: Cap = { reviseReqs: [], retrieveCalls: [], inboxReads: [], reviseDraftCalls: [], notifies: [], learns: [], styleLaneCalls: [] };
+  const styleLane: StyleLane | undefined =
+    over?.guidance !== undefined || over?.styleLaneThrows
+      ? {
+          guidanceFor: async (customerId) => {
+            cap.styleLaneCalls.push(customerId);
+            if (over?.styleLaneThrows) throw new Error('style lane down');
+            return over?.guidance ?? [];
+          },
+        }
+      : undefined;
   const deps: DraftReviserDeps = {
     reviser: {
       reviseReply: over?.reviseReplyImpl
@@ -94,6 +109,7 @@ function makeDeps(over?: {
     learnCorrection: over?.learn
       ? async (input) => { cap.learns.push(input); await over.learn!(input); }
       : undefined,
+    styleLane,
   };
   return { deps, cap };
 }
@@ -201,6 +217,52 @@ test('reviseFromInstruction: a re-present failure AFTER commit does NOT ask to r
   assert.equal(notifies.length, 1);
   assert.match(notifies[0].title, /revised/i);
   assert.doesNotMatch(notifies[0].body, /tap 🔁 Revise and send your instruction again/);
+});
+
+test('reviseFromInstruction: style lane voice guidance flows into the ReviseRequest AND never leaks into citations', async () => {
+  const voice = ['Be warm and informal', 'Sign off with "Cheers"'];
+  const { deps, cap } = makeDeps({
+    guidance: voice,
+    knowledge: [chunk({ title: 'Exports', section: null, route: '/exports', content: 'We support CSV export.' })],
+    reviseResult: { body: 'Cheers — yes, CSV export works great!', usedSourceIndexes: [0] },
+  });
+  const svc = buildDraftReviser(deps);
+
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'warmer tone please', by: 'u' });
+
+  // The lane was asked for THIS customer's directives and they rode into the regeneration request.
+  assert.deepEqual(cap.styleLaneCalls, ['cust-1']);
+  assert.equal(cap.reviseReqs.length, 1);
+  assert.deepEqual(cap.reviseReqs[0].voiceGuidance, voice, 'voice guidance is passed to the reviser');
+
+  // Voice directives are DIRECTIVE, never a citation: they must not appear in the rendered "Based
+  // on:" list nor in the persisted agent_output.citations (which are derived from knowledge only).
+  const ao = cap.reviseDraftCalls[0].agentOutput as { citations: string[] };
+  const citationsBlob = ao.citations.join('\n');
+  for (const v of voice) assert.ok(!citationsBlob.includes(v), `voice directive must not be cited: ${v}`);
+  assert.ok(ao.citations.some((c) => c.includes('Exports')), 'the knowledge source IS cited');
+
+  const notifyBody = cap.notifies[0].n.body;
+  for (const v of voice) assert.ok(!notifyBody.includes(v), 'voice directive must not surface in the founder-facing citations');
+});
+
+test('reviseFromInstruction: no style lane wired → voiceGuidance omitted, revise still succeeds', async () => {
+  const { deps, cap } = makeDeps({ knowledge: [chunk()] });
+  const svc = buildDraftReviser(deps);
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'x', by: 'u' });
+  assert.equal(cap.styleLaneCalls.length, 0, 'lane never called when unwired');
+  assert.equal(cap.reviseReqs[0].voiceGuidance, undefined);
+  assert.equal(cap.reviseDraftCalls.length, 1, 'revise still commits');
+});
+
+test('reviseFromInstruction: a style lane failure NEVER breaks revise (best-effort → no voice guidance)', async () => {
+  const { deps, cap } = makeDeps({ styleLaneThrows: true, knowledge: [chunk()] });
+  const svc = buildDraftReviser(deps);
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'x', by: 'u' }); // must not reject
+  assert.deepEqual(cap.styleLaneCalls, ['cust-1']);
+  assert.deepEqual(cap.reviseReqs[0].voiceGuidance, [], 'a lane throw degrades to empty guidance');
+  assert.equal(cap.reviseDraftCalls.length, 1, 'revise commits despite the lane fault');
+  assert.match(cap.notifies[0].n.title, /revised/i);
 });
 
 // ── capture handler (clear-marker-first idempotency) ─────────────────────────
