@@ -23,8 +23,9 @@ export interface DailyBriefingWorkerDeps {
   now?: () => Date;
 }
 
-/** Reuse the console Approvals read queries; keep only customer + createdAt (drop bodies). */
-async function fetchPendingDrafts(): Promise<PendingItem[]> {
+/** Reuse the console Approvals read queries; keep only customer + createdAt (drop bodies).
+ *  Exported so the Telegram `/pending` and `/briefing` slash commands read the SAME queues. */
+export async function fetchPendingDrafts(): Promise<PendingItem[]> {
   const rows = await listPendingDrafts();
   return rows.map((r) => ({
     customerId: r.customer_id,
@@ -33,7 +34,7 @@ async function fetchPendingDrafts(): Promise<PendingItem[]> {
   }));
 }
 
-async function fetchPendingProposals(): Promise<PendingItem[]> {
+export async function fetchPendingProposals(): Promise<PendingItem[]> {
   const rows = await listPendingBackfillProposals();
   return rows.map((r) => ({
     customerId: r.customer_id,
