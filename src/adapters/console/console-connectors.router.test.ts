@@ -200,6 +200,19 @@ test('DELETE /connectors/accounts/:id: removes the row AND its sealed credential
   });
 });
 
+test('DELETE /connectors/accounts/:id: a Gmail account with history (FK 23503) → 409, not 500', async () => {
+  const store = new FakeStore(true);
+  const gmail = new FakeAccounts('GMAIL');
+  const g = await gmail.create('Work');
+  // Simulate the channel_instances FK RESTRICT (agent_inbox/outbound/customers reference the row).
+  gmail.remove = async () => { throw Object.assign(new Error('update or delete violates foreign key'), { code: '23503' }); };
+  await withRouter({ store, gmailAccounts: gmail }, async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/connectors/accounts/${g.id}`, { method: 'DELETE' });
+    assert.equal(res.status, 409);
+    assert.match(((await res.json()) as { error: string }).error, /disable it instead/i);
+  });
+});
+
 test('PUT/DELETE /connectors/:id: secret set + remove still work (registry secrets)', async () => {
   const store = new FakeStore(true);
   await withRouter({ store }, async (baseUrl) => {

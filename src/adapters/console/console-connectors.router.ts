@@ -233,7 +233,18 @@ export function buildConsoleConnectorsRouter(deps: ConnectorsDeps): Router {
     try {
       const resolved = await resolveAccount(id);
       if (!resolved) return void res.status(404).json({ error: 'unknown account' });
-      const credentialName = await resolved.port.remove(id);
+      let credentialName: string | null;
+      try {
+        credentialName = await resolved.port.remove(id);
+      } catch (err) {
+        // A Gmail account is a channel_instances row that agent_inbox / agent_outbound_queue /
+        // agent_customers FK to (ON DELETE RESTRICT). Once it has history it cannot be hard-deleted
+        // — steer the founder to disable it instead of surfacing an opaque 500 (PG FK code 23503).
+        if ((err as { code?: string })?.code === '23503') {
+          return void res.status(409).json({ error: 'This account has message history and cannot be deleted — disable it instead.' });
+        }
+        throw err;
+      }
       if (credentialName) await store.remove(credentialName);
       await audit(auditCtx(res), 'connector.account.remove', credentialName ?? resolved.record.credentialName, 'set', 'unset');
       res.status(200).json({ data: { id, service: resolved.service, removed: true } });
