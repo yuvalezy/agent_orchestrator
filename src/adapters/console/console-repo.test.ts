@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { closePool, query } from '../../db';
-import { listDecisions, listInbox, requeueInbox } from './console-repo';
+import { decisionDetail, inboxDetail, listDecisions, listInbox, requeueInbox } from './console-repo';
 
 const tag = `test-console-audit-${crypto.randomUUID()}`;
 
@@ -64,6 +64,8 @@ test('inbox and decision list contracts paginate metadata and reject unsafe filt
   assert.ok(inboxPage.nextCursor);
   assert.equal('body' in inboxPage.data[0], false);
   assert.equal('raw_metadata' in inboxPage.data[0], false);
+  const inboxDetailRow = await inboxDetail(String(inboxPage.data[0].id));
+  assert.equal(inboxDetailRow?.body, 'full body is detail-only');
   const inboxNext = await listInbox({ status: 'failed', search: 'metadata list customer', limit: '1', cursor: inboxPage.nextCursor });
   assert.ok(inboxNext);
   assert.equal(inboxNext.data.length, 1);
@@ -75,6 +77,9 @@ test('inbox and decision list contracts paginate metadata and reject unsafe filt
   assert.ok(decisionPage.nextCursor);
   assert.equal('agent_output' in decisionPage.data[0], false);
   assert.equal('human_override' in decisionPage.data[0], false);
+  const decisionDetailRow = await decisionDetail(String(decisionPage.data[0].id));
+  assert.deepEqual(decisionDetailRow?.agent_output, { draft_body: 'detail-only' });
+  assert.deepEqual(decisionDetailRow?.human_override, { edited_body: 'detail-only' });
   assert.equal(await listInbox({ status: 'anything' }), null);
   assert.equal(await listDecisions({ type: 'anything' }), null);
   assert.equal(await listDecisions({ outcome: 'anything' }), null);

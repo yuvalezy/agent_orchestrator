@@ -23,6 +23,14 @@ function validId(value: string): boolean {
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Console failures must not serialize upstream exception messages or attached payloads. */
+export function projectConsoleFailure(err: unknown): { err: { name: string | undefined }; response: { error: 'console request failed' } } {
+  return {
+    err: { name: (err as { name?: string } | undefined)?.name },
+    response: { error: 'console request failed' },
+  };
+}
+
 export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): Router {
   const router = Router();
   const sessions = new ConsoleSessionStore(config);
@@ -250,8 +258,9 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
   }
 
   router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    logger.error({ err: { name: (err as { name?: string } | undefined)?.name } }, 'console request failed');
-    res.status(500).json({ error: 'console request failed' });
+    const safe = projectConsoleFailure(err);
+    logger.error({ err: safe.err }, 'console request failed');
+    res.status(500).json(safe.response);
   });
   return router;
 }

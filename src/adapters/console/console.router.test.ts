@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import bcrypt from 'bcryptjs';
 import { buildApp } from '../../app';
 import { loadConsoleConfig } from '../../config/console';
-import { buildConsoleRouter } from './console.router';
+import { buildConsoleRouter, projectConsoleFailure } from './console.router';
 
 async function withConsole(fn: (baseUrl: string) => Promise<void>): Promise<void> {
   const hash = await bcrypt.hash('correct horse battery staple', 4);
@@ -34,6 +34,16 @@ test('console config fails closed without both valid secrets', () => {
   assert.equal(loadConsoleConfig({ CONSOLE_PASSWORD_HASH: '$2b$12$abcdefghijklmnopqrstuvabcdefghijklmnopqrstuvabcdefghijkl', CONSOLE_SESSION_SECRET: 'short' }), null);
 });
 
+test('console failure projection omits an attached payload and exception message', () => {
+  const secret = 'customer body: private@example.com';
+  const failure = Object.assign(new Error(secret), { body: secret, providerPayload: { secret } });
+
+  const safe = projectConsoleFailure(failure);
+
+  assert.deepEqual(safe, { err: { name: 'Error' }, response: { error: 'console request failed' } });
+  assert.equal(JSON.stringify(safe).includes(secret), false);
+});
+
 test('console API requires auth, creates no-store session, and rejects mutation without CSRF', async () => {
   await withConsole(async (baseUrl) => {
     const unauthenticated = await fetch(`${baseUrl}/console/api/overview`);
@@ -59,6 +69,15 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     assert.ok(Array.isArray(overviewBody.data.activeChannels));
     assert.ok(Array.isArray(overviewBody.data.featureFlags));
     assert.ok(Array.isArray(overviewBody.data.capabilities));
+    const sensitiveFilter = 'customer-body-private@example.com';
+    const invalidInboxFilter = await fetch(`${baseUrl}/console/api/inbox?status=${encodeURIComponent(sensitiveFilter)}`, { headers: { cookie: cookiePair } });
+    assert.equal(invalidInboxFilter.status, 400);
+    const invalidInboxError = await invalidInboxFilter.json() as { error: string };
+    assert.equal(invalidInboxError.error.includes(sensitiveFilter), false);
+    const invalidDecisionFilter = await fetch(`${baseUrl}/console/api/decisions?type=${encodeURIComponent(sensitiveFilter)}`, { headers: { cookie: cookiePair } });
+    assert.equal(invalidDecisionFilter.status, 400);
+    const invalidDecisionError = await invalidDecisionFilter.json() as { error: string };
+    assert.equal(invalidDecisionError.error.includes(sensitiveFilter), false);
     const rejected = await fetch(`${baseUrl}/console/api/inbox/1/requeue`, { method: 'POST', headers: { cookie: cookiePair } });
     assert.equal(rejected.status, 403);
 
