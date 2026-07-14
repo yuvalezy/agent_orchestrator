@@ -138,7 +138,9 @@ export function composeBriefing(
   };
 }
 
-function queueLine(label: string, s: QueueSummary): string {
+/** One queue roll-up line: "📝 Draft replies: 3 pending · oldest 5h" / "… none pending".
+ *  Exported so the on-demand `/pending` slash command renders queues identically (DRY). */
+export function queueLine(label: string, s: QueueSummary): string {
   if (s.count === 0) return `${label}: none pending`;
   return `${label}: ${s.count} pending · oldest ${humanizeAgeHours(s.oldestAgeHours ?? 0)}`;
 }
@@ -193,8 +195,9 @@ export interface DailyBriefingDeps {
   log: SyncLogger;
 }
 
-/** Format a Date as YYYY-MM-DD in the given IANA timezone (en-CA yields ISO order). */
-function dayInTz(d: Date, tz: string): string {
+/** Format a Date as YYYY-MM-DD in the given IANA timezone (en-CA yields ISO order).
+ *  Exported so the on-demand `/briefing` slash command titles its digest the same way. */
+export function dayInTz(d: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: tz,
     year: 'numeric',

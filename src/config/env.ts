@@ -341,6 +341,23 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
+  // ── M5(c): Telegram founder slash-command surface. A founder types a leading `/pending`
+  // (counts + oldest age of the pending draft-reply + backfill-proposal queues), `/briefing`
+  // (the daily digest on demand, posted to the requesting thread), or `/help` (the command
+  // list) in a topic → the CORE router (src/query/commands.ts) dispatches and replies in the
+  // same thread. Reuses the daily-briefing readers + composeBriefing/renderBriefing — NO new
+  // query. `/ask` stays its OWN handler (QUERY_ENGINE_ENABLED); this router handles the others.
+  // Kill-switch (mirrors OUTBOUND_ENABLED strict-bool): the router is wired into the Telegram
+  // callback-poller ONLY when the literal "true"; unset/"false"/anything else → false. DORMANT
+  // by default so a boot never surfaces the command surface by surprise.
+  //
+  // PRECONDITION (Telegram): the router reads `message` updates, so the bot's group privacy mode
+  // MUST be OFF (BotFather /setprivacy) — same precondition as the ✏️ draft-edit capture.
+  SLASH_COMMANDS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── M5(b): daily founder briefing — a once-a-day admin digest of what is WAITING on
   // the founder: pending draft replies + pending backfill task proposals (counts + the
   // oldest item's age) and a ranked "who needs attention" list. Attacks decision
