@@ -16,7 +16,7 @@ after(async () => {
   await closePool();
 });
 
-test('requeue records actor, request correlation, and safe status-only audit metadata', async (t) => {
+test('requeue resets only retry state, retains worker metadata, and records one safe audit event', async (t) => {
   const channel = await query<{ id: string }>('SELECT id::text FROM channel_instances LIMIT 1').catch(() => null);
   if (!channel?.rows[0]) return t.skip('database or seeded channel instance unavailable');
 
@@ -25,13 +25,20 @@ test('requeue records actor, request correlation, and safe status-only audit met
     [`${tag}-customer`, 'Console audit test'],
   );
   const inbox = await query<{ id: string }>(
-    `INSERT INTO agent_inbox (channel_instance_id, channel_message_id, customer_id, received_at, status)
-     VALUES ($1, $2, $3, now(), 'failed') RETURNING id::text`,
-    [channel.rows[0].id, `${tag}-inbox`, customer.rows[0].id],
+    `INSERT INTO agent_inbox (channel_instance_id, channel_message_id, customer_id, received_at, status, retry_count, last_error, processed_at, raw_metadata)
+     VALUES ($1, $2, $3, now(), 'failed', 3, 'safe category only', now(), $4::jsonb) RETURNING id::text`,
+    [channel.rows[0].id, `${tag}-inbox`, customer.rows[0].id, JSON.stringify({ worker_hint: 'retain-me' })],
   );
   const requestId = crypto.randomUUID();
 
   assert.equal(await requeueInbox(inbox.rows[0].id, { actor: 'founder', requestId }), 'ok');
+  const state = await query<{ status: string; retry_count: number; last_error: string | null; processed_at: string | null; raw_metadata: unknown }>(
+    'SELECT status, retry_count, last_error, processed_at, raw_metadata FROM agent_inbox WHERE id = $1',
+    [inbox.rows[0].id],
+  );
+  assert.deepEqual(state.rows, [{ status: 'pending', retry_count: 0, last_error: null, processed_at: null, raw_metadata: { worker_hint: 'retain-me' } }]);
+  assert.equal(await requeueInbox(inbox.rows[0].id, { actor: 'founder', requestId: crypto.randomUUID() }), 'conflict');
+  assert.equal(await requeueInbox('999999999999', { actor: 'founder', requestId: crypto.randomUUID() }), 'not_found');
   const audit = await query<{ actor: string; request_id: string; before: string; after: string }>(
     `SELECT actor, request_id::text, safe_metadata->>'before_status' AS before, safe_metadata->>'after_status' AS after
        FROM console_audit_events

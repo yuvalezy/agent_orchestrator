@@ -20,6 +20,7 @@ async function bootstrapSchema(connectionString: string): Promise<void> {
         retry_count INT NOT NULL DEFAULT 0,
         last_error TEXT,
         processed_at TIMESTAMPTZ,
+        raw_metadata JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       CREATE TABLE agent_outbound_queue (
@@ -68,8 +69,8 @@ test('Testcontainers: concurrent console recovery actions mutate once and audit 
       const channel = await query<{ id: string }>(`INSERT INTO channel_instances (name) VALUES ('test') RETURNING id::text`);
       const customer = await query<{ id: string }>(`INSERT INTO agent_customers (bp_ref, display_name) VALUES ('test', 'Test customer') RETURNING id::text`);
       const inbox = await query<{ id: string }>(
-        `INSERT INTO agent_inbox (channel_instance_id, customer_id, status, retry_count, last_error, processed_at)
-         VALUES ($1, $2, 'failed', 4, 'provider_failed', now()) RETURNING id::text`,
+        `INSERT INTO agent_inbox (channel_instance_id, customer_id, status, retry_count, last_error, processed_at, raw_metadata)
+         VALUES ($1, $2, 'failed', 4, 'provider_failed', now(), '{"worker_hint":"retain-me"}'::jsonb) RETURNING id::text`,
         [channel.rows[0].id, customer.rows[0].id],
       );
       const outbound = await query<{ id: string }>(
@@ -83,10 +84,10 @@ test('Testcontainers: concurrent console recovery actions mutate once and audit 
         requeueInbox(inbox.rows[0].id, { actor: 'founder', requestId: crypto.randomUUID() }),
       ]);
       assert.deepEqual(requeueResults.sort(), ['conflict', 'ok']);
-      const inboxState = await query<{ status: string; retry_count: number; last_error: string | null; processed_at: Date | null }>(
-        'SELECT status, retry_count, last_error, processed_at FROM agent_inbox WHERE id = $1', [inbox.rows[0].id],
+      const inboxState = await query<{ status: string; retry_count: number; last_error: string | null; processed_at: Date | null; raw_metadata: unknown }>(
+        'SELECT status, retry_count, last_error, processed_at, raw_metadata FROM agent_inbox WHERE id = $1', [inbox.rows[0].id],
       );
-      assert.deepEqual(inboxState.rows, [{ status: 'pending', retry_count: 0, last_error: null, processed_at: null }]);
+      assert.deepEqual(inboxState.rows, [{ status: 'pending', retry_count: 0, last_error: null, processed_at: null, raw_metadata: { worker_hint: 'retain-me' } }]);
       const inboxAudit = await query<{ count: string }>(
         `SELECT count(*) AS count FROM console_audit_events WHERE action = 'inbox.requeue' AND entity_id = $1`, [inbox.rows[0].id],
       );
