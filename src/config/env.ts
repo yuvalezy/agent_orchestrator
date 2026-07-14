@@ -360,6 +360,35 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+
+  // ── M3(e): weekly pattern detection — a weekly digest that clusters the week's Layer-A
+  // signal memories (founder corrections + customer conversation/task themes) by their
+  // ALREADY-STORED embeddings and posts the top RECURRING patterns to the Telegram Admin
+  // topic ("3 customers asked about X", "you corrected Y five times"). Purpose: surface
+  // SYSTEMIC issues, not one-off decisions. Kill-switch (mirrors ACCEPTANCE_REPORT_ENABLED
+  // strict-bool): registered ONLY when the literal "true"; unset/"false"/else → false.
+  // DORMANT by default. Requires Telegram (it notifies the founder) — skipped if Telegram
+  // is unconfigured. Idempotent per ISO week (an app_state last-run-week key) so the sub-
+  // weekly interval posts EXACTLY ONCE per week. Read-only: NO new table, NO embed calls
+  // (it reuses the vectors written at ingest) — a pure aggregation over agent_memory.
+  WEEKLY_PATTERNS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  WEEKLY_PATTERNS_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
+  // Timezone for the ISO-week boundary so "weekly" is the founder's local week (not UTC).
+  WEEKLY_PATTERNS_TZ: z.string().default('America/Panama'),
+  // Look-back window (days) for the signal horizon.
+  WEEKLY_PATTERNS_WINDOW_DAYS: z.coerce.number().int().positive().default(7),
+  // ⚠︎ Cosine-distance ceiling (0..2) for two signals to join a cluster — TIGHT (mirrors the
+  // backfill near-dupe collapse) so only genuinely-similar signals group into one pattern.
+  WEEKLY_PATTERNS_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.2),
+  // Minimum cluster size to count as a RECURRING pattern (a one-off is dropped).
+  WEEKLY_PATTERNS_MIN_COUNT: z.coerce.number().int().positive().default(3),
+  // Cap on patterns surfaced per section (themes / corrections).
+  WEEKLY_PATTERNS_TOP_K: z.coerce.number().int().positive().default(5),
+  // Hard cap on signals fetched per tick (blast-radius guard on the aggregation).
+  WEEKLY_PATTERNS_MAX_SIGNALS: z.coerce.number().int().positive().default(2000),
 });
 
 const parsed = envSchema.safeParse(process.env);
