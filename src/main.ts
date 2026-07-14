@@ -13,6 +13,7 @@ import { buildEmailReconcileWorker } from './adapters/email/reconcile.worker';
 import { buildReconcileWorker } from './adapters/reconcile-worker';
 import { ingestInbound } from './inbox/ingestion';
 import { credentialsStore } from './config/credentials-store';
+import { settingsStore } from './config/settings-store';
 import { tryResolveCredential } from './config/credentials';
 import { buildAdminRouter } from './adapters/admin/admin.router';
 import { buildConsoleRouter } from './adapters/console/console.router';
@@ -94,6 +95,12 @@ async function main(): Promise<void> {
   // a credential — the M1.3 registry eagerly resolves WEBHOOK_SECRET, so a
   // store-only secret would be missed if this ran after ChannelRegistry.load().
   await credentialsStore.load();
+
+  // Overlay the DB-authoritative non-secret feature flags onto `env` BEFORE any
+  // worker/route composition below reads them. First boot seeds the app_settings
+  // table from the current env (no data loss); thereafter the DB wins with zero
+  // call-site changes — every `if (env.*_ENABLED)` gate downstream sees DB values.
+  await settingsStore.loadAndOverlay();
 
   // M1.3: load the channel registry and wire the WhatsApp ingestion path
   // (webhook receiver + pull reconciliation). buildWhatsAppAdapter resolves

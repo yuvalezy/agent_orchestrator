@@ -24,6 +24,7 @@
     "backfill:recollapse": "tsx scripts/backfill-recollapse.ts",
     "backfill:style-kind": "tsx scripts/backfill-style-kind.ts",
     "feedback:check": "tsx scripts/feedback-check.ts",
+    "settings:import": "tsx scripts/settings-import.ts",
     "mcp:project-brain": "tsx scripts/mcp-project-brain.ts",
     "smoke:webhook": "tsx scripts/smoke-webhook.ts --",
     "triage:sample": "tsx scripts/triage-sample.ts --",
