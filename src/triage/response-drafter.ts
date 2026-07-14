@@ -4,6 +4,7 @@ import type { ClaimedInbox } from '../inbox/inbox-repo';
 import type { CustomerConfig } from './context-loader';
 import type { enqueueDraft, findOpenDraftByInbox, OpenDraftForInbox } from '../outbound/outbound-repo';
 import type { recordDraftDecision } from '../decisions/decisions';
+import type { StyleLane } from '../knowledge/style-lane';
 import { logger } from '../logger';
 import { draftButtons } from './draft-review';
 
@@ -29,6 +30,10 @@ export interface ResponseDrafterDeps {
   /** Append the 🔁 Revise button under presented drafts (Draft correction loop). Set by the
    *  composition root from DRAFT_REVISE_ENABLED (default false → the original three buttons). */
   reviseEnabled?: boolean;
+  /** Style-Correction Always-On lane (gated STYLE_LANE_ENABLED). When set, ALL of the customer's
+   *  active style/tone corrections are pulled on EVERY draft (not embedding-gated) and injected as
+   *  persistent voice guidance — a DIRECTIVE, never a citation source. Undefined → no voice lane. */
+  styleLane?: StyleLane;
 }
 
 export interface DraftAndPresentInput {
@@ -100,16 +105,24 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
         return;
       }
 
-      // (2) Draft in the customer's preferred language, grounded ONLY in `knowledge`.
+      // (2a) Always-on style lane: pull this customer's persistent voice/tone directives (NOT
+      //      embedding-gated, best-effort → [] on miss). Injected as guidance, NOT a citation
+      //      source — it never feeds renderCitations, so no "Based on:" hallucination.
+      const voiceGuidance = deps.styleLane ? await deps.styleLane.guidanceFor(customerId) : [];
+
+      // (2) Draft in the customer's preferred language, grounded ONLY in `knowledge`; voice
+      //     guidance shapes phrasing only.
       const req: DraftRequest = {
         question: assembleQuestion(row),
         language: config.preferredLanguage,
         customerName: config.displayName,
         knowledge,
+        voiceGuidance,
       };
       const result = await deps.llm.draftReply(req);
 
       // (3) Citations rendered from OUR chunks at the model's used indexes (no hallucinated cite).
+      //     Voice guidance is deliberately EXCLUDED — it is directive, never a cited source.
       const citations = renderCitations(knowledge, result.usedSourceIndexes);
 
       // (4) Open the audit decision (outcome='pending') — the queue row FKs to it.

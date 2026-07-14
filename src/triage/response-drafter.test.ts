@@ -49,6 +49,7 @@ interface Captured {
   enqueues: EnqueueDraftInput[];
   notifies: Array<{ customerId: string; n: Notification; buttons?: Array<{ id: string; label: string }> }>;
   findInboxIds: string[];
+  styleCustomerIds: Array<string | null>;
 }
 
 function makeDeps(over?: {
@@ -56,9 +57,21 @@ function makeDeps(over?: {
   open?: OpenDraftForInbox | null;
   draftReplyImpl?: (r: DraftRequest) => Promise<DraftResult>;
   notifyImpl?: () => Promise<void>;
+  styleGuidance?: string[];
+  styleGuidanceFor?: (customerId: string | null) => Promise<string[]>;
 }): { deps: ResponseDrafterDeps; cap: Captured } {
-  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [] };
+  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [] };
   const deps: ResponseDrafterDeps = {
+    ...(over?.styleGuidance || over?.styleGuidanceFor
+      ? {
+          styleLane: {
+            guidanceFor: async (customerId: string | null): Promise<string[]> => {
+              cap.styleCustomerIds.push(customerId);
+              return over?.styleGuidanceFor ? over.styleGuidanceFor(customerId) : (over?.styleGuidance ?? []);
+            },
+          },
+        }
+      : {}),
     llm: {
       draftReply: over?.draftReplyImpl
         ? over.draftReplyImpl
@@ -260,6 +273,45 @@ test('draftAndPresent: WhatsApp subject+body assembled into the question', async
     intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
   });
   assert.equal(cap.draftReqs[0].question, 'Export question\n\nWhen does it run?');
+});
+
+// ── Style-Correction Always-On lane ──────────────────────────────────────────────
+
+test('style lane: guidance is fetched for the customer and injected as voiceGuidance (never citations)', async () => {
+  const { deps, cap } = makeDeps({ styleGuidance: ['be warmer and less formal', 'greet them by first name'] });
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row(),
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 'tk',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+
+  // Fetched for THIS customer.
+  assert.deepEqual(cap.styleCustomerIds, ['cust-9']);
+  // Passed to the LLM as voice guidance.
+  assert.deepEqual(cap.draftReqs[0].voiceGuidance, ['be warmer and less formal', 'greet them by first name']);
+  // NOT turned into citations — the decision + presentation carry ONLY the knowledge-chunk cite.
+  const ao = cap.records[0].agentOutput as { citations: string[] };
+  assert.deepEqual(ao.citations, ['Exports › Scheduling (/docs/exports)']);
+  assert.equal(cap.notifies[0].n.body.includes('be warmer'), false, 'voice guidance never appears in the founder-facing citation block');
+});
+
+test('style lane: no styleLane dep → voiceGuidance absent/empty, drafting unaffected', async () => {
+  const { deps, cap } = makeDeps();
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row(),
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 'tk',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  assert.equal(cap.styleCustomerIds.length, 0, 'no fetch when the lane is not wired');
+  assert.deepEqual(cap.draftReqs[0].voiceGuidance, [], 'voiceGuidance defaults to empty');
 });
 
 // ── renderCitations ────────────────────────────────────────────────────────────

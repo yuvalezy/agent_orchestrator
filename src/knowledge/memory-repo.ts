@@ -145,6 +145,58 @@ export interface CorrectionMemoryRepo {
   flipCorrectionScope(memoryId: string, target: 'shared' | 'customer'): Promise<{ fact: string; scope: string; originCustomerId: string | null } | null>;
 }
 
+/** One active style correction for a customer (Style-Correction Always-On lane). `fact` is the
+ *  normalized voice/tone directive to inject as persistent guidance; `scope` is 'shared' (applies
+ *  to every customer) or 'customer' (this customer only). Never a citation source. */
+export interface StyleCorrection {
+  fact: string;
+  scope: string;
+}
+
+/** Style-lane reader (Style-Correction Always-On lane). Kept OFF KnowledgeRepo (that is the
+ *  embedding-gated doc mirror + cosine search) — this is the ONE deliberately NON-embedding-gated
+ *  read: it returns ALL of a customer's active style/tone corrections regardless of any question,
+ *  because a voice directive never matches a question by embedding. Intersected onto the concrete
+ *  memoryRepo. NEVER logs the directive bodies. */
+export interface StyleLaneRepo {
+  /**
+   * ALL active `memory_type='correction'` rows tagged `metadata->>'kind'='style'` in scope for
+   * `customerId` — the customer's own rows PLUS shared (customer_id IS NULL) rows; when customerId
+   * is null, shared only. NOT distance-gated (every one applies to every draft). Newest first,
+   * capped at `limit`. STRICT scope isolation (never another customer's rows). NEVER logs bodies.
+   */
+  listStyleCorrections(customerId: string | null, opts: { limit: number }): Promise<StyleCorrection[]>;
+}
+
+/** ⚠︎ PURE SQL builder for the always-on style lane — extracted so the scope rule (customer_id=$1
+ *  OR IS NULL / shared-only when null), the kind='style' + memory_type='correction' filter, and
+ *  the "no distance gate" property are unit-testable WITHOUT a DB. Returns the fact + scope,
+ *  newest-first, capped at `limit`. */
+export function buildStyleLaneSql(input: { customerId: string | null; limit: number }): { text: string; values: unknown[] } {
+  const { customerId, limit } = input;
+  // fact is the normalized directive; degrade to content if an older row lacks it.
+  const projection = `COALESCE(NULLIF(metadata->>'fact', ''), content) AS fact,
+                      COALESCE(metadata->>'scope', CASE WHEN customer_id IS NULL THEN 'shared' ELSE 'customer' END) AS scope`;
+  if (customerId === null) {
+    const text = `SELECT ${projection}
+        FROM agent_memory
+       WHERE memory_type = 'correction'
+         AND metadata->>'kind' = 'style'
+         AND customer_id IS NULL
+       ORDER BY created_at DESC, id DESC
+       LIMIT $1`;
+    return { text, values: [limit] };
+  }
+  const text = `SELECT ${projection}
+      FROM agent_memory
+     WHERE memory_type = 'correction'
+       AND metadata->>'kind' = 'style'
+       AND (customer_id = $1 OR customer_id IS NULL)
+     ORDER BY created_at DESC, id DESC
+     LIMIT $2`;
+  return { text, values: [customerId, limit] };
+}
+
 /** One customer whose task/conversation history semantically matches a release note
  *  (M2(e)). `distance` is the cosine distance of that customer's NEAREST history row
  *  to the release-note embedding (smaller = closer); `excerpt` is that row's content
@@ -346,8 +398,17 @@ export const memoryRepo: KnowledgeRepo &
   FeedbackMemoryRepo &
   ReleaseNoteMatchRepo &
   CorrectionMemoryRepo &
+  StyleLaneRepo &
   TaskSearchRepo &
   BackfillLinkRepo = {
+  async listStyleCorrections(customerId: string | null, opts: { limit: number }): Promise<StyleCorrection[]> {
+    // Always-on style lane: NON-embedding-gated read of the customer's (+ shared) style/tone
+    // corrections. Scope isolation lives in buildStyleLaneSql. NEVER logs the directives.
+    const { text, values } = buildStyleLaneSql({ customerId, limit: opts.limit });
+    const { rows } = await query<{ fact: string; scope: string }>(text, values);
+    return rows.map((r) => ({ fact: r.fact, scope: r.scope }));
+  },
+
   async insertBackfillLink(input: BackfillLinkInput): Promise<{ id: string } | null> {
     // Layer-A row (document_id NULL, never reconciled), memory_type 'conversation'. DEDUP on
     // thread_key within the customer so a re-run does not duplicate the link. Bound + cast
