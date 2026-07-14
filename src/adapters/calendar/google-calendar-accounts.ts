@@ -3,30 +3,32 @@ import { logger } from '../../logger';
 import type { CalendarEvent, CalendarPort, ListUpcomingEventsInput } from '../../ports/calendar.port';
 import { GoogleCalendarClient } from './google-calendar-client';
 
-// Multi-account Google Calendar (M5(d)) — the founder keeps a WORK and a PERSONAL calendar,
-// and a customer meeting can live on either, so meeting-context reads BOTH. This composite
-// fans a single listUpcomingEvents out across every configured account (each with its own
-// OAuth credential + calendar id), then merges → dedups → sorts → caps so the caller sees one
-// unified event list and stays account-agnostic. Best-effort PER ACCOUNT: one account's read
-// failing (or its credential missing) NEVER drops the others and NEVER fails drafting.
+// Multi-account Google Calendar (M5(d)) — the founder keeps a DYNAMIC, console-managed list of
+// calendars (Work + Personal seeded), and a customer meeting can live on any, so meeting-context
+// reads them ALL. This composite fans a single listUpcomingEvents out across every enabled
+// account (each with its own OAuth credential + calendar id), then merges → dedups → sorts →
+// caps so the caller sees one unified event list and stays account-agnostic. Best-effort PER
+// ACCOUNT: one account's read failing (or its credential missing) NEVER drops the others and
+// NEVER fails drafting.
 //
-// Credentials (resolved lazily via the sealed store/env so rotation is picked up):
-//   GOOGLE_CALENDAR_WORK_OAUTH      + GOOGLE_CALENDAR_WORK_ID      (calendar id, default primary)
-//   GOOGLE_CALENDAR_PERSONAL_OAUTH  + GOOGLE_CALENDAR_PERSONAL_ID  (calendar id, default primary)
-// Back-compat: if NEITHER split credential is present, falls back to the legacy single
-// GOOGLE_CALENDAR_OAUTH (using CALENDAR_ID / the input calendarId). NEVER logs tokens.
+// The account list comes LIVE from calendar_accounts (via the injected `listEnabled` loader) so
+// add/disable in the console is picked up without a restart. Credentials resolve lazily via the
+// sealed store/env so rotation is picked up. Back-compat: if NO enabled account has a present
+// credential, falls back to the legacy single GOOGLE_CALENDAR_OAUTH (using legacyCalendarId).
+// NEVER logs tokens.
 
-interface AccountSpec {
-  name: string;
+/** One enabled calendar account as the builder consumes it (from calendar-accounts-repo). */
+export interface CalendarAccountSpec {
+  label: string;
   /** Credential ref (JSON {client_id,client_secret,refresh_token}). */
-  credRef: string;
+  credentialName: string;
   /** Target calendar id for this account ('primary' = the account's own calendar). */
   calendarId: string;
 }
 
-export interface CalendarAccountsConfig {
-  workCalendarId: string;
-  personalCalendarId: string;
+export interface CalendarAccountsInput {
+  /** Live loader of the enabled calendar accounts (calendar-accounts-repo.listEnabledCalendarAccounts). */
+  listEnabled: () => Promise<CalendarAccountSpec[]>;
   /** Legacy single-account calendar id (used only for the GOOGLE_CALENDAR_OAUTH fallback). */
   legacyCalendarId: string;
 }
@@ -37,25 +39,37 @@ interface Account {
   calendarId: string;
 }
 
-/** Which of the configured accounts actually have a credential present, as concrete clients. */
-export function buildCalendarAccounts(cfg: CalendarAccountsConfig): Account[] {
-  const specs: AccountSpec[] = [
-    { name: 'work', credRef: 'GOOGLE_CALENDAR_WORK_OAUTH', calendarId: cfg.workCalendarId },
-    { name: 'personal', credRef: 'GOOGLE_CALENDAR_PERSONAL_OAUTH', calendarId: cfg.personalCalendarId },
-  ];
-  const present = specs.filter((s) => tryResolveCredential(s.credRef));
+/** The enabled accounts that actually have a credential present, as concrete clients (live read). */
+export async function buildCalendarAccounts(input: CalendarAccountsInput): Promise<Account[]> {
+  const specs = await input.listEnabled();
+  const present = specs.filter((s) => tryResolveCredential(s.credentialName));
   if (present.length > 0) {
     return present.map((s) => ({
-      name: s.name,
-      client: new GoogleCalendarClient(() => resolveCredential(s.credRef)),
+      name: s.label,
+      client: new GoogleCalendarClient(() => resolveCredential(s.credentialName)),
       calendarId: s.calendarId,
     }));
   }
   // Back-compat: legacy single-account credential.
   if (tryResolveCredential('GOOGLE_CALENDAR_OAUTH')) {
-    return [{ name: 'default', client: new GoogleCalendarClient(() => resolveCredential('GOOGLE_CALENDAR_OAUTH')), calendarId: cfg.legacyCalendarId }];
+    return [{ name: 'default', client: new GoogleCalendarClient(() => resolveCredential('GOOGLE_CALENDAR_OAUTH')), calendarId: input.legacyCalendarId }];
   }
   return [];
+}
+
+/** A CalendarPort that re-reads the (dynamic) account list per call with a short TTL cache, so a
+ *  console add/disable goes LIVE without a restart while a burst of drafts shares one read. */
+export function buildDynamicMultiCalendar(loadAccounts: () => Promise<Account[]>, ttlMs = 30_000): CalendarPort {
+  let cache: { at: number; accounts: Account[] } | null = null;
+  return {
+    async listUpcomingEvents(input) {
+      const now = Date.now();
+      if (!cache || now - cache.at > ttlMs) {
+        cache = { at: now, accounts: await loadAccounts() };
+      }
+      return buildMultiCalendar(cache.accounts).listUpcomingEvents(input);
+    },
+  };
 }
 
 /** Compose N per-account calendars into ONE read-only CalendarPort: fan out, merge, dedup, cap. */

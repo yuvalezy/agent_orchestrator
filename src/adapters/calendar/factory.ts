@@ -1,21 +1,28 @@
 import { env } from '../../config/env';
 import type { CalendarPort } from '../../ports/calendar.port';
-import { buildCalendarAccounts, buildMultiCalendar } from './google-calendar-accounts';
+import { listEnabledCalendarAccounts } from '../connectors/calendar-accounts-repo';
+import { buildCalendarAccounts, buildDynamicMultiCalendar } from './google-calendar-accounts';
 
 /**
- * Build a read-only Google Calendar adapter spanning the founder's WORK + PERSONAL calendars
- * (whichever credentials are present; legacy single GOOGLE_CALENDAR_OAUTH still works). Each
+ * Build a read-only Google Calendar adapter spanning the founder's DYNAMIC, console-managed
+ * calendar list (calendar_accounts; Work + Personal seeded). The enabled accounts are read LIVE
+ * per call (short-TTL cache) so a console add/disable is picked up WITHOUT a restart; the legacy
+ * single GOOGLE_CALENDAR_OAUTH still works when no enabled account has a credential. Each
  * account's OAuth credential (JSON {client_id,client_secret,refresh_token}, scope
- * calendar.readonly) resolves LAZILY per call via the sealed store/env so rotation is picked
- * up and a MISSING credential degrades inside the best-effort meeting-context wrapper (→ []
- * guidance) rather than failing at boot — a calendar miss must NEVER fail drafting. The
- * composite fans out across accounts then merges/dedups/caps. HTTP-only (invariant #5).
+ * calendar.readonly) resolves LAZILY via the sealed store/env so rotation is picked up and a
+ * MISSING credential degrades inside the best-effort meeting-context wrapper (→ [] guidance)
+ * rather than failing — a calendar miss must NEVER fail drafting. HTTP-only (invariant #5).
  */
 export function buildCalendarAdapter(): CalendarPort {
-  const accounts = buildCalendarAccounts({
-    workCalendarId: env.GOOGLE_CALENDAR_WORK_ID,
-    personalCalendarId: env.GOOGLE_CALENDAR_PERSONAL_ID,
-    legacyCalendarId: env.CALENDAR_ID,
-  });
-  return buildMultiCalendar(accounts);
+  return buildDynamicMultiCalendar(() =>
+    buildCalendarAccounts({
+      listEnabled: async () =>
+        (await listEnabledCalendarAccounts()).map((a) => ({
+          label: a.label,
+          credentialName: a.credentialName,
+          calendarId: a.calendarId,
+        })),
+      legacyCalendarId: env.CALENDAR_ID,
+    }),
+  );
 }

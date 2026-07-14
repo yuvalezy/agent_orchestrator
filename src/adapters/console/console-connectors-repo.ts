@@ -17,19 +17,41 @@ export interface ConnectorsStore {
   remove(name: string): Promise<boolean>;
 }
 
-export interface ConnectorView {
+/** A plain provider-secret connector joined to live credential state. */
+export interface SecretView {
   id: string;
   label: string;
   kind: ConnectorKind;
   credentialName: string;
-  scopes?: readonly string[];
   connected: boolean;
   last4: string | null;
   updatedAt: string | null;
 }
 
-/** Static registry joined to live credential state (has / last4 / updated_at). Order follows the registry. */
-export async function listConnectors(store: ConnectorsStore = credentialsStore): Promise<ConnectorView[]> {
+/** A dynamic Google account (Gmail or Calendar) joined to live credential state. */
+export interface AccountView {
+  id: string;
+  label: string;
+  accountEmail: string | null;
+  credentialName: string;
+  connected: boolean;
+  last4: string | null;
+  updatedAt: string | null;
+  /** Gmail: status='active'; Calendar: enabled=true. */
+  enabled: boolean;
+}
+
+/** The minimal account shape the joiner needs (both repos' account types satisfy it). */
+interface JoinableAccount {
+  id: string;
+  label: string;
+  accountEmail: string | null;
+  credentialName: string;
+  enabled: boolean;
+}
+
+/** Static secret registry joined to live credential state (has / last4 / updated_at). */
+export async function listSecrets(store: ConnectorsStore = credentialsStore): Promise<SecretView[]> {
   const byName = new Map((await store.list()).map((s) => [s.name, s]));
   return CONNECTORS.map((c) => {
     const summary = byName.get(c.credentialName);
@@ -38,10 +60,27 @@ export async function listConnectors(store: ConnectorsStore = credentialsStore):
       label: c.label,
       kind: c.kind,
       credentialName: c.credentialName,
-      ...(c.scopes ? { scopes: c.scopes } : {}),
       connected: store.has(c.credentialName),
       last4: summary?.last4 ?? null,
       updatedAt: summary?.updated_at ?? null,
+    };
+  });
+}
+
+/** Join a dynamic-account list to credential state (connected / last4 / updated_at). */
+export function joinAccountState(accounts: JoinableAccount[], summaries: CredentialSummary[], store: ConnectorsStore): AccountView[] {
+  const byName = new Map(summaries.map((s) => [s.name, s]));
+  return accounts.map((a) => {
+    const summary = byName.get(a.credentialName);
+    return {
+      id: a.id,
+      label: a.label,
+      accountEmail: a.accountEmail,
+      credentialName: a.credentialName,
+      connected: store.has(a.credentialName),
+      last4: summary?.last4 ?? null,
+      updatedAt: summary?.updated_at ?? null,
+      enabled: a.enabled,
     };
   });
 }

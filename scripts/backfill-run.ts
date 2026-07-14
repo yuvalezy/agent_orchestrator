@@ -37,7 +37,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const core = createBackfillCore();
+  const core = await createBackfillCore();
   const notifier = buildTelegramNotifier();
 
   let posted = 0;

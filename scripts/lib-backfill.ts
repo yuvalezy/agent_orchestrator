@@ -8,6 +8,7 @@ import { buildInboxHistorySource } from '../src/knowledge/inbox-history-source';
 import { buildGmailHistorySource } from '../src/adapters/email/gmail-history-source';
 import { buildGmailStarredSource } from '../src/adapters/email/gmail-starred-source';
 import { GmailClient } from '../src/adapters/email/gmail-client';
+import { listGmailAccounts } from '../src/adapters/channel/channel-accounts-repo';
 import { getCustomerEmailIdentity } from '../src/customers/email-identity';
 import { buildWhatsAppDirectoryClient, buildWaHistoryClient } from '../src/adapters/whatsapp-manager/factory';
 import { buildWaHistorySource } from '../src/adapters/whatsapp-manager/wa-history-source';
@@ -27,7 +28,7 @@ export interface BackfillCore {
   embedOne: (text: string) => Promise<number[] | null>;
 }
 
-export function createBackfillCore(): BackfillCore {
+export async function createBackfillCore(): Promise<BackfillCore> {
   const llm = buildLlmRouter({ notifyAdmin: async () => {} });
   const embedder = buildEmbeddingAdapter(
     () => tryResolveCredential('OPENAI_API_KEY'),
@@ -44,11 +45,14 @@ export function createBackfillCore(): BackfillCore {
   };
 
   const inboxReader = buildInboxHistorySource();
-  // Shared Gmail accounts — reused by BOTH the standard Gmail leg and the starred leg (one integration).
-  const gmailAccounts = [
-    { name: 'email:gmail:work', client: new GmailClient(() => tryResolveCredential('GMAIL_WORK_OAUTH') ?? '') },
-    { name: 'email:gmail:personal', client: new GmailClient(() => tryResolveCredential('GMAIL_PERSONAL_OAUTH') ?? '') },
-  ];
+  // Shared Gmail accounts — reused by BOTH the standard Gmail leg and the starred leg (one
+  // integration). Read from the DYNAMIC, console-managed Gmail list (channel_instances) so a
+  // newly connected account is backfilled too; its credential resolves lazily (missing → that
+  // account's read fails and is skipped by safeRead, never dropping the others).
+  const gmailAccounts = (await listGmailAccounts()).map((a) => ({
+    name: a.name,
+    client: new GmailClient(() => tryResolveCredential(a.credentialName) ?? ''),
+  }));
   const gmailReader = buildGmailHistorySource({
     accounts: gmailAccounts,
     getIdentity: getCustomerEmailIdentity,

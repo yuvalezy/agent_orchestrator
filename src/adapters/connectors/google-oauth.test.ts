@@ -36,10 +36,11 @@ test('exchangeGoogleCode: posts to the token endpoint and returns parsed JSON', 
   assert.match(seenBody, /code=code123/);
 });
 
-test('oauth-state: round-trips the connector id, rejects tamper / expiry / wrong secret', () => {
+test('oauth-state: round-trips the account payload, rejects tamper / expiry / wrong secret', () => {
   const secret = 'a'.repeat(32);
-  const state = signOAuthState('gmail_work', secret);
-  assert.equal(verifyOAuthState(state, secret), 'gmail_work');
+  const payload = { credentialName: 'GMAIL_ACME_OAUTH', service: 'gmail' as const, accountId: 'uuid-1' };
+  const state = signOAuthState(payload, secret);
+  assert.deepEqual(verifyOAuthState(state, secret), payload);
   // tampered signature
   assert.equal(verifyOAuthState(state.slice(0, -2) + 'xy', secret), null);
   // wrong secret
@@ -48,6 +49,9 @@ test('oauth-state: round-trips the connector id, rejects tamper / expiry / wrong
   assert.equal(verifyOAuthState(state, secret, Date.now() + 3_600_000), null);
   // malformed
   assert.equal(verifyOAuthState('garbage', secret), null);
+  // a calendar payload round-trips too
+  const cal = { credentialName: 'GOOGLE_CALENDAR_ACME_OAUTH', service: 'calendar' as const, accountId: 'uuid-2' };
+  assert.deepEqual(verifyOAuthState(signOAuthState(cal, secret), secret), cal);
 });
 
 test('clientFromGmailCred / resolveConsoleGoogleClient: parse blobs, prefer GOOGLE_OAUTH_CLIENT', () => {
@@ -61,13 +65,11 @@ test('clientFromGmailCred / resolveConsoleGoogleClient: parse blobs, prefer GOOG
   assert.equal(resolveConsoleGoogleClient(() => undefined), undefined);
 });
 
-test('registry: ids unique, google connectors carry scopes, secrets do not', () => {
+test('registry: ids unique, only secret connectors remain (Google is dynamic now)', () => {
   const ids = CONNECTORS.map((c) => c.id);
   assert.equal(new Set(ids).size, ids.length);
-  for (const c of CONNECTORS) {
-    if (c.kind === 'google-oauth') assert.ok(c.scopes && c.scopes.length > 0, `${c.id} needs scopes`);
-    else assert.equal(c.scopes, undefined, `${c.id} is a secret and must not carry scopes`);
-  }
-  assert.equal(connectorById('gmail_work')?.credentialName, 'GMAIL_WORK_OAUTH');
+  for (const c of CONNECTORS) assert.equal(c.kind, 'secret', `${c.id} must be a secret connector`);
+  assert.equal(connectorById('anthropic')?.credentialName, 'ANTHROPIC_API_KEY');
+  assert.equal(connectorById('gmail_work'), undefined); // dropped — Gmail is a dynamic account now
   assert.equal(connectorById('nope'), undefined);
 });

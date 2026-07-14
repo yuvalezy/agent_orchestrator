@@ -20,7 +20,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const core = createBackfillCore();
+  const core = await createBackfillCore();
 
   const report = await runBackfill(customerId, {
     readThreads: core.readThreads,

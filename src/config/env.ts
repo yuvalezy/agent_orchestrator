@@ -446,11 +446,9 @@ const envSchema = z.object({
   // Legacy single-account calendar id ('primary' = the account's own calendar). Used only for
   // the back-compat GOOGLE_CALENDAR_OAUTH fallback when no split WORK/PERSONAL cred is present.
   CALENDAR_ID: z.string().default('primary'),
-  // Per-account target calendar ids for the multi-account read (WORK + PERSONAL). 'primary' =
-  // that account's own calendar. The credentials are GOOGLE_CALENDAR_WORK_OAUTH /
-  // GOOGLE_CALENDAR_PERSONAL_OAUTH (scope calendar.readonly), resolved via resolveCredential.
-  GOOGLE_CALENDAR_WORK_ID: z.string().default('primary'),
-  GOOGLE_CALENDAR_PERSONAL_ID: z.string().default('primary'),
+  // Per-account target calendar ids now live PER ROW in calendar_accounts.calendar_id (the
+  // console-managed calendar list), not in env — the retired GOOGLE_CALENDAR_{WORK,PERSONAL}_ID
+  // vars are gone. Each dynamic account carries its own calendar id.
   // IANA timezone for rendering meeting date/time lines (the founder's local week).
   CALENDAR_TZ: z.string().default('America/Panama'),
 

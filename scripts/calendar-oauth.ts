@@ -148,7 +148,7 @@ async function main(): Promise<void> {
       '   (or put it in .env as that name = the JSON blob above)',
       '',
       'Then set CALENDAR_ENABLED=true and restart. Each account reads its own primary',
-      'calendar by default (override with GOOGLE_CALENDAR_WORK_ID / _PERSONAL_ID).',
+      'calendar by default (override per row via calendar_accounts.calendar_id).',
       '════════════════════════════════════════════════════════════════',
       '',
     ].join('\n'),
