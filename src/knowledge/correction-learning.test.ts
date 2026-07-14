@@ -48,7 +48,7 @@ const learnInput = (over: Partial<Parameters<ReturnType<typeof buildLearnCorrect
 });
 
 test('product fact → SHARED: inserted with customer_id NULL, origin_customer_id kept, confirm offers make-customer-only', async () => {
-  const { deps, cap } = makeDeps({ scope: 'shared', fact: 'EZY has no QuickBooks integration' });
+  const { deps, cap } = makeDeps({ scope: 'shared', kind: 'fact', fact: 'EZY has no QuickBooks integration' });
   await buildLearnCorrection(deps)(learnInput());
 
   assert.deepEqual(cap.embeds, [['EZY has no QuickBooks integration']], 'embeds the normalized fact');
@@ -56,6 +56,7 @@ test('product fact → SHARED: inserted with customer_id NULL, origin_customer_i
   const ins = cap.inserts[0];
   assert.equal(ins.customerId, null, 'shared → customer_id NULL (readable by every customer)');
   assert.equal(ins.metadata.scope, 'shared');
+  assert.equal(ins.metadata.kind, 'fact', 'a fact correction is tagged kind=fact (normal RAG lane)');
   assert.equal(ins.metadata.fact, 'EZY has no QuickBooks integration');
   assert.equal(ins.metadata.origin_customer_id, 'cust-1', 'keeps the origin customer for a later flip');
   assert.equal(ins.metadata.decision_id, 'd1');
@@ -68,7 +69,7 @@ test('product fact → SHARED: inserted with customer_id NULL, origin_customer_i
 });
 
 test('customer preference → CUSTOMER: written to the customer rows (never shared), confirm offers make-global', async () => {
-  const { deps, cap } = makeDeps({ scope: 'customer', fact: 'this customer prefers a formal tone' });
+  const { deps, cap } = makeDeps({ scope: 'customer', kind: 'fact', fact: 'this customer prefers a formal tone' });
   await buildLearnCorrection(deps)(learnInput());
 
   assert.equal(cap.inserts[0].customerId, 'cust-1', 'customer scope → that customer only, never shared');
@@ -76,14 +77,24 @@ test('customer preference → CUSTOMER: written to the customer rows (never shar
   assert.deepEqual(cap.notifies[0].buttons, [{ id: 'cf:mem-1:s', label: '🌐 Make global' }]);
 });
 
+test('style correction → tagged kind=style in metadata (fuels the always-on voice lane)', async () => {
+  const { deps, cap } = makeDeps({ scope: 'customer', kind: 'style', fact: 'be warmer and less formal' });
+  await buildLearnCorrection(deps)(learnInput());
+
+  assert.equal(cap.inserts.length, 1);
+  assert.equal(cap.inserts[0].customerId, 'cust-1');
+  assert.equal(cap.inserts[0].metadata.kind, 'style', 'style corrections carry kind=style so the lane can pull them');
+  assert.equal(cap.inserts[0].metadata.fact, 'be warmer and less formal');
+});
+
 test('ISOLATION: a customer-scoped correction is NEVER written with a NULL (shared) customer_id', async () => {
-  const { deps, cap } = makeDeps({ scope: 'customer', fact: 'secret discount 20%' });
+  const { deps, cap } = makeDeps({ scope: 'customer', kind: 'fact', fact: 'secret discount 20%' });
   await buildLearnCorrection(deps)(learnInput());
   assert.notEqual(cap.inserts[0].customerId, null, 'a customer secret must not land in the shared store');
 });
 
 test('customer scope but no customer → SKIP (nothing to attach): no embed, no insert, no post', async () => {
-  const { deps, cap } = makeDeps({ scope: 'customer', fact: 'x' });
+  const { deps, cap } = makeDeps({ scope: 'customer', kind: 'fact', fact: 'x' });
   await buildLearnCorrection(deps)(learnInput({ customerId: null }));
   assert.equal(cap.embeds.length, 0);
   assert.equal(cap.inserts.length, 0);
@@ -91,14 +102,14 @@ test('customer scope but no customer → SKIP (nothing to attach): no embed, no 
 });
 
 test('dedup hit (insert returns null) → no confirmation posted (already learned)', async () => {
-  const { deps, cap } = makeDeps({ scope: 'shared', fact: 'known fact' }, { insertId: null });
+  const { deps, cap } = makeDeps({ scope: 'shared', kind: 'fact', fact: 'known fact' }, { insertId: null });
   await buildLearnCorrection(deps)(learnInput());
   assert.equal(cap.inserts.length, 1);
   assert.equal(cap.notifies.length, 0);
 });
 
 test('empty embedding → skip (no insert, no post)', async () => {
-  const { deps, cap } = makeDeps({ scope: 'shared', fact: 'x' }, { embedding: [] });
+  const { deps, cap } = makeDeps({ scope: 'shared', kind: 'fact', fact: 'x' }, { embedding: [] });
   await buildLearnCorrection(deps)(learnInput());
   assert.equal(cap.inserts.length, 0);
   assert.equal(cap.notifies.length, 0);

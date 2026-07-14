@@ -10,19 +10,23 @@ import type { CorrectionClass } from '../../ports/llm.port';
 // so the SAFE bias is customer, and the founder can promote to global from the confirmation.
 // NEVER logs bodies.
 
-/** Strict-output-clean JSON schema for `{ scope: 'shared'|'customer', fact: string }`. */
+/** Strict-output-clean JSON schema for `{ scope, kind, fact }`. */
 export const CORRECTION_CLASS_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['scope', 'fact'],
+  required: ['scope', 'kind', 'fact'],
   properties: {
     scope: { type: 'string', enum: ['shared', 'customer'] },
+    kind: { type: 'string', enum: ['fact', 'style'] },
     fact: { type: 'string' },
   },
 } as const;
 
 const CorrectionEnvelope = z.object({
   scope: z.enum(['shared', 'customer']),
+  // SAFE DEFAULT 'fact' when a provider omits kind: an unclassified correction takes the normal
+  // embedding-gated lane, never the always-on voice lane (a fact wrongly made always-on is worse).
+  kind: z.enum(['fact', 'style']).default('fact'),
   fact: z.string().min(1),
 });
 
@@ -33,7 +37,7 @@ const CorrectionEnvelope = z.object({
  */
 export function parseCorrectionClass(value: unknown): CorrectionClass {
   const parsed = CorrectionEnvelope.parse(value);
-  return { scope: parsed.scope, fact: parsed.fact.trim() };
+  return { scope: parsed.scope, kind: parsed.kind, fact: parsed.fact.trim() };
 }
 
 export const CORRECTION_CLASS_SYSTEM = [
@@ -51,9 +55,21 @@ export const CORRECTION_CLASS_SYSTEM = [
   'If you are genuinely UNSURE which scope applies, choose "customer" — it is the safe',
   'default (a customer-specific detail must never leak into every customer\'s knowledge).',
   '',
-  'Also return "fact": a single normalized sentence stating the corrected truth (what the',
-  'agent should remember), phrased generally, WITHOUT the customer\'s name or private data',
-  'when scope is shared. Return ONLY {"scope": "...", "fact": "..."}.',
+  'Decide the kind:',
+  '  • "fact"  — the correction fixes a SUBSTANTIVE claim: a capability, feature, integration,',
+  '              price, limit, term, name, or step. Anything about WHAT is true.',
+  '  • "style" — the correction is purely about VOICE / TONE / PERSONA / FORMATTING: how to',
+  '              write, not what is true (e.g. "be warmer", "less formal", "shorter", "greet',
+  '              them by first name", "don\'t use exclamation marks", "sign off as the team").',
+  '              A style directive carries NO factual claim about the product or customer.',
+  '',
+  'If you are UNSURE of the kind, choose "fact" — it is the safe default. A real fact wrongly',
+  'marked "style" would be applied as a standing voice directive on EVERY reply, which is worse',
+  'than leaving it in the normal knowledge lane.',
+  '',
+  'Also return "fact": a single normalized sentence stating the corrected truth or the voice',
+  'directive (what the agent should remember), phrased generally, WITHOUT the customer\'s name or',
+  'private data when scope is shared. Return ONLY {"scope": "...", "kind": "...", "fact": "..."}.',
 ].join('\n');
 
 /** Serialize the classifier user message from the correction instruction + prior draft. */

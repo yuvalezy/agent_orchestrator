@@ -360,6 +360,27 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+
+  // ── Style-Correction Always-On lane. Fact corrections are retrievable at draft time (they
+  // share words with the customer's question, clearing the retrieval distance gate) but TONE/
+  // STYLE/persona corrections are NOT — a directive like "be warmer / less formal" has no lexical
+  // overlap with any given question (~0.93 cosine), so it never matches. Raising the gate is the
+  // wrong fix (it pulls in irrelevant facts). Instead, when enabled, the drafter pulls ALL of the
+  // customer's active style corrections on EVERY draft (NOT embedding-gated) and injects them as
+  // persistent voice/tone guidance — a directive, never a cited source. Kill-switch (mirrors
+  // OUTBOUND_ENABLED strict-bool): the lane is wired into the drafter ONLY when the literal
+  // "true"; unset/"false"/anything else → false. DORMANT by default so nothing changes drafting
+  // voice by surprise.
+  //
+  // DEPENDENCY: reads style corrections learned by the DRAFT_REVISE loop (memory_type='correction',
+  // metadata->>'kind'='style'). With none learned yet the lane is a no-op (empty guidance). Only
+  // affects the drafter when KNOWLEDGE_DRAFT_ENABLED is on. No embeddings/secrets — a pure DB read.
+  STYLE_LANE_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Max voice directives injected per draft (blast-radius / prompt-size guard), newest-first.
+  STYLE_LANE_MAX: z.coerce.number().int().positive().default(12),
 });
 
 const parsed = envSchema.safeParse(process.env);

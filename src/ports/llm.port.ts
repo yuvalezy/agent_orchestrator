@@ -82,6 +82,15 @@ export interface DraftRequest {
   customerName: string;
   /** Retrieved cited chunks the reply must be grounded in (length >= 1). */
   knowledge: KnowledgeChunk[];
+  /**
+   * Always-on style lane (per-customer voice/tone guidance). Directive lines that shape HOW
+   * the reply is written (warmth, formality, persona) — persistent across every draft for this
+   * customer. These are NOT a knowledge/citation source: the model must apply them but never
+   * cite them, never treat them as facts, and never list them in `usedSourceIndexes`. Optional
+   * (absent/empty when STYLE_LANE_ENABLED is off or the customer has no style corrections). See
+   * src/knowledge/style-lane.ts.
+   */
+  voiceGuidance?: string[];
 }
 
 /**
@@ -192,9 +201,20 @@ export interface DraftReviserPort {
  *                 mis-scoped customer secret leaking to the shared store is the bad case.
  * `fact` is a normalized one-line statement of the lesson (embedded so a similar future
  * question retrieves it).
+ *
+ * `kind` splits the LEARNING LANE (Style-Correction Always-On lane):
+ *  • 'fact'  — corrects a factual/substantive claim (a capability, price, step, term). Retrieved
+ *              the normal embedding-gated way (it matches a similar future question by content).
+ *  • 'style' — a voice/tone/persona/formatting directive (be warmer, less formal, sign off X)
+ *              with NO factual content. A style directive has no lexical overlap with any given
+ *              question, so it never clears the retrieval distance gate — it is instead pulled
+ *              on EVERY draft for that customer via the always-on style lane. SAFE DEFAULT is
+ *              'fact' when uncertain: a real fact injected as always-on voice guidance is the
+ *              bad case (it would shape every reply as a persistent directive).
  */
 export interface CorrectionClass {
   scope: 'shared' | 'customer';
+  kind: 'fact' | 'style';
   fact: string;
 }
 

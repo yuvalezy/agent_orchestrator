@@ -52,10 +52,18 @@ export const DRAFT_SYSTEM = [
   'is NOT evidence a capability exists — never fabricate a feature or integration to',
   'be helpful. When in doubt, defer to the founder rather than assert.',
   '',
+  'VOICE & TONE GUIDANCE (when a "Persistent voice & tone guidance" section is present):',
+  'those lines are STANDING directives about HOW to write for this customer — warmth,',
+  'formality, greeting, sign-off, length, persona. Apply them to the wording and tone of',
+  'the reply. They are NOT knowledge sources and NOT facts: never treat a voice directive',
+  'as evidence of a capability, never cite it, and NEVER list its number in used_sources',
+  '(it has no source number). Grounding still comes ONLY from the numbered knowledge',
+  'sources; voice guidance shapes phrasing, never content.',
+  '',
   'Write the reply in the requested language. Return ONLY the structured object',
   '{"reply": "...", "used_sources": [n, ...]} where used_sources lists the 0-based',
-  'indexes of the sources you actually relied on (empty if none applied). Do NOT put',
-  'citation markers, source numbers, or a "Based on" list inside the reply text —',
+  'indexes of the KNOWLEDGE sources you actually relied on (empty if none applied). Do NOT',
+  'put citation markers, source numbers, or a "Based on" list inside the reply text —',
   'the founder-facing citations are rendered separately from used_sources.',
 ].join('\n');
 
@@ -65,6 +73,13 @@ export function draftUserMessage(req: DraftRequest): string {
   parts.push(`Reply language: ${req.language}`);
   parts.push(`Customer: ${req.customerName}`);
   parts.push('', 'Customer message:', req.question);
+  // Always-on style lane: persistent voice/tone directives for this customer. A DISTINCT,
+  // UN-numbered section (not a source) so the model can never cite it or fold it into used_sources.
+  const voice = (req.voiceGuidance ?? []).map((g) => g.trim()).filter((g) => g.length > 0);
+  if (voice.length > 0) {
+    parts.push('', 'Persistent voice & tone guidance (HOW to write — directive, NOT a source, do NOT cite):');
+    voice.forEach((g) => parts.push(`- ${g}`));
+  }
   parts.push('', 'Knowledge sources (answer ONLY from these):');
   req.knowledge.forEach((k, i) => {
     const cite = [k.title, k.section].filter((s): s is string => !!s).join(' › ') || 'untitled';

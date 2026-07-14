@@ -95,6 +95,9 @@ export function buildLearnCorrection(deps: LearnCorrectionDeps): (input: LearnCo
       source: 'draft_revision',
       decision_id: input.decisionId,
       scope: cls.scope,
+      // Learning lane: 'style' corrections are pulled always-on by the style lane (not embedding-
+      // gated); 'fact' corrections take the normal RAG lane. Stored on the JSONB (no new column).
+      kind: cls.kind,
       fact,
       ...(input.language ? { language: input.language } : {}),
       // The customer whose draft was corrected — the topic to confirm in AND the customer to
