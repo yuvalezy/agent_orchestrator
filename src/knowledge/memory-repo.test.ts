@@ -98,6 +98,7 @@ test('customer search reaches the shared leg (a shared correction is readable by
   // Structural isolation: the customer-drafting search touches ONLY agent_memory.
   assert.ok(sql.includes('agent_memory'), 'reads agent_memory');
   assert.ok(!sql.includes('internal_knowledge'), 'customer search can NEVER reach internal_knowledge');
+  assert.equal((sql.match(/lifecycle_status = 'active'/g) ?? []).length, 2, 'retired guidance is excluded from both customer and shared retrieval legs');
 });
 
 test('shared-only search (no customer) also never references internal_knowledge', () => {
@@ -152,6 +153,7 @@ test('buildRecentSignalsSql: type filter + window + cap, reads embedding as text
   assert.match(sql, /embedding::text AS embedding/, 'reads the stored vector back as text');
   assert.match(sql, /memory_type = ANY\(\$1::text\[\]\)/, 'type filter');
   assert.match(sql, /created_at >= \$2/, 'window');
+  assert.match(sql, /lifecycle_status = 'active'/, 'retired corrections do not pollute pattern detection');
   assert.match(sql, /ORDER BY created_at DESC/, 'most-recent-first (rep = latest phrasing)');
   assert.match(sql, /LIMIT \$3/, 'blast-radius cap');
   assert.match(sql, /customer_id, content/, 'projects customer_id for distinct-customer counts');

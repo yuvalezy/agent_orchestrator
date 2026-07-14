@@ -134,7 +134,15 @@ async function main(): Promise<void> {
     // separately built web/dist directory from the repository root.
     const packagedAssets = path.join(__dirname, 'web');
     const devAssets = path.join(process.cwd(), 'web', 'dist');
-    appDeps.consoleRouter = buildConsoleRouter(consoleConfig, existsSync(packagedAssets) ? packagedAssets : devAssets);
+    // The console only needs the embedding port for explicit founder guidance writes.
+    // Read-only memory browsing never calls a model/provider.
+    appDeps.consoleRouter = buildConsoleRouter(consoleConfig, existsSync(packagedAssets) ? packagedAssets : devAssets, {
+      embedding: buildEmbeddingAdapter(
+        () => tryResolveCredential('OPENAI_API_KEY'),
+        env.OPENAI_BASE_URL,
+        { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+      ),
+    });
     logger.info('founder console router mounted at /console');
   } else {
     logger.info('founder console router not mounted (console secrets absent or invalid)');

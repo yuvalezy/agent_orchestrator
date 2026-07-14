@@ -1,11 +1,12 @@
 import { type FormEvent, type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, BarChart3, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, Plug, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Users } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, Plug, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Users } from 'lucide-react';
 import { api, type ApiError, setCsrfToken } from './lib/api';
 import { cn } from './lib/utils';
 import { ApprovalsView } from './ApprovalsView';
 import { SettingsView } from './SettingsView';
 import { ConnectorsView } from './ConnectorsView';
+import { MemoryView } from './MemoryView';
 
 type Overview = {
   data: {
@@ -36,6 +37,7 @@ const nav = [
   ['customers', 'Conversations', Users],
   ['decisions', 'Decisions', ShieldCheck],
   ['insights', 'Insights', BarChart3],
+  ['memory', 'Memory', BookOpen],
   ['settings', 'Settings', SlidersHorizontal],
   ['connectors', 'Connectors', Plug],
 ] as const;
@@ -107,7 +109,7 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">
       <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-zinc-800 bg-zinc-950/85 px-5 backdrop-blur"><button onClick={() => setMenuOpen(true)} className="md:hidden"><Menu /></button><div className="text-sm text-zinc-400">Founder-only · Tailscale protected</div><button onClick={() => client.invalidateQueries()} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900 hover:text-white" title="Refresh"><RefreshCw size={17} /></button></header>
-      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
+      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'memory' && <MemoryView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
     </main>
   </div>;
 }

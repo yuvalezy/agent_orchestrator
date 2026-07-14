@@ -74,6 +74,23 @@ Open `https://<machine>.ts.net/console/` from an enrolled device. Do not expose
 port 3100 through a public tunnel or port-forward. The PWA caches only its static
 shell; it never caches console API responses or customer-message detail data.
 
+### Memory Explorer
+
+The **Memory** console area is founder-only and `no-store`. It has separate views for
+the customer corpus (`agent_memory`), founder-only Project Brain
+(`internal_knowledge`), and the curated Project Brain repository-source inventory.
+The repository view is an allow-list/index-health report; it is not a live external
+RBAC or permission mirror and does not query repositories while browsing.
+
+Synced guides/tasks and Project Brain chunks are read-only because their reconcilers
+own them. Add or correct customer behavior with **guidance** instead: factual guidance
+is retrieved when relevant, while style guidance is applied to every draft in its
+global or customer scope. Replacing or retiring feedback/correction guidance marks the
+old memory `superseded`, retains it for history, and prevents it from influencing
+future retrieval. Guidance writes call the configured embedding provider and record a
+content-free console audit event; stored content and vectors are never placed in that
+audit log.
+
 ## Background workers
 
 All workers run on an interval/backoff loop (recursive `setTimeout`; exponential backoff on consecutive failures, capped at 10× the interval). Each tick is isolated — one failure never blocks the others. Their live status is exposed on `/health`.

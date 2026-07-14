@@ -55,6 +55,8 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     const unauthenticated = await fetch(`${baseUrl}/console/api/overview`);
     assert.equal(unauthenticated.status, 401);
     assert.equal(unauthenticated.headers.get('cache-control'), 'no-store');
+    const unauthenticatedMemory = await fetch(`${baseUrl}/console/api/memory/sources`);
+    assert.equal(unauthenticatedMemory.status, 401, 'Memory Explorer inherits the console session boundary');
 
     const login = await fetch(`${baseUrl}/console/api/session`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }),
@@ -86,6 +88,11 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     assert.equal(invalidDecisionError.error.includes(sensitiveFilter), false);
     const rejected = await fetch(`${baseUrl}/console/api/inbox/1/requeue`, { method: 'POST', headers: { cookie: cookiePair } });
     assert.equal(rejected.status, 403);
+    const rejectedGuidance = await fetch(`${baseUrl}/console/api/memory/guidance`, {
+      method: 'POST', headers: { cookie: cookiePair, 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'global', kind: 'fact', fact: 'never reaches embedding without CSRF' }),
+    });
+    assert.equal(rejectedGuidance.status, 403);
 
     const invalidCustomer = await fetch(`${baseUrl}/console/api/customers/not-a-uuid`, { headers: { cookie: cookiePair } });
     assert.equal(invalidCustomer.status, 400);

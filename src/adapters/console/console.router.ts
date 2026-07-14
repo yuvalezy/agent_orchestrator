@@ -11,6 +11,11 @@ import { buildConsoleApprovalsRouter } from './console-approvals.router';
 import { buildConsoleSettingsRouter } from './console-settings.router';
 import { buildConsoleConnectorsRouter, buildConnectorsOAuthCallback } from './console-connectors.router';
 import { getConsoleInsights, parseInsightDays } from './console-insights-repo';
+import {
+  createGuidance, customerMemoryDetail, internalMemoryDetail, listCustomerMemory, listInternalMemory,
+  listMemorySources, retireGuidance, supersedeGuidance, type GuidanceKind, type GuidanceScope,
+} from './console-memory-repo';
+import type { EmbeddingPort } from '../../ports/embedding.port';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -57,7 +62,30 @@ function withPortalTaskLink(data: Record<string, unknown>, portalBaseUrl: string
   return url ? { ...data, portal_task_url: url } : data;
 }
 
-export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): Router {
+export interface ConsoleRouterDeps {
+  /** Optional only in isolated router tests. Guidance writes fail closed when absent. */
+  embedding?: EmbeddingPort;
+}
+
+function parseGuidanceBody(value: unknown): { scope: GuidanceScope; customerId: string | null; kind: GuidanceKind; fact: string } | null {
+  if (!value || typeof value !== 'object') return null;
+  const body = value as Record<string, unknown>;
+  const scope = body.scope === 'global' || body.scope === 'customer' ? body.scope : null;
+  const kind = body.kind === 'fact' || body.kind === 'style' ? body.kind : null;
+  const fact = typeof body.fact === 'string' ? body.fact.trim() : '';
+  const customerId = body.customerId === undefined || body.customerId === null ? null : typeof body.customerId === 'string' && UUID_RE.test(body.customerId) ? body.customerId : undefined;
+  if (!scope || !kind || !fact || fact.length > 2000 || customerId === undefined) return null;
+  if ((scope === 'customer' && !customerId) || (scope === 'global' && customerId !== null)) return null;
+  return { scope, customerId, kind, fact };
+}
+
+async function embedGuidance(deps: ConsoleRouterDeps, fact: string): Promise<number[] | null> {
+  if (!deps.embedding) return null;
+  const [embedding] = await deps.embedding.embed([fact]);
+  return embedding?.length ? embedding : null;
+}
+
+export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, deps: ConsoleRouterDeps = {}): Router {
   const router = Router();
   const sessions = new ConsoleSessionStore(config);
   router.use('/api', noStore);
@@ -244,6 +272,42 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
     } catch (err) { next(err); }
   });
 
+  // Memory Explorer: separate customer/internal paths make the corpus distinction
+  // explicit at the API boundary. Both remain founder-session protected and no-store.
+  router.get('/api/memory/customer', async (req, res, next) => {
+    try {
+      const page = await listCustomerMemory(req.query);
+      if (!page) return void res.status(400).json({ error: 'invalid memory filter or cursor' });
+      res.json(page);
+    } catch (err) { next(err); }
+  });
+  router.get('/api/memory/customer/:id', async (req, res, next) => {
+    if (!validId(req.params.id)) return void res.status(400).json({ error: 'invalid id' });
+    try {
+      const data = await customerMemoryDetail(req.params.id);
+      if (!data) return void res.status(404).json({ error: 'not found' });
+      res.json({ data });
+    } catch (err) { next(err); }
+  });
+  router.get('/api/memory/internal', async (req, res, next) => {
+    try {
+      const page = await listInternalMemory(req.query);
+      if (!page) return void res.status(400).json({ error: 'invalid memory filter or cursor' });
+      res.json(page);
+    } catch (err) { next(err); }
+  });
+  router.get('/api/memory/internal/:id', async (req, res, next) => {
+    if (!validId(req.params.id)) return void res.status(400).json({ error: 'invalid id' });
+    try {
+      const data = await internalMemoryDetail(req.params.id);
+      if (!data) return void res.status(404).json({ error: 'not found' });
+      res.json({ data });
+    } catch (err) { next(err); }
+  });
+  router.get('/api/memory/sources', async (_req, res, next) => {
+    try { res.json({ data: await listMemorySources() }); } catch (err) { next(err); }
+  });
+
   router.use('/api', (req, res, next) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
     if (!sessions.csrfValid(req, res.locals.consoleSession as { csrfToken: string })) {
@@ -281,6 +345,41 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
     } catch (err) {
       next(err);
     }
+  });
+
+  router.post('/api/memory/guidance', async (req, res, next) => {
+    const input = parseGuidanceBody(req.body);
+    if (!input) return void res.status(400).json({ error: 'invalid guidance' });
+    try {
+      const embedding = await embedGuidance(deps, input.fact);
+      if (!embedding) return void res.status(503).json({ error: 'guidance embedding unavailable' });
+      const created = await createGuidance({ ...input, embedding }, res.locals.consoleAuditContext as ConsoleAuditContext);
+      res.status(201).json({ data: { id: created.id, lifecycleStatus: 'active' } });
+    } catch (err) { next(err); }
+  });
+
+  router.post('/api/memory/customer/:id/supersede', async (req, res, next) => {
+    if (!validId(req.params.id)) return void res.status(400).json({ error: 'invalid id' });
+    const input = parseGuidanceBody(req.body);
+    if (!input) return void res.status(400).json({ error: 'invalid guidance' });
+    try {
+      const embedding = await embedGuidance(deps, input.fact);
+      if (!embedding) return void res.status(503).json({ error: 'guidance embedding unavailable' });
+      const result = await supersedeGuidance(req.params.id, { ...input, embedding }, res.locals.consoleAuditContext as ConsoleAuditContext);
+      if (result.result === 'not_found') return void res.status(404).json({ error: 'not found' });
+      if (result.result === 'conflict') return void res.status(409).json({ error: 'state changed; refresh and review' });
+      res.json({ data: { id: result.id, lifecycleStatus: 'active', supersededId: req.params.id } });
+    } catch (err) { next(err); }
+  });
+
+  router.post('/api/memory/customer/:id/retire', async (req, res, next) => {
+    if (!validId(req.params.id)) return void res.status(400).json({ error: 'invalid id' });
+    try {
+      const result = await retireGuidance(req.params.id, res.locals.consoleAuditContext as ConsoleAuditContext);
+      if (result === 'not_found') return void res.status(404).json({ error: 'not found' });
+      if (result === 'conflict') return void res.status(409).json({ error: 'state changed; refresh and review' });
+      res.json({ data: { id: req.params.id, lifecycleStatus: 'superseded' } });
+    } catch (err) { next(err); }
   });
 
   router.use('/api/approvals', buildConsoleApprovalsRouter());

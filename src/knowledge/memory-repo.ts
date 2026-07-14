@@ -179,8 +179,9 @@ export function buildStyleLaneSql(input: { customerId: string | null; limit: num
                       COALESCE(metadata->>'scope', CASE WHEN customer_id IS NULL THEN 'shared' ELSE 'customer' END) AS scope`;
   if (customerId === null) {
     const text = `SELECT ${projection}
-        FROM agent_memory
+       FROM agent_memory
        WHERE memory_type = 'correction'
+         AND lifecycle_status = 'active'
          AND metadata->>'kind' = 'style'
          AND customer_id IS NULL
        ORDER BY created_at DESC, id DESC
@@ -189,8 +190,9 @@ export function buildStyleLaneSql(input: { customerId: string | null; limit: num
   }
   const text = `SELECT ${projection}
       FROM agent_memory
-     WHERE memory_type = 'correction'
-       AND metadata->>'kind' = 'style'
+      WHERE memory_type = 'correction'
+        AND lifecycle_status = 'active'
+        AND metadata->>'kind' = 'style'
        AND (customer_id = $1 OR customer_id IS NULL)
      ORDER BY created_at DESC, id DESC
      LIMIT $2`;
@@ -254,8 +256,9 @@ export function buildSearchSql(input: BuildSearchSqlInput): { text: string; valu
   // Shared-only when there is no customer context: a single customer_id IS NULL query.
   if (customerId === null) {
     const text = `SELECT ${projection}
-        FROM agent_memory
+       FROM agent_memory
        WHERE customer_id IS NULL
+         AND lifecycle_status = 'active'
          AND (embedding <=> $1::vector) <= $2
        ORDER BY embedding <=> $1::vector
        LIMIT $3`;
@@ -267,8 +270,9 @@ export function buildSearchSql(input: BuildSearchSqlInput): { text: string; valu
   // Both are gated by maxDistance and return the cosine distance for citation gating.
   const text = `(
       SELECT ${projection}
-        FROM agent_memory
+       FROM agent_memory
        WHERE customer_id = $2
+         AND lifecycle_status = 'active'
          AND (embedding <=> $1::vector) <= $3
        ORDER BY embedding <=> $1::vector
        LIMIT $4
@@ -276,8 +280,9 @@ export function buildSearchSql(input: BuildSearchSqlInput): { text: string; valu
     UNION ALL
     (
       SELECT ${projection}
-        FROM agent_memory
+       FROM agent_memory
        WHERE customer_id IS NULL
+         AND lifecycle_status = 'active'
          AND (embedding <=> $1::vector) <= $3
        ORDER BY embedding <=> $1::vector
        LIMIT $5
@@ -306,6 +311,7 @@ export function buildReleaseNoteMatchSql(input: {
                (embedding <=> $1::vector) AS distance
           FROM agent_memory
          WHERE customer_id IS NOT NULL
+           AND lifecycle_status = 'active'
            AND memory_type = ANY($3::text[])
            AND (embedding <=> $1::vector) <= $2
          ORDER BY customer_id, embedding <=> $1::vector
@@ -327,8 +333,9 @@ export function buildTaskSearchSql(input: {
 }): { text: string; values: unknown[] } {
   const vec = toVectorLiteral(input.embedding);
   const text = `SELECT content, metadata, (embedding <=> $1::vector) AS distance
-      FROM agent_memory
+     FROM agent_memory
      WHERE customer_id = $2
+       AND lifecycle_status = 'active'
        AND memory_type = 'task'
        AND (embedding <=> $1::vector) <= $3
      ORDER BY embedding <=> $1::vector
@@ -349,6 +356,7 @@ export function buildRecentSignalsSql(input: {
                      embedding::text AS embedding, created_at
                 FROM agent_memory
                WHERE memory_type = ANY($1::text[])
+                 AND lifecycle_status = 'active'
                  AND created_at >= $2
                ORDER BY created_at DESC
                LIMIT $3`;
@@ -642,6 +650,7 @@ export const memoryRepo: KnowledgeRepo &
         WHERE NOT EXISTS (
           SELECT 1 FROM agent_memory
            WHERE memory_type = 'correction'
+             AND lifecycle_status = 'active'
              AND metadata->>'fact' = $5
              AND customer_id IS NOT DISTINCT FROM $1
         )
@@ -665,6 +674,7 @@ export const memoryRepo: KnowledgeRepo &
               metadata = jsonb_set(metadata, '{scope}', to_jsonb($2::text))
         WHERE id = $1
           AND memory_type = 'correction'
+          AND lifecycle_status = 'active'
           AND ($2 = 'shared' OR metadata->>'origin_customer_id' IS NOT NULL)
         RETURNING metadata->>'fact' AS fact, metadata->>'scope' AS scope,
                   metadata->>'origin_customer_id' AS origin`,

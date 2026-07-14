@@ -10,6 +10,7 @@ async function bootstrapSchema(connectionString: string): Promise<void> {
   try {
     await client.query(`
       CREATE EXTENSION IF NOT EXISTS pgcrypto;
+      CREATE EXTENSION IF NOT EXISTS vector;
       CREATE TABLE channel_instances (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL);
       CREATE TABLE agent_customers (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), bp_ref TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL);
       CREATE TABLE agent_inbox (
@@ -41,6 +42,26 @@ async function bootstrapSchema(connectionString: string): Promise<void> {
         safe_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+      CREATE TABLE knowledge_documents (
+        id BIGSERIAL PRIMARY KEY,
+        doc_key TEXT NOT NULL UNIQUE,
+        source_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+      );
+      CREATE TABLE agent_memory (
+        id BIGSERIAL PRIMARY KEY,
+        customer_id UUID REFERENCES agent_customers(id),
+        memory_type TEXT NOT NULL,
+        document_id BIGINT REFERENCES knowledge_documents(id),
+        content TEXT NOT NULL,
+        embedding vector(3) NOT NULL,
+        metadata JSONB,
+        chunk_index INT NOT NULL DEFAULT 0,
+        lifecycle_status TEXT NOT NULL DEFAULT 'active',
+        superseded_at TIMESTAMPTZ,
+        superseded_by BIGINT REFERENCES agent_memory(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
     `);
   } finally {
     await client.end();
@@ -48,7 +69,7 @@ async function bootstrapSchema(connectionString: string): Promise<void> {
 }
 
 test('Testcontainers: concurrent console recovery actions mutate once and audit once', { skip: process.env.RUN_CONTAINERS !== 'true' }, async () => {
-  const container = await new GenericContainer('postgres:16-alpine')
+  const container = await new GenericContainer('pgvector/pgvector:pg16')
     .withEnvironment({ POSTGRES_USER: 'test', POSTGRES_PASSWORD: 'test', POSTGRES_DB: 'console_test' })
     .withExposedPorts(5432)
     .withWaitStrategy(Wait.forListeningPorts())
@@ -63,8 +84,10 @@ test('Testcontainers: concurrent console recovery actions mutate once and audit 
     // repository pool is created at module load time.
     const dbModulePath = '../../db';
     const consoleRepoModulePath = './console-repo';
+    const consoleMemoryRepoModulePath = './console-memory-repo';
     const { query, closePool } = await import(dbModulePath) as typeof import('../../db');
     const { requeueInbox, cancelOutbound } = await import(consoleRepoModulePath) as typeof import('./console-repo');
+    const { listCustomerMemory, retireGuidance, supersedeGuidance } = await import(consoleMemoryRepoModulePath) as typeof import('./console-memory-repo');
     try {
       const channel = await query<{ id: string }>(`INSERT INTO channel_instances (name) VALUES ('test') RETURNING id::text`);
       const customer = await query<{ id: string }>(`INSERT INTO agent_customers (bp_ref, display_name) VALUES ('test', 'Test customer') RETURNING id::text`);
@@ -117,6 +140,42 @@ test('Testcontainers: concurrent console recovery actions mutate once and audit 
         const audit = await query<{ count: string }>('SELECT count(*) AS count FROM console_audit_events WHERE entity_id = $1', [immutable.rows[0].id]);
         assert.equal(audit.rows[0].count, '0');
       }
+
+      const learned = await query<{ id: string }>(
+        `INSERT INTO agent_memory (customer_id, memory_type, content, embedding, metadata)
+         VALUES ($1, 'correction', 'Founder correction (customer): obsolete private fact', '[0.1,0.2,0.3]'::vector,
+                 '{"source":"draft_revision","kind":"fact","fact":"obsolete private fact"}'::jsonb)
+         RETURNING id::text`, [customer.rows[0].id],
+      );
+      const replacement = { scope: 'customer' as const, customerId: customer.rows[0].id, kind: 'fact' as const, fact: 'the corrected private fact', embedding: [0.3, 0.2, 0.1] };
+      const supersedeResults = await Promise.all([
+        supersedeGuidance(learned.rows[0].id, replacement, { actor: 'founder', requestId: crypto.randomUUID() }),
+        supersedeGuidance(learned.rows[0].id, replacement, { actor: 'founder', requestId: crypto.randomUUID() }),
+      ]);
+      assert.deepEqual(supersedeResults.map((r) => r.result).sort(), ['conflict', 'ok']);
+      const currentGuidance = await query<{ lifecycle_status: string; superseded_by: string | null }>(
+        `SELECT lifecycle_status, superseded_by::text FROM agent_memory WHERE id = $1`, [learned.rows[0].id],
+      );
+      assert.equal(currentGuidance.rows[0].lifecycle_status, 'superseded');
+      assert.ok(currentGuidance.rows[0].superseded_by);
+      const active = await listCustomerMemory({ customerId: customer.rows[0].id, scope: 'customer', state: 'active', q: 'corrected' });
+      assert.equal(active?.data.length, 1, 'only the replacement remains retrievable/browsable as active');
+      assert.equal(active?.data[0].id, supersedeResults.find((r) => r.result === 'ok')?.id);
+      const supersedeAudit = await query<{ count: string; safe_metadata: string }>(
+        `SELECT count(*)::text AS count, coalesce(string_agg(safe_metadata::text, ''), '') AS safe_metadata
+           FROM console_audit_events WHERE action = 'memory.guidance.supersede' AND entity_id = $1`, [learned.rows[0].id],
+      );
+      assert.equal(supersedeAudit.rows[0].count, '1');
+      assert.equal(supersedeAudit.rows[0].safe_metadata.includes('corrected private fact'), false, 'audit never stores guidance content');
+      const replacementId = supersedeResults.find((r) => r.result === 'ok')?.id;
+      assert.ok(replacementId);
+      const retireResults = await Promise.all([
+        retireGuidance(replacementId, { actor: 'founder', requestId: crypto.randomUUID() }),
+        retireGuidance(replacementId, { actor: 'founder', requestId: crypto.randomUUID() }),
+      ]);
+      assert.deepEqual(retireResults.sort(), ['conflict', 'ok']);
+      const afterRetire = await listCustomerMemory({ customerId: customer.rows[0].id, scope: 'customer', state: 'active', q: 'corrected' });
+      assert.equal(afterRetire?.data.length, 0, 'retired guidance is excluded from active browse/search results');
     } finally {
       await closePool();
     }
