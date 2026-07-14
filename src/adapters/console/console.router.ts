@@ -7,6 +7,7 @@ import { getConsoleOverview, getHealth } from '../../health/health.service';
 import { logger } from '../../logger';
 import { cancelOutbound, customerDetail, customerTimeline, decisionDetail, inboxDetail, listCustomers, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox, type ConsoleAuditContext } from './console-repo';
 import { ConsoleSessionStore } from './console-session';
+import { buildConsoleApprovalsRouter } from './console-approvals.router';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -231,6 +232,8 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
       next(err);
     }
   });
+
+  router.use('/api/approvals', buildConsoleApprovalsRouter());
 
   router.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
 

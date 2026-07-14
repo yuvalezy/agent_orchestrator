@@ -35,7 +35,7 @@ import {
   buildLearnCorrection,
   isCorrectionFlipOption,
 } from '../../knowledge/correction-learning';
-import type { DecisionEvent } from '../../ports/founder-notifier.port';
+import type { DecisionEvent, FounderNotifierPort } from '../../ports/founder-notifier.port';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildLlmRouter } from '../llm/factory';
 import { buildAskMessageHandler } from '../../query/ask-command';
@@ -62,9 +62,17 @@ const reviseMarkerKey = (threadId: string): string => `draft_revise_pending:${th
  * KNOWLEDGE_RETRIEVAL_ENABLED for grounded regeneration) are off. When retrieval is off the
  * reviser still runs with an empty-knowledge retriever — the founder directive stays authoritative.
  */
-function buildDraftReviserGated(
-  notifier: TelegramNotifier,
-): { service: DraftReviserService; flip: (d: DecisionEvent) => Promise<void> } | null {
+/**
+ * Build ONLY the DraftReviserService (no Telegram scope-flip handler) from a notifier that just
+ * needs notifyCustomerEvent + notifyAdmin. Shared by the Telegram callback poller AND the console
+ * approvals surface (which passes a no-op notifier so a console revise doesn't re-post to Telegram —
+ * the console refetch is the source of truth). Gated by DRAFT_REVISE_ENABLED → null when off. When
+ * retrieval is off it regenerates ungrounded (founder directive only); correction learning still
+ * persists to agent_memory.
+ */
+export function buildDraftReviserService(
+  notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent' | 'notifyAdmin'>,
+): DraftReviserService | null {
   if (!env.DRAFT_REVISE_ENABLED) {
     logger.info('draft revise NOT wired (DRAFT_REVISE_ENABLED=false)');
     return null;
@@ -99,22 +107,16 @@ function buildDraftReviserGated(
   if (!env.KNOWLEDGE_RETRIEVAL_ENABLED) {
     logger.warn('⚠️  DRAFT_REVISE_ENABLED=true but KNOWLEDGE_RETRIEVAL_ENABLED=false — revise regenerates WITHOUT retrieved knowledge (founder directive only).');
   }
-
-  // Phase 2: scoped correction learning (classify → embed → persist → confirm) + the scope-flip
-  // handler. Writes ONLY to agent_memory (customer-readable) — NEVER internal_knowledge.
+  // Phase 2: scoped correction learning (classify → embed → persist → confirm). Writes ONLY to
+  // agent_memory (customer-readable) — NEVER internal_knowledge.
   const learnCorrection = buildLearnCorrection({
     classifier: llm,
     embedding,
     insertCorrection: memoryRepo.insertCorrectionMemory.bind(memoryRepo),
     notifier,
   });
-  const flip = buildCorrectionFlipHandler({
-    flipScope: memoryRepo.flipCorrectionScope.bind(memoryRepo),
-    notifier,
-  });
-
-  logger.info('draft revise wired (DRAFT_REVISE_ENABLED=true)');
-  const service = buildDraftReviser({
+  logger.info('draft revise service wired (DRAFT_REVISE_ENABLED=true)');
+  return buildDraftReviser({
     reviser: llm,
     retriever,
     notifier,
@@ -122,6 +124,21 @@ function buildDraftReviserGated(
     reviseDraft,
     getInboxSubjectBody,
     learnCorrection,
+  });
+}
+
+/**
+ * Telegram-flavored reviser: the shared service PLUS the scope-flip decision handler (the inline
+ * "flip scope" button lives only in Telegram).
+ */
+function buildDraftReviserGated(
+  notifier: TelegramNotifier,
+): { service: DraftReviserService; flip: (d: DecisionEvent) => Promise<void> } | null {
+  const service = buildDraftReviserService(notifier);
+  if (!service) return null;
+  const flip = buildCorrectionFlipHandler({
+    flipScope: memoryRepo.flipCorrectionScope.bind(memoryRepo),
+    notifier,
   });
   return { service, flip };
 }
