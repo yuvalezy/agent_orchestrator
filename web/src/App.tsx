@@ -1,6 +1,6 @@
 import { type FormEvent, type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, Plug, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Users } from 'lucide-react';
+import { Activity, BarChart3, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, Plug, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Users } from 'lucide-react';
 import { api, type ApiError, setCsrfToken } from './lib/api';
 import { cn } from './lib/utils';
 import { ApprovalsView } from './ApprovalsView';
@@ -25,6 +25,7 @@ type WorkerRegistration = 'registered' | 'flag_off' | 'not_registered';
 type Worker = { name: string; intervalMs: number; lastRunAt: string | null; lastSuccessAt: string | null; lastError: string | null; consecutiveFailures: number; isRunning: boolean; state: WorkerState; registration: WorkerRegistration };
 type Row = Record<string, unknown>;
 type Page = { data: Row[]; nextCursor: string | null };
+type Insights = { data: { rangeDays: number; llm: { calls: number; inputTokens: number; outputTokens: number; totalUsd: number; lastCallAt: string | null; byProviderRole: Array<{ provider: string; role: string; calls: number; totalUsd: number }> }; knowledge: { activeDocuments: number; tombstonedDocuments: number; activeChunks: number; lastSyncedAt: string | null; internalChunks: number; lastInternalUpdateAt: string | null }; taskInventory: { activeDocuments: number; customers: number; lastSyncedAt: string | null; portalUrl: string | null }; releaseNotes: { notificationsInRange: number; totalNotifications: number; lastProcessedAt: string | null } } };
 
 const nav = [
   ['overview', 'Overview', Activity],
@@ -34,6 +35,7 @@ const nav = [
   ['outbound', 'Outbound', Send],
   ['customers', 'Conversations', Users],
   ['decisions', 'Decisions', ShieldCheck],
+  ['insights', 'Insights', BarChart3],
   ['settings', 'Settings', SlidersHorizontal],
   ['connectors', 'Connectors', Plug],
 ] as const;
@@ -42,6 +44,7 @@ type View = typeof nav[number][0];
 const fmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 function displayDate(value: unknown): string { return typeof value === 'string' ? fmt.format(new Date(value)) : '—'; }
 function display(value: unknown): string { return typeof value === 'string' && value ? value : '—'; }
+function usd(value: number): string { return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 4 }).format(value); }
 
 export function App(): ReactElement {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -98,7 +101,7 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">
       <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-zinc-800 bg-zinc-950/85 px-5 backdrop-blur"><button onClick={() => setMenuOpen(true)} className="md:hidden"><Menu /></button><div className="text-sm text-zinc-400">Founder-only · Tailscale protected</div><button onClick={() => client.invalidateQueries()} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900 hover:text-white" title="Refresh"><RefreshCw size={17} /></button></header>
-      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
+      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
     </main>
   </div>;
 }
@@ -113,6 +116,16 @@ function OverviewView({ onSelect }: { onSelect: (view: View) => void }): ReactEl
     <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><Metric label="Database" value={data.db === 'ok' ? 'Connected' : 'Unavailable'} tone={data.db === 'ok' ? 'good' : 'bad'} /><Metric label="Inbox pending" value={String(data.backlog.inbox.pending)} detail={`${data.backlog.inbox.failed} failed`} onClick={() => onSelect('inbox')} /><Metric label="Outbound pending" value={String(data.backlog.outboundQueue.pending)} detail={`${data.backlog.outboundQueue.failed} failed`} /><Metric label="Workers" value={String(data.workers.length)} detail={`${data.workers.filter((w) => w.state === 'failing_backoff' || w.state === 'stale' || w.registration === 'not_registered').length} need attention`} onClick={() => onSelect('workers')} /></div>
     <div className="mt-7 grid gap-5 xl:grid-cols-2"><Panel title="Attention needed"><Attention workers={data.workers} /></Panel><Panel title="Capabilities"><div className="space-y-3">{data.capabilities.map((capability) => <div key={capability.name} className="flex items-start justify-between gap-3 text-sm"><div><p className="font-medium text-zinc-200">{capability.name}</p><p className="mt-1 text-xs text-zinc-500">{capability.detail}</p></div><StateBadge enabled={capability.available} offLabel="unavailable" /></div>)}</div></Panel><Panel title="Queue state"><QueueStates label="Inbox" rows={data.queueStates.inbox} /><QueueStates label="Outbound" rows={data.queueStates.outbound} /></Panel><Panel title="Active channel instances"><div className="space-y-3">{data.activeChannels.length === 0 && <p className="text-sm text-zinc-500">No active channel instances in the database.</p>}{data.activeChannels.map((channel) => <div key={channel.name} className="flex items-center justify-between gap-3 text-sm"><span className="font-mono text-xs text-zinc-200">{channel.name}</span><span className="text-xs text-zinc-500">{channel.channelType} · {channel.provider}</span></div>)}</div></Panel><Panel title="Feature switches"><div className="grid gap-3 sm:grid-cols-2">{data.featureFlags.map((flag) => <div key={flag.name} className="flex items-center justify-between gap-3 text-sm"><span className="text-zinc-300">{flag.name}</span><StateBadge enabled={flag.enabled} onLabel="enabled" /></div>)}</div></Panel></div>
   </section>;
+}
+
+function InsightsView(): ReactElement {
+  const [days, setDays] = useState(30);
+  const insights = useQuery({ queryKey: ['insights', days], queryFn: () => api<Insights>(`/insights?days=${days}`) });
+  if (insights.isLoading) return <Loading title="Loading local operational summaries…" />;
+  if (insights.isError) return <ErrorState message={(insights.error as Error).message} />;
+  if (!insights.data) return <Loading title="Loading local operational summaries…" />;
+  const data = insights.data.data;
+  return <section><PageTitle eyebrow="Local aggregates" title="Insights" description="Bounded server-side aggregates from the orchestrator database. Task inventory is cached locally; release-note activity is the local notification ledger, not a live source read." /><div className="mt-6 flex gap-2">{[7, 30, 90].map((value) => <button key={value} onClick={() => setDays(value)} className={cn('rounded-full border px-3 py-1.5 text-sm', days === value ? 'border-emerald-400 bg-emerald-400 text-zinc-950' : 'border-zinc-700 text-zinc-300')}>{value} days</button>)}</div><div className="mt-6 grid gap-5 md:grid-cols-2 xl:grid-cols-4"><Panel title="LLM spend"><p className="text-2xl font-semibold">{usd(data.llm.totalUsd)}</p><p className="mt-2 text-sm text-zinc-400">{data.llm.calls} calls · {data.llm.inputTokens + data.llm.outputTokens} tokens</p><p className="mt-2 text-xs text-zinc-500">Last call: {displayDate(data.llm.lastCallAt)}</p></Panel><Panel title="Customer knowledge"><p className="text-2xl font-semibold">{data.knowledge.activeDocuments} docs</p><p className="mt-2 text-sm text-zinc-400">{data.knowledge.activeChunks} active chunks · {data.knowledge.tombstonedDocuments} tombstoned</p><p className="mt-2 text-xs text-zinc-500">Last sync: {displayDate(data.knowledge.lastSyncedAt)}</p></Panel><Panel title="Task inventory cache"><p className="text-2xl font-semibold">{data.taskInventory.activeDocuments} tasks</p><p className="mt-2 text-sm text-zinc-400">{data.taskInventory.customers} customers represented</p><p className="mt-2 text-xs text-zinc-500">Last local sync: {displayDate(data.taskInventory.lastSyncedAt)}</p>{data.taskInventory.portalUrl && <a href={data.taskInventory.portalUrl} target="_blank" rel="noreferrer" className="mt-3 inline-block text-xs font-medium text-emerald-300 hover:text-emerald-200">View tasks in portal</a>}</Panel><Panel title="Release-note ledger"><p className="text-2xl font-semibold">{data.releaseNotes.notificationsInRange} updates</p><p className="mt-2 text-sm text-zinc-400">{data.releaseNotes.totalNotifications} total local notification records</p><p className="mt-2 text-xs text-zinc-500">Last processed: {displayDate(data.releaseNotes.lastProcessedAt)}</p></Panel></div><div className="mt-5 grid gap-5 xl:grid-cols-2"><Panel title="LLM cost by provider and role">{data.llm.byProviderRole.length === 0 ? <p className="text-sm text-zinc-500">No cost records in this date range.</p> : <div className="divide-y divide-zinc-800">{data.llm.byProviderRole.map((row) => <div key={`${row.provider}-${row.role}`} className="flex items-center justify-between gap-3 py-3 text-sm"><span>{row.provider} · {row.role} <span className="text-zinc-500">({row.calls} calls)</span></span><span className="font-medium">{usd(row.totalUsd)}</span></div>)}</div>}</Panel><Panel title="Internal knowledge"><p className="text-2xl font-semibold">{data.knowledge.internalChunks} chunks</p><p className="mt-2 text-xs text-zinc-500">Last update: {displayDate(data.knowledge.lastInternalUpdateAt)}</p></Panel></div></section>;
 }
 
 function WorkersView(): ReactElement {

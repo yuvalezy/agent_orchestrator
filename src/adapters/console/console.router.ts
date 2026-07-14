@@ -10,6 +10,7 @@ import { ConsoleSessionStore } from './console-session';
 import { buildConsoleApprovalsRouter } from './console-approvals.router';
 import { buildConsoleSettingsRouter } from './console-settings.router';
 import { buildConsoleConnectorsRouter, buildConnectorsOAuthCallback } from './console-connectors.router';
+import { getConsoleInsights, parseInsightDays } from './console-insights-repo';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -37,6 +38,10 @@ export function projectConsoleFailure(err: unknown): { err: { name: string | und
 export function portalTaskUrl(portalBaseUrl: string | null, taskRef: unknown): string | null {
   if (!portalBaseUrl || typeof taskRef !== 'string' || !taskRef.trim() || taskRef.length > 200) return null;
   return `${portalBaseUrl.replace(/\/+$/, '')}/projects/tasks/${encodeURIComponent(taskRef)}`;
+}
+
+function portalTasksUrl(portalBaseUrl: string | null): string | null {
+  return portalBaseUrl ? `${portalBaseUrl.replace(/\/+$/, '')}/projects/tasks` : null;
 }
 
 function withPortalTaskLinks(data: Record<string, unknown>[], portalBaseUrl: string | null): Record<string, unknown>[] {
@@ -106,6 +111,16 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
   router.get('/api/overview', async (_req, res, next) => {
     try {
       res.json({ data: await getConsoleOverview() });
+    } catch (err) {
+      next(err);
+    }
+  });
+  router.get('/api/insights', async (req, res, next) => {
+    const days = parseInsightDays(req.query.days);
+    if (days === null) return void res.status(400).json({ error: 'invalid date range' });
+    try {
+      const insights = await getConsoleInsights(days);
+      res.json({ data: { ...insights, taskInventory: { ...insights.taskInventory, portalUrl: portalTasksUrl(config.portalBaseUrl) } } });
     } catch (err) {
       next(err);
     }
