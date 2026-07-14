@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import bcrypt from 'bcryptjs';
 import { buildApp } from '../../app';
 import { loadConsoleConfig } from '../../config/console';
-import { buildConsoleRouter, projectConsoleFailure } from './console.router';
+import { buildConsoleRouter, portalTaskUrl, projectConsoleFailure } from './console.router';
 
 async function withConsole(fn: (baseUrl: string) => Promise<void>): Promise<void> {
   const hash = await bcrypt.hash('correct horse battery staple', 4);
@@ -42,6 +42,12 @@ test('console failure projection omits an attached payload and exception message
 
   assert.deepEqual(safe, { err: { name: 'Error' }, response: { error: 'console request failed' } });
   assert.equal(JSON.stringify(safe).includes(secret), false);
+});
+
+test('portal task links are generated from local references without a portal request', () => {
+  assert.equal(portalTaskUrl('https://portal.example/', 'task / 1'), 'https://portal.example/projects/tasks/task%20%2F%201');
+  assert.equal(portalTaskUrl(null, 'task-1'), null);
+  assert.equal(portalTaskUrl('https://portal.example', ''), null);
 });
 
 test('console API requires auth, creates no-store session, and rejects mutation without CSRF', async () => {

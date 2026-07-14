@@ -2,11 +2,12 @@ import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { closePool, query } from '../../db';
-import { decisionDetail, inboxDetail, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox } from './console-repo';
+import { customerTimeline, decisionDetail, inboxDetail, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox } from './console-repo';
 
 const tag = `test-console-audit-${crypto.randomUUID()}`;
 
 after(async () => {
+  await query('DELETE FROM agent_tasks WHERE task_ref LIKE $1', [`${tag}%`]).catch(() => {});
   await query('DELETE FROM agent_outbound_queue WHERE recipient_address LIKE $1', [`${tag}%`]).catch(() => {});
   await query('DELETE FROM agent_decisions WHERE customer_id IN (SELECT id FROM agent_customers WHERE bp_ref LIKE $1)', [`${tag}%`]).catch(() => {});
   await query(`DELETE FROM console_audit_events WHERE entity_type = 'agent_inbox' AND entity_id IN (SELECT id::text FROM agent_inbox WHERE channel_message_id LIKE $1)`, [`${tag}%`]).catch(() => {});
@@ -119,4 +120,28 @@ test('outbound list filters only metadata and reserves message content for detai
   assert.equal(draftsOnly.data.length, 0);
   assert.equal(await listOutbound({ isDraft: 'yes' }), null);
   assert.equal(await listOutbound({ channel: 'x'.repeat(101) }), null);
+});
+
+test('customer timeline has a deterministic cursor for equal-timestamp local events', async () => {
+  const customer = await query<{ id: string }>(
+    'INSERT INTO agent_customers (bp_ref, display_name) VALUES ($1, $2) RETURNING id::text',
+    [`${tag}-timeline-customer`, 'Timeline cursor customer'],
+  );
+  const createdAt = '2026-01-01T00:00:00.123456Z';
+  await Promise.all(['one', 'two'].map((suffix) => query(
+    `INSERT INTO agent_tasks (task_ref, customer_id, relationship, created_at)
+     VALUES ($1, $2, 'follow_up', $3)`,
+    [`${tag}-timeline-${suffix}`, customer.rows[0].id, createdAt],
+  )));
+
+  const page = await customerTimeline(customer.rows[0].id, { limit: '1' });
+  assert.ok(page);
+  assert.equal(page.data.length, 1);
+  assert.ok(page.nextCursor);
+  assert.equal(page.data[0].event_type, 'task_link');
+  const next = await customerTimeline(customer.rows[0].id, { limit: '1', cursor: page.nextCursor });
+  assert.ok(next);
+  assert.equal(next.data.length, 1);
+  assert.notEqual(next.data[0].entity_id, page.data[0].entity_id);
+  assert.equal(await customerTimeline(customer.rows[0].id, { cursor: 'not-a-cursor' }), null);
 });

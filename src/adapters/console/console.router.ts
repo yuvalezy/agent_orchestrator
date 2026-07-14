@@ -31,6 +31,20 @@ export function projectConsoleFailure(err: unknown): { err: { name: string | und
   };
 }
 
+/** Build a portal UI URL from a mirrored task reference; this never contacts the portal. */
+export function portalTaskUrl(portalBaseUrl: string | null, taskRef: unknown): string | null {
+  if (!portalBaseUrl || typeof taskRef !== 'string' || !taskRef.trim() || taskRef.length > 200) return null;
+  return `${portalBaseUrl.replace(/\/+$/, '')}/projects/tasks/${encodeURIComponent(taskRef)}`;
+}
+
+function withPortalTaskLinks(data: Record<string, unknown>[], portalBaseUrl: string | null): Record<string, unknown>[] {
+  return data.map((event) => {
+    const metadata = event.metadata as { task_ref?: unknown } | null;
+    const url = portalTaskUrl(portalBaseUrl, metadata?.task_ref);
+    return url ? { ...event, portal_task_url: url } : event;
+  });
+}
+
 export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): Router {
   const router = Router();
   const sessions = new ConsoleSessionStore(config);
@@ -197,8 +211,8 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
     if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid customer id' });
     try {
       const timeline = await customerTimeline(req.params.id, req.query);
-      if (!timeline) return void res.status(400).json({ error: 'invalid limit' });
-      res.json(timeline);
+      if (!timeline) return void res.status(400).json({ error: 'invalid limit or cursor' });
+      res.json({ ...timeline, data: withPortalTaskLinks(timeline.data, config.portalBaseUrl) });
     } catch (err) { next(err); }
   });
 

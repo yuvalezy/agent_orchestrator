@@ -11,6 +11,10 @@ interface Cursor {
   id: string;
 }
 
+interface TimelineCursor extends Cursor {
+  type: string;
+}
+
 function decodeCursor(value: unknown): Cursor | null {
   if (typeof value !== 'string' || !value) return null;
   try {
@@ -24,6 +28,20 @@ function decodeCursor(value: unknown): Cursor | null {
 function encodeCursor(row: { created_at: string; id: string }): string {
   // Paginated queries select UTC text with microsecond precision; a JS Date would lose it.
   return Buffer.from(JSON.stringify({ at: row.created_at, id: row.id })).toString('base64url');
+}
+
+function decodeTimelineCursor(value: unknown): TimelineCursor | null {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as TimelineCursor;
+    return typeof decoded.at === 'string' && typeof decoded.type === 'string' && typeof decoded.id === 'string' ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function encodeTimelineCursor(row: { created_at: string; event_type: string; entity_id: string }): string {
+  return Buffer.from(JSON.stringify({ at: row.created_at, type: row.event_type, id: row.entity_id })).toString('base64url');
 }
 
 export function parseLimit(value: unknown): number | null {
@@ -221,11 +239,13 @@ export async function customerDetail(id: string): Promise<Record<string, unknown
 }
 
 /** Local-only chronological metadata stream. Message bodies and decision output stay detail-only. */
-export async function customerTimeline(id: string, input: { limit?: unknown }): Promise<{ data: Record<string, unknown>[] } | null> {
+export async function customerTimeline(id: string, input: { limit?: unknown; cursor?: unknown }): Promise<Page<Record<string, unknown>> | null> {
   const limit = parseLimit(input.limit);
-  if (limit === null) return null;
+  const cursor = decodeTimelineCursor(input.cursor);
+  if (limit === null || (input.cursor !== undefined && !cursor)) return null;
   const { rows } = await query<Record<string, unknown>>(
-    `SELECT * FROM (
+    `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, entity_id, event_type, status, metadata
+       FROM (
        SELECT i.created_at, i.id::text AS entity_id, 'inbox'::text AS event_type, i.status,
               jsonb_build_object('channel_instance_id', i.channel_instance_id, 'subject', i.subject, 'retry_count', i.retry_count) AS metadata
          FROM agent_inbox i WHERE i.customer_id = $1
@@ -242,11 +262,15 @@ export async function customerTimeline(id: string, input: { limit?: unknown }): 
               jsonb_build_object('task_ref', t.task_ref, 'inbox_message_id', t.inbox_message_id)
          FROM agent_tasks t WHERE t.customer_id = $1
      ) events
-     ORDER BY created_at DESC, entity_id DESC
-     LIMIT $2`,
-    [id, limit],
+      WHERE ($2::timestamptz IS NULL OR (created_at, event_type, entity_id) < ($2::timestamptz, $3::text, $4::text))
+     ORDER BY created_at DESC, event_type DESC, entity_id DESC
+     LIMIT $5`,
+    [id, cursor?.at ?? null, cursor?.type ?? null, cursor?.id ?? null, limit + 1],
   );
-  return { data: rows };
+  const hasMore = rows.length > limit;
+  const data = rows.slice(0, limit);
+  const last = data[data.length - 1] as { created_at: string; event_type: string; entity_id: string } | undefined;
+  return { data, nextCursor: hasMore && last ? encodeTimelineCursor(last) : null };
 }
 
 type MutationResult = 'ok' | 'not_found' | 'conflict';
