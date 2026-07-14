@@ -39,7 +39,16 @@ export function buildGmailQuery(identity: { domain: string | null; addresses: st
   return terms.length ? terms.join(' OR ') : null;
 }
 
-function toThread(customerId: string, account: string, threadId: string, msgs: ProviderEmail[], language?: string): HistoricalThread | null {
+/** Normalize a fetched Gmail thread into a HistoricalThread (shared by the standard + starred legs).
+ *  `threadKeyPrefix` namespaces the idempotency key so the two legs never collide (`gmail:` vs
+ *  `gmail-starred:`). Empty-body messages contribute nothing; an all-empty thread → null (dropped). */
+export function toHistoricalThread(
+  customerId: string,
+  account: string,
+  threadId: string,
+  msgs: ProviderEmail[],
+  opts: { threadKeyPrefix?: string; language?: string } = {},
+): HistoricalThread | null {
   const messages: HistoricalMessage[] = msgs
     .filter((m) => (m.bodyText ?? '').trim())
     .map((m) => ({ from: m.from || 'sender', body: m.bodyText ?? '', at: m.sentAt }));
@@ -47,8 +56,8 @@ function toThread(customerId: string, account: string, threadId: string, msgs: P
   return {
     customerId,
     channel: 'email',
-    threadKey: `gmail:${account}:${threadId}`,
-    language,
+    threadKey: `${opts.threadKeyPrefix ?? 'gmail'}:${account}:${threadId}`,
+    language: opts.language,
     messages,
   };
 }
@@ -77,7 +86,7 @@ export function buildGmailHistorySource(deps: GmailHistorySourceDeps): HistorySo
         for (const tid of threadIds) {
           try {
             const msgs = await account.client.getThread(tid);
-            const t = toThread(customerId, account.name, tid, msgs, language);
+            const t = toHistoricalThread(customerId, account.name, tid, msgs, { language });
             if (t) threads.push(t);
           } catch (err) {
             logger.warn({ customerId, account: account.name, threadId: tid, reason: (err as Error)?.message }, 'gmail history: thread fetch failed — skipped');

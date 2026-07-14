@@ -6,6 +6,7 @@ import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddin
 import { memoryRepo } from '../src/knowledge/memory-repo';
 import { buildInboxHistorySource } from '../src/knowledge/inbox-history-source';
 import { buildGmailHistorySource } from '../src/adapters/email/gmail-history-source';
+import { buildGmailStarredSource } from '../src/adapters/email/gmail-starred-source';
 import { GmailClient } from '../src/adapters/email/gmail-client';
 import { getCustomerEmailIdentity } from '../src/customers/email-identity';
 import { buildWhatsAppDirectoryClient, buildWaHistoryClient } from '../src/adapters/whatsapp-manager/factory';
@@ -43,14 +44,24 @@ export function createBackfillCore(): BackfillCore {
   };
 
   const inboxReader = buildInboxHistorySource();
+  // Shared Gmail accounts — reused by BOTH the standard Gmail leg and the starred leg (one integration).
+  const gmailAccounts = [
+    { name: 'email:gmail:work', client: new GmailClient(() => tryResolveCredential('GMAIL_WORK_OAUTH') ?? '') },
+    { name: 'email:gmail:personal', client: new GmailClient(() => tryResolveCredential('GMAIL_PERSONAL_OAUTH') ?? '') },
+  ];
   const gmailReader = buildGmailHistorySource({
-    accounts: [
-      { name: 'email:gmail:work', client: new GmailClient(() => tryResolveCredential('GMAIL_WORK_OAUTH') ?? '') },
-      { name: 'email:gmail:personal', client: new GmailClient(() => tryResolveCredential('GMAIL_PERSONAL_OAUTH') ?? '') },
-    ],
+    accounts: gmailAccounts,
     getIdentity: getCustomerEmailIdentity,
     maxThreadsPerAccount: 50,
   });
+  // M3(b): starred-email leg (gated, default off) — the founder's starred threads as review candidates.
+  const starredReader = env.BACKFILL_STARRED_ENABLED
+    ? buildGmailStarredSource({
+        accounts: gmailAccounts,
+        getIdentity: getCustomerEmailIdentity,
+        maxThreadsPerAccount: env.BACKFILL_STARRED_MAX_THREADS,
+      })
+    : null;
   const waReader = env.BACKFILL_WA_ENABLED
     ? buildWaHistorySource({
         historyClient: buildWaHistoryClient(),
@@ -68,12 +79,13 @@ export function createBackfillCore(): BackfillCore {
     });
 
   const readThreads = async (customerId: string): Promise<HistoricalThread[]> => {
-    const [inbox, gmail, wa] = await Promise.all([
+    const [inbox, gmail, starred, wa] = await Promise.all([
       safeRead('inbox', inboxReader.readThreads(customerId)),
       safeRead('gmail', gmailReader.readThreads(customerId)),
+      starredReader ? safeRead('gmail-starred', starredReader.readThreads(customerId)) : Promise.resolve([] as HistoricalThread[]),
       waReader ? safeRead('whatsapp', waReader.readThreads(customerId)) : Promise.resolve([] as HistoricalThread[]),
     ]);
-    return [...inbox, ...gmail, ...wa];
+    return [...inbox, ...gmail, ...starred, ...wa];
   };
 
   const reconcile = (thread: HistoricalThread) =>
