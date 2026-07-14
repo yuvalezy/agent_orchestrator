@@ -30,6 +30,7 @@
     "gmail:oauth": "tsx scripts/gmail-oauth.ts --",
     "typecheck": "tsc --noEmit",
     "typecheck:console": "npm --prefix web run typecheck",
+    "test:containers": "RUN_CONTAINERS=true node --import tsx --test src/adapters/console/console-mutations.container.test.ts",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
     "lint:boundary": "node scripts/check-boundary.mjs"
@@ -56,6 +57,7 @@
     "eslint": "^9",
     "eslint-import-resolver-typescript": "^3.7",
     "eslint-plugin-import": "^2.31",
+    "testcontainers": "^12.0.4",
     "tsx": "^4.19.2",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8"
