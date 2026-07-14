@@ -10,3 +10,4 @@ export * from './llm.port';
 export * from './embedding.port';
 export * from './group-summary.port';
 export * from './doc-source.port';
+export * from './calendar.port';

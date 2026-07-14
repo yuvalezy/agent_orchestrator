@@ -5,6 +5,7 @@ import type { CustomerConfig } from './context-loader';
 import type { enqueueDraft, findOpenDraftByInbox, OpenDraftForInbox } from '../outbound/outbound-repo';
 import type { recordDraftDecision } from '../decisions/decisions';
 import type { StyleLane } from '../knowledge/style-lane';
+import type { MeetingContext } from './meeting-context';
 import { logger } from '../logger';
 import { draftButtons } from './draft-review';
 
@@ -34,6 +35,10 @@ export interface ResponseDrafterDeps {
    *  active style/tone corrections are pulled on EVERY draft (not embedding-gated) and injected as
    *  persistent voice guidance — a DIRECTIVE, never a citation source. Undefined → no voice lane. */
   styleLane?: StyleLane;
+  /** Upcoming-meetings context (gated CALENDAR_ENABLED). When set, the drafted customer's upcoming
+   *  meetings are pulled from the founder's calendar on every draft and injected as draft CONTEXT
+   *  (best-effort → [] on miss) — never a citation source. Undefined → no meetings context. */
+  meetings?: MeetingContext;
 }
 
 export interface DraftAndPresentInput {
@@ -110,14 +115,22 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
       //      source — it never feeds renderCitations, so no "Based on:" hallucination.
       const voiceGuidance = deps.styleLane ? await deps.styleLane.guidanceFor(customerId) : [];
 
+      // (2b) Upcoming meetings (gated CALENDAR_ENABLED): the drafted customer's calendar meetings,
+      //      matched by the sender's email, injected as draft CONTEXT (best-effort → [] on miss).
+      //      NOT a citation source — it never feeds renderCitations, so no "Based on:" hallucination.
+      const upcomingMeetings = deps.meetings
+        ? await deps.meetings.upcomingFor({ customerId, matchEmails: meetingMatchEmails(row) })
+        : [];
+
       // (2) Draft in the customer's preferred language, grounded ONLY in `knowledge`; voice
-      //     guidance shapes phrasing only.
+      //     guidance shapes phrasing only; meetings are acknowledgeable context only.
       const req: DraftRequest = {
         question: assembleQuestion(row),
         language: config.preferredLanguage,
         customerName: config.displayName,
         knowledge,
         voiceGuidance,
+        upcomingMeetings,
       };
       const result = await deps.llm.draftReply(req);
 
@@ -191,6 +204,14 @@ export function emailReplySubject(inboundSubject: string | null): string {
   const s = inboundSubject?.trim() ?? '';
   if (!s) return 'Re:';
   return /^re:/i.test(s) ? s : `Re: ${s}`;
+}
+
+/** The email(s) used to match this customer's calendar meetings by attendee (M5(d)). Only an
+ *  email-shaped sender_address qualifies (a WhatsApp phone can't match a calendar attendee), so
+ *  a non-email sender yields [] → the meeting lane is a no-op for that draft. Lower-cased. */
+export function meetingMatchEmails(row: ClaimedInbox): string[] {
+  const addr = row.sender_address?.trim().toLowerCase();
+  return addr && addr.includes('@') ? [addr] : [];
 }
 
 /** Assemble the customer question (subject + body) the drafter answers. Trims + drops

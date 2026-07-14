@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResponseDrafter, emailReplySubject, renderCitations, type ResponseDrafterDeps } from './response-drafter';
+import { buildResponseDrafter, emailReplySubject, meetingMatchEmails, renderCitations, type ResponseDrafterDeps } from './response-drafter';
 import type { ClaimedInbox } from '../inbox/inbox-repo';
 import type { KnowledgeChunk, DraftRequest, DraftResult } from '../ports/llm.port';
 import type { Notification } from '../ports/founder-notifier.port';
@@ -50,6 +50,7 @@ interface Captured {
   notifies: Array<{ customerId: string; n: Notification; buttons?: Array<{ id: string; label: string }> }>;
   findInboxIds: string[];
   styleCustomerIds: Array<string | null>;
+  meetingCalls: Array<{ customerId: string | null; matchEmails: string[] }>;
 }
 
 function makeDeps(over?: {
@@ -59,8 +60,9 @@ function makeDeps(over?: {
   notifyImpl?: () => Promise<void>;
   styleGuidance?: string[];
   styleGuidanceFor?: (customerId: string | null) => Promise<string[]>;
+  meetings?: string[];
 }): { deps: ResponseDrafterDeps; cap: Captured } {
-  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [] };
+  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [], meetingCalls: [] };
   const deps: ResponseDrafterDeps = {
     ...(over?.styleGuidance || over?.styleGuidanceFor
       ? {
@@ -68,6 +70,16 @@ function makeDeps(over?: {
             guidanceFor: async (customerId: string | null): Promise<string[]> => {
               cap.styleCustomerIds.push(customerId);
               return over?.styleGuidanceFor ? over.styleGuidanceFor(customerId) : (over?.styleGuidance ?? []);
+            },
+          },
+        }
+      : {}),
+    ...(over?.meetings
+      ? {
+          meetings: {
+            upcomingFor: async (input): Promise<string[]> => {
+              cap.meetingCalls.push(input);
+              return over.meetings ?? [];
             },
           },
         }
@@ -312,6 +324,65 @@ test('style lane: no styleLane dep → voiceGuidance absent/empty, drafting unaf
   });
   assert.equal(cap.styleCustomerIds.length, 0, 'no fetch when the lane is not wired');
   assert.deepEqual(cap.draftReqs[0].voiceGuidance, [], 'voiceGuidance defaults to empty');
+});
+
+// ── M5(d): upcoming-meetings context ─────────────────────────────────────────────
+
+test('meetings: upcoming meetings fetched for the sender email + injected as draft context (never citations)', async () => {
+  const { deps, cap } = makeDeps({ meetings: ['Tue Jul 15, 1:00 PM — Project kickoff'] });
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row({ channel_type: 'email', sender_address: 'Cust@Acme.com', message_id_header: '<m@x>' }),
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 'tk',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+
+  // Fetched for THIS customer, matched by the (lower-cased) sender email.
+  assert.deepEqual(cap.meetingCalls, [{ customerId: 'cust-9', matchEmails: ['cust@acme.com'] }]);
+  // Passed to the LLM as upcomingMeetings (draft context).
+  assert.deepEqual(cap.draftReqs[0].upcomingMeetings, ['Tue Jul 15, 1:00 PM — Project kickoff']);
+  // NOT turned into citations — the decision carries ONLY the knowledge-chunk cite.
+  const ao = cap.records[0].agentOutput as { citations: string[] };
+  assert.deepEqual(ao.citations, ['Exports › Scheduling (/docs/exports)']);
+  assert.equal(cap.notifies[0].n.body.includes('Project kickoff'), false, 'meetings never appear in the founder-facing citation block');
+});
+
+test('meetings: a non-email sender (WhatsApp phone) → no match emails passed', async () => {
+  const { deps, cap } = makeDeps({ meetings: ['Tue Jul 15 — call'] });
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row(), // default WhatsApp row, sender_address '+15551230000'
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 'tk',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  assert.deepEqual(cap.meetingCalls, [{ customerId: 'cust-9', matchEmails: [] }]);
+});
+
+test('meetings: no meetings dep → upcomingMeetings absent/empty, drafting unaffected', async () => {
+  const { deps, cap } = makeDeps({});
+  const drafter = buildResponseDrafter(deps);
+  await drafter.draftAndPresent({
+    row: row({ channel_type: 'email', sender_address: 'cust@acme.com', message_id_header: '<m@x>' }),
+    customerId: 'cust-9',
+    config: cfg,
+    threadKey: 'tk',
+    knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  assert.equal(cap.meetingCalls.length, 0, 'no fetch when the lane is not wired');
+  assert.deepEqual(cap.draftReqs[0].upcomingMeetings, [], 'upcomingMeetings defaults to empty');
+});
+
+test('meetingMatchEmails: email sender → [lowercased]; phone/blank → []', () => {
+  assert.deepEqual(meetingMatchEmails(row({ sender_address: 'Cust@Acme.com' })), ['cust@acme.com']);
+  assert.deepEqual(meetingMatchEmails(row({ sender_address: '+15551230000' })), []);
+  assert.deepEqual(meetingMatchEmails(row({ sender_address: null })), []);
 });
 
 // ── renderCitations ────────────────────────────────────────────────────────────

@@ -9,6 +9,8 @@ import { TriageService } from '../../triage/triage.service';
 import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
+import { buildMeetingContext, type MeetingContext } from '../../triage/meeting-context';
+import { buildCalendarAdapter } from '../calendar';
 import { buildResponseDrafter, type ResponseDrafter } from '../../triage/response-drafter';
 import { buildCrossChannelDedup, type CrossChannelDedup } from '../../triage/cross-channel-dedup';
 import { searchConversationLinks, insertConversationLink } from '../../triage/conversation-link-repo';
@@ -99,6 +101,40 @@ function buildResponseDrafterGated(
     // Style-Correction Always-On lane: inject the customer's persistent voice/tone directives
     // on every draft (gated; undefined when off → no voice guidance).
     styleLane: buildStyleLaneGated(),
+    // M5(d): upcoming-meetings context from the founder's Google Calendar (gated; undefined
+    // when off → no meetings context).
+    meetings: buildMeetingContextGated(),
+  });
+}
+
+/**
+ * M5(d): build the upcoming-meetings context wired into the drafter — the composition root
+ * where the core meeting-context meets the Google Calendar ADAPTER (D1: core never imports
+ * adapters). Gated by CALENDAR_ENABLED so it stays dormant → drafts carry no meetings context.
+ * Returns undefined when off. When on without a GOOGLE_CALENDAR_OAUTH credential it still wires
+ * (the credential resolves lazily; the meeting lane degrades to [] on the failed read — a
+ * calendar miss NEVER fails drafting) but WARNs loudly at boot. READ-ONLY (no event creation).
+ */
+function buildMeetingContextGated(): MeetingContext | undefined {
+  if (!env.CALENDAR_ENABLED) {
+    logger.info('meeting context NOT wired (CALENDAR_ENABLED=false)');
+    return undefined;
+  }
+  if (!tryResolveCredential('GOOGLE_CALENDAR_OAUTH')) {
+    logger.warn('⚠️  CALENDAR_ENABLED=true but GOOGLE_CALENDAR_OAUTH is UNSET — drafts get no meetings context until it is set (calendar reads degrade to []).');
+  }
+  logger.info(
+    { lookaheadDays: env.CALENDAR_LOOKAHEAD_DAYS, maxEvents: env.CALENDAR_MAX_EVENTS, calendar: env.CALENDAR_ID },
+    'meeting context wired (CALENDAR_ENABLED=true)',
+  );
+  return buildMeetingContext({
+    calendar: buildCalendarAdapter(),
+    options: {
+      lookaheadDays: env.CALENDAR_LOOKAHEAD_DAYS,
+      maxEvents: env.CALENDAR_MAX_EVENTS,
+      calendarId: env.CALENDAR_ID,
+      timeZone: env.CALENDAR_TZ,
+    },
   });
 }
 

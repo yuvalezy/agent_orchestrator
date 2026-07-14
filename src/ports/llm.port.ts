@@ -91,6 +91,15 @@ export interface DraftRequest {
    * src/knowledge/style-lane.ts.
    */
   voiceGuidance?: string[];
+  /**
+   * Upcoming meetings (M5(d)) — short human lines ("Tue Jul 15, 2:00 PM — Project kickoff") for
+   * meetings the drafted customer is on, pulled from the founder's calendar at draft time. Draft
+   * CONTEXT the reply may acknowledge (e.g. "see you Tuesday"); like voiceGuidance these are NOT a
+   * knowledge/citation source — the model must never cite them, never treat them as product facts,
+   * and never list them in `usedSourceIndexes`. Optional (absent/empty when CALENDAR_ENABLED is off
+   * or the customer has no upcoming meetings). See src/triage/meeting-context.ts.
+   */
+  upcomingMeetings?: string[];
 }
 
 /**
