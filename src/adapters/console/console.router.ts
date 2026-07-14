@@ -9,6 +9,7 @@ import { cancelOutbound, customerDetail, customerTimeline, decisionDetail, inbox
 import { ConsoleSessionStore } from './console-session';
 import { buildConsoleApprovalsRouter } from './console-approvals.router';
 import { buildConsoleSettingsRouter } from './console-settings.router';
+import { buildConsoleConnectorsRouter, buildConnectorsOAuthCallback } from './console-connectors.router';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -68,6 +69,12 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
     sessions.destroy(req, res);
     res.status(204).end();
   });
+
+  // PUBLIC (pre-session) Google OAuth callback (B2). Google redirects here as a top-level cross-site
+  // navigation, so the strict-sameSite session cookie is absent — this route authenticates via the
+  // SIGNED `state` minted by the session+CSRF-guarded POST /oauth/start, not the session. Registered
+  // before the session guard so it is reachable; the guarded connectors router mounts below.
+  router.get('/api/connectors/oauth/callback', buildConnectorsOAuthCallback({ sessionSecret: config.sessionSecret }));
 
   router.use('/api', (req, res, next) => {
     const session = sessions.get(req);
@@ -258,6 +265,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string): R
 
   router.use('/api/approvals', buildConsoleApprovalsRouter());
   router.use('/api/settings', buildConsoleSettingsRouter());
+  router.use('/api/connectors', buildConsoleConnectorsRouter({ sessionSecret: config.sessionSecret }));
 
   router.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
 
