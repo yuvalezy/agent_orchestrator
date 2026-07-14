@@ -6,3 +6,6 @@ web/dist/
 *.log
 tmp/
 client_secret_612098052688-h4h2vvr7tiuv98pgdmrs3v1rdb4humog.apps.googleusercontent.com.json
+
+# Local OAuth client secret (never commit)
+/secrets/
