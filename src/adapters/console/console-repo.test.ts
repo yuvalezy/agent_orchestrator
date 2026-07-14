@@ -2,11 +2,12 @@ import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { closePool, query } from '../../db';
-import { decisionDetail, inboxDetail, listDecisions, listInbox, requeueInbox } from './console-repo';
+import { decisionDetail, inboxDetail, listDecisions, listInbox, listOutbound, outboundDetail, requeueInbox } from './console-repo';
 
 const tag = `test-console-audit-${crypto.randomUUID()}`;
 
 after(async () => {
+  await query('DELETE FROM agent_outbound_queue WHERE recipient_address LIKE $1', [`${tag}%`]).catch(() => {});
   await query('DELETE FROM agent_decisions WHERE customer_id IN (SELECT id FROM agent_customers WHERE bp_ref LIKE $1)', [`${tag}%`]).catch(() => {});
   await query(`DELETE FROM console_audit_events WHERE entity_type = 'agent_inbox' AND entity_id IN (SELECT id::text FROM agent_inbox WHERE channel_message_id LIKE $1)`, [`${tag}%`]).catch(() => {});
   await query('DELETE FROM agent_inbox WHERE channel_message_id LIKE $1', [`${tag}%`]).catch(() => {});
@@ -84,4 +85,38 @@ test('inbox and decision list contracts paginate metadata and reject unsafe filt
   assert.equal(await listDecisions({ type: 'anything' }), null);
   assert.equal(await listDecisions({ outcome: 'anything' }), null);
   assert.equal(await listInbox({ search: 'x'.repeat(101) }), null);
+});
+
+test('outbound list filters only metadata and reserves message content for detail', async (t) => {
+  const channel = await query<{ id: string; name: string }>('SELECT id::text, name FROM channel_instances LIMIT 1').catch(() => null);
+  if (!channel?.rows[0]) return t.skip('database or seeded channel instance unavailable');
+
+  const customer = await query<{ id: string }>(
+    'INSERT INTO agent_customers (bp_ref, display_name) VALUES ($1, $2) RETURNING id::text',
+    [`${tag}-outbound-customer`, 'Outbound metadata customer'],
+  );
+  await Promise.all(['one', 'two'].map((suffix) => query(
+    `INSERT INTO agent_outbound_queue (channel_instance_id, customer_id, recipient_address, subject, body, status, is_draft)
+     VALUES ($1, $2, $3, $4, $5, 'approved', false)`,
+    [channel.rows[0].id, customer.rows[0].id, `${tag}-${suffix}@example.test`, `Outbound metadata ${suffix}`, 'full outbound body is detail-only'],
+  )));
+
+  const page = await listOutbound({ status: 'approved', isDraft: 'false', channel: channel.rows[0].name, customer: 'outbound metadata customer', limit: '1' });
+  assert.ok(page);
+  assert.equal(page.data.length, 1);
+  assert.ok(page.nextCursor);
+  assert.equal('body' in page.data[0], false);
+  assert.equal('recipient_address' in page.data[0], false);
+  const detail = await outboundDetail(String(page.data[0].id));
+  assert.equal(detail?.body, 'full outbound body is detail-only');
+  assert.match(String(detail?.recipient_address), new RegExp(`^${tag}`));
+  const next = await listOutbound({ status: 'approved', isDraft: 'false', channel: channel.rows[0].name, customer: 'outbound metadata customer', limit: '1', cursor: page.nextCursor });
+  assert.ok(next);
+  assert.equal(next.data.length, 1);
+  assert.notEqual(next.data[0].id, page.data[0].id);
+  const draftsOnly = await listOutbound({ isDraft: 'true', customer: 'outbound metadata customer' });
+  assert.ok(draftsOnly);
+  assert.equal(draftsOnly.data.length, 0);
+  assert.equal(await listOutbound({ isDraft: 'yes' }), null);
+  assert.equal(await listOutbound({ channel: 'x'.repeat(101) }), null);
 });

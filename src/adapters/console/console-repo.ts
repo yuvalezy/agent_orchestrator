@@ -22,6 +22,7 @@ function decodeCursor(value: unknown): Cursor | null {
 }
 
 function encodeCursor(row: { created_at: string; id: string }): string {
+  // Paginated queries select UTC text with microsecond precision; a JS Date would lose it.
   return Buffer.from(JSON.stringify({ at: row.created_at, id: row.id })).toString('base64url');
 }
 
@@ -54,7 +55,7 @@ export async function listInbox(input: { status?: unknown; search?: unknown; cur
   if (status === undefined) return null;
 
   const { rows } = await query<Record<string, unknown>>(
-    `SELECT i.id::text, i.created_at, i.received_at, i.status, i.retry_count,
+    `SELECT i.id::text, to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, i.received_at, i.status, i.retry_count,
             i.channel_instance_id::text, ci.name AS channel_name,
             i.customer_id::text, c.display_name AS customer_name,
             i.sender_name, i.subject
@@ -89,26 +90,39 @@ export async function inboxDetail(id: string): Promise<Record<string, unknown> |
   return rows[0] ?? null;
 }
 
-export async function listOutbound(input: { status?: unknown; cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
+function parseBooleanFilter(value: unknown): boolean | null | undefined {
+  if (value === undefined) return null;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return undefined;
+}
+
+export async function listOutbound(input: { status?: unknown; isDraft?: unknown; channel?: unknown; customer?: unknown; cursor?: unknown; limit?: unknown }): Promise<Page<Record<string, unknown>> | null> {
   const limit = parseLimit(input.limit);
   const cursor = decodeCursor(input.cursor);
+  const isDraft = parseBooleanFilter(input.isDraft);
+  const channel = parseMetadataSearch(input.channel);
+  const customer = parseMetadataSearch(input.customer);
   if (limit === null || (input.cursor !== undefined && !cursor)) return null;
   const status = typeof input.status === 'string' && ['pending', 'approved', 'sending', 'sent', 'failed', 'cancelled'].includes(input.status)
     ? input.status
     : input.status === undefined ? null : undefined;
-  if (status === undefined) return null;
+  if (status === undefined || isDraft === undefined || channel === undefined || customer === undefined) return null;
   const { rows } = await query<Record<string, unknown>>(
-    `SELECT o.id::text, o.created_at, o.status, o.is_draft, o.retry_count,
+    `SELECT o.id::text, to_char(o.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, o.status, o.is_draft, o.retry_count,
             o.channel_instance_id::text, ci.name AS channel_name,
             o.customer_id::text, c.display_name AS customer_name, o.subject
        FROM agent_outbound_queue o
        JOIN channel_instances ci ON ci.id = o.channel_instance_id
   LEFT JOIN agent_customers c ON c.id = o.customer_id
       WHERE ($1::text IS NULL OR o.status = $1)
-        AND ($2::timestamptz IS NULL OR (o.created_at, o.id) < ($2::timestamptz, $3::bigint))
+        AND ($2::boolean IS NULL OR o.is_draft = $2)
+        AND ($3::text IS NULL OR ci.name ILIKE '%' || $3 || '%')
+        AND ($4::text IS NULL OR c.display_name ILIKE '%' || $4 || '%')
+        AND ($5::timestamptz IS NULL OR (o.created_at, o.id) < ($5::timestamptz, $6::bigint))
    ORDER BY o.created_at DESC, o.id DESC
-      LIMIT $4`,
-    [status, cursor?.at ?? null, cursor?.id ?? null, limit + 1],
+      LIMIT $7`,
+    [status, isDraft, channel, customer, cursor?.at ?? null, cursor?.id ?? null, limit + 1],
   );
   const hasMore = rows.length > limit;
   const data = rows.slice(0, limit);
@@ -143,7 +157,7 @@ export async function listDecisions(input: { type?: unknown; outcome?: unknown; 
     : input.outcome === undefined ? null : undefined;
   if (limit === null || search === undefined || type === undefined || outcome === undefined || (input.cursor !== undefined && !cursor)) return null;
   const { rows } = await query<Record<string, unknown>>(
-    `SELECT d.id::text, d.created_at, d.resolved_at, d.decision_type, d.outcome,
+    `SELECT d.id::text, to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, d.resolved_at, d.decision_type, d.outcome,
             d.customer_id::text, c.display_name AS customer_name, d.inbox_message_id::text
        FROM agent_decisions d
   LEFT JOIN agent_customers c ON c.id = d.customer_id
@@ -180,7 +194,7 @@ export async function listCustomers(input: { search?: unknown; cursor?: unknown;
   const search = typeof input.search === 'string' ? input.search.trim() || null : input.search === undefined ? null : undefined;
   if (limit === null || search === undefined || (input.cursor !== undefined && !cursor)) return null;
   const { rows } = await query<Record<string, unknown>>(
-    `SELECT c.id::text, c.created_at, c.display_name, c.bp_ref, c.timezone, c.preferred_language,
+    `SELECT c.id::text, to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, c.display_name, c.bp_ref, c.timezone, c.preferred_language,
             c.backfill_status, c.project_ref, c.telegram_topic_id,
             (SELECT count(*)::int FROM agent_inbox i WHERE i.customer_id = c.id) AS inbox_count
        FROM agent_customers c
