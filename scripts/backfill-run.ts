@@ -9,6 +9,7 @@ import { buildTelegramNotifier } from '../src/adapters/telegram/factory';
 import { recordBackfillProposal } from '../src/decisions/decisions';
 import { getAppState, setAppState } from '../src/db/app-state';
 import { runBackfill } from '../src/knowledge/backfill';
+import { settingsStore } from '../src/config/settings-store';
 import { createBackfillCore } from './lib-backfill';
 
 // LIVE backfill for ONE customer (default HolaDoc). Reads agent_inbox + Gmail + WhatsApp history,
@@ -27,6 +28,9 @@ const markerKey = (customerId: string, threadKey: string): string =>
 
 async function main(): Promise<void> {
   const customerId = process.argv[2] || DEFAULT_CUSTOMER;
+  // DB is authoritative for the backfill flags + knobs (BACKFILL_ENABLED / JUDGE_VOTES /
+  // COLLAPSE_MAX_DISTANCE) — overlay before reading them so a console change applies here.
+  await settingsStore.loadAndOverlay();
   if (!env.BACKFILL_ENABLED) {
     logger.error('BACKFILL_ENABLED is not true — refusing to run the live sweep');
     process.exitCode = 1;

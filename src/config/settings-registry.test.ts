@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SETTINGS_REGISTRY, SETTINGS_KEYS, settingDef } from './settings-registry';
+import { SETTINGS_REGISTRY, SETTINGS_KEYS, settingDef, coerceSettingValue } from './settings-registry';
 
-// The 22 non-secret `*_ENABLED` flags (blueprint scope pass 1). If a flag is added
-// to / removed from the registry, update this count deliberately.
+// Pass 1 = the 22 `*_ENABLED` booleans; pass 2 appends the 7 tuned knobs (LLM routing/effort +
+// backfill determinism + style-lane size). If a setting is added/removed, update this list.
 const EXPECTED_KEYS = [
   'OUTBOUND_ENABLED',
   'OUTBOUND_EMAIL_ENABLED',
@@ -27,29 +27,79 @@ const EXPECTED_KEYS = [
   'CROSS_CHANNEL_DEDUP_ENABLED',
   'TASK_INVENTORY_ENABLED',
   'CALENDAR_ENABLED',
+  // pass-2 tuning knobs
+  'LLM_DEFAULT_PROVIDER',
+  'LLM_FALLBACK_CHAIN',
+  'LLM_ANTHROPIC_EFFORT',
+  'LLM_OPENAI_EFFORT',
+  'BACKFILL_JUDGE_VOTES',
+  'BACKFILL_COLLAPSE_MAX_DISTANCE',
+  'STYLE_LANE_MAX',
 ];
 
-test('registry holds exactly the 22 expected flags with unique keys', () => {
-  assert.equal(SETTINGS_REGISTRY.length, 22);
-  assert.equal(SETTINGS_KEYS.length, 22);
+test('registry holds exactly the expected settings with unique keys', () => {
+  assert.equal(SETTINGS_REGISTRY.length, EXPECTED_KEYS.length);
+  assert.equal(SETTINGS_KEYS.length, EXPECTED_KEYS.length);
   assert.deepEqual([...SETTINGS_KEYS], EXPECTED_KEYS);
-  assert.equal(new Set(SETTINGS_KEYS).size, 22, 'keys must be unique');
+  assert.equal(new Set(SETTINGS_KEYS).size, EXPECTED_KEYS.length, 'keys must be unique');
 });
 
-test('every def is well-formed (boolean type, false default, valid applyMode)', () => {
+test('every def is well-formed (type-matched default, valid applyMode, enum options, number bounds)', () => {
+  const TYPES = ['boolean', 'number', 'string', 'enum'];
   for (const def of SETTINGS_REGISTRY) {
-    assert.equal(def.type, 'boolean', `${def.key} must be boolean in pass 1`);
-    assert.equal(def.default, false, `${def.key} default mirrors the zod default (false)`);
+    assert.ok(TYPES.includes(def.type), `${def.key} type`);
     assert.ok(['live', 'restart'].includes(def.applyMode), `${def.key} applyMode`);
     assert.ok(def.label.length > 0 && def.description.length > 0, `${def.key} label/description`);
     assert.ok(def.category.length > 0, `${def.key} category`);
+    if (def.type === 'boolean') assert.equal(typeof def.default, 'boolean', `${def.key} default`);
+    if (def.type === 'string') assert.equal(typeof def.default, 'string', `${def.key} default`);
+    if (def.type === 'number') {
+      assert.equal(typeof def.default, 'number', `${def.key} default`);
+      if (def.min !== undefined) assert.ok((def.default as number) >= def.min, `${def.key} default ≥ min`);
+      if (def.max !== undefined) assert.ok((def.default as number) <= def.max, `${def.key} default ≤ max`);
+    }
+    if (def.type === 'enum') {
+      assert.ok(def.options && def.options.length > 0, `${def.key} enum needs options`);
+      assert.ok(def.options!.includes(def.default as string), `${def.key} default must be an option`);
+    }
   }
 });
 
-test('all 22 flags are restart-apply (each is read once at boot, none per-operation)', () => {
+test('every *_ENABLED flag is a restart-apply boolean', () => {
   for (const def of SETTINGS_REGISTRY) {
-    assert.equal(def.applyMode, 'restart', `${def.key} is a boot-read gate`);
+    if (def.key.endsWith('_ENABLED')) {
+      assert.equal(def.type, 'boolean', `${def.key} is a flag`);
+      assert.equal(def.default, false, `${def.key} default mirrors the zod default (false)`);
+      assert.equal(def.applyMode, 'restart', `${def.key} is a boot-read gate`);
+    }
   }
+});
+
+test('the LLM effort + backfill tuning knobs are live-apply', () => {
+  for (const key of ['LLM_ANTHROPIC_EFFORT', 'LLM_OPENAI_EFFORT', 'BACKFILL_JUDGE_VOTES', 'BACKFILL_COLLAPSE_MAX_DISTANCE']) {
+    assert.equal(settingDef(key)?.applyMode, 'live', `${key} applies without a restart`);
+  }
+});
+
+test('coerceSettingValue validates per type/constraint', () => {
+  const provider = settingDef('LLM_DEFAULT_PROVIDER')!;
+  assert.deepEqual(coerceSettingValue(provider, 'openai'), { value: 'openai' });
+  assert.ok('error' in coerceSettingValue(provider, 'grok'), 'enum rejects a non-option');
+  assert.ok('error' in coerceSettingValue(provider, 3), 'enum rejects a non-string');
+
+  const votes = settingDef('BACKFILL_JUDGE_VOTES')!;
+  assert.deepEqual(coerceSettingValue(votes, '3'), { value: 3 }, 'number accepts a numeric string');
+  assert.ok('error' in coerceSettingValue(votes, 0), 'below min rejected');
+  assert.ok('error' in coerceSettingValue(votes, 99), 'above max rejected');
+  assert.ok('error' in coerceSettingValue(votes, 2.5), 'non-integer rejected');
+
+  const dist = settingDef('BACKFILL_COLLAPSE_MAX_DISTANCE')!;
+  assert.deepEqual(coerceSettingValue(dist, '0.35'), { value: 0.35 }, 'fractional number allowed');
+  assert.ok('error' in coerceSettingValue(dist, 5), 'above max rejected');
+
+  const flag = settingDef('OUTBOUND_ENABLED')!;
+  assert.deepEqual(coerceSettingValue(flag, true), { value: true });
+  assert.ok('error' in coerceSettingValue(flag, 'yes'), 'boolean rejects a string');
 });
 
 test('dependsOn always points at another key IN the registry', () => {

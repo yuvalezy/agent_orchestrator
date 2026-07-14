@@ -1,6 +1,6 @@
 import { Router, type Response } from 'express';
 import { logger } from '../../logger';
-import { SETTINGS_REGISTRY, settingDef, type ApplyMode } from '../../config/settings-registry';
+import { SETTINGS_REGISTRY, settingDef, coerceSettingValue, type ApplyMode } from '../../config/settings-registry';
 import { settingsStore, type SettingsStore } from '../../config/settings-store';
 import { query } from '../../db';
 import type { ConsoleAuditContext } from './console-repo';
@@ -50,23 +50,28 @@ export function buildConsoleSettingsRouter(deps: { store?: SettingsStore } = {})
         value: store.get(def.key),
         default: def.default,
         dependsOn: def.dependsOn ?? null,
+        options: def.options ?? null,
+        min: def.min ?? null,
+        max: def.max ?? null,
+        integer: def.integer ?? null,
       });
     }
     const categories = Array.from(byCategory, ([category, settings]) => ({ category, settings }));
     res.json({ data: { categories } });
   });
 
-  // PUT /:key → toggle a single flag. 400 on unknown key or non-boolean value.
+  // PUT /:key → update a single setting. 400 on unknown key or a value that fails the
+  // setting's type/constraint validation (coerced per its registry def).
   router.put('/:key', async (req, res, next) => {
     const key = req.params.key;
     const def = settingDef(key);
     if (!def) return void res.status(400).json({ error: 'unknown setting key' });
-    const value = (req.body as { value?: unknown } | undefined)?.value;
-    if (typeof value !== 'boolean') return void res.status(400).json({ error: 'value must be a boolean' });
+    const coerced = coerceSettingValue(def, (req.body as { value?: unknown } | undefined)?.value);
+    if ('error' in coerced) return void res.status(400).json({ error: coerced.error });
     try {
-      const { applyMode } = await store.set(key, value, auditCtx(res)?.actor);
+      const { applyMode } = await store.set(key, coerced.value, auditCtx(res)?.actor);
       await auditSetting(auditCtx(res), key, applyMode);
-      res.status(200).json({ data: { key, value, applyMode, needsRestart: applyMode === 'restart' } });
+      res.status(200).json({ data: { key, value: coerced.value, applyMode, needsRestart: applyMode === 'restart' } });
     } catch (err) {
       next(err);
     }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createSettingsStore, type SettingsQuery } from './settings-store';
-import { SETTINGS_REGISTRY } from './settings-registry';
+import { SETTINGS_REGISTRY, type SettingValue } from './settings-registry';
 
 // In-memory fake of the app_settings table + a query seam matching SettingsQuery.
 function fakeDb(initial: { key: string; value: string }[] = []) {
@@ -24,8 +24,8 @@ function fakeDb(initial: { key: string; value: string }[] = []) {
 
 test('first boot seeds every missing key from env WITHOUT disabling enabled flags', async () => {
   const db = fakeDb([]); // empty table
-  const env: Record<string, boolean> = { OUTBOUND_ENABLED: true, KNOWLEDGE_SYNC_ENABLED: true };
-  const store = createSettingsStore({ query: db.query, env });
+  const env: Record<string, SettingValue> = { OUTBOUND_ENABLED: true, KNOWLEDGE_SYNC_ENABLED: true };
+  const store = createSettingsStore({ query: db.query, env, processEnv: {} });
 
   await store.loadAndOverlay();
 
@@ -36,7 +36,7 @@ test('first boot seeds every missing key from env WITHOUT disabling enabled flag
   // Unset flags resolve to their registry default (false).
   assert.equal(store.get('CALENDAR_ENABLED'), false);
 
-  // All 22 keys were seeded as ON CONFLICT DO NOTHING inserts, carrying the env value.
+  // All keys were seeded as ON CONFLICT DO NOTHING inserts, carrying the env value.
   assert.equal(db.writes.length, SETTINGS_REGISTRY.length);
   assert.ok(db.writes.every((w) => /DO NOTHING/i.test(w.text)));
   const seededOutbound = db.rows.find((r) => r.key === 'OUTBOUND_ENABLED');
@@ -45,22 +45,22 @@ test('first boot seeds every missing key from env WITHOUT disabling enabled flag
 
 test('DB value wins over env on overlay (env disagreeing is corrected in place)', async () => {
   const db = fakeDb([{ key: 'OUTBOUND_ENABLED', value: 'false' }]); // DB says OFF
-  const env: Record<string, boolean> = { OUTBOUND_ENABLED: true }; // env says ON
-  const store = createSettingsStore({ query: db.query, env });
+  const env: Record<string, SettingValue> = { OUTBOUND_ENABLED: true }; // env says ON
+  const store = createSettingsStore({ query: db.query, env, processEnv: {} });
 
   await store.loadAndOverlay();
 
   assert.equal(store.get('OUTBOUND_ENABLED'), false, 'DB is authoritative');
   assert.equal(env.OUTBOUND_ENABLED, false, 'the shared env object is overlaid to the DB value');
-  // OUTBOUND_ENABLED already existed → NOT re-seeded; only the other 21 are inserted.
+  // OUTBOUND_ENABLED already existed → NOT re-seeded; only the others are inserted.
   assert.equal(db.writes.length, SETTINGS_REGISTRY.length - 1);
   assert.ok(!db.writes.some((w) => w.params[0] === 'OUTBOUND_ENABLED'));
 });
 
 test('set() writes the DB row, overlays env, and returns the applyMode', async () => {
   const db = fakeDb([]);
-  const env: Record<string, boolean> = {};
-  const store = createSettingsStore({ query: db.query, env });
+  const env: Record<string, SettingValue> = {};
+  const store = createSettingsStore({ query: db.query, env, processEnv: {} });
   await store.loadAndOverlay();
   const seedWrites = db.writes.length;
 
@@ -75,14 +75,45 @@ test('set() writes the DB row, overlays env, and returns the applyMode', async (
   assert.equal(db.rows.find((r) => r.key === 'CALENDAR_ENABLED')?.value, 'true');
 });
 
+test('typed knobs seed from process.env (effort) / env (number), and set() coerces + serializes', async () => {
+  const db = fakeDb([]);
+  const env: Record<string, SettingValue> = { BACKFILL_JUDGE_VOTES: 3 }; // zod-resolved number
+  const processEnv: Record<string, string | undefined> = { LLM_ANTHROPIC_EFFORT: 'low' }; // not in zod
+  const store = createSettingsStore({ query: db.query, env, processEnv });
+  await store.loadAndOverlay();
+
+  // Seeded from the live process values, not defaults.
+  assert.equal(store.get('BACKFILL_JUDGE_VOTES'), 3);
+  assert.equal(store.get('LLM_ANTHROPIC_EFFORT'), 'low');
+  assert.equal(db.rows.find((r) => r.key === 'BACKFILL_JUDGE_VOTES')?.value, '3');
+  assert.equal(db.rows.find((r) => r.key === 'LLM_ANTHROPIC_EFFORT')?.value, 'low');
+  // Provider (enum, not in env/processEnv) falls to its registry default.
+  assert.equal(store.get('LLM_DEFAULT_PROVIDER'), 'deepseek');
+
+  // set() an enum → live, writes the string form to BOTH targets so per-call reads pick it up.
+  const r = await store.set('LLM_ANTHROPIC_EFFORT', 'medium', 'tester');
+  assert.deepEqual(r, { applyMode: 'live' });
+  assert.equal(store.get('LLM_ANTHROPIC_EFFORT'), 'medium');
+  assert.equal(processEnv.LLM_ANTHROPIC_EFFORT, 'medium', 'process.env updated for the per-call effort read');
+
+  // set() a number → typed env value + serialized DB text.
+  await store.set('BACKFILL_JUDGE_VOTES', 5, 'tester');
+  assert.equal(env.BACKFILL_JUDGE_VOTES, 5);
+  assert.equal(db.rows.find((r) => r.key === 'BACKFILL_JUDGE_VOTES')?.value, '5');
+
+  // set() rejects an out-of-range / wrong-type value.
+  await assert.rejects(() => store.set('BACKFILL_JUDGE_VOTES', 99), /Invalid value/);
+  await assert.rejects(() => store.set('LLM_DEFAULT_PROVIDER', 'grok'), /Invalid value/);
+});
+
 test('set() rejects a key that is not in the registry', async () => {
-  const store = createSettingsStore({ query: fakeDb([]).query, env: {} });
+  const store = createSettingsStore({ query: fakeDb([]).query, env: {}, processEnv: {} });
   await assert.rejects(() => store.set('NOPE_ENABLED', true), /Unknown setting key/);
 });
 
 test('all() snapshots every registry key from the overlay cache', async () => {
   const db = fakeDb([{ key: 'OUTBOUND_ENABLED', value: 'true' }]);
-  const store = createSettingsStore({ query: db.query, env: {} });
+  const store = createSettingsStore({ query: db.query, env: {}, processEnv: {} });
   await store.loadAndOverlay();
 
   const all = store.all();

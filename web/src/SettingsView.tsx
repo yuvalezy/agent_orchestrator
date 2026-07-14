@@ -1,20 +1,24 @@
-import { type ReactElement, type ReactNode, useState } from 'react';
+import { type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CircleAlert, RotateCw } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
 
-// Settings surface (Contract B3): render the DB-authoritative feature flags grouped by category as
-// labeled toggles. Almost all flags apply at boot, so a "needs restart" badge + a persistent banner
-// tell the founder to run ./debug.sh. Self-contained local primitives keep App.tsx edits to 3 lines.
+// Settings surface (Contract B3 + pass-2 tuning knobs): render the DB-authoritative config
+// grouped by category. Booleans are toggles; enums are selects; numbers/strings are inputs that
+// save on blur/Enter. Restart-apply settings carry a "needs restart" badge + a persistent banner;
+// live settings (LLM effort, backfill knobs) apply without a restart.
 
 type ApplyMode = 'live' | 'restart';
+type SettingType = 'boolean' | 'number' | 'string' | 'enum';
+type SettingValue = boolean | number | string;
 interface SettingRow {
-  key: string; label: string; description: string; type: 'boolean';
-  applyMode: ApplyMode; value: boolean; default: boolean; dependsOn?: string;
+  key: string; label: string; description: string; type: SettingType;
+  applyMode: ApplyMode; value: SettingValue; default: SettingValue; dependsOn?: string | null;
+  options?: string[] | null; min?: number | null; max?: number | null; integer?: boolean | null;
 }
 interface Category { category: string; settings: SettingRow[] }
 interface SettingsPayload { data: { categories: Category[] } }
-interface PutResult { data: { key: string; value: boolean; applyMode: ApplyMode; needsRestart: boolean } }
+interface PutResult { data: { key: string; value: SettingValue; applyMode: ApplyMode; needsRestart: boolean } }
 
 function Loading(): ReactElement { return <div className="mt-8 rounded-xl border border-zinc-800 p-8 text-sm text-zinc-400">Loading settings…</div>; }
 function ErrorState({ message }: { message: string }): ReactElement { return <div className="mt-8 flex items-center gap-3 rounded-xl border border-red-900/60 bg-red-950/30 p-5 text-sm text-red-200"><CircleAlert size={18} />{message}</div>; }
@@ -34,6 +38,64 @@ function Toggle({ checked, disabled, pending, onChange }: { checked: boolean; di
   );
 }
 
+const inputCls = 'rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-100 outline-none focus:border-emerald-400/60 disabled:opacity-50';
+
+/** Enum select — value props are always concrete strings (never empty). Applies on change. */
+function EnumControl({ s, disabled, pending, onSave }: { s: SettingRow; disabled: boolean; pending: boolean; onSave: (v: string) => void }): ReactElement {
+  return (
+    <select
+      className={inputCls}
+      disabled={disabled || pending}
+      value={String(s.value)}
+      onChange={(e) => e.target.value !== String(s.value) && onSave(e.target.value)}
+    >
+      {(s.options ?? []).map((o) => <option key={o} value={o}>{o}</option>)}
+    </select>
+  );
+}
+
+/** Number/string input — local draft, saves on blur or Enter when it differs from the stored value. */
+function TextControl({ s, disabled, pending, onSave }: { s: SettingRow; disabled: boolean; pending: boolean; onSave: (v: SettingValue) => void }): ReactElement {
+  const [draft, setDraft] = useState<string>(String(s.value));
+  useEffect(() => { setDraft(String(s.value)); }, [s.value]);
+  const dirty = draft !== String(s.value);
+
+  const commit = (): void => {
+    if (!dirty) return;
+    if (s.type === 'number') {
+      const n = Number(draft);
+      if (!Number.isFinite(n)) { setDraft(String(s.value)); return; } // reject → revert; server also validates
+      onSave(n);
+    } else {
+      onSave(draft);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      {dirty && <span className="text-[11px] text-amber-300/80">unsaved</span>}
+      <input
+        type={s.type === 'number' ? 'number' : 'text'}
+        className={`${inputCls} w-40`}
+        disabled={disabled || pending}
+        value={draft}
+        min={s.type === 'number' && s.min != null ? s.min : undefined}
+        max={s.type === 'number' && s.max != null ? s.max : undefined}
+        step={s.type === 'number' ? (s.integer ? 1 : 'any') : undefined}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur(); } if (e.key === 'Escape') { setDraft(String(s.value)); } }}
+      />
+    </div>
+  );
+}
+
+function SettingControl({ s, disabled, pending, onSave }: { s: SettingRow; disabled: boolean; pending: boolean; onSave: (v: SettingValue) => void }): ReactElement {
+  if (s.type === 'boolean') return <Toggle checked={s.value === true} disabled={disabled} pending={pending} onChange={() => onSave(!(s.value === true))} />;
+  if (s.type === 'enum') return <EnumControl s={s} disabled={disabled} pending={pending} onSave={onSave} />;
+  return <TextControl s={s} disabled={disabled} pending={pending} onSave={onSave} />;
+}
+
 export function SettingsView(): ReactElement {
   const client = useQueryClient();
   const query = useQuery({ queryKey: ['settings'], queryFn: () => api<SettingsPayload>('/settings') });
@@ -43,7 +105,7 @@ export function SettingsView(): ReactElement {
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
-    mutationFn: ({ key, value }: { key: string; value: boolean }) => api<PutResult>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+    mutationFn: ({ key, value }: { key: string; value: SettingValue }) => api<PutResult>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
     onMutate: ({ key }) => { setPendingKey(key); setError(null); },
     onSuccess: (res) => { if (res.data.needsRestart) setRestartRequired(true); return client.invalidateQueries({ queryKey: ['settings'] }); },
     onError: (err: ApiError) => setError(err.message),
@@ -56,9 +118,9 @@ export function SettingsView(): ReactElement {
   if (categories.length === 0) return <Panel title="Settings"><p className="text-sm text-zinc-500">No configurable settings are registered.</p></Panel>;
 
   const activeCategory = categories.find((c) => c.category === active) ?? categories[0];
-  // Effective value + label of every flag, so a child can tell whether its dependsOn parent (which may
-  // live in another category) is currently on and name it in the hint.
-  const valueOf = new Map<string, boolean>();
+  // Effective value + label of every setting, so a child can tell whether its dependsOn parent (which
+  // may live in another category) is currently on and name it in the hint.
+  const valueOf = new Map<string, SettingValue>();
   const labelOf = new Map<string, string>();
   categories.forEach((c) => c.settings.forEach((s) => { valueOf.set(s.key, s.value); labelOf.set(s.key, s.label); }));
 
@@ -67,7 +129,7 @@ export function SettingsView(): ReactElement {
       <div>
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-300">Configuration</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight">Settings</h1>
-        <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">Feature flags resolve from the database. Most apply when the orchestrator boots, so a saved change marked <span className="text-amber-200">needs restart</span> only takes effect after the next restart.</p>
+        <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">Configuration resolves from the database. Values marked <span className="text-amber-200">needs restart</span> apply at the next boot; the rest apply live.</p>
       </div>
 
       {restartRequired && (
@@ -107,12 +169,14 @@ export function SettingsView(): ReactElement {
                     <p className="mt-1 font-mono text-[11px] text-zinc-600">{s.key}</p>
                     {parentOff && <p className="mt-1 text-xs text-amber-300/80">Disabled — enable {parentLabel ?? s.dependsOn} first.</p>}
                   </div>
-                  <Toggle
-                    checked={s.value}
-                    disabled={parentOff}
-                    pending={pendingKey === s.key}
-                    onChange={() => mutation.mutate({ key: s.key, value: !s.value })}
-                  />
+                  <div className="shrink-0 pt-0.5">
+                    <SettingControl
+                      s={s}
+                      disabled={parentOff}
+                      pending={pendingKey === s.key}
+                      onSave={(value) => mutation.mutate({ key: s.key, value })}
+                    />
+                  </div>
                 </div>
               );
             })}
