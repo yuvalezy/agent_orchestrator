@@ -5,9 +5,9 @@ import assert from 'node:assert/strict';
 import bcrypt from 'bcryptjs';
 import { buildApp } from '../../app';
 import { loadConsoleConfig } from '../../config/console';
-import { buildConsoleRouter, portalTaskUrl, projectConsoleFailure } from './console.router';
+import { buildConsoleRouter, portalTaskUrl, projectConsoleFailure, type ConsoleRouterDeps } from './console.router';
 
-async function withConsole(fn: (baseUrl: string) => Promise<void>): Promise<void> {
+async function withConsole(fn: (baseUrl: string) => Promise<void>, deps: ConsoleRouterDeps = {}): Promise<void> {
   const hash = await bcrypt.hash('correct horse battery staple', 4);
   const config = loadConsoleConfig({
     CONSOLE_PASSWORD_HASH: hash,
@@ -15,7 +15,7 @@ async function withConsole(fn: (baseUrl: string) => Promise<void>): Promise<void
     CONSOLE_LOGIN_MAX_ATTEMPTS: '2',
   });
   assert.ok(config);
-  const server = createServer(buildApp({ consoleRouter: buildConsoleRouter(config) }));
+  const server = createServer(buildApp({ consoleRouter: buildConsoleRouter(config, undefined, deps) }));
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
@@ -32,6 +32,22 @@ test('console config fails closed without both valid secrets', () => {
   assert.equal(loadConsoleConfig({}), null);
   assert.equal(loadConsoleConfig({ CONSOLE_PASSWORD_HASH: 'not-a-hash', CONSOLE_SESSION_SECRET: 'a'.repeat(32) }), null);
   assert.equal(loadConsoleConfig({ CONSOLE_PASSWORD_HASH: '$2b$12$abcdefghijklmnopqrstuvabcdefghijklmnopqrstuvabcdefghijkl', CONSOLE_SESSION_SECRET: 'short' }), null);
+});
+
+test('console query requires CSRF and uses the injected founder query service', async () => {
+  const calls: Array<{ question: string; opts: unknown }> = [];
+  await withConsole(async (baseUrl) => {
+    const login = await fetch(`${baseUrl}/console/api/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }) });
+    const cookie = login.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie);
+    const csrf = ((await login.json()) as { data: { csrfToken: string } }).data.csrfToken;
+    const forbidden = await fetch(`${baseUrl}/console/api/query`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ question: 'how?', scope: 'internal', customerId: null }) });
+    assert.equal(forbidden.status, 403);
+    const answer = await fetch(`${baseUrl}/console/api/query`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-console-csrf': csrf }, body: JSON.stringify({ question: 'how?', scope: 'internal', customerId: null }) });
+    assert.equal(answer.status, 200);
+    assert.deepEqual(calls, [{ question: 'how?', opts: { forceInternal: true } }]);
+    assert.deepEqual(await answer.json(), { data: { scope: { kind: 'internal' }, answer: 'grounded', citations: [] } });
+  }, { query: { answer: async (question, opts) => { calls.push({ question, opts }); return { scope: { kind: 'internal' as const }, answer: 'grounded', citations: [] }; } } });
 });
 
 test('console failure projection omits an attached payload and exception message', () => {

@@ -17,6 +17,7 @@ import { settingsStore } from './config/settings-store';
 import { tryResolveCredential } from './config/credentials';
 import { buildAdminRouter } from './adapters/admin/admin.router';
 import { buildConsoleRouter } from './adapters/console/console.router';
+import { buildQueryEngineService } from './adapters/query/factory';
 import { loadConsoleConfig } from './config/console';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
@@ -142,6 +143,9 @@ async function main(): Promise<void> {
         env.OPENAI_BASE_URL,
         { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
       ),
+      // Reuse the same isolated founder query service used by Telegram /ask. The
+      // console renders failures itself, so it intentionally has no Telegram alert.
+      query: buildQueryEngineService(async () => {}),
     });
     logger.info('founder console router mounted at /console');
   } else {

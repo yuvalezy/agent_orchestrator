@@ -29,6 +29,14 @@ test('a customer match → customer scope carrying the resolved id + name', asyn
   assert.deepEqual(scope, { kind: 'customer', customerId: 'c1', customerName: 'HolaDoc' });
 });
 
+test('an explicit console customer scope bypasses name inference', async () => {
+  const spy = { calls: [] as string[] };
+  const r = resolver(null, spy);
+  const scope = await r.resolveScope('unrelated question', { customer: { customerId: 'c-explicit', customerName: 'Acme' } });
+  assert.deepEqual(scope, { kind: 'customer', customerId: 'c-explicit', customerName: 'Acme' });
+  assert.equal(spy.calls.length, 0);
+});
+
 test('no customer match → internal fallback (founder path degrades to the project corpus)', async () => {
   const r = resolver(null);
   const scope = await r.resolveScope('how does the outbound drainer gate sends?');

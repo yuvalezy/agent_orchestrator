@@ -16,6 +16,7 @@ import {
   listMemorySources, retireGuidance, supersedeGuidance, type GuidanceKind, type GuidanceScope,
 } from './console-memory-repo';
 import type { EmbeddingPort } from '../../ports/embedding.port';
+import type { QueryService } from '../../query/query-service';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -65,6 +66,8 @@ function withPortalTaskLink(data: Record<string, unknown>, portalBaseUrl: string
 export interface ConsoleRouterDeps {
   /** Optional only in isolated router tests. Guidance writes fail closed when absent. */
   embedding?: EmbeddingPort;
+  /** Existing founder query engine; absent when QUERY_ENGINE_ENABLED is off. */
+  query?: QueryService | null;
 }
 
 function parseGuidanceBody(value: unknown): { scope: GuidanceScope; customerId: string | null; kind: GuidanceKind; fact: string } | null {
@@ -83,6 +86,17 @@ async function embedGuidance(deps: ConsoleRouterDeps, fact: string): Promise<num
   if (!deps.embedding) return null;
   const [embedding] = await deps.embedding.embed([fact]);
   return embedding?.length ? embedding : null;
+}
+
+function parseConsoleQuery(value: unknown): { question: string; scope: 'internal' | 'customer'; customerId: string | null } | null {
+  if (!value || typeof value !== 'object') return null;
+  const body = value as Record<string, unknown>;
+  const question = typeof body.question === 'string' ? body.question.trim() : '';
+  const scope = body.scope === 'internal' || body.scope === 'customer' ? body.scope : null;
+  const customerId = body.customerId === undefined || body.customerId === null ? null : typeof body.customerId === 'string' && UUID_RE.test(body.customerId) ? body.customerId : undefined;
+  if (!question || question.length > 2000 || !scope || customerId === undefined) return null;
+  if ((scope === 'customer' && !customerId) || (scope === 'internal' && customerId !== null)) return null;
+  return { question, scope, customerId };
 }
 
 export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, deps: ConsoleRouterDeps = {}): Router {
@@ -355,6 +369,23 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, de
       if (!embedding) return void res.status(503).json({ error: 'guidance embedding unavailable' });
       const created = await createGuidance({ ...input, embedding }, res.locals.consoleAuditContext as ConsoleAuditContext);
       res.status(201).json({ data: { id: created.id, lifecycleStatus: 'active' } });
+    } catch (err) { next(err); }
+  });
+
+  // Founder query UI reuses the existing query service; it never directly calls
+  // either knowledge repository or reimplements retrieval/citation selection.
+  router.post('/api/query', async (req, res, next) => {
+    const input = parseConsoleQuery(req.body);
+    if (!input) return void res.status(400).json({ error: 'invalid query' });
+    if (!deps.query) return void res.status(503).json({ error: 'query service unavailable' });
+    try {
+      if (input.scope === 'internal') {
+        res.json({ data: await deps.query.answer(input.question, { forceInternal: true }) });
+        return;
+      }
+      const customer = await customerDetail(input.customerId!);
+      if (!customer || typeof customer.display_name !== 'string') return void res.status(404).json({ error: 'customer not found' });
+      res.json({ data: await deps.query.answer(input.question, { customer: { customerId: input.customerId!, customerName: customer.display_name } }) });
     } catch (err) { next(err); }
   });
 

@@ -33,6 +33,8 @@ export interface ResolveScopeOptions {
   /** Force the internal corpus regardless of any customer mention — the Telegram
    *  `/ask` headline path pins this true (it is the internal "Project Brain" channel). */
   forceInternal?: boolean;
+  /** Explicit founder-selected customer scope (for example, the console query UI). */
+  customer?: ResolvedCustomer;
 }
 
 export interface ScopeResolver {
@@ -49,6 +51,7 @@ export function buildScopeResolver(deps: ScopeResolverDeps): ScopeResolver {
   return {
     async resolveScope(question: string, opts?: ResolveScopeOptions): Promise<QueryScope> {
       if (opts?.forceInternal) return { kind: 'internal' };
+      if (opts?.customer) return { kind: 'customer', customerId: opts.customer.customerId, customerName: opts.customer.customerName };
       const customer = await deps.findCustomer(question);
       if (customer) {
         return { kind: 'customer', customerId: customer.customerId, customerName: customer.customerName };
