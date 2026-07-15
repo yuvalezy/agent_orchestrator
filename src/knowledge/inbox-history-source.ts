@@ -57,6 +57,11 @@ export function buildInboxHistorySource(): HistorySourcePort {
           customerId,
           channel: head.channel_type,
           threadKey: `inbox:${key}`,
+          // The channel's own conversation id, so the Gmail/WhatsApp legs — which re-read these same
+          // conversations from the source of truth, more completely — can drop this thinner copy
+          // instead of embedding it a second time (dropCoveredThreads). NULL thread id → this row
+          // stands alone and no leg can claim to cover it.
+          sourceThreadId: head.channel_thread_id ?? undefined,
           displayName: head.display_name,
           language: head.preferred_language ?? undefined,
           messages: kept.map((m) => ({

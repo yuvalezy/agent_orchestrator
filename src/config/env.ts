@@ -169,12 +169,8 @@ const envSchema = z.object({
   BACKFILL_WA_IDLE_GAP_MS: z.coerce.number().int().positive().default(21_600_000), // 6h → new window
   BACKFILL_WA_MAX_PER_WINDOW: z.coerce.number().int().positive().default(40), // msgs per window
   BACKFILL_WA_MAX_WINDOWS: z.coerce.number().int().positive().default(60), // windows/customer cap
-  // M3(b) starred-email leg: sweep the founder's STARRED Gmail threads (is:starred ∩ customer identity)
-  // into the same proposal pipeline. High-signal review candidates the standard Gmail leg might cap out.
-  BACKFILL_STARRED_ENABLED: z
-    .string()
-    .optional()
-    .transform((v) => v === 'true'),
+  // Star marking is not optional — it IS the propose gate (an unstarred unmatched thread becomes
+  // memory, not a card), so there is no flag, only the cap on the per-account starred id-set search.
   BACKFILL_STARRED_MAX_THREADS: z.coerce.number().int().positive().default(50), // starred threads/account cap
   // Sweep-wide collapse: the strict "explicit request" confidence floor + the near-duplicate ceiling.
   BACKFILL_PROPOSE_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.7),

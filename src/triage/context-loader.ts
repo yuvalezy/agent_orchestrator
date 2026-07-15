@@ -14,6 +14,12 @@ export interface CustomerConfig {
   workItemTypeRef: string | null;
   telegramTopicId: string | null;
   preferredLanguage: string;
+  /** The go-live watermark: messages that PREDATE this were already history when the
+   *  customer was onboarded, so they are context, never work (triage.service.ts skips
+   *  them). NULL = "triage everything" — the pre-watermark behavior every customer
+   *  onboarded before this column had a job still relies on. NULL must NEVER be read
+   *  as "skip everything": that would silently mute a live customer. */
+  backfillCutoff: Date | null;
 }
 
 /** Load a customer's onboarding config (createTask needs project/WIT refs; notify
@@ -27,8 +33,10 @@ export async function loadCustomerConfig(customerId: string): Promise<CustomerCo
     work_item_type_ref: string | null;
     telegram_topic_id: string | null;
     preferred_language: string;
+    backfill_cutoff: Date | null;
   }>(
-    `SELECT id, bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id, preferred_language
+    `SELECT id, bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id, preferred_language,
+            backfill_cutoff
        FROM agent_customers WHERE id = $1`,
     [customerId],
   );
@@ -42,6 +50,9 @@ export async function loadCustomerConfig(customerId: string): Promise<CustomerCo
     workItemTypeRef: r.work_item_type_ref,
     telegramTopicId: r.telegram_topic_id,
     preferredLanguage: r.preferred_language,
+    // pg returns TIMESTAMPTZ as a Date (no type parser is registered); normalize
+    // anyway so a driver/parser change can't turn the guard into a string compare.
+    backfillCutoff: r.backfill_cutoff ? new Date(r.backfill_cutoff) : null,
   };
 }
 

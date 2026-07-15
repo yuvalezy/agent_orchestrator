@@ -82,6 +82,11 @@ export function buildWaHistorySource(deps: WaHistorySourceDeps): HistorySourcePo
 
       const threads: HistoricalThread[] = [];
       for (const [chatId, rows] of byChat) {
+        // agent_inbox keys a WA conversation by contact_number (message-mapper's threadKeyOf is
+        // `contact_number ?? sender_number`, and whatsapp_manager always stores the former), so this
+        // — not chat_id, which is the full JID agent_inbox never sees — is the identity that lets the
+        // inbox leg's copy of this chat be dropped rather than embedded twice (dropCoveredThreads).
+        const sourceThreadId = rows[0].contact_number ?? undefined;
         try {
           const windows = windowChat(
             rows.map((m) => ({
@@ -96,6 +101,7 @@ export function buildWaHistorySource(deps: WaHistorySourceDeps): HistorySourcePo
               customerId,
               channel: 'whatsapp',
               threadKey: `wa:${chatId}:${w.startAt.getTime()}`,
+              sourceThreadId,
               displayName: info.displayName,
               language: info.language ?? undefined,
               messages: w.messages,

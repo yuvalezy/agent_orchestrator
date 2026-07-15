@@ -39,7 +39,7 @@ export interface FsDocSourceDeps {
   hash?: typeof computeContentHash;
 }
 
-const DEFAULT_REPO_ROOTS: Record<KnowledgeSource['repo'], string> = {
+export const DEFAULT_REPO_ROOTS: Record<KnowledgeSource['repo'], string> = {
   portal: '/mnt/dev/portal',
   'ai-agent': '/mnt/dev/ai-agent',
   wms: '/mnt/dev/wms',

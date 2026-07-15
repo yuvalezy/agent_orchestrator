@@ -174,17 +174,6 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     dependsOn: 'BACKFILL_ENABLED',
   },
   {
-    key: 'BACKFILL_STARRED_ENABLED',
-    type: 'boolean',
-    category: BACKFILL,
-    label: 'Backfill starred-email leg',
-    description:
-      'Adds the starred-Gmail leg to the backfill sweep: sweeps the founder’s starred threads (∩ customer identity) into the same proposal pipeline as high-signal review candidates.',
-    applyMode: 'restart',
-    default: false,
-    dependsOn: 'BACKFILL_ENABLED',
-  },
-  {
     key: 'LIVE_DEDUP_FINGERPRINT_ENABLED',
     type: 'boolean',
     category: BACKFILL,

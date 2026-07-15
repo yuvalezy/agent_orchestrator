@@ -37,6 +37,43 @@ export function isCcOnly(row: Pick<ClaimedInbox, 'channel_type' | 'account_email
   return cc.includes(me) && !to.includes(me);
 }
 
+/**
+ * The live-triage watermark. A customer's `backfill_cutoff` is their go-live
+ * instant: anything they sent BEFORE it was already history when we onboarded them,
+ * so it is context to retrieve — never work to action.
+ *
+ * This guard is what makes pulling channel history safe. whatsapp_manager's backfill
+ * saves historical rows with `updated_at = now()`, and reconcile.worker.ts polls
+ * `GET /messages?updated_since=<cursor>` — an updated_at cursor, NOT a message-time
+ * one. So a months-old backfilled message looks BRAND NEW to the reconciler, lands
+ * here as 'pending', and would auto-create a task with no approval gate — hundreds of
+ * junk tasks per pull. The backfill sweep's own starred gate does not help: that gate
+ * is on the sweep, this is the live loop.
+ *
+ * Two semantics that must not be inverted:
+ *   • NULL cutoff = triage EVERYTHING (the pre-watermark behavior). If NULL ever read
+ *     as "skip", every customer onboarded before this column had a job would go
+ *     silently mute. The `!cutoff` bail is load-bearing, not defensive noise.
+ *   • The boundary is EXCLUSIVE (`< cutoff` skips; `>= cutoff` triages). Onboarding
+ *     stamps the cutoff at now(), so a message landing on the same instant is live
+ *     traffic and must be worked. Ties resolve toward triage — the safe direction,
+ *     since the failure mode is a missed task rather than a muted customer.
+ *
+ * `received_at` IS the message's own send time (ingestion.ts writes `msg.sentAt` into
+ * it); the row's insertion time is `created_at`. Comparing against received_at is the
+ * whole point — created_at would be ~now() for every backfilled row and skip nothing.
+ */
+export function isPreCutoff(
+  row: Pick<ClaimedInbox, 'received_at'>,
+  config: Pick<CustomerConfig, 'backfillCutoff'>,
+): boolean {
+  const cutoff = config.backfillCutoff;
+  if (!cutoff) return false; // NULL = triage everything. Never invert this.
+  const sentAt = new Date(row.received_at);
+  if (Number.isNaN(sentAt.getTime())) return false; // unparseable → triage (fail toward work, not silence)
+  return sentAt.getTime() < cutoff.getTime();
+}
+
 /** The task-origin triple for a created/deduped task, keyed by channel type.
  *  Service-desk tickets must match the portal's OWN convention (frontend
  *  CreateProjectTaskDialog.tsx: sourceService='serviceDeskApp', entityType='Ticket')
@@ -201,6 +238,15 @@ export class TriageService {
         body: `Customer ${customerId} is not fully onboarded (missing project/work-item-type).`,
         severity: 'warning',
       });
+      return;
+    }
+
+    if (isPreCutoff(row, config)) {
+      await markSkipped(inboxId, 'pre-backfill-cutoff (history, not work)');
+      logger.info(
+        { inboxId, customerId, channelType: row.channel_type, cutoff: config.backfillCutoff?.toISOString() },
+        'triage: message predates the backfill cutoff — skipped (context only)',
+      );
       return;
     }
 

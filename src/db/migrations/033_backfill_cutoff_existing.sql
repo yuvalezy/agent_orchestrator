@@ -1,0 +1,43 @@
+-- 033: give every EXISTING customer a backfill_cutoff, so Part 4's WhatsApp pull is safe to reach.
+--
+-- Numbered 033: 030 (telegram scheduling) and 031 (founder push subscription actor) are taken on
+-- master, and 032 is this branch's docs_root migration.
+--
+-- WHY THIS EXISTS
+-- backfill_cutoff is the live-triage watermark: triage.service.ts skips any inbox row older than
+-- it ("history is context, not work"). A NULL cutoff means TRIAGE EVERYTHING — deliberately, so the
+-- watermark can never silently mute a live customer, and every test asserting that stays true.
+--
+-- That default is safe only while nothing back-dates the inbox. Part 4 breaks exactly that: the
+-- AO can now trigger whatsapp_manager's `POST /backfill`, which is WHOLE-ARCHIVE — every whitelisted
+-- number and every monitored group, i.e. EVERY customer's chats, not just the one being onboarded.
+-- whatsapp_manager stamps updated_at=now() on each row it stores, and the AO's reconcile worker
+-- polls `GET /messages?updated_since=<cursor>` with no customer filter, so months-old history
+-- arrives looking brand-new: agent_inbox 'pending' -> triage -> createTask, with no approval gate.
+--
+-- The cutoff is the only thing standing in front of that, and onboarding stamps it for ONE customer
+-- (the one being onboarded). The customers already in the table were onboarded before the watermark
+-- existed and still carry NULL — so the first onboard of customer #5 would pull the archive and
+-- auto-create portal tasks out of customers #1-4's old chats. That is the junk flood the whole
+-- backfill change exists to prevent, on the live loop rather than the sweep, where the starred gate
+-- cannot help. The plan's Risks section calls for this explicitly.
+--
+-- WHY now() IS SAFE FOR A LIVE CUSTOMER
+-- It mutes nothing that is still live: everything before now() has already been through triage (it
+-- arrived as live traffic and was handled), and everything after now() is still triaged normally.
+-- The only rows it excludes are back-dated ones — precisely the ones that must never become tasks.
+--
+-- backfill_status is deliberately LEFT ALONE. It stays 'pending', which is the truth: no seed has
+-- run for these customers. This closes the triage hole; it does not claim their memory is seeded.
+-- (Consequence, and it is the right one: a later `npm run onboard` for them finds the cutoff already
+-- set, leaves it UNCHANGED — re-stamping would retroactively mute everything they have sent since —
+-- and their status goes 'pending' -> 'done' when the live sweep completes, never passing through
+-- 'in_progress'. A cosmetic gap in a status field, versus a data-loss risk in a watermark.)
+--
+-- ⚠︎ NOT a general defense. This backfills the rows that exist TODAY; a customer inserted later (or
+-- onboarded with BACKFILL_ENABLED off) is NULL again. The durable guard is fail-closed and lives in
+-- ensureWaHistoryPull, which refuses to trigger the global pull while ANY customer is un-stamped.
+-- This migration and that guard are two halves of one fix: without the migration the guard would
+-- refuse every pull forever; without the guard the hole re-opens with the next un-stamped row.
+
+UPDATE agent_customers SET backfill_cutoff = now() WHERE backfill_cutoff IS NULL;

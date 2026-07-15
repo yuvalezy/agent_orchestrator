@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SETTINGS_REGISTRY, SETTINGS_KEYS, settingDef, coerceSettingValue } from './settings-registry';
 
-// Pass 1 = the 23 `*_ENABLED` booleans; pass 2 appends the 7 tuned knobs (LLM routing/effort +
+// Pass 1 = the 22 `*_ENABLED` booleans; pass 2 appends the 7 tuned knobs (LLM routing/effort +
 // backfill determinism + style-lane size). If a setting is added/removed, update this list.
 const EXPECTED_KEYS = [
   'OUTBOUND_ENABLED',
@@ -17,7 +17,6 @@ const EXPECTED_KEYS = [
   'SLASH_COMMANDS_ENABLED',
   'BACKFILL_ENABLED',
   'BACKFILL_WA_ENABLED',
-  'BACKFILL_STARRED_ENABLED',
   'LIVE_DEDUP_FINGERPRINT_ENABLED',
   'DAILY_BRIEFING_ENABLED',
   'WEEKLY_PATTERNS_ENABLED',

@@ -21,13 +21,19 @@ export function buildWhatsAppDirectoryClient(): WhatsAppDirectoryClient {
 }
 
 /**
- * Build the read-only WhatsApp history client (backfill). Same read key as the directory client;
- * drains `GET /messages` from epoch. HTTP-only — never the whatsapp_manager DB (invariant #5).
+ * Build the WhatsApp history client (backfill). Both keys, mirroring the group-summary adapter:
+ * the READ key (`WHATSAPP_MANAGER_API_KEY`) drains `GET /messages` from epoch and polls
+ * `GET /backfill/status`; the WRITE key (`WHATSAPP_MANAGER_WRITE_KEY`, scoped to POST /backfill)
+ * triggers the pull — falling back to the read key (→ a clean 403, never a silent unauthenticated
+ * call). Keys resolve lazily (no secret in env.ts). HTTP-only — never the whatsapp_manager DB
+ * (invariant #5).
  */
 export function buildWaHistoryClient(opts?: WaHistoryClientOptions): WaHistoryClient {
   const http = new WhatsAppHttp({
     baseUrl: env.WHATSAPP_MANAGER_BASE_URL,
     resolveApiKey: () => resolveCredential('WHATSAPP_MANAGER_API_KEY'),
+    resolveWriteApiKey: () =>
+      tryResolveCredential('WHATSAPP_MANAGER_WRITE_KEY') ?? resolveCredential('WHATSAPP_MANAGER_API_KEY'),
   });
   return new WaHistoryClient(http, opts);
 }

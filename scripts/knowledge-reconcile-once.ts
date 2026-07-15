@@ -4,10 +4,11 @@ import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
 import { credentialsStore } from '../src/config/credentials-store';
-import { buildFsDocSource } from '../src/adapters/knowledge/fs-doc-source';
+import { buildCustomerAwareDocSource } from '../src/adapters/knowledge/customer-sources';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from '../src/knowledge/memory-repo';
 import { dbContactResolutionQueries } from '../src/customers/contact-resolution';
+import { listCustomerDocSources } from '../src/customers/customer-doc-sources';
 import { reconcileKnowledge } from '../src/knowledge/sync';
 import { chunkMarkdown } from '../src/knowledge/chunker';
 
@@ -33,7 +34,13 @@ async function main(): Promise<void> {
   }
 
   const summary = await reconcileKnowledge({
-    docSource: buildFsDocSource(),
+    // Same union as the main.ts worker: KNOWLEDGE_SOURCES + the DB-registered customer
+    // corpora (migration 032). Kept identical on purpose — a manual reconcile that walked a
+    // narrower corpus than the worker would report a misleading summary.
+    docSource: buildCustomerAwareDocSource({
+      listCustomers: listCustomerDocSources,
+      log: logger,
+    }),
     embedding: buildEmbeddingAdapter(
       () => tryResolveCredential('OPENAI_API_KEY'),
       env.OPENAI_BASE_URL,

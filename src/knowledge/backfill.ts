@@ -9,10 +9,18 @@ import type { SyncLogger } from './sync';
 //   link-open      → matches an OPEN task (backlog/todo/in-progress/review): seed a context
 //                    link, NO portal write, respect its status.
 //   link-resolved  → matches a done/cancelled task: seed as resolved history, never reopen.
-//   propose        → no confident match AND a work-request intent: a DRAFT task proposal for
-//                    the founder to approve (nothing is created here).
-//   skip           → no actionable ask, or an unmatched non-work intent (question/follow-up),
-//                    or a retryable gap (embed unavailable) that a later run should re-try.
+//   propose        → no confident match, a work-request intent, AND the founder STARRED the
+//                    thread: a DRAFT task proposal to approve (nothing is created here).
+//   memory         → no confident match and not a starred work-request: the thread is CONTEXT,
+//                    embedded as conversation memory for later retrieval. No card, no task.
+//   skip           → nothing readable/classifiable: an empty thread, or a retryable gap
+//                    (classify/embed unavailable) that a later run should re-try.
+//
+// ⚠︎ BACKFILL IS CONTEXT, NOT WORK. A naive sweep proposed a card for EVERY unmatched work-request
+// in history (23 for one customer) — months-old junk the founder must triage by hand. The star is
+// the founder's OWN pre-existing signal of "this still matters", so it gates the propose arm: an
+// unstarred work-request becomes memory instead. `starred` is set only by the Gmail leg; the inbox
+// and WhatsApp legs leave it undefined, so they can never propose (by design).
 //
 // ⚠︎ A false LINK (folding an unrelated thread into a task) is worse than a missed one, so the
 // match must clear BOTH a vector-distance gate AND an LLM-judge threshold. Best-effort: an
@@ -47,8 +55,17 @@ export interface HistoricalThread {
   channel: string;
   /** Stable idempotency key (email threadId, or WA groupId+window). */
   threadKey: string;
+  /** The CHANNEL's own id for this conversation: the Gmail threadId, the WA chat's contact/group
+   *  key, the agent_inbox channel_thread_id. `threadKey` namespaces that id PER LEG ('inbox:X' vs
+   *  'gmail:<acct>:X'), so it can never answer "did another leg already read this conversation?".
+   *  This can — two legs reading the same conversation carry the SAME value here. Undefined = the
+   *  leg cannot state an identity, and the thread is then never deduped away. See dropCoveredThreads. */
+  sourceThreadId?: string;
   displayName?: string;
   language?: string;
+  /** The founder starred this thread (Gmail only) — the ONLY way an unmatched work-request becomes
+   *  a task proposal. Undefined on legs with no star concept (inbox/WhatsApp) → context only. */
+  starred?: boolean;
   messages: HistoricalMessage[];
 }
 
@@ -56,6 +73,8 @@ export type BackfillOutcome =
   | { kind: 'link-open'; taskRef: string; code: string | null; status: string; distance: number; judged: number; summary: string }
   | { kind: 'link-resolved'; taskRef: string; code: string | null; status: string; distance: number; judged: number; summary: string }
   | { kind: 'propose'; title: string; description: string; priority: Intent['priority']; summary: string; confidence: number }
+  /** Context-only: embed as conversation memory. `reason` is diagnostic (why it wasn't a proposal). */
+  | { kind: 'memory'; summary: string; reason: string }
   | { kind: 'skip'; reason: string; retryable?: boolean };
 
 export interface BackfillReconcileConfig {
@@ -121,8 +140,11 @@ export async function reconcileThread(thread: HistoricalThread, deps: BackfillRe
     return { kind: 'skip', reason: 'classify failed', retryable: true };
   }
 
+  // No actionable ask — still CONTEXT worth retrieving later, so it becomes memory rather than being
+  // dropped. This arm returns BEFORE embedding, so there is no intent summary: fall back to the
+  // classifier's first (non-actionable) summary, else the head of the thread body itself.
   const intent = primaryIntent(intents);
-  if (!intent) return { kind: 'skip', reason: 'no actionable ask' };
+  if (!intent) return { kind: 'memory', summary: intents[0]?.summary ?? body.slice(0, MATCH_BODY_CHARS), reason: 'no actionable ask' };
 
   const text = `${intent.suggested_title}. ${intent.summary}`.trim();
 
@@ -189,17 +211,56 @@ export async function reconcileThread(thread: HistoricalThread, deps: BackfillRe
     return OPEN_STATUSES.has(status) ? { kind: 'link-open', ...common } : { kind: 'link-resolved', ...common };
   }
 
-  // No confident match. A work-request intent → a task proposal; anything else is conversation.
-  if (PROPOSE_CATEGORIES.has(intent.category)) {
+  // No confident match. BOTH gates must pass to propose: a work-request intent (a question or
+  // follow-up is never a task) AND the founder's star (this old thread still matters). Fail either
+  // → conversation memory: retrievable context, but no card and no task.
+  const isWorkRequest = PROPOSE_CATEGORIES.has(intent.category);
+  if (isWorkRequest && thread.starred) {
     return { kind: 'propose', title: intent.suggested_title, description: intent.summary, priority: intent.priority, summary: intent.summary, confidence: intent.confidence };
   }
-  return { kind: 'skip', reason: `unmatched ${intent.category} — no task warranted` };
+  return {
+    kind: 'memory',
+    summary: intent.summary,
+    reason: isWorkRequest ? `unmatched ${intent.category} (not starred)` : `unmatched ${intent.category} — no task warranted`,
+  };
+}
+
+// ── Cross-leg coverage (CORE, pure) ─────────────────────────────────────────────────────────
+
+/** Channel-scoped so a Gmail threadId can never collide with a WhatsApp contact key. */
+const coverageKey = (channel: string, sourceThreadId: string): string => `${channel}|${sourceThreadId}`;
+
+/**
+ * Drop the `candidates` whose conversation a richer leg already returned.
+ *
+ * The history legs OVERLAP. agent_inbox holds what the live workers already ingested, and the Gmail
+ * / WhatsApp legs re-read those SAME conversations from the source of truth. Their threadKeys differ
+ * only by leg prefix ('inbox:X' vs 'gmail:w:X'), and insertBackfillLink dedups on thread_key — so an
+ * overlapping pair writes TWO conversation memories, with two embeddings, for one conversation. That
+ * is the same duplicate the starred leg was folded away to kill (gmail-history-source.ts's header),
+ * one leg-pair further out, and it only became visible once unmatched threads started reaching
+ * `memory` instead of writing nothing at all.
+ *
+ * Coverage is OBSERVED, never assumed: only a conversation actually present in `covering` is
+ * dropped. A leg that is disabled, unreachable, or read nothing therefore covers nothing, and the
+ * inbox copy survives as the fallback reader it has always been.
+ *
+ * The source leg wins because it is the CONTENT SUPERSET — Gmail keeps the founder's own replies and
+ * everything predating the connection; agent_inbox keeps neither. Collapsing the pair onto a shared
+ * threadKey instead would make insertBackfillLink first-writer-wins and let the thinner copy
+ * silently suppress the richer one.
+ */
+export function dropCoveredThreads(candidates: HistoricalThread[], covering: HistoricalThread[]): HistoricalThread[] {
+  const covered = new Set<string>();
+  for (const t of covering) if (t.sourceThreadId) covered.add(coverageKey(t.channel, t.sourceThreadId));
+  if (covered.size === 0) return candidates;
+  return candidates.filter((t) => !t.sourceThreadId || !covered.has(coverageKey(t.channel, t.sourceThreadId)));
 }
 
 // ── Orchestrator (CORE) ─────────────────────────────────────────────────────────────────────
 // Sweeps one customer's historical threads through reconcileThread and routes each outcome. The
 // DEFAULT is dryRun=true — it reads + classifies + matches and returns a REPORT of would-be
-// links/proposals, writing NOTHING and posting NOTHING. Live mode (dryRun=false) invokes the
+// links/memories/proposals, writing NOTHING and posting NOTHING. Live mode (dryRun=false) invokes the
 // writing sinks and marks each processed thread (idempotent re-run). A retryable skip is NOT
 // marked, so a later run re-tries it.
 
@@ -220,7 +281,11 @@ export interface BackfillReport {
   proposed: number;
   /** Raw `propose` outcomes before collapse/gate (≥ proposed). Present when collapsing. */
   proposalsConsidered: number;
+  /** Threads seeded as conversation memory (the expected bulk of a sweep — context, not work). */
+  memories: number;
   skipped: number;
+  /** Threads left UNMARKED for a later run to re-try: a retryable skip (classify/embed unavailable)
+   *  or a write the sink reported as not landed. Never counted as a memory/link. */
   retryable: number;
   items: BackfillReportItem[];
 }
@@ -244,10 +309,16 @@ export interface BackfillOrchestratorDeps {
   readThreads: (customerId: string) => Promise<HistoricalThread[]>;
   /** reconcileThread bound with its ports (injected so the orchestrator stays pure/testable). */
   reconcile: (thread: HistoricalThread) => Promise<BackfillOutcome>;
-  /** LIVE-only: persist a matched thread as a context link (open or resolved). */
-  writeLink: (thread: HistoricalThread, outcome: Extract<BackfillOutcome, { kind: 'link-open' | 'link-resolved' }>) => Promise<void>;
+  /** LIVE-only: persist a matched thread as a context link (open or resolved).
+   *  Returns TRUE only when the row actually LANDED; FALSE means it did not (e.g. the embedder is
+   *  down) and the thread must be left unmarked so a later run retries it. See writeThen. */
+  writeLink: (thread: HistoricalThread, outcome: Extract<BackfillOutcome, { kind: 'link-open' | 'link-resolved' }>) => Promise<boolean>;
   /** LIVE-only: record a draft task proposal for founder approval. */
   recordProposal: (thread: HistoricalThread, outcome: Extract<BackfillOutcome, { kind: 'propose' }>) => Promise<void>;
+  /** LIVE-only: seed an unmatched thread as conversation memory (context — no card, no task).
+   *  Same TRUE=landed contract as writeLink — this is where the bulk of a sweep goes, so a silent
+   *  false success here loses the bulk of the customer's history. */
+  writeMemory: (thread: HistoricalThread, outcome: Extract<BackfillOutcome, { kind: 'memory' }>) => Promise<boolean>;
   /** OPTIONAL sweep-wide post-processor. When provided, `propose` outcomes are collected across all
    *  threads, passed here to dedupe/collapse/strict-gate, and only the returned survivors are
    *  recorded. Runs in dry-run too (read-only) so the report reflects the true card count. Absent →
@@ -271,9 +342,33 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
     linkedResolved: 0,
     proposed: 0,
     proposalsConsidered: 0,
+    memories: 0,
     skipped: 0,
     retryable: 0,
     items: [],
+  };
+
+  /**
+   * LIVE write + mark, as ONE observed step: a thread is marked processed ONLY when its sink says
+   * the row landed. The marker is permanent and consulted by isProcessed on every later run, so
+   * marking an UNOBSERVED write doesn't lose a retry — it loses the thread forever, silently, while
+   * the report still counts it as a success. A transient 429 from the embedder would have deleted a
+   * slice of the customer's history with no error anywhere.
+   *
+   * `false` is treated exactly like skip{retryable} below: counted as retryable, left unmarked, so
+   * the next run re-tries it. Sinks report, they never throw — one bad thread can't abort a sweep.
+   */
+  const writeThen = async (write: () => Promise<boolean>, thread: HistoricalThread, kind: BackfillOutcome['kind']): Promise<boolean> => {
+    if (await write()) {
+      await deps.markProcessed(customerId, thread.threadKey, kind);
+      return true;
+    }
+    report.retryable += 1;
+    deps.log?.warn(
+      { threadKey: thread.threadKey, channel: thread.channel, kind },
+      'backfill: the write did not land — thread left UNMARKED so a later run re-tries it',
+    );
+    return false;
   };
 
   const threads = await deps.readThreads(customerId);
@@ -295,23 +390,21 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
     report.items.push({ threadKey: thread.threadKey, channel: thread.channel, outcome });
 
     switch (outcome.kind) {
+      // Each counter now increments on a LANDED write (dry-run counts the would-be outcome), so the
+      // report can never claim a memory/link that isn't in the DB.
       case 'link-open':
-        report.linkedOpen += 1;
-        if (!deps.dryRun) {
-          await deps.writeLink(thread, outcome);
-          await deps.markProcessed(customerId, thread.threadKey, outcome.kind);
-        }
+        if (deps.dryRun || (await writeThen(() => deps.writeLink(thread, outcome), thread, outcome.kind))) report.linkedOpen += 1;
         break;
       case 'link-resolved':
-        report.linkedResolved += 1;
-        if (!deps.dryRun) {
-          await deps.writeLink(thread, outcome);
-          await deps.markProcessed(customerId, thread.threadKey, outcome.kind);
-        }
+        if (deps.dryRun || (await writeThen(() => deps.writeLink(thread, outcome), thread, outcome.kind))) report.linkedResolved += 1;
         break;
       case 'propose':
         // Deferred to the post-loop collapse phase (see below).
         pending.push({ thread, outcome });
+        break;
+      case 'memory':
+        // Terminal outcome — marked once it lands, or every re-run re-embeds the same history.
+        if (deps.dryRun || (await writeThen(() => deps.writeMemory(thread, outcome), thread, outcome.kind))) report.memories += 1;
         break;
       case 'skip':
         if (outcome.retryable) report.retryable += 1;
@@ -349,6 +442,7 @@ export async function runBackfill(customerId: string, deps: BackfillOrchestrator
       linkedResolved: report.linkedResolved,
       proposed: report.proposed,
       proposalsConsidered: report.proposalsConsidered,
+      memories: report.memories,
       skipped: report.skipped,
       retryable: report.retryable,
       alreadyProcessed: report.alreadyProcessed,

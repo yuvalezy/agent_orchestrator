@@ -128,11 +128,13 @@ function groupSummaryFake(opts: {
   return { gs, calls };
 }
 
-async function seedInbox(msgId: string, body: string | null): Promise<ClaimedInbox> {
+/** `receivedAt` (the message's own send time) defaults to now(); the backfill-cutoff
+ *  tests pass an explicit instant to place the message either side of the watermark. */
+async function seedInbox(msgId: string, body: string | null, receivedAt?: string): Promise<ClaimedInbox> {
   const { rows } = await query<{ id: string; received_at: string }>(
     `INSERT INTO agent_inbox (channel_instance_id, channel_message_id, channel_thread_id, sender_address, direction, body, received_at, status)
-     VALUES ($1, $2, '50900000001', '50900000001', 'inbound', $3, now(), 'processing') RETURNING id, received_at`,
-    [waInstanceId, msgId, body],
+     VALUES ($1, $2, '50900000001', '50900000001', 'inbound', $3, COALESCE($4::timestamptz, now()), 'processing') RETURNING id, received_at`,
+    [waInstanceId, msgId, body, receivedAt ?? null],
   );
   return {
     id: rows[0].id, channel_instance_id: waInstanceId, channel_type: 'whatsapp',
@@ -315,6 +317,87 @@ test('muted group + @-mention, re-processed (R49) → NO re-summarize, no second
   assert.equal(calls.summarize, 1, 'R49: NOT re-summarized on reclaim');
   assert.equal(f.created.length, 1, 'R49: no second task');
   assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
+});
+
+// ── the live-triage watermark (agent_customers.backfill_cutoff) ──
+// Backfilled history reaches the reconciler with updated_at = now() and so arrives
+// here looking brand new. Without this gate a WhatsApp history pull auto-creates a
+// task per historical message. Guard lives at the top of runMoneyLoop, so it covers
+// the author path AND the muted-group path off one config load.
+
+/** Seed a customer whose backfill_cutoff is `cutoff` (an ISO instant, or null). */
+async function seedCustomerWithCutoff(bpRef: string, cutoff: string | null): Promise<string> {
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id, backfill_cutoff)
+     VALUES ($1, 'Triage Test Co', 'proj-1', 'wit-1', '99', $2::timestamptz) RETURNING id`,
+    [bpRef, cutoff],
+  );
+  return rows[0].id;
+}
+
+const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+
+test('cutoff: message PREDATING the cutoff → inbox skipped, NO task, no notify', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  customerId = await seedCustomerWithCutoff('bp-cutoff-pre', new Date().toISOString());
+
+  const f = fakes([BUG], 'known');
+  // A months-old WhatsApp message the backfill just surfaced — the exact flood case.
+  const row = await seedInbox(`${TAG}-cut-pre`, 'the export button was broken back then', daysAgo(90));
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 0, 'pre-cutoff history must NEVER create a task');
+  assert.equal(f.notified.length, 0, 'pre-cutoff history must not ping the founder');
+  const inbox = await query<{ status: string; customer_id: string }>(
+    `SELECT status, customer_id FROM agent_inbox WHERE id = $1`, [row.id],
+  );
+  assert.equal(inbox.rows[0].status, 'skipped', "stored for context, never triaged — the existing 'skipped' status");
+  assert.equal(inbox.rows[0].customer_id, customerId, 'still attributed to the customer, so it stays retrievable as context');
+});
+
+test('cutoff: message AFTER the cutoff → triaged normally (live traffic still works)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  customerId = await seedCustomerWithCutoff('bp-cutoff-post', daysAgo(30));
+
+  const f = fakes([BUG], 'known');
+  const row = await seedInbox(`${TAG}-cut-post`, 'the export button is broken');
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 1, 'post-cutoff message is real work → task created');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'processed');
+});
+
+test('cutoff: NULL cutoff → triaged, however old (anti-regression: NULL must never mute a customer)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  // Every customer onboarded before the watermark had a job has backfill_cutoff NULL.
+  // If NULL ever read as "skip everything", live triage would go silently dead for all
+  // of them — so assert it against a message old enough that ANY cutoff would skip it.
+  customerId = await seedCustomerWithCutoff('bp-cutoff-null', null);
+
+  const f = fakes([BUG], 'known');
+  const row = await seedInbox(`${TAG}-cut-null`, 'the export button is broken', daysAgo(365));
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 1, 'NULL cutoff = triage everything (the pre-watermark behavior)');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'processed');
+});
+
+test('cutoff: received_at EXACTLY == cutoff → triaged (boundary is exclusive)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  // Onboarding stamps the cutoff at now(), so a message on the same instant is live
+  // traffic. Ties resolve toward triage: a missed task beats a muted customer.
+  const INSTANT = '2026-01-01T00:00:00.000Z';
+  customerId = await seedCustomerWithCutoff('bp-cutoff-eq', INSTANT);
+
+  const f = fakes([BUG], 'known');
+  const row = await seedInbox(`${TAG}-cut-eq`, 'the export button is broken', INSTANT);
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 1, 'a message exactly AT the cutoff is triaged, not skipped');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'processed');
 });
 
 test('muted group + @-mention, summary unavailable → skipped + admin note, no task', async (t) => {

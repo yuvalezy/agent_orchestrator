@@ -39,10 +39,11 @@ import { enqueueDraft } from './outbound/outbound-repo';
 import { recordReleaseNoteDraftDecision } from './decisions/decisions';
 import { loadCustomerConfig } from './triage/context-loader';
 import { buildLlmRouter } from './adapters/llm/factory';
-import { buildFsDocSource } from './adapters/knowledge/fs-doc-source';
+import { buildCustomerAwareDocSource } from './adapters/knowledge/customer-sources';
 import { buildPortalTaskSource } from './adapters/knowledge/portal-task-source';
 import { buildEzyPortalGateway } from './adapters/ezy-portal/factory';
 import { listTaskInventoryCustomers } from './customers/task-inventory-customers';
+import { listCustomerDocSources } from './customers/customer-doc-sources';
 import { seedTaskFingerprints } from './knowledge/task-fingerprint-seed';
 import {
   PORTAL_FINGERPRINT_CHANNEL,
@@ -280,7 +281,14 @@ async function main(): Promise<void> {
       logger.warn('⚠️  KNOWLEDGE_SYNC_ENABLED=true but OPENAI_API_KEY is UNSET — embedding calls will fail until it is set.');
     }
     const syncWorker = buildKnowledgeSyncWorker({
-      docSource: buildFsDocSource(),
+      // The static KNOWLEDGE_SOURCES const unioned with every customer corpus registered in
+      // agent_customers.docs_root (migration 032), re-read per tick — onboarding a customer's
+      // docs no longer needs a code edit + redeploy. Dynamic sources are customer-scoped and
+      // fail-closed: a row without a resolvable bpRef is skipped, never registered as shared.
+      docSource: buildCustomerAwareDocSource({
+        listCustomers: listCustomerDocSources,
+        log: logger,
+      }),
       embedding: buildEmbeddingAdapter(
         () => tryResolveCredential('OPENAI_API_KEY'),
         env.OPENAI_BASE_URL,
