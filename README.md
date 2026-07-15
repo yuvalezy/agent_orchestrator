@@ -7,7 +7,7 @@ Telegram. This repo is the **M1.1 service skeleton** — DB schema, ports, worke
 framework, `/health`, and the D1 import boundary. No channel adapters, LLM
 router, or credentials store yet (those are M1.2+).
 
-See the plan in `/mnt/dev/tools/yuval_dev_manager/plan/` (project invariants in
+See the plan in `docs/plan/` (project invariants in
 `project.md`, this milestone's contract in
 `blueprints/M1.1-orchestrator-scaffold.md`).
 

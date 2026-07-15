@@ -39,9 +39,10 @@ export interface InternalSource {
 }
 
 /** Absolute checkout root per repo. Mirrors fs-doc-source's DEFAULT_REPO_ROOTS shape;
- *  yuval_dev_manager holds the orchestrator planning corpus (plan/…). */
+ *  the 'yuval_dev_manager' repo key is a legacy citation label — the orchestrator
+ *  planning corpus (plan/…) now lives under this repo's own docs/. */
 export const INTERNAL_REPO_ROOTS: Record<InternalRepo, string> = {
-  yuval_dev_manager: '/mnt/dev/tools/yuval_dev_manager',
+  yuval_dev_manager: '/mnt/dev/tools/agent_orchestrator/docs',
   'ai-agent': '/mnt/dev/ai-agent',
   portal: '/mnt/dev/portal',
   wms: '/mnt/dev/wms',

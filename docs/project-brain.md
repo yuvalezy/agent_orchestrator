@@ -41,7 +41,7 @@ Verify with `claude mcp list` / `codex mcp list` (expect `project-brain … ✔`
 ```mermaid
 flowchart TD
   subgraph disk[On-disk internal docs]
-    P1[yuval_dev_manager/plan/**]
+    P1[agent_orchestrator/docs/plan/**]
     P2[ai-agent/plan/reference/** + SaaS spec]
     P3[portal/superplan/specs/**]
   end
