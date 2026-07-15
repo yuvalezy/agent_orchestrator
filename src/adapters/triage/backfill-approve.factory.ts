@@ -2,7 +2,13 @@ import { logger } from '../../logger';
 import type { DecisionEvent } from '../../ports/founder-notifier.port';
 import type { TelegramNotifier } from '../telegram/telegram-notifier';
 import { buildEzyPortalGateway } from '../ezy-portal/factory';
-import { getBackfillProposal, resolveBackfillProposalDecision } from '../../decisions/decisions';
+import {
+  claimBackfillProposalDecision,
+  completeBackfillProposalDecision,
+  getBackfillProposal,
+  releaseBackfillProposalDecision,
+  resolveBackfillProposalDecision,
+} from '../../decisions/decisions';
 import { loadCustomerConfig } from '../../triage/context-loader';
 import { approveBackfillProposal, rejectBackfillProposal } from '../../knowledge/backfill-approve';
 
@@ -34,8 +40,14 @@ export function parseTap(d: DecisionEvent): { approve: boolean; decisionId: stri
   return null;
 }
 
-export function buildBackfillApproveHandler(deps: { notifier: TelegramNotifier }): BackfillApproveHandler {
+export function buildBackfillApproveHandler(deps: {
+  notifier: Pick<TelegramNotifier, 'replyInThread'>;
+  approve?: typeof approveBackfillProposal;
+  reject?: typeof rejectBackfillProposal;
+}): BackfillApproveHandler {
   const portal = buildEzyPortalGateway();
+  const approveProposal = deps.approve ?? approveBackfillProposal;
+  const rejectProposal = deps.reject ?? rejectBackfillProposal;
   const confirm = async (d: DecisionEvent, text: string): Promise<void> => {
     if (d.threadId) await deps.notifier.replyInThread(d.threadId, text);
   };
@@ -48,22 +60,24 @@ export function buildBackfillApproveHandler(deps: { notifier: TelegramNotifier }
       const { approve, decisionId } = parsed;
       try {
         if (approve) {
-          const r = await approveBackfillProposal(decisionId, d.by, {
+          const r = await approveProposal(decisionId, d.by, {
+            claim: claimBackfillProposalDecision,
             getProposal: getBackfillProposal,
             getCustomerTarget: async (customerId) => {
               const c = await loadCustomerConfig(customerId);
               return c ? { projectRef: c.projectRef, workItemTypeRef: c.workItemTypeRef } : null;
             },
             createTask: (i) => portal.createTask(i),
-            resolve: resolveBackfillProposalDecision,
+            complete: completeBackfillProposalDecision,
+            release: releaseBackfillProposalDecision,
             log: logger,
           });
           if (!r.ok) await confirm(d, `⚠️ Could not create the task: ${r.reason}`);
-          else if (!r.created) await confirm(d, 'ℹ️ Already handled.');
+          else if (!r.created) return; // another surface already won; do not duplicate a notification
           else await confirm(d, `✅ Task created: ${r.title}`);
         } else {
-          const r = await rejectBackfillProposal(decisionId, d.by, { resolve: resolveBackfillProposalDecision, log: logger });
-          await confirm(d, r.resolved ? '❌ Skipped — no task created.' : 'ℹ️ Already handled.');
+          const r = await rejectProposal(decisionId, d.by, { resolve: resolveBackfillProposalDecision, log: logger });
+          if (r.resolved) await confirm(d, '❌ Skipped — no task created.');
         }
       } catch (err) {
         logger.warn({ decisionId, reason: (err as Error)?.message }, 'backfill approve handler failed');

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTap } from './backfill-approve.factory';
+import { buildBackfillApproveHandler, parseTap } from './backfill-approve.factory';
 
 // The notifier splits callback_data on the FIRST ':' → optionId=before, notificationRef=after.
 // These tests lock BOTH encodings so a card tap routes to approve/reject with the right decisionId
@@ -26,4 +26,16 @@ test('legacy encoding bf:no:<id> → reject + decisionId', () => {
 test('a non-backfill option → null (falls through the router)', () => {
   assert.equal(parseTap({ notificationRef: 't1', optionId: 'x', by: 'y' }), null);
   assert.equal(parseTap({ notificationRef: 'weird', optionId: 'bf', by: 'y' }), null);
+});
+
+test('a Telegram action that lost to another surface posts no duplicate confirmation', async () => {
+  const replies: string[] = [];
+  const handler = buildBackfillApproveHandler({
+    notifier: { replyInThread: async (_threadId, text) => { replies.push(text); } },
+    approve: async () => ({ ok: true, created: false, reason: 'already-resolved' }),
+    reject: async () => ({ resolved: false }),
+  });
+  await handler.handle({ optionId: 'bfok', notificationRef: '19', by: 'founder', threadId: 'thread-1' });
+  await handler.handle({ optionId: 'bfno', notificationRef: '19', by: 'founder', threadId: 'thread-1' });
+  assert.deepEqual(replies, []);
 });

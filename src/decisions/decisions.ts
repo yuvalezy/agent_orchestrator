@@ -153,6 +153,68 @@ export async function getBackfillProposal(decisionId: string): Promise<{
   return r ? { decisionId: r.id, customerId: r.customer_id, outcome: r.outcome, agentOutput: r.agent_output } : null;
 }
 
+/** Atomically reserve a pending proposal before any external task creation. */
+export async function claimBackfillProposalDecision(input: {
+  decisionId: string;
+  claimToken: string;
+  by: string;
+}): Promise<{
+  decisionId: string;
+  customerId: string;
+  outcome: string | null;
+  agentOutput: Record<string, unknown>;
+} | null> {
+  const { rows } = await query<{ id: string; customer_id: string; outcome: string | null; agent_output: Record<string, unknown> }>(
+    `UPDATE agent_decisions
+        SET backfill_claim_token = $2,
+            backfill_claimed_at = now(),
+            human_override = $3::jsonb
+      WHERE id = $1
+        AND decision_type = 'backfill_task_proposal'
+        AND outcome = 'pending'
+        AND backfill_claim_token IS NULL
+      RETURNING id, customer_id, outcome, agent_output`,
+    [input.decisionId, input.claimToken, JSON.stringify({ action: 'accepting', by: input.by })],
+  );
+  const row = rows[0];
+  return row ? { decisionId: row.id, customerId: row.customer_id, outcome: row.outcome, agentOutput: row.agent_output } : null;
+}
+
+/** Finish the action held by `claimToken`; a stale or losing surface cannot resolve it. */
+export async function completeBackfillProposalDecision(input: {
+  decisionId: string;
+  claimToken: string;
+  taskRef: string;
+  by: string;
+}): Promise<boolean> {
+  const { rowCount } = await query(
+    `UPDATE agent_decisions
+        SET outcome = 'accepted', task_ref = $3,
+            human_override = $4::jsonb, resolved_at = now(),
+            backfill_claim_token = NULL, backfill_claimed_at = NULL
+      WHERE id = $1
+        AND decision_type = 'backfill_task_proposal'
+        AND outcome = 'pending'
+        AND backfill_claim_token = $2`,
+    [input.decisionId, input.claimToken, input.taskRef, JSON.stringify({ action: 'accepted', by: input.by })],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/** Release a claim only when its owner failed before external task creation. */
+export async function releaseBackfillProposalDecision(input: { decisionId: string; claimToken: string }): Promise<boolean> {
+  const { rowCount } = await query(
+    `UPDATE agent_decisions
+        SET backfill_claim_token = NULL, backfill_claimed_at = NULL, human_override = NULL
+      WHERE id = $1
+        AND decision_type = 'backfill_task_proposal'
+        AND outcome = 'pending'
+        AND backfill_claim_token = $2`,
+    [input.decisionId, input.claimToken],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
 /**
  * All PENDING backfill proposals already carded for a customer (title/summary pulled out of the
  * stored agent_output). Used by the sweep-wide collapser to drop a fresh survivor that a PRIOR run
@@ -168,6 +230,7 @@ export async function getPendingBackfillProposals(
        FROM agent_decisions
       WHERE decision_type = 'backfill_task_proposal'
         AND outcome = 'pending'
+        AND backfill_claim_token IS NULL
         AND customer_id = $1`,
     [customerId],
   );
@@ -188,7 +251,8 @@ export async function resolveBackfillProposalDecision(input: {
   const { rowCount } = await query(
     `UPDATE agent_decisions
         SET outcome = $2, task_ref = $3, human_override = $4::jsonb, resolved_at = now()
-      WHERE id = $1 AND decision_type = 'backfill_task_proposal' AND outcome = 'pending'`,
+      WHERE id = $1 AND decision_type = 'backfill_task_proposal'
+        AND outcome = 'pending' AND backfill_claim_token IS NULL`,
     [input.decisionId, input.outcome, input.taskRef ?? null, JSON.stringify({ action: input.outcome, by: input.by ?? null })],
   );
   return (rowCount ?? 0) > 0;

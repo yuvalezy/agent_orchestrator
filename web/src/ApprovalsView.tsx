@@ -57,15 +57,15 @@ function useConfirm(): { ask: (o: ConfirmOpts) => void; dialog: ReactElement | n
 
 export function ApprovalsView(): ReactElement {
   const [tab, setTab] = useState<'drafts' | 'proposals'>('drafts');
-  const drafts = useQuery({ queryKey: ['approvals', 'drafts'], queryFn: () => api<{ data: DraftRow[] }>('/approvals/drafts') });
-  const proposals = useQuery({ queryKey: ['approvals', 'proposals'], queryFn: () => api<{ data: ProposalRow[] }>('/approvals/proposals') });
+  const drafts = useQuery({ queryKey: ['approvals', 'drafts'], queryFn: () => api<{ data: DraftRow[] }>('/approvals/drafts'), refetchInterval: 15_000 });
+  const proposals = useQuery({ queryKey: ['approvals', 'proposals'], queryFn: () => api<{ data: ProposalRow[] }>('/approvals/proposals'), refetchInterval: 15_000 });
 
   return (
     <div className="space-y-6">
       <div>
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-300">Approvals</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight">Pending decisions</h1>
-        <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">Approve, edit, revise, or reject drafts, and accept or skip backfill task proposals — the same actions as Telegram. Approving a draft sends the reply to the customer.</p>
+        <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">Approve, edit, revise, or reject drafts, and accept or skip backfill task proposals — the same actions as Telegram. The first action wins; this queue refreshes if Telegram has already handled it. Approving a draft sends the reply to the customer.</p>
       </div>
       <div className="flex gap-2">
         <button onClick={() => setTab('drafts')} className={`${btn} ${tab === 'drafts' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-900'}`}>Draft replies {drafts.data ? `(${drafts.data.data.length})` : ''}</button>
@@ -76,12 +76,18 @@ export function ApprovalsView(): ReactElement {
   );
 }
 
-function useActionState(): { err: string | null; ok: string | null; run: (p: Promise<unknown>, okMsg: string) => Promise<void> } {
+function useActionState(onConflict: () => void): { err: string | null; ok: string | null; run: (p: Promise<unknown>, okMsg: string) => Promise<void> } {
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
   const run = async (p: Promise<unknown>, okMsg: string): Promise<void> => {
     setErr(null); setOk(null);
-    try { await p; setOk(okMsg); } catch (e) { setErr((e as ApiError).message); }
+    try { await p; setOk(okMsg); } catch (e) {
+      const error = e as ApiError;
+      if (error.status === 409) {
+        onConflict();
+        setErr('Handled on another surface. The queue has been refreshed.');
+      } else setErr(error.message);
+    }
   };
   return { err, ok, run };
 }
@@ -92,9 +98,9 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
   const reviseEnabled = caps.data?.data.reviseEnabled ?? false;
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   const [revising, setRevising] = useState<{ id: string; text: string } | null>(null);
-  const { err, ok, run } = useActionState();
   const { ask, dialog } = useConfirm();
   const refetch = (): void => void client.invalidateQueries({ queryKey: ['approvals', 'drafts'] });
+  const { err, ok, run } = useActionState(refetch);
 
   if (query.isLoading) return <Loading />;
   if (query.isError) return <ErrorState message={(query.error as Error).message} />;
@@ -160,9 +166,9 @@ function ProposalsTab({ query }: { query: ReturnType<typeof useQuery<{ data: Pro
   const client = useQueryClient();
   const [priority, setPriority] = useState<string>('');
   const [customer, setCustomer] = useState<string>('');
-  const { err, ok, run } = useActionState();
   const { ask, dialog } = useConfirm();
   const refetch = (): void => void client.invalidateQueries({ queryKey: ['approvals', 'proposals'] });
+  const { err, ok, run } = useActionState(refetch);
 
   if (query.isLoading) return <Loading />;
   if (query.isError) return <ErrorState message={(query.error as Error).message} />;

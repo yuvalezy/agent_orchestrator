@@ -3,7 +3,13 @@ import { logger } from '../../logger';
 import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import { approveDraft, cancelDraft, replaceDraftBodyAndApprove } from '../../outbound/outbound-repo';
 import { approveBackfillProposal, rejectBackfillProposal } from '../../knowledge/backfill-approve';
-import { getBackfillProposal, resolveBackfillProposalDecision } from '../../decisions/decisions';
+import {
+  claimBackfillProposalDecision,
+  completeBackfillProposalDecision,
+  getBackfillProposal,
+  releaseBackfillProposalDecision,
+  resolveBackfillProposalDecision,
+} from '../../decisions/decisions';
 import { loadCustomerConfig } from '../../triage/context-loader';
 import { buildEzyPortalGateway } from '../ezy-portal/factory';
 import { buildDraftReviserService } from '../triage/callback-poller.factory';
@@ -34,13 +40,15 @@ export function buildConsoleApprovalsRouter(): Router {
   const reviser = buildDraftReviserService(noopNotifier);
 
   const backfillDeps = {
+    claim: claimBackfillProposalDecision,
     getProposal: getBackfillProposal,
     getCustomerTarget: async (customerId: string) => {
       const c = await loadCustomerConfig(customerId);
       return c ? { projectRef: c.projectRef, workItemTypeRef: c.workItemTypeRef } : null;
     },
     createTask: (i: Parameters<typeof portal.createTask>[0]) => portal.createTask(i),
-    resolve: resolveBackfillProposalDecision,
+    complete: completeBackfillProposalDecision,
+    release: releaseBackfillProposalDecision,
     log: logger,
   };
 

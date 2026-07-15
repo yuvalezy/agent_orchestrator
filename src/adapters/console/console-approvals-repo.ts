@@ -76,7 +76,8 @@ export async function listPendingBackfillProposals(): Promise<PendingProposalRow
             d.agent_output->>'summary'       AS summary
        FROM agent_decisions d
        LEFT JOIN agent_customers c ON c.id = d.customer_id
-      WHERE d.decision_type = 'backfill_task_proposal' AND d.outcome = 'pending'
+      WHERE d.decision_type = 'backfill_task_proposal'
+        AND d.outcome = 'pending' AND d.backfill_claim_token IS NULL
       ORDER BY d.created_at DESC, d.id DESC
       LIMIT 200`,
   );

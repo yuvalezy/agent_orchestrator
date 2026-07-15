@@ -100,6 +100,16 @@ hour of age (capped at 72) and five points per retry (capped at 20). Each
 pagination walk freezes an `asOf` snapshot in its cursor, so a record cannot
 move between pages while it is being reviewed. Refresh starts a new snapshot.
 
+### Cross-surface approvals
+
+Telegram and console approval actions share the same guarded decision records.
+For draft replies, the queue flip and decision resolution are one transaction.
+For a backfill task approval, the winning surface first claims the pending
+decision; only that claim may create the portal task. A second action sees it as
+handled and makes no queue change, task, or duplicate Telegram confirmation.
+If a portal task is created but the final decision update fails, its claim stays
+in place to prevent another task; review that exceptional row before intervening.
+
 ## Background workers
 
 All workers run on an interval/backoff loop (recursive `setTimeout`; exponential backoff on consecutive failures, capped at 10× the interval). Each tick is isolated — one failure never blocks the others. Their live status is exposed on `/health`.
