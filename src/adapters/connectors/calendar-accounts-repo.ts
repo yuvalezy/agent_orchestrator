@@ -56,6 +56,26 @@ export async function getCalendarAccount(id: string, q: Query = dbQuery): Promis
   return rows[0] ? toAccount(rows[0]) : null;
 }
 
+/**
+ * The calendar account a customer's task deadlines are written to (M5(d) write path, mig 035):
+ * agent_customers.calendar_account_id → calendar_accounts. Returns null when the customer has no
+ * per-customer target OR that account is disabled — the caller then falls back (see
+ * calendar-write-target.ts). Keyed by `bp_ref` because the task port's `customerRef` IS the
+ * bpRef, so the join answers it in one read instead of a bpRef→customerId hop.
+ * Joins on `enabled = true`: disabling an account in the console must stop writes to it too, not
+ * just reads.
+ */
+export async function findCustomerCalendarAccount(bpRef: string, q: Query = dbQuery): Promise<CalendarAccount | null> {
+  const { rows } = await q<Row>(
+    `SELECT ca.id, ca.label, ca.account_email, ca.credentials_ref, ca.calendar_id, ca.enabled
+       FROM agent_customers c
+       JOIN calendar_accounts ca ON ca.id = c.calendar_account_id
+      WHERE c.bp_ref = $1 AND ca.enabled = true`,
+    [bpRef],
+  );
+  return rows[0] ? toAccount(rows[0]) : null;
+}
+
 /** Mint a unique GOOGLE_CALENDAR_<SLUG>_OAUTH credential ref for a new account (avoids the
  *  reserved work/personal creds + any existing row's credentials_ref). Pure (collision testable). */
 export function mintCalendarCredentialName(label: string, existingRefs: string[]): string {

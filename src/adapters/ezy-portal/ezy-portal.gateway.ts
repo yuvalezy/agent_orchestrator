@@ -307,6 +307,7 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
     priority: 'low' | 'medium' | 'high' | 'urgent';
     source: { service: string; entityType: string; entityId: string; display: string; url?: string };
     tags: string[];
+    dueAt?: Date;
   }): Promise<TaskRef> {
     const created = await this.http.post<EzyTask>('/api/projects/tasks', {
       projectId: input.projectRef,
@@ -314,6 +315,9 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
       title: truncateRunes(input.title, TITLE_MAX),
       description: truncateRunes(input.description, DESC_MAX),
       priority: input.priority,
+      // DA-verified optional field (`dueAt`, ISO string). Omitted entirely when absent — the
+      // portal distinguishes "no deadline" from a null/empty value.
+      dueAt: input.dueAt?.toISOString(),
       sourceService: input.source.service,
       sourceEntityType: input.source.entityType,
       sourceEntityId: input.source.entityId,

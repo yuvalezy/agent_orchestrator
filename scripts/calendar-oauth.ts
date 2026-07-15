@@ -6,17 +6,22 @@ import { spawn } from 'node:child_process';
 import { buildGoogleAuthUrl, clientFromGmailCred, exchangeGoogleCode } from '../src/adapters/connectors/google-oauth';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Google Calendar OAuth helper (M5(d) prerequisite) — mint a READ-ONLY refresh
-// token for ONE Google account with the calendar.readonly scope, via the loopback
-// flow. Run it ONCE PER ACCOUNT (work, then personal — pick the right Google
-// account in the browser each time). No external deps: raw http + fetch.
+// Google Calendar OAuth helper (M5(d) prerequisite) — mint a refresh token for ONE
+// Google account with the calendar.readonly + calendar.events scopes, via the
+// loopback flow. Run it ONCE PER ACCOUNT (work, then personal — pick the right
+// Google account in the browser each time). No external deps: raw http + fetch.
+//
+// ⚠︎ RE-CONSENT: calendar.events (needed to CREATE task-deadline events) was added
+// after the first tokens were minted. A token minted with calendar.readonly alone
+// keeps working for reads and 403s on every write — re-run this for each account
+// before turning CALENDAR_WRITE_ENABLED on.
 //
 // The Google client (client_id/client_secret) is REUSED from the existing Gmail
 // OAuth setup by default — same GCP project, no new client to create. You still
 // must, one time in that project:
 //   1. APIs & Services → Library → enable "Google Calendar API".
-//   2. OAuth consent screen → add the scope .../auth/calendar.readonly (and keep
-//      your Gmail account(s) as Test users).
+//   2. OAuth consent screen → add the scopes .../auth/calendar.readonly and
+//      .../auth/calendar.events (and keep your Gmail account(s) as Test users).
 // (The loopback redirect is already allowed for the Desktop client Gmail uses.)
 //
 // ── Run ──────────────────────────────────────────────────────────────────────
@@ -31,7 +36,8 @@ import { buildGoogleAuthUrl, clientFromGmailCred, exchangeGoogleCode } from '../
 // GOOGLE_CALENDAR_WORK_OAUTH / GOOGLE_CALENDAR_PERSONAL_OAUTH.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly'];
+// Read + write. Mirrors google-account-scopes.ts (the console flow) — one story for the grants.
+const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/calendar.events'];
 const CAL = 'https://www.googleapis.com/calendar/v3';
 
 function arg(name: string): string | undefined {

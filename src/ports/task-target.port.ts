@@ -56,6 +56,10 @@ export interface TaskTargetPort {
     priority: 'low' | 'medium' | 'high' | 'urgent';
     source: { service: string; entityType: string; entityId: string; display: string; url?: string };
     tags: string[];
+    /** Deadline instant, when the task has one. Optional — most tasks don't. Beyond being
+     *  stored on the task, a `dueAt` is what puts the deadline on the founder's calendar
+     *  (see src/triage/due-event-sync.ts); omitting it creates no event. */
+    dueAt?: Date;
   }): Promise<TaskRef>;
   addComment(task: TaskRef, body: string): Promise<void>;
   findOpenTasks(q: {

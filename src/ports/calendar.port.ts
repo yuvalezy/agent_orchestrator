@@ -1,8 +1,11 @@
-// Calendar port (M5(d)). READ-ONLY today: the founder's Google Calendar is polled at
-// draft time so the drafter can surface the drafted customer's UPCOMING meetings as
-// draft context. Implemented by the Google Calendar adapter (src/adapters/calendar).
-// Best-effort everywhere — a calendar miss NEVER fails drafting (D1: core never imports
-// the adapter; the Google client is wired only in the composition root).
+// Calendar ports (M5(d)). TWO interfaces, deliberately split (see CalendarWriterPort):
+//   • CalendarPort       — READ. The founder's Google Calendar is polled at draft time so the
+//                          drafter can surface the drafted customer's UPCOMING meetings.
+//   • CalendarWriterPort — WRITE. A task created with a `dueAt` gets a deadline event.
+// Both are implemented by the Google Calendar adapter (src/adapters/calendar). Best-effort
+// everywhere — a calendar miss NEVER fails drafting, and a calendar WRITE failure never fails
+// task creation (D1: core never imports the adapter; the Google client is wired only in the
+// composition root).
 
 /**
  * One NORMALIZED calendar event (provider-shape stripped). `startsAt`/`endsAt` are the
@@ -45,15 +48,60 @@ export interface ListUpcomingEventsInput {
   maxEvents?: number;
 }
 
-/**
- * Read-only calendar access. `listUpcomingEvents` is the only method today; a future write
- * follow-up (M5(d) event-creation / task-dueAt sync) will add a `createEvent(...)` alongside
- * it — the port is intentionally shaped so that write method slots in without disturbing the
- * read path. NOT implemented now.
- */
+/** Read-only calendar access — the meeting-context lane's only dependency. */
 export interface CalendarPort {
   listUpcomingEvents(input: ListUpcomingEventsInput): Promise<CalendarEvent[]>;
-  // FUTURE (write follow-up, deliberately NOT wired now):
-  //   createEvent(input: { calendarId?: string; title: string; startsAt: Date; endsAt: Date;
-  //                        attendeeEmails?: string[] }): Promise<{ id: string }>;
+}
+
+/**
+ * One event to CREATE. `startsAt`/`endsAt` are absolute instants; `endsAt` is EXCLUSIVE (as
+ * Google treats it). `timeZone` is the IANA zone the event is rendered in — and, for an
+ * `allDay` event, the zone whose local day `startsAt` is projected onto (an instant alone
+ * cannot name a day). NEVER carries customer message text: the description is a short
+ * system-authored line, because a calendar event is not a private surface.
+ */
+export interface CreateEventInput {
+  /** Target calendar id; defaults to 'primary' when omitted. */
+  calendarId?: string;
+  title: string;
+  startsAt: Date;
+  /** EXCLUSIVE end instant. */
+  endsAt: Date;
+  /** Render as a date-only (all-day) event on the `timeZone` day containing `startsAt`. */
+  allDay?: boolean;
+  /** IANA zone for rendering (and the all-day day projection). */
+  timeZone: string;
+  description?: string;
+  attendeeEmails?: string[];
+  /**
+   * Caller-supplied DETERMINISTIC event id. Google rejects a duplicate id with 409, so a
+   * caller that derives this id from its own domain key gets an idempotent insert AT THE API
+   * — the second attempt cannot double-create, even if the caller's own guard was lost.
+   * Must be base32hex (lowercase a–v + 0–9, 5–1024 chars) or Google rejects it with 400.
+   */
+  eventId?: string;
+}
+
+/** The created (or already-existing) event. */
+export interface CreatedEvent {
+  id: string;
+  /** Google `htmlLink` (UI deep link), or null when absent / not returned. */
+  htmlLink: string | null;
+  /**
+   * TRUE when the deterministic `eventId` already existed (Google 409) — this call created
+   * NOTHING. Not an error: it is the API-level idempotency guard reporting a duplicate.
+   */
+  alreadyExisted: boolean;
+}
+
+/**
+ * Calendar WRITE access. Split from `CalendarPort` rather than added to it, for a structural
+ * reason: the read adapter is a multi-account COMPOSITE (it fans a read out across every
+ * enabled calendar and merges), and a fan-out has no single target to write to — a write must
+ * name exactly ONE calendar + ONE credential. Keeping the writer its own interface means the
+ * read composite stays a valid `CalendarPort` without having to implement a write it cannot
+ * sensibly perform (ISP), and a reader-only consumer (meeting context) cannot reach a write.
+ */
+export interface CalendarWriterPort {
+  createEvent(input: CreateEventInput): Promise<CreatedEvent>;
 }

@@ -239,9 +239,12 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
       })()
     : null;
 
-  // M5(c): founder slash commands (/pending, /briefing, /help) — gated by SLASH_COMMANDS_ENABLED
-  // (null when off). Consumes only a REGISTERED command; else falls through (so /ask and the
-  // free-text captures still see the message). Runs alongside /ask, before revise/edit captures.
+  // M5(c): founder slash commands (/pending, /briefing, /status, /summary, /history, /draft email,
+  // /backfill, /help) — gated by SLASH_COMMANDS_ENABLED (null when off); each command's own
+  // dependency (the drafter, the backfill sweep, …) is gated inside the factory, so an off feature
+  // answers "unavailable" instead of throwing. Consumes only a REGISTERED command; else falls
+  // through (so /ask and the free-text captures still see the message). Runs alongside /ask,
+  // before revise/edit captures.
   const slash = buildSlashCommandsHandler(notifier);
   const scheduling = buildSchedulingGated(notifier, threadMarkers);
 

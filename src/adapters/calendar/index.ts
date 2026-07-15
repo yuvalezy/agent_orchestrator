@@ -1,5 +1,6 @@
-// Google Calendar adapter barrel (M5(d), READ-ONLY). Wired to the CalendarPort only in
-// composition roots (src/adapters/triage/inbox-processor.factory.ts) — never imported by
-// core (D1).
-export { GoogleCalendarClient, normalizeEvent } from './google-calendar-client';
+// Google Calendar adapter barrel (M5(d)). READ (meeting context) + WRITE (task-dueAt deadline
+// events). Wired to the calendar ports only in composition roots
+// (src/adapters/triage/inbox-processor.factory.ts) — never imported by core (D1).
+export { GoogleCalendarClient, CalendarHttpError, normalizeEvent, googleTime, dateInTz } from './google-calendar-client';
 export { buildCalendarAdapter } from './factory';
+export { resolveDueEventTarget } from './calendar-write-target';

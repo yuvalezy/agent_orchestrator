@@ -458,8 +458,27 @@ const envSchema = z.object({
   // Per-account target calendar ids now live PER ROW in calendar_accounts.calendar_id (the
   // console-managed calendar list), not in env — the retired GOOGLE_CALENDAR_{WORK,PERSONAL}_ID
   // vars are gone. Each dynamic account carries its own calendar id.
-  // IANA timezone for rendering meeting date/time lines (the founder's local week).
+  // IANA timezone for rendering meeting date/time lines (the founder's local week). Also the
+  // zone the WRITE path renders deadline events in, and whose local day decides all-day vs timed.
   CALENDAR_TZ: z.string().default('America/Panama'),
+
+  // M5(d) WRITE path: a task created with a `dueAt` also gets a deadline event on the founder's
+  // calendar (src/triage/due-event-sync.ts). SEPARATE kill-switch from CALENDAR_ENABLED (which
+  // only gates the read/meeting-context lane) because this is the first thing that MUTATES the
+  // founder's calendar — turning meeting context on must not silently start writing. Strict-bool,
+  // DORMANT by default: wired ONLY on the literal "true"; unset/"false"/else → false.
+  //
+  // ⚠︎ SCOPE: writing needs an OAuth credential minted with .../auth/calendar.events. The accounts
+  // consented BEFORE this flag existed hold calendar.readonly only and will 403 on every write
+  // until re-consented (see google-account-scopes.ts). A 403 degrades to "no event" — it never
+  // fails task creation.
+  CALENDAR_WRITE_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Length of a TIMED deadline block (minutes). A deadline at a real time-of-day becomes a short
+  // block starting at the deadline; an all-day deadline ignores this. Default 30.
+  CALENDAR_DUE_EVENT_DURATION_MINUTES: z.coerce.number().int().positive().default(30),
 
   // ── M3(e): weekly pattern detection — a weekly digest that clusters the week's Layer-A
   // signal memories (founder corrections + customer conversation/task themes) by their

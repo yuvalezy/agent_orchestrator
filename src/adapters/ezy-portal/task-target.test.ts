@@ -50,6 +50,28 @@ test('createTask posts camelCase body + source* + Idempotency-Key; truncates a l
   assert.equal((c.body!.title as string).length, 240); // truncated
 });
 
+test('createTask sends a dueAt as an ISO string, and OMITS the field entirely when absent', async () => {
+  const withDue = gatewayWith(201, { id: 'task-1', title: 'T' });
+  await withDue.gw.createTask({
+    customerRef: 'bp-1', projectRef: 'proj-1', workItemTypeRef: 'wit-1',
+    title: 'T', description: 'd', priority: 'high',
+    source: { service: 's', entityType: 'e', entityId: 'i', display: 'd' },
+    tags: [],
+    dueAt: new Date('2026-07-15T22:00:00Z'),
+  });
+  assert.equal(withDue.calls[0].body!.dueAt, '2026-07-15T22:00:00.000Z');
+
+  const noDue = gatewayWith(201, { id: 'task-2', title: 'T' });
+  await noDue.gw.createTask({
+    customerRef: 'bp-1', projectRef: 'proj-1', workItemTypeRef: 'wit-1',
+    title: 'T', description: 'd', priority: 'high',
+    source: { service: 's', entityType: 'e', entityId: 'i', display: 'd' },
+    tags: [],
+  });
+  // Absent, not null: the portal distinguishes "no deadline" from an explicit null.
+  assert.ok(!('dueAt' in noDue.calls[0].body!), 'dueAt must not appear at all when the task has no deadline');
+});
+
 test('createTask maps the human code + a portal deep link off the client baseUrl', async () => {
   const { gw } = gatewayWith(201, { id: '9f1c2d3e-4b5a-6789-abcd-ef0123456789', title: 'Zero values', code: 'TSK-00247' });
   const ref = await gw.createTask({

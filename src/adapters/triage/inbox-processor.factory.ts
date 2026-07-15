@@ -10,7 +10,10 @@ import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
 import { buildMeetingContext, type MeetingContext } from '../../triage/meeting-context';
-import { buildCalendarAdapter } from '../calendar';
+import { withDueDateCalendarEventsIf } from '../../triage/due-event-sync';
+import { claimDueEvent, completeDueEvent, releaseDueEvent } from '../../triage/due-event-ledger';
+import { buildCalendarAdapter, resolveDueEventTarget } from '../calendar';
+import type { TaskTargetPort } from '../../ports/task-target.port';
 import { buildResponseDrafter, type ResponseDrafter } from '../../triage/response-drafter';
 import { buildCrossChannelDedup, type CrossChannelDedup } from '../../triage/cross-channel-dedup';
 import { searchConversationLinks, insertConversationLink } from '../../triage/conversation-link-repo';
@@ -176,8 +179,36 @@ function buildCrossChannelDedupGated(): CrossChannelDedup | undefined {
   });
 }
 
+/**
+ * M5(d) WRITE path: wrap the task target so a task created WITH a `dueAt` also lands a deadline
+ * event on the founder's calendar. The composition root is where the CORE decorator
+ * (src/triage/due-event-sync.ts — ports only) meets the Google client + the ledger (D1).
+ *
+ * Gated by CALENDAR_WRITE_ENABLED — its OWN flag, not CALENDAR_ENABLED: this MUTATES the
+ * founder's calendar, so it stays dormant until asked for explicitly. When off, the UNWRAPPED
+ * port is returned — not a wrapper that no-ops — so the money path is byte-for-byte what it was
+ * before this feature existed.
+ */
+function withDueEventsGated(taskTarget: TaskTargetPort): TaskTargetPort {
+  logger.info(
+    env.CALENDAR_WRITE_ENABLED
+      ? { timeZone: env.CALENDAR_TZ, durationMinutes: env.CALENDAR_DUE_EVENT_DURATION_MINUTES }
+      : {},
+    env.CALENDAR_WRITE_ENABLED
+      ? 'calendar due-events wired (CALENDAR_WRITE_ENABLED=true) — a task dueAt creates a deadline event'
+      : 'calendar due-events NOT wired (CALENDAR_WRITE_ENABLED=false) — tasks with a dueAt create no event',
+  );
+  return withDueDateCalendarEventsIf(env.CALENDAR_WRITE_ENABLED, taskTarget, () => ({
+    resolveTarget: resolveDueEventTarget,
+    claim: (taskRef) => claimDueEvent(taskRef),
+    complete: (taskRef, eventId, calendarId) => completeDueEvent(taskRef, eventId, calendarId),
+    release: (taskRef) => releaseDueEvent(taskRef),
+    options: { timeZone: env.CALENDAR_TZ, durationMinutes: env.CALENDAR_DUE_EVENT_DURATION_MINUTES },
+  }));
+}
+
 export function buildInboxProcessorWorker(notifier: FounderNotifierPort): WorkerDefinition {
-  const taskTarget = buildEzyPortalGateway();
+  const taskTarget = withDueEventsGated(buildEzyPortalGateway());
   const llm = buildLlmRouter({
     notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
   });
