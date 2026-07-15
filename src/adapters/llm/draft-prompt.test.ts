@@ -25,6 +25,16 @@ const req = (over: Partial<DraftRequest> = {}): DraftRequest => ({
   ...over,
 });
 
+// A gendered language forces agreement with the person; without this the model can only
+// hedge ("Bienvenido/a"). Absent must stay absent — not a value the model reinterprets.
+test('draftUserMessage: a known recipient gender is sent, an unknown one is omitted', () => {
+  assert.match(draftUserMessage(req({ gender: 'female' })), /Recipient grammatical gender: female/);
+  for (const gender of [null, undefined]) {
+    assert.equal(/grammatical gender/i.test(draftUserMessage(req({ gender }))), false, `gender=${gender} → omitted`);
+  }
+  assert.match(DRAFT_SYSTEM, /gendered language/i);
+});
+
 test('draftUserMessage: voice guidance renders as a distinct directive section, not a numbered source', () => {
   const msg = draftUserMessage(req({ voiceGuidance: ['be warmer and less formal', 'greet them by first name'] }));
   assert.match(msg, /Persistent voice & tone guidance/);

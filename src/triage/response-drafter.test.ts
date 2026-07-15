@@ -61,6 +61,7 @@ function makeDeps(over?: {
   styleGuidance?: string[];
   styleGuidanceFor?: (customerId: string | null) => Promise<string[]>;
   meetings?: string[];
+  resolveGender?: (channelType: string, address: string) => Promise<'male' | 'female' | null>;
 }): { deps: ResponseDrafterDeps; cap: Captured } {
   const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [], meetingCalls: [] };
   const deps: ResponseDrafterDeps = {
@@ -84,6 +85,7 @@ function makeDeps(over?: {
           },
         }
       : {}),
+    ...(over?.resolveGender ? { recipientProfile: { resolveGender: over.resolveGender } } : {}),
     llm: {
       draftReply: over?.draftReplyImpl
         ? over.draftReplyImpl
@@ -115,6 +117,42 @@ function makeDeps(over?: {
 }
 
 const cfg = { displayName: 'Ada Lovelace', preferredLanguage: 'es' };
+
+// preferredLanguage='es' + no gender leaves the model only the hedge "Bienvenido/a",
+// which no native speaker writes. The sender we are replying TO is the person to match.
+test('draftAndPresent: the sender gender reaches the draft request', async () => {
+  const asked: Array<[string, string]> = [];
+  const { deps, cap } = makeDeps({
+    resolveGender: async (channelType, address) => { asked.push([channelType, address]); return 'female'; },
+  });
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()],
+    intent: { category: 'question_existing' } as never,
+  });
+  assert.deepEqual(asked, [['whatsapp', '+15551230000']]);
+  assert.equal(cap.draftReqs[0].gender, 'female');
+  assert.equal(cap.draftReqs[0].language, 'es');
+});
+
+test('draftAndPresent: without a gender lookup the draft is simply gender-neutral', async () => {
+  const { deps, cap } = makeDeps();
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()],
+    intent: { category: 'question_existing' } as never,
+  });
+  assert.equal(cap.draftReqs[0].gender, null);
+  assert.equal(cap.enqueues.length, 1, 'drafting is unaffected');
+});
+
+// A gender lookup must never be able to break the hot inbound path.
+test('draftAndPresent: a failing gender lookup does not break the draft', async () => {
+  const { deps, cap } = makeDeps({ resolveGender: async () => { throw new Error('whitelist down'); } });
+  await assert.doesNotReject(buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()],
+    intent: { category: 'question_existing' } as never,
+  }));
+  assert.equal(cap.enqueues.length, 1, 'the draft still went out');
+});
 
 test('draftAndPresent: enqueues a cited draft, records the decision, presents with buttons', async () => {
   const { deps, cap } = makeDeps();

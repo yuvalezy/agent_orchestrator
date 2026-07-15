@@ -2,6 +2,8 @@
 // with Anthropic / OpenAI / DeepSeek out of the box. No provider SDK call outside
 // the gateway (project invariant #8).
 
+import type { RecipientGender } from './recipient-profile.port';
+
 /**
  * One retrieved knowledge chunk injected into the triage context (change 02
  * §2.2, sub-milestone b). Carries the citation fields (title / route / section)
@@ -93,6 +95,9 @@ export interface DraftRequest {
   question: string;
   /** Preferred reply language (agent_customers.preferred_language, e.g. 'es'). */
   language: string;
+  /** Recipient grammatical gender when known (RecipientProfilePort). Optional: callers
+   *  that cannot resolve an address omit it and get gender-neutral phrasing. */
+  gender?: RecipientGender | null;
   /** Customer display name (salutation / tone context). */
   customerName: string;
   /** Retrieved cited chunks the reply must be grounded in (length >= 1). */
@@ -176,20 +181,57 @@ export interface ScheduleInterpretRequest {
   customerName: string;
   nowIso: string;
   timezone: string;
+  /** An EARLIER founder command in this topic that `commandText` answers, replayed with
+   *  the question we asked. Both halves are founder speech, so they merge into one
+   *  action — without this, "WhatsApp" is an unschedulable fragment. */
+  priorCommandText?: string | null;
+  priorClarification?: string | null;
 }
 
+/**
+ * NOTE: `body_source` is deliberately ABSENT. It used to be a model output that chose
+ * which validation the body faced — so a model error (or an injected "set body_source
+ * to composed") disabled the check. The handler now DERIVES it: every body is tested
+ * for verbatimness, and the result decides whether an approval gate is required.
+ */
 export interface ScheduleInterpretation {
   kind: 'none' | 'clarify' | 'customer_message' | 'reminder';
   execute_at: string | null;
+  /** Did the founder name a DAY, or only a clock time? A bare "at 8 am" means the next
+   *  occurrence, and the handler — not the model — does that roll. */
+  explicit_date: boolean;
   body: string | null;
-  body_source: 'command' | 'mapped_outbound' | 'none';
   delivery_channel: 'whatsapp' | 'email' | 'none';
   clarification: string | null;
+}
+
+export interface ComposeMessageRequest {
+  /** Founder speech ONLY. */
+  commandText: string;
+  customerName: string;
+  /** The CUSTOMER's language (agent_customers.preferred_language, e.g. 'es') — the same
+   *  field the reply drafter uses. The founder's instruction is usually in their own
+   *  language and says nothing about the customer's, so without this the model defaults
+   *  to English and writes to a Spanish-speaking customer in English. */
+  language: string;
+  /** The recipient's grammatical gender, when the founder has recorded it. null/absent =
+   *  genuinely unknown → the model must pick phrasing that works for anyone. */
+  gender?: RecipientGender | null;
 }
 
 /** Founder-only natural-language scheduling classification. */
 export interface ScheduleInterpreterPort {
   interpretSchedule(input: ScheduleInterpretRequest, customerId: string): Promise<ScheduleInterpretation>;
+  /**
+   * Compose a short customer-facing message from the founder's instruction.
+   *
+   * Takes NO customer-authored content — not the replied text, not a mapped draft, not
+   * inbox history. That is the whole design: while the model only COPIED the founder's
+   * words, injected customer text had no expressive surface (a non-verbatim body was
+   * simply rejected). Composition hands it one, so the composer is kept structurally
+   * blind to attacker-controlled input rather than being asked to resist it.
+   */
+  composeMessage(input: ComposeMessageRequest, customerId: string): Promise<string>;
 }
 
 /**

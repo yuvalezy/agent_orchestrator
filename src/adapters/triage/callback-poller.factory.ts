@@ -28,6 +28,7 @@ import {
 } from '../../outbound/outbound-repo';
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
 import { buildBackfillApproveHandler } from './backfill-approve.factory';
+import { buildThreadMarkers } from '../../triage/thread-markers';
 import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
 import { memoryRepo } from '../../knowledge/memory-repo';
@@ -42,7 +43,7 @@ import { buildLlmRouter } from '../llm/factory';
 import { buildAskMessageHandler } from '../../query/ask-command';
 import { buildQueryEngineService } from '../query/factory';
 import { buildSlashCommandsHandler } from '../query/slash-commands.factory';
-import { buildScheduleMessageHandlerGated } from '../scheduling/factory';
+import { buildSchedulingGated } from '../scheduling/factory';
 import { cancelScheduledAction } from '../../scheduling/scheduling-repo';
 
 // Composition: register the callback handlers on the notifier and drive its poll from
@@ -56,8 +57,15 @@ import { cancelScheduledAction } from '../../scheduling/scheduling-repo';
 // composition root; the boundary rule only forbids core → adapters).
 
 const OFFSET_KEY = 'telegram_update_offset';
-const editMarkerKey = (threadId: string): string => `draft_edit_pending:${threadId}`;
-const reviseMarkerKey = (threadId: string): string => `draft_revise_pending:${threadId}`;
+
+/** ONE marker set for the whole founder surface: arming any capture clears the others,
+ *  and every marker expires. Both invariants live in thread-markers.ts — see the note
+ *  there on why an un-expiring ✏️ Edit marker sends the founder's next message to the
+ *  customer verbatim. */
+const threadMarkers = buildThreadMarkers(
+  { get: getAppState, set: setAppState, clear: clearAppState },
+  () => new Date(),
+);
 
 /**
  * Build the gated 🔁 Revise service (DraftReviserService | null). Needs its own LLM router +
@@ -160,17 +168,12 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // DRAFT_REVISE_ENABLED=false).
   const revise = buildDraftReviserGated(notifier);
 
-  // Marker arming with MUTUAL EXCLUSION (DA N2): a thread holds at most one pending capture.
-  // Arming one kind CLEARS the other FIRST (so a crash between the two ops leaves NEITHER
-  // armed → the founder retries — the safe direction — never BOTH armed → a mis-consume).
-  const armEditMarker = async (threadId: string, queueId: string): Promise<void> => {
-    await clearAppState(reviseMarkerKey(threadId));
-    await setAppState(editMarkerKey(threadId), queueId);
-  };
-  const armReviseMarker = async (threadId: string, queueId: string): Promise<void> => {
-    await clearAppState(editMarkerKey(threadId));
-    await setAppState(reviseMarkerKey(threadId), queueId);
-  };
+  // Marker arming with MUTUAL EXCLUSION (DA N2): a thread holds at most one pending
+  // capture. threadMarkers owns the ordering (clear others, then set) and the TTL.
+  const armEditMarker = (threadId: string, queueId: string): Promise<void> =>
+    threadMarkers.arm('draft_edit', threadId, queueId);
+  const armReviseMarker = (threadId: string, queueId: string): Promise<void> =>
+    threadMarkers.arm('draft_revise', threadId, queueId);
 
   // M2c: the draft Approve/Edit/Reject(/Revise) handler — wired ONLY when the drafter is on.
   // armRevise is passed only when the revise loop is enabled (else the 🔁 button isn't rendered
@@ -206,6 +209,7 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
       }
       return;
     }
+    if (scheduling && scheduling.isScheduleOption(d.optionId)) return scheduling.onDecision(d);
     if (d.optionId === CANCEL_OPTION) return cancel(d);
     if (draft && isDraftOption(d.optionId)) return draft(d);
     if (revise && isCorrectionFlipOption(d.optionId)) return revise.flip(d);
@@ -239,20 +243,20 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // (null when off). Consumes only a REGISTERED command; else falls through (so /ask and the
   // free-text captures still see the message). Runs alongside /ask, before revise/edit captures.
   const slash = buildSlashCommandsHandler(notifier);
-  const scheduling = buildScheduleMessageHandlerGated(notifier);
+  const scheduling = buildSchedulingGated(notifier, threadMarkers);
 
   const reviseCapture = revise
     ? buildDraftReviseMessageHandler({
-        readArmedRevise: (threadId) => getAppState(reviseMarkerKey(threadId)),
-        clearArmedRevise: (threadId) => clearAppState(reviseMarkerKey(threadId)),
+        readArmedRevise: (threadId) => threadMarkers.read('draft_revise', threadId),
+        clearArmedRevise: (threadId) => threadMarkers.clear('draft_revise', threadId),
         reviser: revise.service,
       })
     : null;
 
   const draftEdit = env.KNOWLEDGE_DRAFT_ENABLED
     ? buildDraftEditMessageHandler({
-        readArmedEdit: (threadId) => getAppState(editMarkerKey(threadId)),
-        clearArmedEdit: (threadId) => clearAppState(editMarkerKey(threadId)),
+        readArmedEdit: (threadId) => threadMarkers.read('draft_edit', threadId),
+        clearArmedEdit: (threadId) => threadMarkers.clear('draft_edit', threadId),
         replaceDraftBodyAndApprove,
         notifier,
       })
@@ -264,7 +268,7 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
       if (slash && (await slash(m))) return; // /pending·/briefing·/help consumed it (M5(c))
       if (reviseCapture && (await reviseCapture(m))) return;
       if (draftEdit && (await draftEdit(m))) return;
-      if (scheduling) await scheduling(m);
+      if (scheduling) await scheduling.onMessage(m);
     });
   }
 

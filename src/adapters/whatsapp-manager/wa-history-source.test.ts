@@ -34,7 +34,7 @@ function makeDeps(messages: StoredWaMessage[], whitelist: WaWhitelistEntry[], gr
 }
 
 const wl = (phone: string, bp: string | null): WaWhitelistEntry => ({
-  id: 1, phone_number: phone, label: null, preferred_language: 'en', ezy_bp_id: bp, ezy_contact_id: null, ezy_contact_name: null,
+  id: 1, phone_number: phone, label: null, preferred_language: 'en', gender: 'unknown', ezy_bp_id: bp, ezy_contact_id: null, ezy_contact_name: null,
 });
 const grp = (groupId: string, bp: string | null): WaGroupEntry => ({ id: 1, group_id: groupId, chat_id: `${groupId}@g.us`, subject: 'G', ezy_bp_id: bp });
 

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
@@ -9,7 +9,7 @@ import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draf
 import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './answer-prompt';
 import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
-import { SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
+import { COMPOSE_SCHEMA, COMPOSE_SYSTEM, SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, composeUserMessage, parseComposedBody, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
 
@@ -250,6 +250,21 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftRevi
       messages: [{ role: 'user', content: scheduleUserMessage(input) }],
       maxTokens: 512,
       validate: parseScheduleInterpretation,
+      customerId,
+    });
+  }
+
+  /** Deliberately a SEPARATE call from interpretSchedule: its payload carries founder
+   *  text and the customer's display name only, so customer-authored content is never
+   *  in the window where the model is composing. Role 'draft' — this is generation. */
+  async composeMessage(input: ComposeMessageRequest, customerId: string): Promise<string> {
+    return this.callStructured<string>({
+      role: 'draft',
+      schema: COMPOSE_SCHEMA,
+      system: COMPOSE_SYSTEM,
+      messages: [{ role: 'user', content: composeUserMessage(input) }],
+      maxTokens: 512,
+      validate: parseComposedBody,
       customerId,
     });
   }

@@ -66,6 +66,9 @@ export const DRAFT_SYSTEM = [
   'knowledge sources and NOT facts: never cite them, never list their number in used_sources,',
   'and never invent, move, or promise a meeting that is not listed.',
   '',
+  'In a gendered language, use the supplied recipient gender for adjectives/participles about them.',
+  'When no gender is supplied you do NOT know it: use phrasing that works for anyone — never guess from',
+  'the name, and never hedge with a slash ("Bienvenido/a"), which no native speaker writes.',
   'Write the reply in the requested language. Return ONLY the structured object',
   '{"reply": "...", "used_sources": [n, ...]} where used_sources lists the 0-based',
   'indexes of the KNOWLEDGE sources you actually relied on (empty if none applied). Do NOT',
@@ -77,6 +80,7 @@ export const DRAFT_SYSTEM = [
 export function draftUserMessage(req: DraftRequest): string {
   const parts: string[] = [];
   parts.push(`Reply language: ${req.language}`);
+  if (req.gender) parts.push(`Recipient grammatical gender: ${req.gender}`);
   parts.push(`Customer: ${req.customerName}`);
   parts.push('', 'Customer message:', req.question);
   // Always-on style lane: persistent voice/tone directives for this customer. A DISTINCT,

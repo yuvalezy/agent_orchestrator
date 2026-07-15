@@ -5,12 +5,16 @@ import { WhatsAppHttp } from './http';
 // the onboarding CLI client-filters by `ezy_bp_id`. Identity fields mirror
 // whatsapp_manager's whitelist.service / group.service row shapes.
 
-/** A whitelist row (a monitored contact). Only the fields onboarding reads. */
+/** A whitelist row (a monitored contact). A SUBSET of what `GET /whitelist` returns —
+ *  only the fields we read. */
 export interface WaWhitelistEntry {
   id: number;
   phone_number: string;
   label: string | null;
   preferred_language: string;
+  /** whatsapp_manager's own CHECK constraint: 'male' | 'female' | 'unknown'. The founder
+   *  curates this per contact; it exists nowhere in this service's schema. */
+  gender: 'male' | 'female' | 'unknown';
   ezy_bp_id: string | null;
   ezy_contact_id: string | null;
   ezy_contact_name: string | null;

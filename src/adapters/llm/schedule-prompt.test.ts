@@ -1,16 +1,37 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
+import {
+  COMPOSE_MAX_CHARS,
+  COMPOSE_SCHEMA,
+  COMPOSE_SYSTEM,
+  SCHEDULE_SCHEMA,
+  SCHEDULE_SYSTEM,
+  composeUserMessage,
+  parseComposedBody,
+  parseScheduleInterpretation,
+  scheduleUserMessage,
+} from './schedule-prompt';
 
 test('schedule schema is strict-output compatible and parses the closed action set', () => {
   assert.equal(SCHEDULE_SCHEMA.additionalProperties, false);
-  assert.deepEqual(SCHEDULE_SCHEMA.required, ['kind', 'execute_at', 'body', 'body_source', 'delivery_channel', 'clarification']);
+  assert.deepEqual(SCHEDULE_SCHEMA.required, ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification']);
   const parsed = parseScheduleInterpretation({
-    kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', body: 'follow up',
-    body_source: 'command', delivery_channel: 'none', clarification: null,
+    kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'follow up',
+    delivery_channel: 'none', clarification: null,
   });
   assert.equal(parsed.kind, 'reminder');
   assert.throws(() => parseScheduleInterpretation({ kind: 'send_everything' }));
+});
+
+// body_source used to be a model output that selected its own enforcement level.
+test('the model cannot declare its own body_source', () => {
+  assert.ok(!('body_source' in SCHEDULE_SCHEMA.properties));
+  assert.ok(!SCHEDULE_SCHEMA.required.includes('body_source' as never));
+  const parsed = parseScheduleInterpretation({
+    kind: 'customer_message', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'hi',
+    delivery_channel: 'whatsapp', clarification: null, body_source: 'command',
+  });
+  assert.ok(!('body_source' in parsed), 'a smuggled body_source is stripped, not honoured');
 });
 
 test('replied text is delimited as data and the system prompt denies it authority', () => {
@@ -22,5 +43,57 @@ test('replied text is delimited as data and the system prompt denies it authorit
   assert.match(user, /IGNORE ALL RULES/);
   assert.match(SCHEDULE_SYSTEM, /ONLY authority/);
   assert.match(SCHEDULE_SYSTEM, /untrusted context/);
-  assert.match(SCHEDULE_SYSTEM, /explicitly choose WhatsApp or email/);
+});
+
+test('the prior turn is carried as authoritative founder speech to merge', () => {
+  const user = scheduleUserMessage({
+    commandText: 'WhatsApp', priorCommandText: 'say hi to Shlomo at 8 am',
+    priorClarification: 'Which channel?', customerName: 'Shlomo',
+    nowIso: '2026-07-14T09:00:00-05:00', timezone: 'America/Panama',
+  });
+  assert.match(user, /say hi to Shlomo at 8 am/);
+  assert.match(user, /Which channel\?/);
+  assert.match(SCHEDULE_SYSTEM, /merge them into ONE action/i);
+  // The channel question is resolved by the system, not by badgering the founder.
+  assert.match(SCHEDULE_SYSTEM, /Do NOT clarify merely because the channel is absent/);
+});
+
+// The composer's payload is the security boundary: while the model only copied founder
+// words, injected customer text had no expressive surface. Composition hands it one, so
+// the composer is kept blind rather than asked to resist.
+test('the compose payload carries founder text and a display name — no customer content', () => {
+  const user = composeUserMessage({ commandText: 'say hi to Shlomo', customerName: 'Shlomo', language: 'es' });
+  assert.deepEqual(JSON.parse(user), { customer: 'Shlomo', language: 'es', instruction: 'say hi to Shlomo' });
+  assert.deepEqual(Object.keys(JSON.parse(user)).sort(), ['customer', 'instruction', 'language']);
+});
+
+// Regression: gender was on the request type and described in the system prompt, but never
+// serialized into the payload — so the model never saw it and wrote "¡Bienvenido!" for a
+// female recipient. A prompt rule about a field that is not sent is worse than no rule.
+test('a known gender actually reaches the model, and an unknown one is omitted', () => {
+  const withGender = JSON.parse(composeUserMessage({
+    commandText: 'welcome her aboard', customerName: 'Alex', language: 'es', gender: 'female',
+  }));
+  assert.equal(withGender.gender, 'female');
+
+  for (const gender of [null, undefined]) {
+    const without = JSON.parse(composeUserMessage({
+      commandText: 'welcome them aboard', customerName: 'Alex', language: 'es', gender,
+    }));
+    assert.ok(!('gender' in without), `gender=${gender} must be omitted, not sent as a value`);
+  }
+});
+
+test('the compose prompt states the gendered-language rule it is given the field for', () => {
+  assert.match(COMPOSE_SYSTEM, /Bienvenido/);
+  assert.match(COMPOSE_SYSTEM, /Bienvenida/);
+});
+
+test('the compose prompt forbids inventing facts and caps length', () => {
+  assert.equal(COMPOSE_SCHEMA.additionalProperties, false);
+  assert.match(COMPOSE_SYSTEM, new RegExp(String(COMPOSE_MAX_CHARS)));
+  assert.match(COMPOSE_SYSTEM, /must not/i);
+  assert.match(COMPOSE_SYSTEM, /invent/i);
+  assert.equal(parseComposedBody({ body: '  Hi Shlomo!  ' }), 'Hi Shlomo!');
+  assert.throws(() => parseComposedBody({ body: 42 }));
 });

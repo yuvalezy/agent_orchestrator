@@ -22,7 +22,7 @@ import { buildEzyPortalGateway } from '../ezy-portal';
 import { buildLlmRouter } from '../llm/factory';
 import type { AgentLlmPort } from '../../ports/llm.port';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
-import { buildGroupSummaryAdapter } from '../whatsapp-manager/factory';
+import { buildGroupSummaryAdapter, buildRecipientProfileAdapter } from '../whatsapp-manager/factory';
 
 // Composition (imports adapters + core): build the TriageService with the real
 // EZY gateway + LLM router + Telegram notifier, and the inbox-processor worker
@@ -98,6 +98,10 @@ function buildResponseDrafterGated(
     findOpenDraftByInbox,
     // Draft correction loop: append the 🔁 Revise button on presented drafts when enabled.
     reviseEnabled: env.DRAFT_REVISE_ENABLED,
+    // Recipient gender from the founder's WhatsApp whitelist, so a reply in a gendered
+    // language agrees with the person instead of hedging ("Bienvenido/a"). Best-effort:
+    // a miss or an outage just yields neutral phrasing.
+    recipientProfile: buildRecipientProfileAdapter(),
     // Style-Correction Always-On lane: inject the customer's persistent voice/tone directives
     // on every draft (gated; undefined when off → no voice guidance).
     styleLane: buildStyleLaneGated(),

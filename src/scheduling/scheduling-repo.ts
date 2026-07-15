@@ -18,6 +18,10 @@ export interface ScheduleRoute {
   threadKey: string | null;
   inReplyTo: string | null;
   subject: string | null;
+  /** A group route sends to EVERY participant. Only the primary-contact tier filters
+   *  groups out; a reply-origin route can be one, and `recipientLabel` renders a group
+   *  exactly like a person, so callers must be able to tell them apart. */
+  isGroup: boolean;
 }
 
 export interface ReplyOrigin {
@@ -49,12 +53,17 @@ export interface ScheduledAction {
   retry_count: number;
 }
 
-export async function findCustomerByTelegramTopic(threadId: string): Promise<{ id: string; displayName: string } | null> {
-  const { rows } = await query<{ id: string; display_name: string }>(
-    `SELECT id, display_name FROM agent_customers WHERE telegram_topic_id = $1 LIMIT 2`,
+export async function findCustomerByTelegramTopic(
+  threadId: string,
+): Promise<{ id: string; displayName: string; language: string } | null> {
+  const { rows } = await query<{ id: string; display_name: string; preferred_language: string | null }>(
+    `SELECT id, display_name, preferred_language FROM agent_customers WHERE telegram_topic_id = $1 LIMIT 2`,
     [threadId],
   );
-  return rows.length === 1 ? { id: rows[0].id, displayName: rows[0].display_name } : null;
+  if (rows.length !== 1) return null;
+  // Same source and same 'es' fallback the reply drafter uses (DraftRequest.language) —
+  // a scheduled message must not arrive in a different language than a live reply.
+  return { id: rows[0].id, displayName: rows[0].display_name, language: rows[0].preferred_language ?? 'es' };
 }
 
 export async function recordTelegramNotificationRef(input: {
@@ -111,10 +120,12 @@ export async function resolveScheduleRoute(
       thread_key: string | null;
       in_reply_to: string;
       subject: string | null;
+      is_group: boolean;
     }>(
       `SELECT i.channel_instance_id, ci.channel_type,
               CASE WHEN coalesce((i.raw_metadata->'metadata'->>'isGroup')::boolean, false)
                    THEN i.channel_thread_id ELSE i.sender_address END AS recipient_address,
+              coalesce((i.raw_metadata->'metadata'->>'isGroup')::boolean, false) AS is_group,
               coalesce(cc.display_name, i.sender_name) AS recipient_label,
               i.channel_thread_id AS thread_key,
               CASE WHEN ci.channel_type = 'email'
@@ -145,6 +156,7 @@ export async function resolveScheduleRoute(
         threadKey: r.thread_key,
         inReplyTo: r.in_reply_to,
         subject,
+        isGroup: Boolean(r.is_group),
       };
     }
   }
@@ -158,9 +170,11 @@ export async function resolveScheduleRoute(
       thread_key: string | null;
       in_reply_to: string | null;
       subject: string | null;
+      is_group: boolean;
     }>(
       `SELECT q.channel_instance_id, ci.channel_type, q.recipient_address,
-              cc.display_name AS recipient_label, q.thread_key, q.in_reply_to, q.subject
+              cc.display_name AS recipient_label, q.thread_key, q.in_reply_to, q.subject,
+              coalesce(cc.is_group, false) AS is_group
          FROM agent_outbound_queue q
          JOIN channel_instances ci ON ci.id = q.channel_instance_id AND ci.status = 'active'
          JOIN agent_customer_contacts cc
@@ -180,10 +194,29 @@ export async function resolveScheduleRoute(
         threadKey: r.thread_key,
         inReplyTo: r.in_reply_to,
         subject: r.subject,
+        isGroup: Boolean(r.is_group),
       };
     }
   }
 
+  return (await listScheduleRouteCandidates(customerId, allowedChannelTypes))[0] ?? null;
+}
+
+/**
+ * Every send-capable 1:1 route for a customer, best-first — the primary-contact tier of
+ * `resolveScheduleRoute` without its `LIMIT 1`.
+ *
+ * This exists so "which channels does this customer have?" is answered by the SAME
+ * predicate that later routes the send. A separate COUNT would drift from this one and
+ * we would auto-pick "the only channel" and then route somewhere else. Callers derive
+ * availability from the distinct `channelType`s here, then narrow `allowedChannelTypes`
+ * to the chosen one and re-resolve.
+ */
+export async function listScheduleRouteCandidates(
+  customerId: string,
+  allowedChannelTypes: string[],
+): Promise<ScheduleRoute[]> {
+  if (allowedChannelTypes.length === 0) return [];
   const { rows } = await query<{
     channel_instance_id: string;
     channel_type: string;
@@ -202,22 +235,19 @@ export async function resolveScheduleRoute(
           LIMIT 1
        ) ci ON true
       WHERE cc.customer_id = $1 AND cc.is_group = false
-      ORDER BY cc.is_primary DESC, cc.created_at ASC
-      LIMIT 1`,
+      ORDER BY cc.is_primary DESC, cc.created_at ASC`,
     [customerId, allowedChannelTypes],
   );
-  const r = rows[0];
-  return r
-    ? {
-        channelInstanceId: r.channel_instance_id,
-        channelType: r.channel_type,
-        recipientAddress: r.address,
-        recipientLabel: r.display_name?.trim() || r.address,
-        threadKey: null,
-        inReplyTo: null,
-        subject: null,
-      }
-    : null;
+  return rows.map((r) => ({
+    channelInstanceId: r.channel_instance_id,
+    channelType: r.channel_type,
+    recipientAddress: r.address,
+    recipientLabel: r.display_name?.trim() || r.address,
+    threadKey: null,
+    inReplyTo: null,
+    subject: null,
+    isGroup: false, // the query filters groups out
+  }));
 }
 
 export async function createScheduledAction(input: {

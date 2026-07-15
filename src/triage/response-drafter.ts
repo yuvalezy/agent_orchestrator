@@ -1,4 +1,5 @@
 import type { AgentLlmPort, DraftRequest, DraftResult, Intent, KnowledgeChunk } from '../ports/llm.port';
+import type { RecipientGender, RecipientProfilePort } from '../ports/recipient-profile.port';
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { ClaimedInbox } from '../inbox/inbox-repo';
 import type { CustomerConfig } from './context-loader';
@@ -39,6 +40,11 @@ export interface ResponseDrafterDeps {
    *  meetings are pulled from the founder's calendar on every draft and injected as draft CONTEXT
    *  (best-effort → [] on miss) — never a citation source. Undefined → no meetings context. */
   meetings?: MeetingContext;
+  /** Recipient grammatical gender lookup. In a gendered language a reply must agree with the
+   *  person; with `preferred_language='es'` and no gender the model can only hedge
+   *  ("Bienvenido/a"). Best-effort by contract → null just means neutral phrasing.
+   *  Undefined → never looked up. */
+  recipientProfile?: RecipientProfilePort;
 }
 
 export interface DraftAndPresentInput {
@@ -127,9 +133,23 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
 
       // (2) Draft in the customer's preferred language, grounded ONLY in `knowledge`; voice
       //     guidance shapes phrasing only; meetings are acknowledgeable context only.
+      // (2c) Recipient gender (best-effort → null): the sender we are replying TO is the
+      //      person whose grammar the reply must agree with in a gendered language. The
+      //      port contracts to swallow its own failures, but this is the hot inbound path
+      //      and gender is a nicety — belt-and-braces so no lookup can ever cost a reply.
+      let gender: RecipientGender | null = null;
+      if (deps.recipientProfile) {
+        try {
+          gender = await deps.recipientProfile.resolveGender(row.channel_type, row.sender_address);
+        } catch (err) {
+          logger.warn({ inboxId: row.id, reason: (err as Error)?.message }, 'drafter: gender lookup failed — writing neutral');
+        }
+      }
+
       const req: DraftRequest = {
         question: assembleQuestion(row),
         language: config.preferredLanguage,
+        gender,
         customerName: config.displayName,
         knowledge,
         voiceGuidance,

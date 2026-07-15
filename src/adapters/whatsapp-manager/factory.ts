@@ -3,6 +3,8 @@ import { resolveCredential, tryResolveCredential } from '../../config/credential
 import type { ChannelInstanceConfig } from '../../ports/channel.port';
 import { WhatsAppHttp } from './http';
 import { WhatsAppDirectoryClient } from './directory-client';
+import { buildRecipientProfile } from './recipient-profile';
+import type { RecipientProfilePort } from '../../ports/recipient-profile.port';
 import { WhatsAppManagerAdapter } from './whatsapp-manager.adapter';
 import { GroupSummaryAdapter } from './group-summary.adapter';
 import { WaHistoryClient, type WaHistoryClientOptions } from './wa-history-client';
@@ -18,6 +20,25 @@ export function buildWhatsAppDirectoryClient(): WhatsAppDirectoryClient {
     resolveApiKey: () => resolveCredential('WHATSAPP_MANAGER_API_KEY'),
   });
   return new WhatsAppDirectoryClient(http);
+}
+
+/**
+ * Recipient facts (gender) for customer-facing drafting, read from the founder's
+ * whitelist over HTTP — never the whatsapp_manager DB (invariant #5).
+ *
+ * ONE shared instance on purpose: the whole point is the cache, and `GET /whitelist`
+ * returns the entire list, so a per-call builder would refetch it for every drafted
+ * message. Memoized rather than built at boot so an unset WHATSAPP_MANAGER_API_KEY only
+ * bites callers that actually use it.
+ */
+let recipientProfile: RecipientProfilePort | null = null;
+
+export function buildRecipientProfileAdapter(): RecipientProfilePort {
+  if (!recipientProfile) {
+    const directory = buildWhatsAppDirectoryClient();
+    recipientProfile = buildRecipientProfile({ listWhitelist: () => directory.listWhitelist() });
+  }
+  return recipientProfile;
 }
 
 /**
