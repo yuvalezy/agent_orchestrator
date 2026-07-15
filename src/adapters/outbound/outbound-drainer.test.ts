@@ -48,6 +48,8 @@ function claimRow(over: Partial<ClaimedOutbound> = {}): ClaimedOutbound {
     faith: null,
     is_group: null,
     attachment_ref: null,
+    scheduled_action_id: null,
+    bypass_send_window: false,
     ...over,
   };
 }
@@ -263,6 +265,19 @@ test('off-hours → deferUntil FIRST + exactly one note, no send', async () => {
   assert.equal(calls.markSent.length, 0, 'nothing sent');
   // customer-less row → the "queued until" note goes to the admin topic, exactly once.
   assert.equal(admin.length + customer.length, 1, 'exactly one note');
+});
+
+test('explicit scheduled send bypasses off-hours but still dispatches through the normal adapter', async () => {
+  const closed: BusinessHour[] = Array.from({ length: 7 }, (_, d) => ({
+    dayOfWeek: d, startTime: '09:00', endTime: '18:00', isWorkingDay: false,
+  }));
+  const { calls } = await runTick({
+    adapter: waAdapter(okFetch()),
+    row: claimRow({ bypass_send_window: true, scheduled_action_id: '91' }),
+    repoOver: { loadBusinessHours: async () => closed },
+  });
+  assert.equal(calls.deferUntil.length, 0);
+  assert.equal(calls.markSent.length, 1);
 });
 
 test('rate cap reached → deferUntil, NO note (internal pacing)', async () => {

@@ -1,8 +1,10 @@
 import { env } from '../../config/env';
-import { resolveCredential } from '../../config/credentials';
+import { resolveCredential, tryResolveCredential } from '../../config/credentials';
 import { query } from '../../db';
 import { TelegramClient } from './telegram-client';
 import { TelegramNotifier } from './telegram-notifier';
+import { recordTelegramNotificationRef } from '../../scheduling/scheduling-repo';
+import { buildOpenAiTranscriptionClient } from '../llm/openai-transcription.client';
 
 /**
  * Build the TelegramNotifier from non-secret env + the lazily-resolved bot token
@@ -25,10 +27,16 @@ export function buildTelegramNotifier(): TelegramNotifier {
   const client = new TelegramClient({
     resolveToken: () => resolveCredential('TELEGRAM_BOT_TOKEN'),
   });
+  const transcription = buildOpenAiTranscriptionClient({
+    resolveKey: () => tryResolveCredential('OPENAI_API_KEY'),
+    baseUrl: env.OPENAI_BASE_URL,
+  });
 
   return new TelegramNotifier(client, {
     supergroupChatId,
     adminTopicId: env.TELEGRAM_ADMIN_TOPIC_ID,
+    recordNotificationRef: recordTelegramNotificationRef,
+    transcribeAudio: (input) => transcription.transcribe(input),
     resolveCustomerTopicId: async (customerId: string) => {
       const { rows } = await query<{ telegram_topic_id: string | null }>(
         'SELECT telegram_topic_id FROM agent_customers WHERE id = $1',

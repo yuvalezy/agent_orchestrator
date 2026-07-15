@@ -154,6 +154,29 @@ export interface AnswerResult {
   usedSourceIndexes: number[];
 }
 
+export interface ScheduleInterpretRequest {
+  commandText: string;
+  repliedText?: string | null;
+  mappedOutboundBody?: string | null;
+  customerName: string;
+  nowIso: string;
+  timezone: string;
+}
+
+export interface ScheduleInterpretation {
+  kind: 'none' | 'clarify' | 'customer_message' | 'reminder';
+  execute_at: string | null;
+  body: string | null;
+  body_source: 'command' | 'mapped_outbound' | 'none';
+  delivery_channel: 'whatsapp' | 'email' | 'none';
+  clarification: string | null;
+}
+
+/** Founder-only natural-language scheduling classification. */
+export interface ScheduleInterpreterPort {
+  interpretSchedule(input: ScheduleInterpretRequest, customerId: string): Promise<ScheduleInterpretation>;
+}
+
 /**
  * Founder-query answer synthesis (M5(a)). SEPARATE from AgentLlmPort (interface
  * segregation): the query engine depends only on this, and existing triage fakes are

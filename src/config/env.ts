@@ -39,6 +39,10 @@ const envSchema = z.object({
   // is missing when Telegram is actually used (onboarding CLI).
   TELEGRAM_SUPERGROUP_CHAT_ID: z.string().optional(),
   TELEGRAM_ADMIN_TOPIC_ID: z.string().optional(),
+  TELEGRAM_SCHEDULING_TZ: z.string().default('America/Panama'),
+  TELEGRAM_SCHEDULING_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
+  TELEGRAM_SCHEDULING_GRACE_MINUTES: z.coerce.number().int().positive().default(15),
+  TELEGRAM_SCHEDULING_ENABLED: z.string().optional().transform((v) => v === 'true'),
 
   // ── M1.3: WhatsApp pull-reconciliation tuning (non-secret). Defaults suit prod;
   // the test env may set the interval low (e.g. 15_000) for deterministic drills.

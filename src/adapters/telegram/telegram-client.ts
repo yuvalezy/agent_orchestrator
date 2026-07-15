@@ -50,6 +50,11 @@ export interface TelegramClientOptions {
   retry?: Partial<RetryOptions>;
 }
 
+export interface DownloadedTelegramFile {
+  data: Uint8Array;
+  filename: string;
+}
+
 export class TelegramClient {
   private readonly resolveToken: () => string;
   private readonly fetchImpl: typeof fetch;
@@ -122,6 +127,27 @@ export class TelegramClient {
     return this.call('sendMessage', params);
   }
 
+  async downloadFile(fileId: string, maxBytes: number): Promise<DownloadedTelegramFile> {
+    const file = await this.call<{ file_path?: string; file_size?: number }>('getFile', { file_id: fileId });
+    if (!file.file_path) throw new TelegramError('getFile', 400, 'missing file_path', false);
+    if (file.file_size !== undefined && file.file_size > maxBytes) {
+      throw new TelegramError('getFile', 413, 'audio file is too large', false);
+    }
+    const token = this.resolveToken();
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const res = await this.fetchImpl(url, { signal: AbortSignal.timeout(Math.max(this.timeoutMs, 60_000)) });
+    if (!res.ok) {
+      throw new TelegramError('downloadFile', res.status, 'file download failed', res.status === 429 || res.status >= 500);
+    }
+    const contentLength = Number(res.headers.get('content-length'));
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      throw new TelegramError('downloadFile', 413, 'audio file is too large', false);
+    }
+    const data = new Uint8Array(await res.arrayBuffer());
+    if (data.byteLength > maxBytes) throw new TelegramError('downloadFile', 413, 'audio file is too large', false);
+    return { data, filename: file.file_path.split('/').pop() || 'voice.ogg' };
+  }
+
   /** Poll for updates (M1.5b callback routing + M2c edit-text capture). `timeout: 0`
    *  = short poll — the callback-poller worker owns the cadence, so the fetch never
    *  long-hangs. `offset` acks everything below it (persist it to stop restart
@@ -156,6 +182,23 @@ export interface TelegramMessage {
   text?: string;
   from?: { id: number; is_bot?: boolean };
   chat: { id: number };
+  caption?: string;
+  voice?: TelegramAudio;
+  audio?: TelegramAudio;
+  reply_to_message?: {
+    message_id: number;
+    text?: string;
+    caption?: string;
+  };
+}
+
+export interface TelegramAudio {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  mime_type?: string;
+  file_size?: number;
+  file_name?: string;
 }
 
 export interface TelegramUpdate {

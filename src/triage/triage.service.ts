@@ -202,7 +202,7 @@ export class TriageService {
       if (customerId) {
         await this.deps.notifier.notifyCustomerEvent(
           customerId,
-          { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing) },
+          { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing), contextRef: { kind: 'inbox', ref: inboxId } },
           cancelButton(existing),
         );
       }
@@ -514,6 +514,7 @@ export class TriageService {
         title: '💬 Comment added',
         body: `Added to an existing task for ${config.displayName}:\n“${intent.summary}”`,
         url: this.deps.deepLink(dedup.taskRef),
+        contextRef: { kind: 'inbox', ref: inboxId },
       });
       return;
     }
@@ -543,6 +544,7 @@ export class TriageService {
         title: `🆕 New task · ${intent.priority}`,
         body: `${config.displayName}: ${intent.suggested_title}\n“${intent.summary}”`,
         url: this.deps.deepLink(task.ref),
+        contextRef: { kind: 'inbox', ref: inboxId },
       },
       cancelButton(task.ref),
     );

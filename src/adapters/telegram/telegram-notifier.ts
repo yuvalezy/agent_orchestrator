@@ -1,5 +1,8 @@
 import { FounderNotifierPort, Notification, DecisionEvent, MessageEvent } from '../../ports';
 import { logger } from '../../logger';
+import type { AudioTranscriptionInput } from '../../ports/audio-transcription.port';
+import { TranscriptionError } from '../llm/openai-transcription.client';
+import { TelegramError } from './telegram-client';
 import { TelegramClient } from './telegram-client';
 
 // TelegramNotifier — the FounderNotifierPort adapter (design.md D7). One forum
@@ -16,7 +19,20 @@ export interface TelegramNotifierOptions {
   adminTopicId?: string;
   /** Resolve a customer's stored topic ref (agent_customers.telegram_topic_id). */
   resolveCustomerTopicId: (customerId: string) => Promise<string | null>;
+  recordNotificationRef?: (input: {
+    chatId: string;
+    messageId: number;
+    threadId: string;
+    customerId: string;
+    context: { kind: 'inbox' | 'outbound'; ref: string };
+  }) => Promise<void>;
+  transcribeAudio?: (input: AudioTranscriptionInput) => Promise<string>;
+  maxAudioBytes?: number;
+  maxAudioDurationSeconds?: number;
 }
+
+const DEFAULT_MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_AUDIO_DURATION_SECONDS = 10 * 60;
 
 function render(n: Notification): string {
   const parts = [n.title, '', n.body];
@@ -58,12 +74,23 @@ export class TelegramNotifier implements FounderNotifierPort {
     if (!topicId) {
       throw new Error(`No Telegram topic for customer ${customerId} — onboard before notifying`);
     }
-    await this.client.sendMessage({
+    const sent = await this.client.sendMessage({
       chatId: this.opts.supergroupChatId,
       messageThreadId: topicId,
       text: render(n),
       inlineKeyboard: buttons ? [buttons.map((b) => ({ text: b.label, callback_data: b.id }))] : undefined,
     });
+    if (n.contextRef && this.opts.recordNotificationRef) {
+      await this.opts.recordNotificationRef({
+        chatId: this.opts.supergroupChatId,
+        messageId: sent.message_id,
+        threadId: topicId,
+        customerId,
+        context: n.contextRef,
+      }).catch((err) => {
+        logger.warn({ customerId, reason: (err as Error)?.message }, 'Telegram notification context ref write failed');
+      });
+    }
   }
 
   async notifyAdmin(n: Notification): Promise<void> {
@@ -142,9 +169,17 @@ export class TelegramNotifier implements FounderNotifierPort {
     for (const u of updates) {
       const cq = u.callback_query;
       if (cq?.data) {
+        const by = String(cq.from.id);
+        const callbackChatId = cq.message?.chat?.id !== undefined ? String(cq.message.chat.id) : undefined;
+        if (callbackChatId !== this.opts.supergroupChatId) {
+          logger.warn({ by, callbackChatId }, 'Telegram callback rejected — wrong chat');
+          await this.client.answerCallbackQuery(cq.id, 'Wrong chat').catch(() => undefined);
+          next = u.update_id + 1;
+          continue;
+        }
         try {
           const threadId = cq.message?.message_thread_id !== undefined ? String(cq.message.message_thread_id) : undefined;
-          await this.dispatchCallback(cq.data, String(cq.from.id), threadId);
+          await this.dispatchCallback(cq.data, by, threadId);
         } catch (err) {
           // Do NOT advance the offset past a FAILED dispatch (code-review #1):
           // getUpdates(offset) never re-delivers anything below `offset`, and there
@@ -162,14 +197,57 @@ export class TelegramNotifier implements FounderNotifierPort {
       // text; the handler ignores UNARMED threads. Same hold-offset-on-error discipline
       // as callbacks: a failed dispatch must not silently lose the founder's edit.
       const msg = u.message;
-      if (this.messageHandler && msg?.text && msg.message_thread_id !== undefined && !msg.from?.is_bot) {
+      const audio = msg?.voice ?? msg?.audio;
+      if (this.messageHandler && msg && (msg.text || audio) && msg.message_thread_id !== undefined && !msg.from?.is_bot) {
+        const by = msg.from ? String(msg.from.id) : 'unknown';
+        const chatId = String(msg.chat.id);
+        if (chatId !== this.opts.supergroupChatId) {
+          logger.warn({ by, chatId }, 'Telegram message rejected — wrong chat');
+          next = u.update_id + 1;
+          continue;
+        }
         try {
+          let messageText = msg.text?.trim() ?? '';
+          if (audio) {
+            const maxBytes = this.opts.maxAudioBytes ?? DEFAULT_MAX_AUDIO_BYTES;
+            const maxDuration = this.opts.maxAudioDurationSeconds ?? DEFAULT_MAX_AUDIO_DURATION_SECONDS;
+            if (!this.opts.transcribeAudio) throw new TranscriptionError('Voice transcription is not configured', false);
+            if (audio.duration > maxDuration || (audio.file_size !== undefined && audio.file_size > maxBytes)) {
+              throw new TranscriptionError('Voice message exceeds the 10-minute or 20 MB limit', false);
+            }
+            const downloaded = await this.client.downloadFile(audio.file_id, maxBytes);
+            const transcript = await this.opts.transcribeAudio({
+              data: downloaded.data,
+              filename: audio.file_name ?? downloaded.filename,
+              mimeType: audio.mime_type ?? 'audio/ogg',
+            });
+            messageText = [msg.caption?.trim(), transcript].filter(Boolean).join('\n\n');
+          }
           await this.messageHandler({
+            chatId,
+            messageId: String(msg.message_id),
             threadId: String(msg.message_thread_id),
-            text: msg.text,
-            by: msg.from ? String(msg.from.id) : 'unknown',
+            text: messageText,
+            by,
+            replyTo: msg.reply_to_message
+              ? {
+                  messageId: String(msg.reply_to_message.message_id),
+                  text: msg.reply_to_message.text ?? msg.reply_to_message.caption ?? null,
+                }
+              : undefined,
           });
         } catch (err) {
+          const permanentAudioFailure = audio && (
+            (err instanceof TranscriptionError && !err.retryable)
+            || (err instanceof TelegramError && !err.retryable)
+          );
+          if (permanentAudioFailure) {
+            logger.warn({ reason: (err as Error).message }, 'Telegram audio rejected permanently');
+            await this.replyInThread(String(msg.message_thread_id), `⚠️ I could not process that audio: ${(err as Error).message}`)
+              .catch(() => undefined);
+            next = u.update_id + 1;
+            continue;
+          }
           logger.error({ reason: (err as Error)?.message }, 'Telegram message dispatch failed — holding offset for retry');
           return next;
         }

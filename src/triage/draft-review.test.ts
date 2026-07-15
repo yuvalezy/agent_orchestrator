@@ -215,7 +215,7 @@ test('armed thread + non-empty text → replaceDraftBodyAndApprove(queueId,text,
     notifier,
   });
 
-  await handler({ threadId: '42', text: 'the corrected reply', by: 'user-5' });
+  await handler({ chatId: '-100', messageId: '1', threadId: '42', text: 'the corrected reply', by: 'user-5' });
 
   assert.deepEqual(calls, [{ fn: 'replace', args: ['q7', 'the corrected reply', 'user-5'] }]);
   assert.equal(store.map.has('42'), false, 'marker cleared after resolve');
@@ -233,7 +233,7 @@ test('UNARMED thread → message ignored (no replace, no clear, no notify)', asy
     replaceDraftBodyAndApprove: async () => { replaceCalled = true; return res(); },
     notifier,
   });
-  await handler({ threadId: '42', text: 'just chatting in the topic', by: 'u' });
+  await handler({ chatId: '-100', messageId: '1', threadId: '42', text: 'just chatting in the topic', by: 'u' });
   assert.equal(replaceCalled, false);
   assert.equal(notifies.length, 0);
 });
@@ -249,7 +249,7 @@ test('empty/whitespace replacement (must-fix #3) → NOT approved, marker still 
     notifier,
   });
 
-  await handler({ threadId: '42', text: '   \n\t ', by: 'u' });
+  await handler({ chatId: '-100', messageId: '1', threadId: '42', text: '   \n\t ', by: 'u' });
 
   assert.equal(replaceCalled, false, 'never approve a blank body');
   assert.equal(store.map.get('42'), 'q7', 'marker stays armed for the next non-empty message');
@@ -265,7 +265,7 @@ test('armed + non-empty but replace returns null (replayed message) → marker c
     replaceDraftBodyAndApprove: async () => null, // already resolved
     notifier,
   });
-  await handler({ threadId: '42', text: 'corrected reply', by: 'u' });
+  await handler({ chatId: '-100', messageId: '1', threadId: '42', text: 'corrected reply', by: 'u' });
   assert.equal(store.map.has('42'), false);
   assert.equal(notifies.length, 0);
 });

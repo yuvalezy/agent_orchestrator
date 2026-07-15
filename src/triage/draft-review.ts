@@ -222,11 +222,11 @@ export interface DraftEditMessageHandlerDeps {
  */
 export function buildDraftEditMessageHandler(
   deps: DraftEditMessageHandlerDeps,
-): (m: MessageEvent) => Promise<void> {
-  return async ({ threadId, text, by }: MessageEvent): Promise<void> => {
+): (m: MessageEvent) => Promise<boolean> {
+  return async ({ threadId, text, by }: MessageEvent): Promise<boolean> => {
     // Unarmed thread → normal topic chatter, never consume it.
     const queueId = await deps.readArmedEdit(threadId);
-    if (!queueId) return;
+    if (!queueId) return false;
 
     // Empty / whitespace-only replacement (blueprint must-fix #3): DO NOT consume the
     // marker and DO NOT approve — a blank body would send an empty reply. Leave the
@@ -235,7 +235,7 @@ export function buildDraftEditMessageHandler(
     // simply stays armed — see flagged signature note.)
     if (!text.trim()) {
       logger.info({ queueId }, 'draft edit: empty replacement text — held, marker still armed');
-      return;
+      return true;
     }
 
     // Guarded flip → body replaced, 'approved', decision resolved 'modified' with the
@@ -246,7 +246,7 @@ export function buildDraftEditMessageHandler(
     if (!res) {
       // Already resolved by a replayed message (held offset re-delivered) → no double.
       logger.info({ queueId }, 'draft edit: already resolved — no-op (idempotent)');
-      return;
+      return true;
     }
     logger.info({ queueId, by }, 'draft edited & approved — released to drainer');
     if (res.customerId) {
@@ -256,5 +256,6 @@ export function buildDraftEditMessageHandler(
         severity: 'info',
       });
     }
+    return true;
   };
 }

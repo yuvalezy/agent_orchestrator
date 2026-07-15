@@ -155,20 +155,23 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       return;
     }
 
-    // (c) business-hours / holiday window (D-D/E).
-    const tz = row.timezone ?? cfg.defaultTz;
-    const faith = row.customer_id ? row.faith : 'none';
-    const win = computeSendWindow({ nowUtc: new Date(now), tz, businessHours, holidays, faith });
-    if (!win.allowed) {
-      const until = win.nextOpenUtc ?? new Date(now + DAY_MS);
-      await repo.deferUntil(row.id, until); // defer FIRST (D-E), then notify once
-      logger.info({ worker: NAME, id: row.id, status: 'deferred' }, 'outbound: outside send window');
-      if (!win.nextOpenUtc) {
-        await alertAdmin(`#${row.id} to ${row.recipient_address}: no open window within 14 days — deferred 24h.`);
+    // (c) business-hours / holiday window (D-D/E). An explicitly scheduled founder
+    // command carries a narrow override; every other guard remains active.
+    if (!row.bypass_send_window) {
+      const tz = row.timezone ?? cfg.defaultTz;
+      const faith = row.customer_id ? row.faith : 'none';
+      const win = computeSendWindow({ nowUtc: new Date(now), tz, businessHours, holidays, faith });
+      if (!win.allowed) {
+        const until = win.nextOpenUtc ?? new Date(now + DAY_MS);
+        await repo.deferUntil(row.id, until); // defer FIRST (D-E), then notify once
+        logger.info({ worker: NAME, id: row.id, status: 'deferred' }, 'outbound: outside send window');
+        if (!win.nextOpenUtc) {
+          await alertAdmin(`#${row.id} to ${row.recipient_address}: no open window within 14 days — deferred 24h.`);
+        }
+        const whenLocal = DateTime.fromJSDate(until, { zone: tz }).toFormat('ccc dd LLL HH:mm');
+        await note(row, { title: 'Message queued', body: `Queued until ${whenLocal} (${win.reason}).`, severity: 'info' });
+        return;
       }
-      const whenLocal = DateTime.fromJSDate(until, { zone: tz }).toFormat('ccc dd LLL HH:mm');
-      await note(row, { title: 'Message queued', body: `Queued until ${whenLocal} (${win.reason}).`, severity: 'info' });
-      return;
     }
 
     // (d) per-recipient rate limit (D-F) — internal pacing, NO notify.

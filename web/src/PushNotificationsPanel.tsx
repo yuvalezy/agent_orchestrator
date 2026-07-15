@@ -20,6 +20,18 @@ function browserState(): BrowserState {
   return Notification.permission;
 }
 
+function pushRegistrationError(err: unknown): string {
+  const message = err instanceof Error ? err.message : '';
+  // Brave deliberately disables Google-backed push messaging by default. Its
+  // PushManager exposes only the generic browser error, so point the owner at
+  // the browser-local opt-in rather than implying that the console stored data
+  // or sent anything to a push provider.
+  if ('brave' in navigator && /push service error/i.test(message)) {
+    return 'Brave has push messaging disabled. Open brave://settings/privacy, enable “Use Google services for push messaging”, reload this console, then try again.';
+  }
+  return message || 'Could not enable web push.';
+}
+
 export function PushNotificationsPanel(): ReactElement {
   const [state, setState] = useState<BrowserState>(browserState);
   const [registered, setRegistered] = useState(false);
@@ -44,7 +56,7 @@ export function PushNotificationsPanel(): ReactElement {
       const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlBytes(server.data.publicKey) });
       await api('/push/subscription', { method: 'POST', body: JSON.stringify(subscription.toJSON()) });
       setRegistered(true); setMessage('This browser can now receive urgent, privacy-safe alerts.');
-    } catch (err) { setMessage((err as ApiError).message || 'Could not enable web push.'); }
+    } catch (err) { setMessage(pushRegistrationError(err)); }
     finally { setBusy(false); }
   };
 
