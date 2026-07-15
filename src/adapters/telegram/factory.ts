@@ -30,6 +30,8 @@ export function buildTelegramNotifier(): TelegramNotifier {
   const transcription = buildOpenAiTranscriptionClient({
     resolveKey: () => tryResolveCredential('OPENAI_API_KEY'),
     baseUrl: env.OPENAI_BASE_URL,
+    // Read through `env` per call — the settings store overlays this same object.
+    resolveModel: () => env.OPENAI_TRANSCRIBE_MODEL,
   });
 
   return new TelegramNotifier(client, {

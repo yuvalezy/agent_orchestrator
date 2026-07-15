@@ -16,7 +16,9 @@ test('posts Telegram audio as multipart and returns trimmed transcript', async (
   assert.equal(await client.transcribe({ data: new Uint8Array([1, 2]), filename: 'voice.ogg', mimeType: 'audio/ogg' }), 'remind me tomorrow');
   assert.equal(captured?.headers && (captured.headers as Record<string, string>).Authorization, 'Bearer sk-test');
   assert.ok(captured?.body instanceof FormData);
-  assert.equal((captured.body as FormData).get('model'), 'gpt-4o-mini-transcribe');
+  // The default is the ACCURATE tier, not the cheap one — a misheard name or time ends
+  // up in a scheduled customer message.
+  assert.equal((captured.body as FormData).get('model'), 'gpt-4o-transcribe');
   assert.equal((captured.body as FormData).get('file') instanceof Blob, true);
 });
 
@@ -68,4 +70,22 @@ test('missing key is a permanent transcription error', async () => {
     client.transcribe({ data: new Uint8Array([1]), filename: 'voice.ogg', mimeType: 'audio/ogg' }),
     (err: unknown) => err instanceof TranscriptionError && !err.retryable,
   );
+});
+
+test('the model is resolved per call so a settings change needs no restart', async () => {
+  let model = 'gpt-4o-transcribe';
+  const seen: string[] = [];
+  const client = buildOpenAiTranscriptionClient({
+    resolveKey: () => 'sk-test', baseUrl: 'https://api.openai.com/v1',
+    resolveModel: () => model,
+    fetchImpl: async (_url, init) => {
+      seen.push(String((init?.body as FormData).get('model')));
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 });
+    },
+  });
+  const input = { data: new Uint8Array([1]), filename: 'file_1.oga', mimeType: 'audio/ogg' };
+  await client.transcribe(input);
+  model = 'whisper-1'; // changed in the console — same live client
+  await client.transcribe(input);
+  assert.deepEqual(seen, ['gpt-4o-transcribe', 'whisper-1']);
 });

@@ -326,6 +326,17 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: 'anthropic,openai',
   },
   {
+    key: 'OPENAI_TRANSCRIBE_MODEL',
+    type: 'enum',
+    category: LLM,
+    label: 'Voice transcription model',
+    description:
+      'Model for founder voice notes in Telegram. gpt-4o-transcribe is the most accurate; gpt-4o-mini-transcribe is roughly half the price and mishears more; whisper-1 is the older model. A misheard name or time flows straight into a scheduled customer message, so accuracy is worth more here than the per-minute rate. Applies to the NEXT voice note — no restart needed.',
+    applyMode: 'live',
+    default: 'gpt-4o-transcribe',
+    options: ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1'],
+  },
+  {
     key: 'LLM_ANTHROPIC_EFFORT',
     type: 'enum',
     category: LLM,

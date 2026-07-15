@@ -66,11 +66,22 @@ account isolation, and delivery-failure protections still apply.
 ### Voice and audio commands
 
 Voice notes and uploaded audio in a customer topic are downloaded from Telegram,
-transcribed with OpenAI (`gpt-4o-mini-transcribe`), and passed through the same
-command pipeline as typed text. This includes `/ask`, draft edit/revise, reminders,
-and scheduled customer messages. `OPENAI_API_KEY` must be configured in Connectors.
-Audio is limited to 10 minutes and 20 MB; wrong-chat and bot-authored media is
-rejected before download.
+transcribed with OpenAI, and passed through the same command pipeline as typed text.
+This includes `/ask`, draft edit/revise, reminders, and scheduled customer messages.
+`OPENAI_API_KEY` must be configured in Connectors. Audio is limited to 10 minutes and
+20 MB; wrong-chat and bot-authored media is rejected before download.
+
+The model is `OPENAI_TRANSCRIBE_MODEL` (settings-managed, console → Settings → LLM
+Routing; `applyMode: 'live'`, so a change applies to the next voice note). It defaults
+to **`gpt-4o-transcribe`** — the most accurate tier, deliberately not the cheapest:
+a misheard name or time flows straight into a scheduled customer message, where the
+cost of being wrong dwarfs the per-minute rate.
+
+> **`.oga` is not a supported upload extension on the gpt-4o transcribe models**, and
+> Telegram names every voice note `file_<n>.oga`. OpenAI infers the container from the
+> upload FILENAME, ignoring its Content-Type, so the client rewrites the name from the
+> mime type before uploading (`normalizeAudioFilename`). `whisper-1` accepts `.oga` and
+> the gpt-4o models do not — which is why this looked like a model-specific bug.
 
 ## One-time setup
 

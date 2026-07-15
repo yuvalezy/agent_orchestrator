@@ -74,6 +74,10 @@ const envSchema = z.object({
   LLM_DAILY_COST_CAP_USD: z.coerce.number().nonnegative().default(10),
   ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com/v1'),
+  // Voice-note transcription. Defaults to the MOST ACCURATE tier, not the cheapest: a
+  // misheard name or time feeds straight into a scheduled customer message, and the cost
+  // is noise next to the LLM calls that follow it. Settings-managed (LLM Routing).
+  OPENAI_TRANSCRIBE_MODEL: z.string().default('gpt-4o-transcribe'),
   DEEPSEEK_BASE_URL: z.string().url().default('https://api.deepseek.com'),
 
   // ── M1.8: outbound delivery (NON-secret; the WRITE key WHATSAPP_MANAGER_WRITE_KEY

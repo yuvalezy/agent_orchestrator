@@ -65,15 +65,22 @@ function parseOpenAiErrorMessage(body: string): string {
 export interface OpenAiTranscriptionOptions {
   resolveKey: () => string | undefined;
   baseUrl: string;
-  model?: string;
+  /** Resolved per call, not captured at build: the model is settings-managed with
+   *  applyMode 'live', so a console change must reach the next voice note without a
+   *  restart. Mirrors the lazy `resolveKey`. */
+  resolveModel?: () => string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
 
+/** The most accurate tier, deliberately — NOT the cheapest. A misheard name or time in a
+ *  founder voice note flows into a scheduled CUSTOMER message, and the per-minute
+ *  difference is noise next to the LLM calls that follow. */
+export const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+
 export function buildOpenAiTranscriptionClient(opts: OpenAiTranscriptionOptions): AudioTranscriptionPort {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const baseUrl = opts.baseUrl.replace(/\/$/, '');
-  const model = opts.model ?? 'gpt-4o-mini-transcribe';
   const timeoutMs = opts.timeoutMs ?? 120_000;
 
   return {
@@ -81,6 +88,8 @@ export function buildOpenAiTranscriptionClient(opts: OpenAiTranscriptionOptions)
       const key = opts.resolveKey();
       if (!key) throw new TranscriptionError('OpenAI transcription is not configured', false);
 
+      // Per attempt, so a mid-flight settings change is picked up on the retry too.
+      const model = opts.resolveModel?.() || DEFAULT_TRANSCRIBE_MODEL;
       const response = await withRetry(
         async () => {
           const form = new FormData();

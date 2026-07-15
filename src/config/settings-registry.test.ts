@@ -32,6 +32,7 @@ const EXPECTED_KEYS = [
   // pass-2 tuning knobs
   'LLM_DEFAULT_PROVIDER',
   'LLM_FALLBACK_CHAIN',
+  'OPENAI_TRANSCRIBE_MODEL',
   'LLM_ANTHROPIC_EFFORT',
   'LLM_OPENAI_EFFORT',
   'BACKFILL_JUDGE_VOTES',
@@ -78,7 +79,7 @@ test('every *_ENABLED flag is a restart-apply boolean', () => {
 });
 
 test('the LLM effort + backfill tuning knobs are live-apply', () => {
-  for (const key of ['LLM_ANTHROPIC_EFFORT', 'LLM_OPENAI_EFFORT', 'BACKFILL_JUDGE_VOTES', 'BACKFILL_COLLAPSE_MAX_DISTANCE']) {
+  for (const key of ['LLM_ANTHROPIC_EFFORT', 'LLM_OPENAI_EFFORT', 'OPENAI_TRANSCRIBE_MODEL', 'BACKFILL_JUDGE_VOTES', 'BACKFILL_COLLAPSE_MAX_DISTANCE']) {
     assert.equal(settingDef(key)?.applyMode, 'live', `${key} applies without a restart`);
   }
 });
