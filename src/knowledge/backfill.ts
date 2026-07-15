@@ -8,7 +8,8 @@ import type { SyncLogger } from './sync';
 //
 //   link-open      → matches an OPEN task (backlog/todo/in-progress/review): seed a context
 //                    link, NO portal write, respect its status.
-//   link-resolved  → matches a done/cancelled task: seed as resolved history, never reopen.
+//   link-resolved  → matches a done/cancelled task AND is plausibly that task's history: seed as
+//                    resolved history, never reopen. Two guards below can veto this arm.
 //   propose        → no confident match, a work-request intent, AND the founder STARRED the
 //                    thread: a DRAFT task proposal to approve (nothing is created here).
 //   memory         → no confident match and not a starred work-request: the thread is CONTEXT,
@@ -25,6 +26,26 @@ import type { SyncLogger } from './sync';
 // ⚠︎ A false LINK (folding an unrelated thread into a task) is worse than a missed one, so the
 // match must clear BOTH a vector-distance gate AND an LLM-judge threshold. Best-effort: an
 // embed/judge error degrades to skip{retryable}, NEVER throws (one bad thread can't abort a sweep).
+//
+// ⚠︎ RESOLVED-LINK GUARDS. Both gates still pass on a false link into a CLOSED task, and that arm is
+// silent — link-resolved writes history and never offers a card, so the thread is gone. It happened:
+// a starred 2026-07-15 thread ("new materials in SAP aren't appearing in the portal") matched the
+// done TSK-00184 "Problemas de la sincronizacion" — a title so generic it is semantically near ANY
+// sync issue — and a live founder-flagged issue was recorded as already-resolved history. So a match
+// to a done/cancelled task is VETOED, and re-routed through the normal no-match arms, when either:
+//
+//   (a) TEMPORAL — the thread's latest message is NEWER than the instant the task was CLOSED
+//       (`completed_at`, falling back to `updated_at`; see closedAt). A thread cannot be the history
+//       of a task that closed before the thread happened; it is a new occurrence or a regression.
+//       Needs BOTH instants: `HistoricalMessage.at` is optional and the task's instants only exist
+//       on re-synced rows, so a missing/malformed side just skips (a) — (b) still applies.
+//   (b) STARRED — the founder's star is the strongest "this needs action" signal we have, and it
+//       must never be overridden SILENTLY. Worst case the veto proposes and he taps ❌ once; the
+//       cost of being wrong the other way is losing the issue entirely.
+//
+// Vetoing only re-routes: a starred work-request lands on `propose`, anything else on `memory`. An
+// OPEN match is untouched by both guards — that work is tracked and open, so linking is correct and
+// no card is wanted, starred or not.
 
 /** Intent categories that carry an actionable ask worth reconciling against tasks. */
 const ACTIONABLE = new Set<Intent['category']>([
@@ -123,6 +144,54 @@ function primaryIntent(intents: Intent[]): Intent | null {
   return intents.find((i) => ACTIONABLE.has(i.category)) ?? null;
 }
 
+/** Best-effort instant from whatever a port handed us (Date | ISO string | epoch ms). Anything
+ *  unparseable → null, so a malformed timestamp DISABLES a guard rather than throwing. */
+function toInstant(value: unknown): Date | null {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** The thread's latest message instant, or null when NO message carries a usable one (`at` is
+ *  optional on HistoricalMessage — legs that can't state it exist). Null = guard (a) can't run. */
+function latestMessageAt(thread: HistoricalThread): Date | null {
+  let latest: number | null = null;
+  for (const m of thread.messages) {
+    const at = toInstant(m.at);
+    if (at && (latest === null || at.getTime() > latest)) latest = at.getTime();
+  }
+  return latest === null ? null : new Date(latest);
+}
+
+/**
+ * The instant a closed task's work was declared finished. `completed_at` is the real answer and is
+ * preferred; `updated_at` is only a FALLBACK for a task that carries no completion instant.
+ *
+ * The distinction is safety-relevant, not cosmetic: `updated_at` drifts later on any unrelated edit
+ * after closure (a retitle, a re-tag), and every drift makes the temporal guard LESS likely to fire —
+ * it fails toward the FALSE LINK. `completed_at` is fixed at closure, which is exactly the question
+ * the guard asks: did this thread happen after the work was declared done?
+ */
+function closedAt(taskMetadata: Record<string, unknown>): Date | null {
+  return toInstant(taskMetadata['completed_at']) ?? toInstant(taskMetadata['updated_at']);
+}
+
+/**
+ * Why a confident match to a DONE/CANCELLED task must NOT be recorded as resolved history — see the
+ * RESOLVED-LINK GUARDS note at the top. Returns the veto reason (diagnostic), or null to link.
+ * Never throws: an absent/malformed instant just leaves guard (a) unable to fire.
+ */
+function resolvedLinkVeto(thread: HistoricalThread, taskMetadata: Record<string, unknown>): string | null {
+  if (thread.starred) return 'starred thread — never silently linked to a closed task';
+  const threadAt = latestMessageAt(thread);
+  const taskAt = closedAt(taskMetadata);
+  if (threadAt && taskAt && threadAt.getTime() > taskAt.getTime()) {
+    return 'thread is newer than the closed task — a new occurrence, not its history';
+  }
+  return null;
+}
+
 /** Reconcile ONE historical thread against the customer's task inventory. Pure — no I/O beyond
  *  the injected ports; never throws (best-effort degrades to skip{retryable}). */
 export async function reconcileThread(thread: HistoricalThread, deps: BackfillReconcileDeps): Promise<BackfillOutcome> {
@@ -208,12 +277,21 @@ export async function reconcileThread(thread: HistoricalThread, deps: BackfillRe
     const taskRef = String(md['task_ref'] ?? '');
     const code = md['code'] != null ? String(md['code']) : null;
     const common = { taskRef, code, status, distance: best.match.distance, judged: best.judged, summary: intent.summary };
-    return OPEN_STATUSES.has(status) ? { kind: 'link-open', ...common } : { kind: 'link-resolved', ...common };
+    // An OPEN match always links — the work is tracked and open, so neither guard applies.
+    if (OPEN_STATUSES.has(status)) return { kind: 'link-open', ...common };
+    // A CLOSED match links only if this thread is plausibly that task's history (guards above).
+    const veto = resolvedLinkVeto(thread, md);
+    if (!veto) return { kind: 'link-resolved', ...common };
+    deps.log?.info(
+      { threadKey: thread.threadKey, taskRef, code, status, distance: best.match.distance, judged: best.judged, reason: veto },
+      'backfill: matched a closed task but did NOT link-resolve — re-routed as unmatched',
+    );
+    // Fall through to the no-match routing below: starred work-request → propose, else memory.
   }
 
-  // No confident match. BOTH gates must pass to propose: a work-request intent (a question or
-  // follow-up is never a task) AND the founder's star (this old thread still matters). Fail either
-  // → conversation memory: retrievable context, but no card and no task.
+  // No confident match (or a vetoed closed-task match). BOTH gates must pass to propose: a
+  // work-request intent (a question or follow-up is never a task) AND the founder's star (this old
+  // thread still matters). Fail either → conversation memory: retrievable context, no card/task.
   const isWorkRequest = PROPOSE_CATEGORIES.has(intent.category);
   if (isWorkRequest && thread.starred) {
     return { kind: 'propose', title: intent.suggested_title, description: intent.summary, priority: intent.priority, summary: intent.summary, confidence: intent.confidence };

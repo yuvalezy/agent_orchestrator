@@ -3,7 +3,13 @@
 
 export interface TaskRef {
   ref: string;
+  /** Adapter-built UI deep link for the ref. Produced by the adapter (it alone knows
+   *  the portal's URL shape); core only ever passes it through as opaque data. */
   url?: string;
+  /** Human task code (e.g. 'TSK-00247') — what the founder sees and searches by; the
+   *  `ref` is a UUID and is not quotable. Distinct from `display` (the task TITLE),
+   *  which is why this is a new field rather than an overload of it. */
+  code?: string;
   display?: string;
 } // opaque
 
@@ -19,6 +25,10 @@ export interface TargetTask {
   url?: string;
   projectRef?: string;
   updatedAt?: Date;
+  /** When the work was declared finished (terminal statuses only). Fixed at closure, unlike
+   *  `updatedAt`, which drifts later on any unrelated post-closure edit — backfill's temporal
+   *  guard needs the former to decide "did this thread happen AFTER this task was closed?". */
+  completedAt?: Date;
   /** Human task code (e.g. 'TSK-00214'); present on list reads. */
   code?: string;
   /** Task priority (low|medium|high|urgent); present on list reads. */

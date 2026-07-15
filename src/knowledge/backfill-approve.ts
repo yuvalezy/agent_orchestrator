@@ -1,4 +1,4 @@
-import type { TaskTargetPort } from '../ports/task-target.port';
+import type { TaskRef, TaskTargetPort } from '../ports/task-target.port';
 import type { SyncLogger } from './sync';
 import { randomUUID } from 'node:crypto';
 
@@ -27,8 +27,13 @@ export interface ApproveBackfillDeps {
   log?: SyncLogger;
 }
 
+/** `code`/`url` are the created task's human handle + deep link, passed straight through
+ *  from the TaskRef the port returned — core never formats a URL (it cannot know the
+ *  portal's shape, and D1 forbids reaching for an adapter to find out). Both optional:
+ *  a port that supplies neither yields today's exact result shape, so a surface must
+ *  degrade rather than assume. */
 export type ApproveResult =
-  | { ok: true; created: true; taskRef: string; title: string }
+  | { ok: true; created: true; taskRef: string; title: string; code?: string; url?: string }
   | { ok: true; created: false; reason: 'already-resolved' }
   | { ok: false; reason: string };
 
@@ -45,7 +50,7 @@ export async function approveBackfillProposal(decisionId: string, by: string, de
     }
   };
 
-  let task: { ref: string };
+  let task: TaskRef;
   try {
     const target = await deps.getCustomerTarget(p.customerId);
     if (!target?.projectRef || !target.workItemTypeRef) {
@@ -85,7 +90,16 @@ export async function approveBackfillProposal(decisionId: string, by: string, de
     deps.log?.error?.({ decisionId, taskRef: task.ref }, 'backfill approve: task created but decision completion lost its claim');
     return { ok: false, reason: 'task created but decision completion needs review' };
   }
-  return { ok: true, created: true, taskRef: task.ref, title: String(p.agentOutput['title'] ?? 'Untitled') };
+  // Spread conditionally: an absent code/url stays an ABSENT key, not an `undefined`
+  // one, so a port that supplies neither returns byte-identical to the pre-link shape.
+  return {
+    ok: true,
+    created: true,
+    taskRef: task.ref,
+    title: String(p.agentOutput['title'] ?? 'Untitled'),
+    ...(task.code ? { code: task.code } : {}),
+    ...(task.url ? { url: task.url } : {}),
+  };
 }
 
 export interface RejectBackfillDeps {

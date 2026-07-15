@@ -60,7 +60,11 @@ function parseRetryAfter(header: string | null): number | undefined {
 }
 
 export class EzyPortalHttpClient {
-  private readonly baseUrl: string;
+  /** Public (read-only) because EZY_PORTAL_BASE_URL is also the portal's UI origin:
+   *  the gateway builds task deep links off it via portalTaskUrl. Exposing it keeps
+   *  the gateway env-free (the factory stays the only env reader) and lets the
+   *  gateway tests assert a deterministic link from the injected base. */
+  readonly baseUrl: string;
   private readonly filesBaseUrl: string;
   private readonly resolveApiKey: () => string;
   private readonly fetchImpl: typeof fetch;

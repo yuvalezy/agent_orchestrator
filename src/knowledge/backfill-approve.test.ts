@@ -49,6 +49,25 @@ test('approve → claims first, creates the task with a backfill source triple, 
   assert.equal((completed[0] as { taskRef?: string }).taskRef, 'TSK-NEW');
 });
 
+test('approve passes the TaskRef code + url through to its result (core never builds a URL)', async () => {
+  const { deps: d } = deps({
+    createTask: async () => ({ ref: 'uuid-1', code: 'TSK-00247', url: 'https://account.ezyts.com/projects/tasks/uuid-1', display: 'Build X' }),
+  });
+  const r = await approveBackfillProposal('d1', 'yuval', d);
+  assert.deepEqual(r, {
+    ok: true, created: true, taskRef: 'uuid-1', title: 'Build X',
+    code: 'TSK-00247', url: 'https://account.ezyts.com/projects/tasks/uuid-1',
+  });
+});
+
+test('approve omits code/url keys entirely when the port returns a bare ref', async () => {
+  // A port with no code/url must yield the pre-link shape — no `undefined` keys for a
+  // surface to render as the string 'undefined'.
+  const { deps: d } = deps();
+  const r = await approveBackfillProposal('d1', 'yuval', d);
+  assert.deepEqual(Object.keys(r).sort(), ['created', 'ok', 'taskRef', 'title']);
+});
+
 test('approve is idempotent: a losing claim creates nothing', async () => {
   const { deps: d, created } = deps({
     claim: async () => null,

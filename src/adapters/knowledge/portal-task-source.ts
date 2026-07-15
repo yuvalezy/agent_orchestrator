@@ -38,10 +38,28 @@ export interface PortalTaskSourceDeps {
   log?: SyncLogger;
 }
 
-/** Canonical hash recipe — a change to any semantic field (status/priority/title/code)
- *  re-embeds; a no-op sync SKIPs at zero embed cost. */
+/** Best-effort ISO instant — null for absent OR unparseable dates, so a malformed value can never
+ *  throw out of a hash/metadata build (`new Date('nope').toISOString()` is a RangeError). */
+function isoOrNull(d: Date | undefined): string | null {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+/** Canonical hash recipe — a change to any semantic field (status/priority/title/code) or to the
+ *  task's instants (updatedAt/completedAt) re-embeds; a no-op sync SKIPs at zero embed cost.
+ *
+ *  ⚠︎ The instants are in the recipe on PURPOSE, and it is load-bearing twice over:
+ *  1. Rows are HASH-CONTROLLED, so metadata alone can't reach already-synced tasks — without a
+ *     recipe change the reconciler SKIPs them and the new updated_at/completed_at metadata never
+ *     lands on the existing inventory (including TSK-00184, the task that caused backfill to
+ *     swallow a live starred thread as resolved history). Backfill's temporal guard reads that
+ *     metadata, so a stale row silently disables the guard for exactly the tasks it must protect.
+ *  2. It closes a real pre-existing gap: `description` is part of the rendered doc content but was
+ *     never in the recipe, so a description edit NEVER re-embedded. Keying on updatedAt (which the
+ *     portal bumps on any edit) catches that too.
+ *  Cost is a one-time re-embed of the whole inventory (~85 tasks) on the next sync. */
 function taskContentHash(t: TargetTask): string {
-  const recipe = `${t.code ?? t.ref}\n${t.title}\n${t.status}\n${t.priority ?? ''}`;
+  const recipe = [t.code ?? t.ref, t.title, t.status, t.priority ?? '', isoOrNull(t.updatedAt) ?? '', isoOrNull(t.completedAt) ?? ''].join('\n');
   return createHash('sha256').update(recipe, 'utf8').digest('hex');
 }
 
@@ -74,6 +92,11 @@ function toScannedDoc(t: TargetTask, cust: TaskInventoryCustomer): ScannedDoc {
       code,
       status: t.status,
       priority: t.priority ?? null,
+      // Instants backfill's resolved-link temporal guard reads off the matched candidate: is this
+      // thread NEWER than the task's closure? `completed_at` is the precise answer (fixed at
+      // closure); `updated_at` is the fallback and drifts later on unrelated post-closure edits.
+      updated_at: isoOrNull(t.updatedAt),
+      completed_at: isoOrNull(t.completedAt),
       project_ref: cust.projectRef,
       kind: 'task-inventory',
     },

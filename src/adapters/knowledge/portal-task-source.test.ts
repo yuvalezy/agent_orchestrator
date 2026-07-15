@@ -62,6 +62,49 @@ test('a status change flips the contentHash (→ re-embed); an unrelated field d
   assert.equal(open.contentHash, again.contentHash);
 });
 
+// ── task instants (backfill's resolved-link temporal guard reads these) ──────────
+test('metadata carries updated_at + completed_at as ISO strings (null when absent)', async () => {
+  const completedAt = new Date('2026-05-10T17:03:54.939757Z');
+  const updatedAt = new Date('2026-05-10T17:03:54.939759Z');
+  const [done] = await sourceOf({ 'proj-a': [task({ ref: 't1', status: 'done', completedAt, updatedAt })] }, [CUST_A]).listDocs();
+  assert.equal(done.extraMetadata?.completed_at, completedAt.toISOString());
+  assert.equal(done.extraMetadata?.updated_at, updatedAt.toISOString());
+
+  // An OPEN task has no completion instant — null, never undefined/omitted.
+  const [open] = await sourceOf({ 'proj-a': [task({ ref: 't2', updatedAt })] }, [CUST_A]).listDocs();
+  assert.equal(open.extraMetadata?.completed_at, null);
+  assert.equal(open.extraMetadata?.updated_at, updatedAt.toISOString());
+
+  // No instants at all → both null, no throw.
+  const [bare] = await sourceOf({ 'proj-a': [task({ ref: 't3' })] }, [CUST_A]).listDocs();
+  assert.equal(bare.extraMetadata?.updated_at, null);
+  assert.equal(bare.extraMetadata?.completed_at, null);
+});
+
+test('the hash CHANGES when updatedAt or completedAt changes (→ re-embed lands the new metadata)', async () => {
+  // Rows are hash-controlled: without the instants in the recipe the reconciler SKIPs already-synced
+  // tasks and the guard metadata never reaches them — including TSK-00184, which caused the bug.
+  const may = new Date('2026-05-10T17:03:54Z');
+  const june = new Date('2026-06-10T00:00:00Z');
+  const [base] = await sourceOf({ 'proj-a': [task({ ref: 't1', updatedAt: may })] }, [CUST_A]).listDocs();
+  const [bumped] = await sourceOf({ 'proj-a': [task({ ref: 't1', updatedAt: june })] }, [CUST_A]).listDocs();
+  assert.notEqual(base.contentHash, bumped.contentHash, 'an updatedAt bump must re-embed');
+
+  const [completed] = await sourceOf({ 'proj-a': [task({ ref: 't1', updatedAt: may, completedAt: may })] }, [CUST_A]).listDocs();
+  assert.notEqual(base.contentHash, completed.contentHash, 'gaining a completedAt must re-embed');
+
+  // Still stable for an untouched task (the SKIP path — zero embed cost).
+  const [again] = await sourceOf({ 'proj-a': [task({ ref: 't1', updatedAt: may })] }, [CUST_A]).listDocs();
+  assert.equal(base.contentHash, again.contentHash);
+});
+
+test('an invalid Date in the instants never throws (hash + metadata degrade to null)', async () => {
+  const [d] = await sourceOf({ 'proj-a': [task({ ref: 't1', updatedAt: new Date('nope'), completedAt: new Date('nope') })] }, [CUST_A]).listDocs();
+  assert.equal(d.extraMetadata?.updated_at, null);
+  assert.equal(d.extraMetadata?.completed_at, null);
+  assert.match(d.contentHash, /^[0-9a-f]{64}$/);
+});
+
 test('falls back to task ref when a task has no code', async () => {
   const src = sourceOf({ 'proj-a': [task({ ref: 't99', code: undefined })] }, [CUST_A]);
   const [d] = await src.listDocs();

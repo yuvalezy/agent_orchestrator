@@ -40,6 +40,22 @@ export function parseTap(d: DecisionEvent): { approve: boolean; decisionId: stri
   return null;
 }
 
+/** Render the approve confirmation. The founder taps ✅ and then needs to GO LOOK at the
+ *  task, so lead with the human code and put the deep link on its own line. `code`/`url`
+ *  are optional (see ApproveResult) — each degrades independently to the pre-link text
+ *  rather than rendering 'undefined'.
+ *
+ *  PLAIN TEXT, deliberately unescaped: replyInThread → TelegramClient.sendMessage sets
+ *  NO parse_mode, so Telegram applies no entity parsing and a title containing _ * [ or
+ *  ` is safe as-is. Escaping here would print literal backslashes. (The sibling proposal
+ *  card in scripts/backfill-run.ts:128 leans on the same thing — its `_priority: …_`
+ *  underscores are cosmetic, not markup.) Bare URL on its own line → Telegram
+ *  auto-links it. Exported for the render test. */
+export function renderTaskCreated(r: { title: string; code?: string; url?: string }): string {
+  const head = r.code ? `${r.code} — ${r.title}` : r.title;
+  return r.url ? `✅ Task created: ${head}\n${r.url}` : `✅ Task created: ${head}`;
+}
+
 export function buildBackfillApproveHandler(deps: {
   notifier: Pick<TelegramNotifier, 'replyInThread'>;
   approve?: typeof approveBackfillProposal;
@@ -74,7 +90,7 @@ export function buildBackfillApproveHandler(deps: {
           });
           if (!r.ok) await confirm(d, `⚠️ Could not create the task: ${r.reason}`);
           else if (!r.created) return; // another surface already won; do not duplicate a notification
-          else await confirm(d, `✅ Task created: ${r.title}`);
+          else await confirm(d, renderTaskCreated(r));
         } else {
           const r = await rejectProposal(decisionId, d.by, { resolve: resolveBackfillProposalDecision, log: logger });
           if (r.resolved) await confirm(d, '❌ Skipped — no task created.');

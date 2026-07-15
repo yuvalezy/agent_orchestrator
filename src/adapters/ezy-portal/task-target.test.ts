@@ -50,6 +50,30 @@ test('createTask posts camelCase body + source* + Idempotency-Key; truncates a l
   assert.equal((c.body!.title as string).length, 240); // truncated
 });
 
+test('createTask maps the human code + a portal deep link off the client baseUrl', async () => {
+  const { gw } = gatewayWith(201, { id: '9f1c2d3e-4b5a-6789-abcd-ef0123456789', title: 'Zero values', code: 'TSK-00247' });
+  const ref = await gw.createTask({
+    customerRef: 'bp-1', projectRef: 'proj-1', workItemTypeRef: 'wit-1',
+    title: 'Zero values', description: 'd', priority: 'high',
+    source: { service: 'backfill', entityType: 'thread', entityId: 'tk-1', display: 'backfill:email' },
+    tags: [],
+  });
+  assert.equal(ref.code, 'TSK-00247');
+  assert.equal(ref.display, 'Zero values');
+  // Same shape the console links with — /projects/tasks/<uuid> on the portal origin.
+  assert.equal(ref.url, 'http://portal/projects/tasks/9f1c2d3e-4b5a-6789-abcd-ef0123456789');
+});
+
+test('createTask omits code (and never fabricates one) when the portal response has none', async () => {
+  const { gw } = gatewayWith(201, { id: 'task-1', title: 'T' });
+  const ref = await gw.createTask({
+    customerRef: 'b', projectRef: 'p', workItemTypeRef: 'w', title: 'x', description: 'd', priority: 'low',
+    source: { service: 's', entityType: 'e', entityId: 'i', display: 'd' }, tags: [],
+  });
+  assert.equal(ref.code, undefined);
+  assert.equal(ref.url, 'http://portal/projects/tasks/task-1'); // url is ref-derived, so it still resolves
+});
+
 test('findOpenTasks filters by sourceEntity + open statuses, maps text→search', async () => {
   const { gw, calls } = gatewayWith(200, { data: [{ id: 't1', title: 'T', status: 'todo', projectId: 'proj-1', updatedAt: '2026-07-05T00:00:00Z' }] });
   const tasks = await gw.findOpenTasks({ projectRef: 'proj-1', sourceEntity: { service: 'agent-orchestrator', type: 'whatsapp', id: 'thread-9' }, text: 'export' });

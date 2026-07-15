@@ -18,6 +18,7 @@ import {
 import type { EmbeddingPort } from '../../ports/embedding.port';
 import type { QueryService } from '../../query/query-service';
 import { listUrgencyInbox } from './console-urgency-repo';
+import { portalTaskUrl } from '../shared/portal-url';
 import { buildConsolePushRouter } from './console-push.router';
 import type { WebPushConfig } from '../../config/web-push';
 
@@ -43,11 +44,10 @@ export function projectConsoleFailure(err: unknown): { err: { name: string | und
   };
 }
 
-/** Build a portal UI URL from a mirrored task reference; this never contacts the portal. */
-export function portalTaskUrl(portalBaseUrl: string | null, taskRef: unknown): string | null {
-  if (!portalBaseUrl || typeof taskRef !== 'string' || !taskRef.trim() || taskRef.length > 200) return null;
-  return `${portalBaseUrl.replace(/\/+$/, '')}/projects/tasks/${encodeURIComponent(taskRef)}`;
-}
+// Re-exported so this module's public surface (and its tests) are unchanged by the
+// move to adapters/shared — the EZY gateway needs the same formatter and must not
+// import a console router to get it. See adapters/shared/portal-url.ts.
+export { portalTaskUrl };
 
 function portalTasksUrl(portalBaseUrl: string | null): string | null {
   return portalBaseUrl ? `${portalBaseUrl.replace(/\/+$/, '')}/projects/tasks` : null;

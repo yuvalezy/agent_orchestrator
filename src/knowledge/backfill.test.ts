@@ -81,6 +81,178 @@ test('matches a DONE task → link-resolved (never reopened)', async () => {
   assert.equal((out as Record<string, unknown>).taskRef, 'TSK-9');
 });
 
+// ── the resolved-link guards (a live issue must not be swallowed as history) ─────
+// link-resolved is the SILENT arm: it writes history and never offers a card. A false link there
+// deletes the issue. Guard (a): a thread NEWER than the task's closure is a new occurrence, not that
+// task's history. Guard (b): a starred thread is the founder's own "this needs action" — never
+// override it silently. Both veto ONLY the closed arm, re-routing through the no-match arms.
+
+const MAY = new Date('2026-05-10T17:03:54Z');
+const JUNE = new Date('2026-06-10T00:00:00Z');
+const JULY = new Date('2026-07-15T00:00:00Z');
+const AUGUST = new Date('2026-08-10T00:00:00Z');
+
+/** A closed task carrying its instants, exactly as portal-task-source now emits them (ISO). */
+const doneTask = (over: { completedAt?: Date; updatedAt?: Date; status?: string } = {}): TaskMatch => ({
+  content: 'Task TSK-00184: Problemas de la sincronizacion',
+  distance: 0.6,
+  metadata: {
+    task_ref: 'TSK-00184',
+    code: 'TSK-00184',
+    status: over.status ?? 'done',
+    completed_at: over.completedAt ? over.completedAt.toISOString() : null,
+    updated_at: over.updatedAt ? over.updatedAt.toISOString() : null,
+  },
+});
+
+test('CF009 REGRESSION: a STARRED thread matching a DONE task → propose, never link-resolved', async () => {
+  // The real bug: a starred 2026-07-15 thread ("new materials CF009 not appearing in the portal")
+  // matched the done TSK-00184 ("synchronization problems" — generic enough to match ANY sync
+  // issue) and was silently recorded as already-resolved history. The founder's star must win.
+  const out = await reconcileThread(
+    starredThread({ messages: [{ from: 'founder', body: 'CF009 materials are not appearing in the portal', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY, updatedAt: MAY })] }),
+  );
+  assert.equal(out.kind, 'propose', 'a starred thread must surface as a card, not vanish into history');
+  assert.equal((out as Record<string, unknown>).title, 'Build X');
+});
+
+test('a STARRED thread matching a DONE task with NO instants → still propose (guard (b) needs no dates)', async () => {
+  const out = await reconcileThread(
+    starredThread(),
+    deps({ searchTasks: async () => [taskMatch({ taskRef: 'TSK-9', status: 'done' })] }),
+  );
+  assert.equal(out.kind, 'propose');
+});
+
+test('unstarred thread NEWER than the closed task → memory, not link-resolved (a new occurrence)', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY, updatedAt: MAY })] }),
+  );
+  assert.equal(out.kind, 'memory', 'a thread cannot be the history of a task that closed before it');
+  assert.match(String((out as Record<string, unknown>).reason), /not starred/);
+});
+
+test('unstarred thread OLDER than the closed task → still link-resolved (unchanged behavior)', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JUNE }] }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: JULY, updatedAt: JULY })] }),
+  );
+  assert.equal(out.kind, 'link-resolved', 'genuine history still links — the guards must not over-fire');
+  assert.equal((out as Record<string, unknown>).taskRef, 'TSK-00184');
+});
+
+test('temporal guard fires off completed_at when updated_at is absent', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY })] }),
+  );
+  assert.equal(out.kind, 'memory');
+});
+
+test('completed_at WINS over an updated_at that drifted later (the unsafe-direction case)', async () => {
+  // Closed in May, edited in August (a retitle), thread in July. updated_at alone would say the
+  // thread PREDATES the task and link-resolve it — the exact false link the guard exists to stop.
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY, updatedAt: AUGUST })] }),
+  );
+  assert.equal(out.kind, 'memory', 'a post-closure edit must not disable the guard');
+});
+
+test('completed_at wins when updated_at drifted to June and the thread is July', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY, updatedAt: JUNE })] }),
+  );
+  assert.equal(out.kind, 'memory');
+});
+
+test('falls back to updated_at when the task carries no completed_at', async () => {
+  const older = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JUNE }] }),
+    deps({ searchTasks: async () => [doneTask({ updatedAt: JULY })] }),
+  );
+  assert.equal(older.kind, 'link-resolved', 'thread predates the only instant we have → history');
+
+  const newer = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ updatedAt: JUNE })] }),
+  );
+  assert.equal(newer.kind, 'memory', 'thread postdates it → not history');
+});
+
+test('NO message timestamps + DONE + unstarred → still link-resolved (guard skipped, no crash)', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X' }] }), // `at` is optional
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY, updatedAt: MAY })] }),
+  );
+  assert.equal(out.kind, 'link-resolved', 'an unprovable guard degrades to the prior behavior');
+});
+
+test('a malformed task instant degrades safely → link-resolved, never throws', async () => {
+  const out = await reconcileThread(
+    thread({ messages: [{ from: 'them', body: 'please build X', at: JULY }] }),
+    deps({
+      searchTasks: async () => [
+        { content: 'Task', distance: 0.6, metadata: { task_ref: 'TSK-1', status: 'done', completed_at: 'not-a-date', updated_at: '' } },
+      ],
+    }),
+  );
+  assert.equal(out.kind, 'link-resolved');
+});
+
+test('the thread\'s LATEST message decides the temporal guard (mixed/absent timestamps)', async () => {
+  const out = await reconcileThread(
+    thread({
+      messages: [
+        { from: 'them', body: 'original report', at: JUNE },
+        { from: 'them', body: 'no timestamp here' },
+        { from: 'them', body: 'it is happening again', at: JULY }, // the latest → after closure
+      ],
+    }),
+    deps({ searchTasks: async () => [doneTask({ completedAt: MAY })] }),
+  );
+  assert.equal(out.kind, 'memory', 'a regression reported on an old thread is not that task\'s history');
+});
+
+test('cancelled is guarded exactly like done (starred → propose)', async () => {
+  const out = await reconcileThread(
+    starredThread({ messages: [{ from: 'f', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [doneTask({ status: 'cancelled', completedAt: MAY })] }),
+  );
+  assert.equal(out.kind, 'propose');
+});
+
+test('an OPEN match is UNTOUCHED by both guards: starred + newer still → link-open', async () => {
+  // The work is tracked and open — linking is right and no card is wanted, starred or not.
+  const starredOut = await reconcileThread(
+    starredThread({ messages: [{ from: 'f', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [taskMatch({ taskRef: 'TSK-5', status: 'in-progress', metadata: { task_ref: 'TSK-5', status: 'in-progress', completed_at: null, updated_at: MAY.toISOString() } })] }),
+  );
+  assert.equal(starredOut.kind, 'link-open', 'a star must not turn tracked open work into a duplicate card');
+  assert.equal((starredOut as Record<string, unknown>).taskRef, 'TSK-5');
+
+  const unstarredOut = await reconcileThread(
+    thread({ messages: [{ from: 'c', body: 'please build X', at: JULY }] }),
+    deps({ searchTasks: async () => [taskMatch({ taskRef: 'TSK-5', status: 'todo', metadata: { task_ref: 'TSK-5', status: 'todo', updated_at: MAY.toISOString() } })] }),
+  );
+  assert.equal(unstarredOut.kind, 'link-open');
+});
+
+test('a vetoed closed match still respects the intent gate: starred QUESTION → memory, not propose', async () => {
+  const out = await reconcileThread(
+    starredThread(),
+    deps({
+      extractIntents: async () => [intentOf({ category: 'question_existing' })],
+      searchTasks: async () => [doneTask({ completedAt: MAY })],
+    }),
+  );
+  assert.equal(out.kind, 'memory', 'the veto re-routes through the EXISTING routing, it does not bypass it');
+  assert.match(String((out as Record<string, unknown>).reason), /question_existing/);
+});
+
 test('cancelled is treated as resolved (not open)', async () => {
   const out = await reconcileThread(
     thread(),

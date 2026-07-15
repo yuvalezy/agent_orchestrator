@@ -9,6 +9,7 @@ import {
   TicketThreadEntry,
 } from '../../ports';
 import { EzyPortalHttpClient } from './http-client';
+import { portalTaskUrl } from '../shared/portal-url';
 
 /** Portal field limits (DA-verified vs task_input.go) — truncate defensively so a
  *  long LLM title/description never 422s. M1.5b should also validate upstream. */
@@ -77,6 +78,9 @@ interface EzyTask {
   status: string;
   projectId?: string;
   updatedAt?: string;
+  /** When the work was declared finished. Distinct from updatedAt, which drifts on any
+   *  later edit to a closed task — see mapTask. */
+  completedAt?: string;
   code?: string;
   priority?: string;
   description?: string;
@@ -171,6 +175,13 @@ function fullName(c: EzyContact): string {
 }
 
 /** Portal task row → opaque TargetTask (the task API has no url field). */
+/** ⚠︎ `completedAt` is NOT interchangeable with `updatedAt`, and the backfill's
+ *  resolved-link veto depends on the difference. `updatedAt` drifts forward on ANY
+ *  later edit to an already-closed task (a retitle months after the fact), and every
+ *  such drift makes the veto LESS likely to fire — i.e. it fails toward re-linking a
+ *  live thread onto closed work. `completedAt` is the instant the work was declared
+ *  finished, which is the actual question ("did this thread happen after this was
+ *  closed?"). Kept optional: the portal omits it for never-completed tasks. */
 function mapTask(t: EzyTask): TargetTask {
   return {
     ref: t.id,
@@ -178,6 +189,7 @@ function mapTask(t: EzyTask): TargetTask {
     status: t.status,
     projectRef: t.projectId,
     updatedAt: t.updatedAt ? new Date(t.updatedAt) : undefined,
+    completedAt: t.completedAt ? new Date(t.completedAt) : undefined,
     code: t.code,
     priority: t.priority,
     description: t.description,
@@ -309,7 +321,20 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
       sourceUrl: input.source.url,
       tags: input.tags.slice(0, TAGS_MAX).map((t) => truncateBytes(t, TAG_MAX)),
     });
-    return { ref: created.id, display: created.title };
+    // Surface `code` + `url` so a caller can TELL THE FOUNDER WHERE THE TASK IS: the
+    // ref is a UUID (unquotable, unbrowsable) and every confirmation built from it
+    // alone was a dead end. The code comes straight off the create response; the url
+    // is formatted from this client's baseUrl (also the portal's UI origin) with the
+    // same portalTaskUrl the console links with — one formatter, one URL shape.
+    // Both stay optional: a portal response without `code`, or a base that
+    // portalTaskUrl rejects, degrades to today's ref-only TaskRef rather than
+    // fabricating a link.
+    return {
+      ref: created.id,
+      display: created.title,
+      code: created.code,
+      url: portalTaskUrl(this.http.baseUrl, created.id) ?? undefined,
+    };
   }
 
   async addComment(task: TaskRef, body: string): Promise<void> {
