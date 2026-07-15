@@ -73,6 +73,8 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     assert.equal(unauthenticated.headers.get('cache-control'), 'no-store');
     const unauthenticatedMemory = await fetch(`${baseUrl}/console/api/memory/sources`);
     assert.equal(unauthenticatedMemory.status, 401, 'Memory Explorer inherits the console session boundary');
+    const unauthenticatedUrgency = await fetch(`${baseUrl}/console/api/urgency-inbox`);
+    assert.equal(unauthenticatedUrgency.status, 401, 'Priority inbox inherits the console session boundary');
 
     const login = await fetch(`${baseUrl}/console/api/session`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }),
@@ -102,6 +104,8 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     assert.equal(invalidDecisionFilter.status, 400);
     const invalidDecisionError = await invalidDecisionFilter.json() as { error: string };
     assert.equal(invalidDecisionError.error.includes(sensitiveFilter), false);
+    const invalidUrgencyCursor = await fetch(`${baseUrl}/console/api/urgency-inbox?cursor=not-a-cursor`, { headers: { cookie: cookiePair } });
+    assert.equal(invalidUrgencyCursor.status, 400);
     const rejected = await fetch(`${baseUrl}/console/api/inbox/1/requeue`, { method: 'POST', headers: { cookie: cookiePair } });
     assert.equal(rejected.status, 403);
     const rejectedGuidance = await fetch(`${baseUrl}/console/api/memory/guidance`, {

@@ -17,6 +17,7 @@ import {
 } from './console-memory-repo';
 import type { EmbeddingPort } from '../../ports/embedding.port';
 import type { QueryService } from '../../query/query-service';
+import { listUrgencyInbox } from './console-urgency-repo';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -173,6 +174,13 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, de
     } catch (err) {
       next(err);
     }
+  });
+  router.get('/api/urgency-inbox', async (req, res, next) => {
+    try {
+      const page = await listUrgencyInbox(req.query);
+      if (!page) return void res.status(400).json({ error: 'invalid urgency cursor or limit' });
+      res.json(page);
+    } catch (err) { next(err); }
   });
 
   router.get('/api/inbox', async (req, res, next) => {

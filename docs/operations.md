@@ -91,6 +91,15 @@ future retrieval. Guidance writes call the configured embedding provider and rec
 content-free console audit event; stored content and vectors are never placed in that
 audit log.
 
+### Priority inbox
+
+The **Priority inbox** is a cross-customer, metadata-only attention queue for
+`failed`, `pending`, and `processing` inbound records. Its deterministic score
+is state (`failed` 1000, `pending` 500, `processing` 200), plus one point per
+hour of age (capped at 72) and five points per retry (capped at 20). Each
+pagination walk freezes an `asOf` snapshot in its cursor, so a record cannot
+move between pages while it is being reviewed. Refresh starts a new snapshot.
+
 ## Background workers
 
 All workers run on an interval/backoff loop (recursive `setTimeout`; exponential backoff on consecutive failures, capped at 10× the interval). Each tick is isolated — one failure never blocks the others. Their live status is exposed on `/health`.
