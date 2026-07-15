@@ -74,6 +74,66 @@ Open `https://<machine>.ts.net/console/` from an enrolled device. Do not expose
 port 3100 through a public tunnel or port-forward. The PWA caches only its static
 shell; it never caches console API responses or customer-message detail data.
 
+The console threat-model checklist — tailnet transport, session fixation, CSRF, cache
+history, referrer leakage, PII logging, state drift, and ambiguous outbound delivery,
+each with its mitigation and its uncovered residual risk — lives in
+[`docs/plan/changes/06-add-mobile-inbox/design.md`](plan/changes/06-add-mobile-inbox/design.md#threat-model-checklist).
+Read it before changing console auth, headers, or a mutation path.
+
+### Console secrets
+
+`CONSOLE_PASSWORD_HASH` and `CONSOLE_SESSION_SECRET` are `.env` bootstrap values
+read straight from `process.env` in `src/config/console.ts` — deliberately outside
+both the zod schema and the sealed store. The loader returns a config or `null`,
+never a partial: if either secret is missing or malformed, `/console` simply does
+not mount.
+
+**Create the password hash.** Login compares the password against
+`CONSOLE_PASSWORD_HASH` with `bcryptjs` (already a dependency — no native build).
+Run this from the repo root; `read -rs` keeps the password out of your shell
+history and off the process argv:
+
+```bash
+read -rsp 'Console password: ' CONSOLE_PW && echo
+CONSOLE_PW="$CONSOLE_PW" node -e 'console.log(require("bcryptjs").hashSync(process.env.CONSOLE_PW, 12))'
+unset CONSOLE_PW
+```
+
+Paste the `$2b$12$…` output into `.env` as `CONSOLE_PASSWORD_HASH` and re-run
+`./debug.sh`. It needs no quoting or escaping — dotenv does not expand `$`. The
+loader accepts only a well-formed `$2a`/`$2b`/`$2y` hash with a two-digit cost, so
+a truncated paste or a plaintext password leaves the console unmounted rather than
+weakly guarded. Cost 12 is the recommended default; a higher cost slows every
+login by design. Changing the password is just this procedure again — it does not
+disturb `CONSOLE_SESSION_SECRET`, but the restart ends active sessions anyway.
+
+**Rotate the session secret.** `CONSOLE_SESSION_SECRET` must be ≥32 characters and
+does two jobs: it derives opaque session ids (HMAC-SHA256 over per-session random
+entropy, `console-session.ts`) and it signs the `state` parameter of the
+Connectors Google OAuth flow (`console-connectors.router.ts`) — that callback is a
+public top-level redirect with no session cookie, so the signed `state` is its only
+authentication.
+
+```bash
+node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))'
+```
+
+Put the value in `.env` and restart. Impact to expect:
+
+- **Every active session ends.** Sessions live in a per-process in-memory `Map`, so
+  the restart alone invalidates them — a restart always logs the founder out, with
+  or without a rotation. Sign in again; browsers drop the stale cookie.
+- **Any in-flight Connectors OAuth authorization breaks.** A `state` signed with
+  the old secret fails verification on return. Finish or abandon pending Google
+  account authorizations first, then re-add the account after restarting.
+- **Nothing else re-keys.** The secret signs and derives; it encrypts no stored
+  data. Stored credentials, settings, and push registrations are sealed with
+  `CREDENTIALS_ENCRYPTION_KEY` and are unaffected.
+
+Rotate on suspected exposure, on a lost/stolen enrolled device, or when a `.env`
+leaks. There is no rolling window — rotation is a hard cut, which is why it is
+cheap here: one founder, one session.
+
 ### Memory Explorer
 
 The **Memory** console area is founder-only and `no-store`. It has separate views for
@@ -153,6 +213,46 @@ Connectors](./configuration.md#settings--connectors--the-db-authoritative-overla
 Use `npm run settings:import` to seed/migrate a settings snapshot from a file
 (never deletes rows). The raw credentials store is also reachable over
 `/admin/credentials` — see [configuration.md](./configuration.md).
+
+### Backup & rollback
+
+The console has no datastore of its own: everything it owns lives in the single
+`agent_orchestrator` Postgres database (`PGDATABASE`), so one dump covers it.
+Sessions are in-memory only and are not backed up — by design, a restore starts
+with everyone logged out.
+
+```bash
+# Backup — PGHOST/PGPORT/PGUSER/PGPASSWORD supply the connection
+pg_dump --format=custom --file="ao-$(date +%F).dump" agent_orchestrator
+
+# Restore over an existing database (drops the objects it recreates)
+pg_restore --clean --if-exists --dbname=agent_orchestrator ao-2026-07-15.dump
+```
+
+Four console-owned tables deserve attention when you plan a restore:
+
+| Table | Migration | Restore concern |
+|---|---|---|
+| `console_audit_events` | 023, 024 | Append-only ledger of every console mutation (app code only ever `INSERT`s). Nothing else records these actions — a lost dump loses the history for good. |
+| `app_settings` | 025 | DB-authoritative flags/knobs. The one table with a second copy: keep a snapshot and re-seed with `npm run settings:import`. |
+| `credentials` | 009 | Sealed values — see the key warning below. |
+| `founder_push_subscriptions` | 029, 031 | Sealed device registrations; same warning. Cheap to rebuild — re-register each browser. |
+
+> **A database dump alone cannot restore the console.** `credentials` and
+> `founder_push_subscriptions` are sealed with AES-256-GCM under
+> `CREDENTIALS_ENCRYPTION_KEY` (`src/crypto/secret-box.ts`), and that key lives in
+> `.env`, never in the database. Restoring a dump under a different (or lost) key
+> yields rows that will not decrypt. Back up the key with — and store it apart
+> from — the dump, and treat `.env` as part of the backup set: it also holds the
+> two console secrets above.
+
+**Rollback is restore-only.** The migration runner (`src/db/migrate.ts`) is
+forward-only: it applies each `*.sql` once, in lexical order, tracked in
+`schema_migrations`, and there are no down migrations. Each migration runs in one
+transaction, so a *failed* one rolls itself back cleanly and leaves no row — fix
+it and re-run `npm run migrate`. Undoing an *applied* migration is manual: restore
+the dump, or hand-write the reverse DDL and delete the `schema_migrations` row.
+Take a dump before applying migrations to a database you care about.
 
 ## Background workers
 

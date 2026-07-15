@@ -16,7 +16,7 @@ function makeStore(seed: Record<string, string> = {}) {
 
 test('arming any marker clears every other kind on that thread', async () => {
   const { map, store } = makeStore();
-  let clock = new Date('2026-07-15T10:00:00Z');
+  const clock = new Date('2026-07-15T10:00:00Z');
   const markers = buildThreadMarkers(store, () => clock);
 
   await markers.arm('draft_edit', '42', 'queue-1');

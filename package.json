@@ -36,7 +36,8 @@
     "test:containers": "RUN_CONTAINERS=true node --import tsx --test src/adapters/console/console-mutations.container.test.ts",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
-    "lint:boundary": "node scripts/check-boundary.mjs"
+    "lint:boundary": "node scripts/check-boundary.mjs",
+    "ci": "bash ci.sh"
   },
   "dependencies": {
     "@hebcal/core": "^6.6.0",

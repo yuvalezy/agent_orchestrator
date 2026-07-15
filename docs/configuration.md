@@ -181,6 +181,10 @@ for a single founder session and must be served only behind Tailscale Serve / a
 MagicDNS HTTPS name — never a public port-forward or tunnel. It queries only the
 orchestrator database and does not replace Telegram's draft-approval authority.
 
+> The procedures for these secrets — creating the bcrypt hash, rotating the
+> session secret, and console backup/rollback — are in
+> [operations.md § Console secrets](./operations.md#console-secrets).
+
 | Variable | Secret? | Default | Purpose |
 |---|---|---|---|
 | `CONSOLE_PASSWORD_HASH` | yes | *(unset)* | bcrypt hash for the founder password. Invalid/missing → `/console` is not mounted. |

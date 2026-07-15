@@ -7,12 +7,13 @@ import { buildApp } from '../../app';
 import { loadConsoleConfig } from '../../config/console';
 import { buildConsoleRouter, portalTaskUrl, projectConsoleFailure, type ConsoleRouterDeps } from './console.router';
 
-async function withConsole(fn: (baseUrl: string) => Promise<void>, deps: ConsoleRouterDeps = {}): Promise<void> {
+async function withConsole(fn: (baseUrl: string) => Promise<void>, deps: ConsoleRouterDeps = {}, env: NodeJS.ProcessEnv = {}): Promise<void> {
   const hash = await bcrypt.hash('correct horse battery staple', 4);
   const config = loadConsoleConfig({
     CONSOLE_PASSWORD_HASH: hash,
     CONSOLE_SESSION_SECRET: 'a'.repeat(32),
     CONSOLE_LOGIN_MAX_ATTEMPTS: '2',
+    ...env,
   });
   assert.ok(config);
   const server = createServer(buildApp({ consoleRouter: buildConsoleRouter(config, undefined, deps) }));
@@ -82,6 +83,80 @@ test('portal task links are generated from local references without a portal req
   assert.equal(portalTaskUrl('https://portal.example/', 'task / 1'), 'https://portal.example/projects/tasks/task%20%2F%201');
   assert.equal(portalTaskUrl(null, 'task-1'), null);
   assert.equal(portalTaskUrl('https://portal.example', ''), null);
+});
+
+test('logout destroys the session server-side and clears the cookie', async () => {
+  await withConsole(async (baseUrl) => {
+    const login = await fetch(`${baseUrl}/console/api/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }) });
+    const cookie = login.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie);
+    const csrf = ((await login.json()) as { data: { csrfToken: string } }).data.csrfToken;
+    assert.equal((await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie } })).status, 200);
+
+    const logout = await fetch(`${baseUrl}/console/api/session`, { method: 'DELETE', headers: { cookie, 'x-console-csrf': csrf } });
+    assert.equal(logout.status, 204);
+    assert.match(logout.headers.get('set-cookie') ?? '', /^ao_console_session=;/, 'logout clears the cookie');
+
+    // The cookie value is dead server-side, not merely dropped by the client.
+    assert.equal((await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie } })).status, 401);
+    assert.equal((await fetch(`${baseUrl}/console/api/session`, { headers: { cookie } })).status, 401);
+  });
+});
+
+test('expired sessions are rejected even with a valid cookie', async () => {
+  await withConsole(async (baseUrl) => {
+    const login = await fetch(`${baseUrl}/console/api/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }) });
+    assert.equal(login.status, 201);
+    const cookie = login.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie);
+    const { data } = (await login.json()) as { data: { expiresAt: string } };
+    assert.ok(Date.parse(data.expiresAt) <= Date.now(), 'the 1ms TTL has already lapsed by the time login returns');
+
+    assert.equal((await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie } })).status, 401);
+    assert.equal((await fetch(`${baseUrl}/console/api/session`, { headers: { cookie } })).status, 401);
+  }, {}, { CONSOLE_SESSION_TTL_MS: '1' });
+});
+
+test('login does not honour a pre-supplied session id and mints a fresh one each time', async () => {
+  await withConsole(async (baseUrl) => {
+    const fixated = 'ao_console_session=attacker-chosen-session-id';
+    assert.equal((await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie: fixated } })).status, 401);
+
+    const login = await fetch(`${baseUrl}/console/api/session`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: fixated }, body: JSON.stringify({ password: 'correct horse battery staple' }),
+    });
+    assert.equal(login.status, 201);
+    const cookie = login.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie);
+    assert.notEqual(cookie, fixated, 'login issues its own id rather than adopting the presented one');
+    assert.equal((await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie } })).status, 200);
+
+    // The pre-auth value never becomes valid, so a fixated cookie cannot ride the login.
+    assert.equal((await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie: fixated } })).status, 401);
+
+    const relogin = await fetch(`${baseUrl}/console/api/session`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ password: 'correct horse battery staple' }),
+    });
+    assert.equal(relogin.status, 201);
+    assert.notEqual(relogin.headers.get('set-cookie')?.split(';')[0], cookie, 'each login rotates to a new session id');
+  });
+});
+
+test('login rate limiting locks out further attempts once the window is exhausted', async () => {
+  await withConsole(async (baseUrl) => {
+    const attempt = (password: string) => fetch(`${baseUrl}/console/api/session`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }),
+    });
+
+    // CONSOLE_LOGIN_MAX_ATTEMPTS=2, so the third attempt is refused before any password check.
+    assert.equal((await attempt('wrong')).status, 401);
+    assert.equal((await attempt('wrong')).status, 401);
+
+    const limited = await attempt('correct horse battery staple');
+    assert.equal(limited.status, 401, 'the limiter rejects the correct password once the window is exhausted');
+    assert.equal(limited.headers.get('set-cookie'), null, 'no session is issued to a rate-limited attempt');
+    assert.deepEqual(await limited.json(), { error: 'invalid credentials' });
+  });
 });
 
 test('console API requires auth, creates no-store session, and rejects mutation without CSRF', async () => {

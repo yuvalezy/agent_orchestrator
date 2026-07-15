@@ -35,6 +35,131 @@ The login endpoint checks a bcrypt password hash, applies a small per-IP and per
 
 The console is single-founder by design. There is no user administration, password reset, persistent session database, or cross-device session synchronisation in this change.
 
+## Threat-model checklist
+
+Each item states the threat, the mitigation that exists in code today, and what is
+**not** covered. "Not covered" is deliberately literal: an untested mitigation is
+listed as untested even where the code reads correctly.
+
+**1. Tailnet transport.** *Threat:* the console is reachable from a network other than
+the tailnet, reducing the whole gate to one password. *Mitigation:* Tailscale
+Serve/MagicDNS HTTPS is the network gate (`docs/operations.md`, "Founder console"); the
+app gate is independent and fails closed when either secret is missing/invalid
+(`src/config/console.ts`, asserted in `src/adapters/console/console.router.test.ts:31-35`),
+and the console router only mounts when that config validates (`src/app.ts:73`). The
+session cookie is `Secure` (`src/adapters/console/console-session.ts:88`) and helmet
+adds HSTS (`src/app.ts:25`). *Not covered:* nothing in the process asserts its own
+network exposure — there is no IP filter, no tailnet identity header check, and no
+startup refusal to bind a routable interface. If port 3100 is published directly, a
+browser will refuse to store the `Secure` cookie over plain HTTP, but `POST
+/console/api/session` still accepts password guesses; bcrypt plus the login limiter are
+then the only barrier. The deployment topology is an operational promise, not an
+enforced invariant.
+
+**2. Session fixation.** *Threat:* an attacker plants a known session ID that survives
+the founder's login. *Mitigation:* structurally prevented — no pre-authentication
+session exists. `create()` mints a fresh HMAC-derived opaque ID per login and sets the
+cookie in the same step (`console-session.ts:75-93`), and `get()` resolves only IDs
+already present in the server-side `Map`, so a client-supplied or stale cookie yields
+`null` → 401 (`console-session.ts:95-104`). Sessions die on TTL or process restart.
+*Not covered:* no test asserts that a pre-existing cookie value is replaced at login, so
+the property is currently structural rather than regression-guarded. Sessions are not
+enumerable or individually revocable; `destroy()` clears only the caller's own session
+(`console-session.ts:111-115`).
+
+**3. CSRF.** *Threat:* a cross-site request rides the founder's cookie into a mutation.
+*Mitigation:* a per-session random token is minted at login (`console-session.ts:79`),
+returned only to authenticated bootstrap responses (`console.router.ts:122` and
+`:153-156`), and compared with `timingSafeEqual` on every `POST`/`PUT`/`PATCH`/`DELETE`
+under `/api` (`console.router.ts:337-344`, `console-session.ts:106-109`).
+`SameSite=Strict` on the cookie is defence-in-depth (`console-session.ts:88`). Tested at
+`console.router.test.ts:44-45`, `:66-68`, `:127-133` and
+`console-approvals.router.test.ts:59`. *Not covered:* the CSRF guard is registered
+**after** the read routes (`console.router.ts:337`) — correct today because everything
+above it is a `GET`, but any future mutating route added above that line silently
+bypasses the check. Route ordering is load-bearing and unguarded by a test. The OAuth
+callback at `console.router.ts:134` is intentionally outside both the session and CSRF
+guards and relies on a signed `state` instead.
+
+**4. Cache history.** *Threat:* customer data persists in the browser cache or
+back/forward history after sign-out. *Mitigation:* `Cache-Control: no-store` on every
+`/console/api` response (`console.router.ts:25-28`, mounted at `:110`) and on the SPA
+shell (`console.router.ts:440`); static assets are served `maxAge: 0`
+(`console.router.ts:438`). Asserted on both the 401 and the login response
+(`console.router.test.ts:91`, `:101`). *Not covered:* the React Query cache and
+in-memory detail state are not proven to be cleared on sign-out/expiry — this design
+requires it (see "Deferred PWA…") but no test exercises it. `no-store` does not by
+itself evict bfcache entries. Also note the static asset directory and SPA shell are
+served **without** a session (`console.router.ts:435-445`), which is narrower than the
+"including SPA fallback, require a valid session" wording under "Access control"; the
+shell carries no runtime data, but the prose overstates the code.
+
+**5. Referrer leakage.** *Threat:* a console URL containing record IDs leaks to a third
+party through the `Referer` header. *Mitigation:* `helmet()` (`src/app.ts:25`) applies
+its default `Referrer-Policy: no-referrer` (helmet 8 —
+`node_modules/helmet/index.cjs:187`), so no `Referer` is emitted at all, including on
+portal deep links (`console.router.ts:56-67`). The three `target="_blank"` anchors in
+`web/src/App.tsx` all carry `rel="noreferrer"`. *Not covered:* no test asserts the
+`Referrer-Policy` header, and the policy is inherited from a helmet default rather than
+set explicitly — a helmet major upgrade that changes its defaults would regress this
+silently. Console IDs also sit in URL paths, so any future policy relaxation leaks them
+directly.
+
+**6. PII logging.** *Threat:* customer content or upstream response bodies reach logs,
+`/health`, or console responses through an exception message. *Mitigation:* worker
+failures are projected to an allowlisted category — `network:<CODE>`,
+`upstream_http:<NNN>`, `timeout`, or `worker_failed` (`src/workers/worker-runner.ts:32-42`,
+consumed at `:78`; registry field documented at `src/workers/worker-registry.ts:13`),
+with a regression test using a sensitive upstream body
+(`src/workers/worker-runner.test.ts:15-16`). Console errors are projected before logging
+or serialization (`console.router.ts:40-45`, `:447-451`; test `console.router.test.ts:71-79`).
+The malformed-JSON handler logs only `path`/`method`, never `err.body` (`src/app.ts:41-49`).
+Audit rows store only `before_status`/`after_status` built server-side
+(`console-repo.ts:297-303`); the container test asserts guidance content never lands in
+`safe_metadata` (`console-mutations.container.test.ts:169`). *Not covered:* the audit
+content-freedom assertion lives in a test skipped unless `RUN_CONTAINERS=true`
+(`console-mutations.container.test.ts:71`), so a default test run does not prove it. The
+approvals audit insert is deliberately non-transactional and best-effort
+(`console-approvals-repo.ts:1-9`), so an audit row can be lost after a committed
+mutation.
+
+**7. State drift.** *Threat:* the console acts on a record that Telegram (or a worker)
+already resolved, producing a double effect or a false success. *Mitigation:* two
+shapes, both converging on the same rows. Approvals reuse the core conditional update
+`WHERE id = $1 AND is_draft = true AND status = 'pending' RETURNING`, with zero rows →
+`null` → 409 (`src/outbound/outbound-repo.ts:347-377`, surfaced at
+`console-approvals.router.ts:73-81`). Console-owned requeue/cancel take `SELECT … FOR
+UPDATE`, re-check status inside the transaction, and write the audit row in that same
+transaction (`console-repo.ts:305-327`, `:329-355`), mapping to 409/404 at
+`console.router.ts:346-374`. The container test drives concurrent pairs and asserts
+exactly `['conflict', 'ok']` with exactly one audit row, and that terminal states
+neither mutate nor audit (`console-mutations.container.test.ts:109-141`). *Not covered:*
+that test is skipped unless `RUN_CONTAINERS=true` (`:71`), so drift is unproven in a
+default run. Note also that requeue/cancel use a pessimistic row lock, not the
+"conditional `UPDATE … WHERE id AND status` … inspect affected-row count" shape
+described under "Mutation and audit invariants" — serialization is equivalent, but the
+prose describes the approvals path, not these two.
+
+**8. Ambiguous outbound delivery.** *Threat:* a console action sends a message twice, or
+the founder cannot tell a sent message from a draft. *Mitigation:* the console never
+composes or sends — approve is a one-way `is_draft: true → false` flip guarded by the
+same predicate, so a double-tap or retry returns 409 rather than a second send
+(`outbound-repo.ts:390-401` via `:347-377`); delivery is left to the existing worker
+that claims `status='approved' AND is_draft=false` rows into `'sending'`
+(`outbound-repo.ts:34-52`). Cancel refuses drafts and anything not exactly `approved`
+(`console-repo.ts:342`), so an in-flight or sent row cannot be cancelled. A console
+revise uses a no-op notifier so it cannot re-post to Telegram
+(`console-approvals.router.ts:32-37`). Draft vs sent is carried explicitly as
+`is_draft` + `status` in both list and detail DTOs (`console-repo.ts:130`, `:153`).
+Crash-window rows wedged in `sending` are reclaimed **by age to `failed`, never flipped
+back to `approved`**, and tagged `possibly-delivered:` precisely because delivery is
+unknown (`outbound-repo.ts:86-107`). *Not covered:* the outbound **list** query does not
+select `last_error` (`console-repo.ts:130-132`), so a `possibly-delivered:` row is
+indistinguishable from a clean failure until the founder opens the detail view — the one
+place where "did this reach the customer?" is genuinely ambiguous is the place the list
+UI flattens. No test covers double-approve of a real pending draft;
+`console-approvals.router.test.ts:75` only covers a non-existent draft → 409.
+
 ## Data/API conventions
 
 All list endpoints are parameterized queries with allowlisted sort/filter values, default limit 50, maximum 100, and opaque keyset cursors containing the deterministic sort tuple and direction. No offset pagination. A changed/invalid cursor returns validation failure, never an unbounded scan.
