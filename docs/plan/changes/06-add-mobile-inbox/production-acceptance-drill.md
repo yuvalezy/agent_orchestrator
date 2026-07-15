@@ -1,5 +1,21 @@
 # Production acceptance drill — Change 06
 
+> ## ⏸ Deferred — not runnable today (R53)
+>
+> **There is no deployment to run this against.** Tailscale is not installed on the host, so
+> there is no tailnet, no MagicDNS name, and no TLS. `/console` is bound to `127.0.0.1:3100`
+> (`src/main.ts:685`) and is reachable only from the `fedora` box. A phone cannot reach it over
+> `http://<lan-ip>:3100` either: the session cookie is `Secure`, so a browser drops it on a
+> plaintext origin and login cannot persist.
+>
+> **Unblock by choosing a TLS terminator** — Tailscale Serve (as `operations.md` intends) or the
+> nginx already on `:443` — as its own change. That choice rewrites § A7 below and the
+> "Tailnet transport" entry in [`design.md`](./design.md). Everything else on this page stays.
+>
+> **Already banked, don't redo:** A7's network-exposure half is verified — `192.168.88.25:3100`
+> refuses on `/console/` and `/health`, `127.0.0.1:3100/health` returns 200, `ss -ltnp` shows
+> `127.0.0.1:3100`. A2/A4's data path is covered by `console.acceptance.test.ts`.
+
 > **This is a MANUAL drill. It cannot be automated and it cannot be run by an agent.**
 > Every step below requires a real browser on a **real device enrolled in the tailnet**,
 > against a **real deployment** holding real rows. Browser notification permission, lock-screen

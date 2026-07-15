@@ -64,14 +64,26 @@ same-origin by the Express process. It does not mount unless both console secret
 are configured. The browser gets an HttpOnly Secure SameSite session cookie; every
 mutation also requires the in-memory CSRF token returned at sign-in.
 
-Expose it only through Tailscale Serve/MagicDNS HTTPS, for example:
+> **Not deployed yet (R53) — this section is the intended target, not the current
+> state.** Tailscale is not installed on the dev host, so there is no tailnet and no
+> MagicDNS name. The app binds `127.0.0.1:3100` (`src/main.ts:685`), so today the
+> console is reachable **only from the host itself**. It cannot be reached from a phone
+> over `http://<lan-ip>:3100` either — and not as a matter of policy: the session cookie
+> is `Secure`, so a browser drops it on a plaintext origin and the next request 401s.
+> Serving the console needs a TLS terminator first. Choosing one (Tailscale Serve, as
+> below, or the nginx already on `:443`) is its own change, and it rewrites the
+> "Tailnet transport" entry in the threat-model checklist.
+
+Once deployed, expose it only through Tailscale Serve/MagicDNS HTTPS:
 
 ```bash
 tailscale serve --https=443 http://127.0.0.1:3100
 ```
 
-Open `https://<machine>.ts.net/console/` from an enrolled device. Do not expose
-port 3100 through a public tunnel or port-forward. The PWA caches only its static
+Then open `https://<machine>.ts.net/console/` from an enrolled device. Do not expose
+port 3100 through a public tunnel or port-forward, and do not "fix" phone access by
+binding a routable interface — that trades the network gate for one bcrypt password and
+is the regression `src/main.ts:685` exists to prevent. The PWA caches only its static
 shell; it never caches console API responses or customer-message detail data.
 
 The console threat-model checklist — tailnet transport, session fixation, CSRF, cache

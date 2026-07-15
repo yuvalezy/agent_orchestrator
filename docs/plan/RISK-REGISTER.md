@@ -27,6 +27,7 @@ _Last updated: 2026-07-06. Phase 1 (M0 + change 01, M1.1–M1.9) is shipped and 
 | R35 | Enrichment-upsert has a narrow same-id concurrency race (self-heals, no drop/dup) | monitoring | ⚪ |
 | R36 | Voice-defer must key on media-type (ptt/audio + transcript-pending), not bare `body IS NULL` — verify still honored if inbox worker logic changes | regression guard | ⚪ |
 | R45 | Portal task-status writes can 409 for read-only-project / WIP-limit reasons, not just 422 — gateway should classify distinctly | regression guard | ⚪ |
+| R53 | `/console` has no deployment: Tailscale is not installed (no binary/daemon/`tailnet0`/`100.64/10`), so the tailnet gate and MagicDNS name that `operations.md` and `design.md` § "Threat-model checklist" both presume **do not exist**. The `Secure` session cookie (`console-session.ts:87`) means no browser can hold a session over plain HTTP, so the console is unreachable from a phone until *something* terminates TLS — Tailscale Serve, or the nginx already listening on `:443`. Bound to `127.0.0.1:3100` in the meantime (`main.ts:685`), i.e. host-only. Blocks change 06 task 6.4 (production acceptance) and § B of `production-acceptance-drill.md`. | closing change 06 / any founder use of the console | 🔴 |
 
 ## 2. Accepted / deferred by design (not bugs — tracked so they aren't rediscovered)
 
