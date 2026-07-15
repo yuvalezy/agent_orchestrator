@@ -47,6 +47,16 @@ const nav = [
 ] as const;
 type View = typeof nav[number][0];
 
+const consoleBasePath = '/console/';
+
+function viewFromPathname(pathname: string): View | null {
+  if (!pathname.startsWith(consoleBasePath)) return null;
+  const segment = pathname.slice(consoleBasePath.length);
+  return nav.some(([key]) => key === segment) ? segment as View : null;
+}
+
+function consolePath(view: View): string { return `${consoleBasePath}${view}`; }
+
 const fmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 function displayDate(value: unknown): string { return typeof value === 'string' ? fmt.format(new Date(value)) : '—'; }
 function display(value: unknown): string { return typeof value === 'string' && value ? value : '—'; }
@@ -56,6 +66,35 @@ function readConsoleParam(key: string, fallback = ''): string { return new URLSe
 function writeConsoleParam(key: string, value: string): void { const url = new URL(window.location.href); if (value) url.searchParams.set(key, value); else url.searchParams.delete(key); window.history.replaceState({}, '', url); window.dispatchEvent(new Event('console:urlchange')); }
 function useConsoleUrlParam(key: string, fallback = ''): readonly [string, (value: string) => void] { const [value, setValue] = useState(() => readConsoleParam(key, fallback)); useEffect(() => { const sync = () => setValue(readConsoleParam(key, fallback)); window.addEventListener('popstate', sync); window.addEventListener('console:urlchange', sync); return () => { window.removeEventListener('popstate', sync); window.removeEventListener('console:urlchange', sync); }; }, [key, fallback]); return [value, (next) => writeConsoleParam(key, next)] as const; }
 function useConsoleUrlOptionalParam(key: string): readonly [string | null, (value: string | null) => void] { const [value, setValue] = useState<string | null>(() => readConsoleParam(key) || null); useEffect(() => { const sync = () => setValue(readConsoleParam(key) || null); window.addEventListener('popstate', sync); window.addEventListener('console:urlchange', sync); return () => { window.removeEventListener('popstate', sync); window.removeEventListener('console:urlchange', sync); }; }, [key]); return [value, (next) => writeConsoleParam(key, next ?? '')] as const; }
+
+function useConsoleRoute(): readonly [View, (view: View) => void] {
+  const read = (): View => viewFromPathname(window.location.pathname) ?? 'overview';
+  const [view, setView] = useState(read);
+
+  useEffect(() => {
+    const sync = () => setView(read());
+    const url = new URL(window.location.href);
+    const pathView = viewFromPathname(url.pathname);
+    const legacyView = nav.some(([key]) => key === url.searchParams.get('view')) ? url.searchParams.get('view') as View : null;
+    if (!pathView || url.searchParams.has('view')) {
+      url.pathname = consolePath(pathView ?? legacyView ?? 'overview');
+      url.searchParams.delete('view');
+      window.history.replaceState({}, '', url);
+    }
+    sync();
+    window.addEventListener('popstate', sync);
+    window.addEventListener('console:urlchange', sync);
+    return () => { window.removeEventListener('popstate', sync); window.removeEventListener('console:urlchange', sync); };
+  }, []);
+
+  return [view, (next) => {
+    const url = new URL(window.location.href);
+    url.pathname = consolePath(next);
+    url.searchParams.delete('view');
+    window.history.pushState({}, '', url);
+    window.dispatchEvent(new Event('console:urlchange'));
+  }] as const;
+}
 
 export function App(): ReactElement {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -98,12 +137,11 @@ function Login({ onSuccess }: { onSuccess: (csrf: string) => void }): ReactEleme
 }
 
 function Console({ onLogout }: { onLogout: () => void }): ReactElement {
-  const [viewParam, setViewParam] = useConsoleUrlParam('view', 'overview');
-  const view = nav.some(([key]) => key === viewParam) ? viewParam as View : 'overview';
+  const [view, setView] = useConsoleRoute();
   const [menuOpen, setMenuOpen] = useState(false);
   const client = useQueryClient();
   const logout = useMutation({ mutationFn: () => api<void>('/session', { method: 'DELETE' }), onSettled: onLogout });
-  const choose = (next: View) => { setViewParam(next); setMenuOpen(false); };
+  const choose = (next: View) => { setView(next); setMenuOpen(false); };
   return <div className="min-h-screen bg-zinc-950 text-zinc-100">
     <aside className={cn('fixed inset-y-0 z-20 w-64 border-r border-zinc-800 bg-zinc-950 p-4 transition-transform md:translate-x-0', menuOpen ? 'translate-x-0' : '-translate-x-full')}>
       <div className="mb-7 flex items-center gap-3 px-2"><div className="grid size-8 place-items-center rounded-lg bg-emerald-400 text-zinc-950"><Activity size={18} /></div><span className="font-semibold">AO Console</span></div>
