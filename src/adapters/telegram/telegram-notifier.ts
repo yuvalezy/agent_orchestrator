@@ -1,5 +1,8 @@
 import { FounderNotifierPort, Notification, DecisionEvent, MessageEvent } from '../../ports';
 import { logger } from '../../logger';
+import type { AudioTranscriptionInput } from '../../ports/audio-transcription.port';
+import { TranscriptionError } from '../llm/openai-transcription.client';
+import { TelegramError } from './telegram-client';
 import { TelegramClient } from './telegram-client';
 
 // TelegramNotifier — the FounderNotifierPort adapter (design.md D7). One forum
@@ -23,7 +26,13 @@ export interface TelegramNotifierOptions {
     customerId: string;
     context: { kind: 'inbox' | 'outbound'; ref: string };
   }) => Promise<void>;
+  transcribeAudio?: (input: AudioTranscriptionInput) => Promise<string>;
+  maxAudioBytes?: number;
+  maxAudioDurationSeconds?: number;
 }
+
+const DEFAULT_MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_AUDIO_DURATION_SECONDS = 10 * 60;
 
 function render(n: Notification): string {
   const parts = [n.title, '', n.body];
@@ -188,7 +197,8 @@ export class TelegramNotifier implements FounderNotifierPort {
       // text; the handler ignores UNARMED threads. Same hold-offset-on-error discipline
       // as callbacks: a failed dispatch must not silently lose the founder's edit.
       const msg = u.message;
-      if (this.messageHandler && msg?.text && msg.message_thread_id !== undefined && !msg.from?.is_bot) {
+      const audio = msg?.voice ?? msg?.audio;
+      if (this.messageHandler && msg && (msg.text || audio) && msg.message_thread_id !== undefined && !msg.from?.is_bot) {
         const by = msg.from ? String(msg.from.id) : 'unknown';
         const chatId = String(msg.chat.id);
         if (chatId !== this.opts.supergroupChatId) {
@@ -197,11 +207,27 @@ export class TelegramNotifier implements FounderNotifierPort {
           continue;
         }
         try {
+          let messageText = msg.text?.trim() ?? '';
+          if (audio) {
+            const maxBytes = this.opts.maxAudioBytes ?? DEFAULT_MAX_AUDIO_BYTES;
+            const maxDuration = this.opts.maxAudioDurationSeconds ?? DEFAULT_MAX_AUDIO_DURATION_SECONDS;
+            if (!this.opts.transcribeAudio) throw new TranscriptionError('Voice transcription is not configured', false);
+            if (audio.duration > maxDuration || (audio.file_size !== undefined && audio.file_size > maxBytes)) {
+              throw new TranscriptionError('Voice message exceeds the 10-minute or 20 MB limit', false);
+            }
+            const downloaded = await this.client.downloadFile(audio.file_id, maxBytes);
+            const transcript = await this.opts.transcribeAudio({
+              data: downloaded.data,
+              filename: audio.file_name ?? downloaded.filename,
+              mimeType: audio.mime_type ?? 'audio/ogg',
+            });
+            messageText = [msg.caption?.trim(), transcript].filter(Boolean).join('\n\n');
+          }
           await this.messageHandler({
             chatId,
             messageId: String(msg.message_id),
             threadId: String(msg.message_thread_id),
-            text: msg.text,
+            text: messageText,
             by,
             replyTo: msg.reply_to_message
               ? {
@@ -211,6 +237,17 @@ export class TelegramNotifier implements FounderNotifierPort {
               : undefined,
           });
         } catch (err) {
+          const permanentAudioFailure = audio && (
+            (err instanceof TranscriptionError && !err.retryable)
+            || (err instanceof TelegramError && !err.retryable)
+          );
+          if (permanentAudioFailure) {
+            logger.warn({ reason: (err as Error).message }, 'Telegram audio rejected permanently');
+            await this.replyInThread(String(msg.message_thread_id), `⚠️ I could not process that audio: ${(err as Error).message}`)
+              .catch(() => undefined);
+            next = u.update_id + 1;
+            continue;
+          }
           logger.error({ reason: (err as Error)?.message }, 'Telegram message dispatch failed — holding offset for retry');
           return next;
         }
