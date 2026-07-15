@@ -71,7 +71,7 @@ test('customer-originated done task → drafts on the origin channel, threaded, 
 
   const res = await notifier.notifyForDoneTask(TASK);
 
-  assert.deepEqual(res, { drafted: true, skipped: false });
+  assert.deepEqual(res, { drafted: true, skipped: false, failed: false });
   assert.equal(calls.composed, 1, 'composed exactly once');
 
   // Enqueued on the ORIGIN channel, threaded + quoting the inbound message.
@@ -114,14 +114,14 @@ test('NOT customer-originated (resolveTaskOrigin null) → skipped, nothing enqu
 
   const res = await notifier.notifyForDoneTask(TASK);
 
-  assert.deepEqual(res, { drafted: false, skipped: true, reason: 'not customer-originated' });
+  assert.deepEqual(res, { drafted: false, skipped: true, failed: false, reason: 'not customer-originated' });
   assert.equal(calls.composed, 0, 'no LLM call for a non-originated task');
   assert.equal(calls.enqueued.length, 0, 'nothing enqueued');
   assert.equal(calls.decisions.length, 0, 'no decision opened');
   assert.equal(calls.presented.length, 0, 'nothing presented');
 });
 
-test('a compose failure is isolated to a skip — never thrown, nothing enqueued', async () => {
+test('a compose failure is a transient FAILURE (not a skip) — never thrown, nothing enqueued', async () => {
   const calls = freshCalls();
   const notifier = buildResolutionNotifier(
     buildDeps(calls, {
@@ -133,11 +133,26 @@ test('a compose failure is isolated to a skip — never thrown, nothing enqueued
 
   const res = await notifier.notifyForDoneTask(TASK);
 
-  assert.equal(res.drafted, false);
-  assert.equal(res.skipped, true);
-  assert.equal(res.reason, 'llm down');
+  // failed=true so the worker releases the claim + holds the cursor to retry (NOT a skip).
+  assert.deepEqual(res, { drafted: false, skipped: false, failed: true, reason: 'llm down' });
   assert.equal(calls.enqueued.length, 0, 'nothing enqueued when the draft could not be composed');
   assert.equal(calls.presented.length, 0, 'nothing presented');
+});
+
+test('an origin-lookup failure is a transient FAILURE (retry), not a skip', async () => {
+  const calls = freshCalls();
+  const notifier = buildResolutionNotifier(
+    buildDeps(calls, {
+      resolveTaskOrigin: async () => {
+        throw new Error('db blip');
+      },
+    }),
+  );
+
+  const res = await notifier.notifyForDoneTask(TASK);
+
+  assert.deepEqual(res, { drafted: false, skipped: false, failed: true, reason: 'db blip' });
+  assert.equal(calls.enqueued.length, 0);
 });
 
 test('unresolvable customer config → skipped, nothing enqueued', async () => {
@@ -146,7 +161,7 @@ test('unresolvable customer config → skipped, nothing enqueued', async () => {
 
   const res = await notifier.notifyForDoneTask(TASK);
 
-  assert.deepEqual(res, { drafted: false, skipped: true, reason: 'customer config unresolved' });
+  assert.deepEqual(res, { drafted: false, skipped: true, failed: false, reason: 'customer config unresolved' });
   assert.equal(calls.enqueued.length, 0);
   assert.equal(calls.presented.length, 0);
 });

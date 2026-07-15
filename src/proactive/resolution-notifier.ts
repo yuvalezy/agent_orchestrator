@@ -38,10 +38,18 @@ export interface ResolutionNotifierDeps {
   notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent'>;
 }
 
-/** Per-task outcome (no body — ids/flags only). */
+/**
+ * Per-task outcome (no body — ids/flags only). Three mutually-exclusive states:
+ *  - drafted: the resolution draft was enqueued + presented (success).
+ *  - skipped: a BY-DESIGN no-op (no customer origin / no customer config) — a permanent
+ *    decision, so the caller keeps the ledger claim and advances the cursor.
+ *  - failed: a TRANSIENT error in compose/decision/enqueue/present — the caller must
+ *    RELEASE the claim and hold the cursor so the next tick retries. Never thrown out.
+ */
 export interface ResolutionNotifyResult {
   drafted: boolean;
   skipped: boolean;
+  failed: boolean;
   reason?: string;
 }
 
@@ -58,19 +66,25 @@ const PRESENT_TITLE = '✅ Resolution notification — needs approval';
 export function buildResolutionNotifier(deps: ResolutionNotifierDeps): ResolutionNotifier {
   return {
     async notifyForDoneTask(task: DoneTask): Promise<ResolutionNotifyResult> {
-      // (1) Origin bridge FIRST — a task with no customer-conversation origin is not
-      // ours to notify about (SKIP, before any LLM/decision/queue work).
-      const origin = await deps.resolveTaskOrigin(task.ref);
-      if (!origin) {
-        logger.info({ taskRef: task.ref }, 'resolution: not customer-originated — skipped');
-        return { drafted: false, skipped: true, reason: 'not customer-originated' };
-      }
-
+      // customerId is only known once the origin resolves — undefined until then so the
+      // catch can log it when the origin lookup itself is what failed.
+      let customerId: string | undefined;
       try {
+        // (1) Origin bridge FIRST — a task with no customer-conversation origin is not
+        // ours to notify about (by-design SKIP, before any LLM/decision/queue work). A
+        // THROW here (transient DB blip) falls through to the catch as a FAILURE (retry),
+        // never a skip — otherwise the claim would suppress the notice forever.
+        const origin = await deps.resolveTaskOrigin(task.ref);
+        if (!origin) {
+          logger.info({ taskRef: task.ref }, 'resolution: not customer-originated — skipped');
+          return { drafted: false, skipped: true, failed: false, reason: 'not customer-originated' };
+        }
+        customerId = origin.customerId;
+
         const config = await deps.loadCustomerConfig(origin.customerId);
         if (!config) {
           logger.warn({ taskRef: task.ref, customerId: origin.customerId }, 'resolution: customer config unresolved — skipped');
-          return { drafted: false, skipped: true, reason: 'customer config unresolved' };
+          return { drafted: false, skipped: true, failed: false, reason: 'customer config unresolved' };
         }
 
         // (2) Compose the warm, cite-or-abstain resolution body in the customer's language.
@@ -120,12 +134,14 @@ export function buildResolutionNotifier(deps: ResolutionNotifierDeps): Resolutio
           { taskRef: task.ref, customerId: origin.customerId, queueId, decisionId },
           'resolution: draft enqueued (pending) — presenting for approval',
         );
-        return { drafted: true, skipped: false };
+        return { drafted: true, skipped: false, failed: false };
       } catch (err) {
-        // Per-task isolation: any failure after the origin resolves is a skip, never a throw.
+        // Per-task isolation: NEVER throw out. A compose/decision/enqueue/present error (or an
+        // origin-lookup blip) is a TRANSIENT FAILURE — the caller releases the ledger claim and
+        // holds the cursor so the next tick retries (distinct from a by-design skip above).
         const reason = errMessage(err);
-        logger.warn({ taskRef: task.ref, customerId: origin.customerId, reason }, 'resolution: draft failed — skipped');
-        return { drafted: false, skipped: true, reason };
+        logger.warn({ taskRef: task.ref, customerId, reason }, 'resolution: draft failed — will retry');
+        return { drafted: false, skipped: false, failed: true, reason };
       }
     },
   };

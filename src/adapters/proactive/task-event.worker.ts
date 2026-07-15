@@ -6,7 +6,7 @@ import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import type { ResolutionNotifier } from '../../proactive/resolution-notifier';
 import { buildEzyPortalGateway } from '../ezy-portal/factory';
 import { buildLlmRouter } from '../llm/factory';
-import { claimTransition } from '../../proactive/task-transition-ledger';
+import { claimTransition, releaseTransition } from '../../proactive/task-transition-ledger';
 import { resolveTaskOrigin } from '../../proactive/resolution-origin-repo';
 import { buildResolutionComposer } from '../../proactive/resolution-draft';
 import { buildResolutionNotifier } from '../../proactive/resolution-notifier';
@@ -24,10 +24,13 @@ import { getAppState, setAppState } from '../../db/app-state';
 // app_state; the exactly-once ledger (claimTransition) turns the forever-repoll into a single
 // draft per (task,'done'). NEVER logs bodies — ids/refs/counts only.
 //
-// FIRST-RUN WATERMARK (critical): a customer with NO cursor key yet is watermarked to now()
-// and SKIPPED this tick — we only notify tasks that transition to done AFTER go-live, never
-// the historical done backlog. v1: status==='done' notifies; 'cancelled' (and anything else)
-// is skipped.
+// FIRST-RUN SEED (critical): a customer with NO cursor key yet drains EVERY currently-terminal
+// (done/cancelled) task from epoch and pre-CLAIMS each in the ledger WITHOUT notifying, then sets
+// the cursor. This suppresses the historical backlog (bulk skip) AND — unlike a bare now()
+// watermark — a pre-go-live done task whose `updatedAt` is later bumped by an edit (comment/re-tag/
+// priority) is already claimed, so it can't draft a stale "resolved" notice. A task that was
+// NON-terminal at go-live and legitimately transitions to done afterward is NOT pre-claimed → it
+// still notifies. v1: status==='done' notifies; 'cancelled' (and anything else) is skipped.
 
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
@@ -50,6 +53,8 @@ export interface TaskEventWorkerDeps {
   ) => Promise<{ tasks: Array<{ ref: string; title: string; status: string; code?: string }>; nextCursor: string }>;
   /** Exactly-once (task_ref, status) claim — TRUE iff THIS call is the first to observe it. */
   claimTransition: (taskRef: string, status: string) => Promise<boolean>;
+  /** Roll back a claim after a TRANSIENT notify failure so the next tick re-observes it. */
+  releaseTransition: (taskRef: string, status: string) => Promise<void>;
   /** Drafts + presents the resolution notice for a done task (never throws). */
   resolutionNotifier: ResolutionNotifier;
   /** app_state read/write (the per-customer cursor). */
@@ -63,9 +68,9 @@ export interface TaskEventWorkerDeps {
 
 /**
  * Build the proactive task-event worker. Startup catch-up is INTENTIONALLY off
- * (runImmediately defaults to false): a customer's first-ever tick only sets the
- * watermark, so there is no boot backlog to catch up on — the first interval is soon
- * enough and avoids a boot-time portal fan-out.
+ * (runImmediately defaults to false): a customer's first-ever tick only seeds the
+ * ledger (pre-claims the terminal backlog) and sets the cursor — no notices are drafted
+ * on that tick, so the first interval is soon enough and avoids a boot-time portal fan-out.
  */
 export function buildTaskEventWorker(deps: TaskEventWorkerDeps): WorkerDefinition {
   const now = deps.now ?? ((): Date => new Date());
@@ -91,34 +96,65 @@ async function processCustomer(customer: TaskEventCustomer, deps: TaskEventWorke
   const key = cursorKey(customer.customerId);
   const cursor = await deps.getState(key);
 
-  // FIRST-RUN WATERMARK: no cursor yet → stamp now() and SKIP. We only ever notify a
-  // transition observed AFTER go-live, never the historical done backlog.
+  // FIRST-RUN SEED: no cursor yet → drain EVERY terminal task from epoch and pre-claim
+  // each WITHOUT notifying, so the historical backlog is suppressed and a later updatedAt
+  // bump on an already-done task can't draft a stale notice. Then set the cursor.
   if (cursor === null) {
-    await deps.setState(key, now().toISOString());
-    deps.log.info({ customerId: customer.customerId }, 'proactive: first-run watermark set — skipping historical backlog');
+    await seedLedger(customer, deps, now);
     return;
   }
 
   const { tasks, nextCursor } = await deps.listChangedTasks(customer.projectRef, cursor);
+  // Tasks arrive sorted by updatedAt ASCENDING (gateway: sortBy=updatedAt&sortDescending=false),
+  // so on a held tick everything before the failed task has already been claimed+drafted and
+  // stays suppressed, and the failed one is the earliest un-notified transition to retry next tick.
+  let heldForRetry = false;
   for (const task of tasks) {
     // v1: only 'done' notifies; 'cancelled' (and any other terminal status) is skipped.
     if (task.status !== 'done') continue;
-    try {
-      // Claim BEFORE drafting so a crash mid-draft is at-most-once (never a second
-      // customer-facing draft). A repeat pass conflicts here and suppresses.
-      const claimed = await deps.claimTransition(task.ref, 'done');
-      if (!claimed) continue;
-      await deps.resolutionNotifier.notifyForDoneTask({ ref: task.ref, code: task.code ?? '', title: task.title });
-    } catch (err) {
-      // Best-effort per task — the ledger already claimed it, so a failure here is
-      // at-most-once by design (it is not re-drafted next pass).
-      deps.log.warn({ customerId: customer.customerId, taskRef: task.ref, reason: errMessage(err) }, 'proactive: task notify failed');
+    // Claim BEFORE drafting so a crash mid-draft is at-most-once (never a second
+    // customer-facing draft). A repeat pass conflicts here and suppresses.
+    if (!(await deps.claimTransition(task.ref, 'done'))) continue;
+    const r = await deps.resolutionNotifier.notifyForDoneTask({ ref: task.ref, code: task.code ?? '', title: task.title });
+    if (r.failed) {
+      // TRANSIENT failure: release the claim so the next tick re-observes this task, HOLD the
+      // cursor (don't advance), and stop processing further tasks this tick. Already-succeeded
+      // (claimed) tasks stay suppressed; only this one retries. A by-design skip (r.skipped) is
+      // a permanent decision — it stays claimed and the cursor still advances below.
+      await deps.releaseTransition(task.ref, 'done');
+      heldForRetry = true;
+      deps.log.warn({ customerId: customer.customerId, taskRef: task.ref, reason: r.reason }, 'proactive: notify failed — held for retry');
+      break;
     }
   }
 
-  // Advance the cursor AFTER draining the page (max(updatedAt) or the passed cursor on
-  // an empty drain — never null/empty per the port contract).
-  await deps.setState(key, nextCursor);
+  // Advance the cursor AFTER draining the page (max(updatedAt) or the passed cursor on an
+  // empty drain — never null/empty per the port contract) UNLESS a task was held for retry,
+  // in which case leaving the cursor makes the next tick re-poll this window.
+  if (!heldForRetry) {
+    await deps.setState(key, nextCursor);
+  }
+}
+
+/**
+ * First-run ledger seed: drain every currently-terminal (done/cancelled) task for this
+ * project from epoch and claimTransition each WITHOUT notifying (mark already-handled), then
+ * persist the cursor (the drain's nextCursor, or now() on an empty drain). Best-effort — a
+ * per-customer failure is caught by the tick's isolation wrapper. One-time; paginated by the
+ * gateway, so a huge project is fine.
+ */
+async function seedLedger(customer: TaskEventCustomer, deps: TaskEventWorkerDeps, now: () => Date): Promise<void> {
+  const key = cursorKey(customer.customerId);
+  const { tasks, nextCursor } = await deps.listChangedTasks(customer.projectRef, '1970-01-01T00:00:00.000Z');
+  for (const task of tasks) {
+    await deps.claimTransition(task.ref, task.status);
+  }
+  const cursor = tasks.length > 0 ? nextCursor : now().toISOString();
+  await deps.setState(key, cursor);
+  deps.log.info(
+    { customerId: customer.customerId, terminalTasks: tasks.length },
+    `proactive: seeded ledger for ${customer.customerId}, ${tasks.length} terminal tasks`,
+  );
 }
 
 /**
@@ -144,6 +180,7 @@ export function buildTaskEventWorkerFactory(notifier: FounderNotifierPort): Work
       (await listTaskInventoryCustomers()).map((c) => ({ customerId: c.customerId, projectRef: c.projectRef })),
     listChangedTasks: (projectRef, updatedAfter) => gateway.listChangedTasks(projectRef, updatedAfter),
     claimTransition: (taskRef, status) => claimTransition(taskRef, status),
+    releaseTransition: (taskRef, status) => releaseTransition(taskRef, status),
     resolutionNotifier,
     getState: getAppState,
     setState: setAppState,

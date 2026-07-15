@@ -32,3 +32,19 @@ export async function claimTransition(
   );
   return rowCount === 1;
 }
+
+/**
+ * Release a previously-claimed (task_ref, status) — DELETE the ledger row so the NEXT
+ * poll re-observes the transition and claimTransition returns TRUE again. Used only to
+ * roll back a claim after a TRANSIENT notify failure (compose/enqueue error): claim is
+ * written BEFORE the draft, so without this a transient error would permanently suppress
+ * the notice (claimed forever, never drafted). A by-design SKIP is NOT released — it stays
+ * claimed (a permanent decision, not a retry). No-op when the row is absent. Never logs bodies.
+ */
+export async function releaseTransition(
+  taskRef: string,
+  status: string,
+  query: LedgerQuery = pooledQuery,
+): Promise<void> {
+  await query(`DELETE FROM agent_task_transition_ledger WHERE task_ref = $1 AND status = $2`, [taskRef, status]);
+}

@@ -14,16 +14,18 @@ interface Harness {
   state: Map<string, string>;
   claims: Set<string>;
   notified: string[];
+  released: string[];
 }
 
 function harness(over: Partial<TaskEventWorkerDeps> = {}): Harness {
   const state = new Map<string, string>();
   const claims = new Set<string>();
   const notified: string[] = [];
+  const released: string[] = [];
   const resolutionNotifier: ResolutionNotifier = {
     notifyForDoneTask: async (task) => {
       notified.push(task.ref);
-      return { drafted: true, skipped: false };
+      return { drafted: true, skipped: false, failed: false };
     },
   };
   const deps: TaskEventWorkerDeps = {
@@ -35,6 +37,10 @@ function harness(over: Partial<TaskEventWorkerDeps> = {}): Harness {
       claims.add(k);
       return true;
     },
+    releaseTransition: async (taskRef, status) => {
+      released.push(taskRef);
+      claims.delete(`${taskRef}|${status}`);
+    },
     resolutionNotifier,
     getState: async (key) => state.get(key) ?? null,
     setState: async (key, value) => void state.set(key, value),
@@ -43,21 +49,61 @@ function harness(over: Partial<TaskEventWorkerDeps> = {}): Harness {
     now: () => new Date('2026-07-14T12:00:00.000Z'),
     ...over,
   };
-  return { deps, state, claims, notified };
+  return { deps, state, claims, notified, released };
 }
 
-test('first-run: no cursor → watermark to now() and SKIP (no portal read, no notify)', async () => {
-  let portalReads = 0;
+test('first-run: seeds the ledger from every terminal task (no notify) and sets cursor to the drain max', async () => {
+  const seededFrom: string[] = [];
   const h = harness({
-    listChangedTasks: async () => {
-      portalReads += 1;
-      return { tasks: [], nextCursor: 'x' };
+    listChangedTasks: async (_projectRef, updatedAfter) => {
+      seededFrom.push(updatedAfter);
+      return {
+        tasks: [
+          { ref: 'OLD-1', title: 'already done', status: 'done', code: 'OLD-1' },
+          { ref: 'OLD-2', title: 'already cancelled', status: 'cancelled', code: 'OLD-2' },
+        ],
+        nextCursor: '2026-06-01T00:00:00.000Z',
+      };
     },
   });
   await buildTaskEventWorker(h.deps).run();
-  assert.equal(portalReads, 0, 'never polls the portal on the watermark tick');
+  assert.deepEqual(seededFrom, ['1970-01-01T00:00:00.000Z'], 'drains terminal tasks from epoch');
+  assert.equal(h.notified.length, 0, 'seeding never drafts a notice');
+  assert.equal(h.claims.has('OLD-1|done'), true, 'pre-go-live done task is pre-claimed');
+  assert.equal(h.claims.has('OLD-2|cancelled'), true, 'pre-go-live cancelled task is pre-claimed');
+  assert.equal(h.state.get(cursorKey('cust-1')), '2026-06-01T00:00:00.000Z', 'cursor = drain nextCursor');
+});
+
+test('first-run with NO terminal tasks → cursor watermarked to now(), nothing claimed', async () => {
+  const h = harness({
+    // Empty drain: the gateway echoes the passed updatedAfter as nextCursor (epoch) — we must
+    // NOT persist that; the seed falls back to now().
+    listChangedTasks: async () => ({ tasks: [], nextCursor: '1970-01-01T00:00:00.000Z' }),
+  });
+  await buildTaskEventWorker(h.deps).run();
   assert.equal(h.notified.length, 0);
-  assert.equal(h.state.get(cursorKey('cust-1')), '2026-07-14T12:00:00.000Z');
+  assert.equal(h.claims.size, 0);
+  assert.equal(h.state.get(cursorKey('cust-1')), '2026-07-14T12:00:00.000Z', 'empty drain → now() watermark');
+});
+
+test('seeded terminal task later gets an updatedAt bump → suppressed (no stale notice)', async () => {
+  // Regression for FIX 1: OLD-1 was already done at go-live (pre-claimed by the seed). A later
+  // edit bumps its updatedAt past the cursor so the portal re-lists it — claim must conflict.
+  let call = 0;
+  const h = harness({
+    listChangedTasks: async () => {
+      call += 1;
+      if (call === 1) {
+        // seed drain
+        return { tasks: [{ ref: 'OLD-1', title: 'done pre-go-live', status: 'done', code: 'OLD-1' }], nextCursor: '2026-06-01T00:00:00.000Z' };
+      }
+      // next tick: the same task resurfaces with a bumped updatedAt
+      return { tasks: [{ ref: 'OLD-1', title: 'done pre-go-live', status: 'done', code: 'OLD-1' }], nextCursor: '2026-07-14T08:00:00.000Z' };
+    },
+  });
+  await buildTaskEventWorker(h.deps).run(); // seeds OLD-1
+  await buildTaskEventWorker(h.deps).run(); // re-lists OLD-1 → claim conflicts → suppressed
+  assert.deepEqual(h.notified, [], 'a pre-claimed terminal task never drafts a stale notice on a later bump');
 });
 
 test('done task: claims then notifies once, and advances the cursor', async () => {
@@ -87,6 +133,51 @@ test('ledger suppression: a re-observed done transition is not re-drafted', asyn
   await buildTaskEventWorker(h.deps).run(); // first pass: claims + notifies
   await buildTaskEventWorker(h.deps).run(); // second pass: conflict → suppressed
   assert.deepEqual(h.notified, ['TSK-1'], 'exactly one draft across repeated polls');
+});
+
+test('transient notify failure: releases the claim, holds the cursor, and stops the tick', async () => {
+  const h = harness({
+    listChangedTasks: async () => ({
+      tasks: [
+        { ref: 'TSK-A', title: 'ok first', status: 'done', code: 'TSK-A' },
+        { ref: 'TSK-B', title: 'fails', status: 'done', code: 'TSK-B' },
+        { ref: 'TSK-C', title: 'never reached', status: 'done', code: 'TSK-C' },
+      ],
+      nextCursor: '2026-07-14T09:00:00.000Z',
+    }),
+    resolutionNotifier: {
+      notifyForDoneTask: async (task) => {
+        if (task.ref === 'TSK-B') return { drafted: false, skipped: false, failed: true, reason: 'llm down' };
+        return { drafted: true, skipped: false, failed: false };
+      },
+    },
+  });
+  h.state.set(cursorKey('cust-1'), '2026-07-01T00:00:00.000Z');
+  await buildTaskEventWorker(h.deps).run();
+
+  assert.deepEqual(h.released, ['TSK-B'], 'the failed task is released so it retries next tick');
+  assert.equal(h.claims.has('TSK-A|done'), true, 'the already-drafted task stays claimed (suppressed)');
+  assert.equal(h.claims.has('TSK-B|done'), false, 'the failed task is no longer claimed');
+  assert.equal(h.claims.has('TSK-C|done'), false, 'processing stopped before TSK-C');
+  assert.equal(h.state.get(cursorKey('cust-1')), '2026-07-01T00:00:00.000Z', 'cursor NOT advanced (held for retry)');
+});
+
+test('by-design skip stays claimed and the cursor still advances', async () => {
+  const h = harness({
+    listChangedTasks: async () => ({
+      tasks: [{ ref: 'TSK-S', title: 'not customer-originated', status: 'done', code: 'TSK-S' }],
+      nextCursor: '2026-07-14T09:00:00.000Z',
+    }),
+    resolutionNotifier: {
+      notifyForDoneTask: async () => ({ drafted: false, skipped: true, failed: false, reason: 'not customer-originated' }),
+    },
+  });
+  h.state.set(cursorKey('cust-1'), '2026-07-01T00:00:00.000Z');
+  await buildTaskEventWorker(h.deps).run();
+
+  assert.deepEqual(h.released, [], 'a by-design skip is never released');
+  assert.equal(h.claims.has('TSK-S|done'), true, 'a skip stays claimed (permanent decision)');
+  assert.equal(h.state.get(cursorKey('cust-1')), '2026-07-14T09:00:00.000Z', 'cursor advances past a skip');
 });
 
 test('per-customer isolation: one customer failing does not stop the others', async () => {
