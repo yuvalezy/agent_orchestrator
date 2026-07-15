@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SETTINGS_REGISTRY, SETTINGS_KEYS, settingDef, coerceSettingValue } from './settings-registry';
 
-// Pass 1 = the 22 `*_ENABLED` booleans; pass 2 appends the 7 tuned knobs (LLM routing/effort +
+// Pass 1 = the 23 `*_ENABLED` booleans; pass 2 appends the 7 tuned knobs (LLM routing/effort +
 // backfill determinism + style-lane size). If a setting is added/removed, update this list.
 const EXPECTED_KEYS = [
   'OUTBOUND_ENABLED',
@@ -27,6 +27,7 @@ const EXPECTED_KEYS = [
   'CROSS_CHANNEL_DEDUP_ENABLED',
   'TASK_INVENTORY_ENABLED',
   'CALENDAR_ENABLED',
+  'PROACTIVE_NOTIFICATIONS_ENABLED',
   // pass-2 tuning knobs
   'LLM_DEFAULT_PROVIDER',
   'LLM_FALLBACK_CHAIN',

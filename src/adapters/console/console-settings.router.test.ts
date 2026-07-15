@@ -75,7 +75,7 @@ test('settings GET returns categories in first-seen order with per-setting metad
     // First-seen category order from the registry (LLM Routing is the pass-2 section, added last).
     assert.deepEqual(
       cats.map((c) => c.category),
-      ['Outbound', 'Knowledge & Drafting', 'Backfill', 'Intelligence & Digests', 'Triage', 'LLM Routing'],
+      ['Outbound', 'Knowledge & Drafting', 'Backfill', 'Intelligence & Digests', 'Triage', 'Proactive', 'LLM Routing'],
     );
     // Every registry key is present exactly once across the categories.
     const flat = cats.flatMap((c) => c.settings);

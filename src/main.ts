@@ -60,6 +60,7 @@ import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learni
 import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
 import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.worker';
 import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker';
+import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
 
@@ -620,6 +621,27 @@ async function main(): Promise<void> {
     logger.info('release-note drafts worker NOT registered (RELEASE_NOTE_DRAFTS_ENABLED=false) — nothing drafts customer notifications');
   }
 
+  // M4: proactive task-done resolution drafts — registered ONLY when
+  // PROACTIVE_NOTIFICATIONS_ENABLED (kill-switch, mirrors OUTBOUND_ENABLED). DORMANT by
+  // default. Requires Telegram (the drafts present in customer topics) — the produced drafts
+  // are is_draft=true (approved via the existing draft-review flow, drained by the outbound
+  // drainer). The worker's per-customer FIRST-RUN watermark means a boot never floods the
+  // historical done backlog; only transitions observed after go-live draft.
+  const proactiveWorkers: WorkerDefinition[] = [];
+  if (env.PROACTIVE_NOTIFICATIONS_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  PROACTIVE_NOTIFICATIONS_ENABLED=true but Telegram is unconfigured — resolution drafts have nowhere to present; NOT registering.');
+    } else {
+      if (!tryResolveCredential('OPENAI_API_KEY')) {
+        logger.warn('⚠️  PROACTIVE_NOTIFICATIONS_ENABLED=true but OPENAI_API_KEY is UNSET — resolution-draft composition will fail until an LLM provider key is set.');
+      }
+      proactiveWorkers.push(buildTaskEventWorkerFactory(notifier));
+      logger.info('proactive task-event worker registered (PROACTIVE_NOTIFICATIONS_ENABLED=true)');
+    }
+  } else {
+    logger.info('proactive task-event worker NOT registered (PROACTIVE_NOTIFICATIONS_ENABLED=false) — nothing drafts task-done resolution notices');
+  }
+
   const app = buildApp(appDeps);
   const server = app.listen(env.PORT, () => {
     logger.info(`agent-orchestrator listening on http://localhost:${env.PORT}`);
@@ -634,6 +656,7 @@ async function main(): Promise<void> {
     ...outboundWorkers,
     ...knowledgeWorkers,
     ...feedbackWorkers,
+    ...proactiveWorkers,
   ].map(startWorker);
 
   let shuttingDown = false;

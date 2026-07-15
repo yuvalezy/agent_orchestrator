@@ -63,6 +63,14 @@ export interface TaskTargetPort {
    *  which is page-1 + open-only). Includes code/priority so a status/priority change
    *  re-embeds. Does NOT fetch descriptions (a per-task detail read). */
   listAllTasks(projectRef: string): Promise<TargetTask[]>;
+  /** Drain a project's tasks that moved to a TERMINAL status (done/cancelled) since
+   *  `updatedAfter` (INCLUSIVE), paginated to completion — the M4 proactive
+   *  "your request is resolved" detector. `nextCursor` = max(updatedAt) over the
+   *  drained set, or the passed `updatedAfter` on an empty drain (never null). */
+  listChangedTasks(
+    projectRef: string,
+    updatedAfter: string,
+  ): Promise<{ tasks: TargetTask[]; nextCursor: string }>;
   listWorkItemTypes(projectRef: string): Promise<Array<{ ref: string; name: string }>>;
   setStatus(task: TaskRef, status: string): Promise<void>; // used from change 04
   /** Attach a binary file to a task (M2 group-mention media path). Best-effort at

@@ -22,6 +22,9 @@ const OPEN_STATUSES = 'backlog,todo,in-progress,review';
  *  sourceEntityType, sourceEntityId) across ALL statuses, so a closed task still
  *  "owns" its source and a new create 400s. Dedup must find it (any status). */
 const ALL_STATUSES = 'backlog,todo,in-progress,review,done,cancelled';
+/** Terminal statuses only — the proactive "your request is resolved" detector polls
+ *  tasks that moved to done/cancelled (M4). Same comma-joined `status IN ?` format. */
+const TERMINAL_STATUSES = 'done,cancelled';
 
 // EzyPortalGateway — the single adapter behind the EZY Portal ports (invariant
 // #4). M1.2 implements CustomerDirectoryPort plus the real two-hop
@@ -387,6 +390,46 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
       page += 1;
     }
     return out;
+  }
+
+  /**
+   * Drain the changed-TASK list on an INCLUSIVE `updatedAfter` (M4 proactive
+   * detector — the task analog of listChangedTickets). `status=done,cancelled`
+   * (terminal only), `sortBy=updatedAt&sortDescending=false&pageSize=200`, walking
+   * `page` until `(page-1)*pageSize >= total`. `nextCursor = max(updatedAt)` across
+   * the drained set, or the passed `updatedAfter` on an empty drain (never null —
+   * B9). Re-delivered boundary rows are deduped downstream by ref (no +1ms). Note
+   * the tasks envelope is {data, total, page, pageSize, totalPages} — distinct from
+   * the service-desk EzyTicketList's totalCount/pageNumber shape.
+   */
+  async listChangedTasks(
+    projectRef: string,
+    updatedAfter: string,
+  ): Promise<{ tasks: TargetTask[]; nextCursor: string }> {
+    const pageSize = 200;
+    const tasks: TargetTask[] = [];
+    let page = 1;
+    let total = Infinity;
+    // Drain EVERY page before advancing (R32) — a partial drain would lose rows
+    // past the cursor once max(updatedAt) advances.
+    while ((page - 1) * pageSize < total) {
+      const res = await this.http.get<PagedTasks<EzyTask>>('/api/projects/tasks', {
+        projectId: projectRef,
+        status: TERMINAL_STATUSES,
+        updatedAfter,
+        sortBy: 'updatedAt',
+        sortDescending: 'false',
+        page: String(page),
+        pageSize: String(pageSize),
+      });
+      total = res.total ?? 0;
+      for (const t of res.data) tasks.push(mapTask(t));
+      if (res.data.length === 0) break; // safety: no more rows than total claims
+      page += 1;
+    }
+    let maxMs = new Date(updatedAfter).getTime();
+    for (const t of tasks) if (t.updatedAt) maxMs = Math.max(maxMs, t.updatedAt.getTime());
+    return { tasks, nextCursor: new Date(maxMs).toISOString() };
   }
 
   async setStatus(task: TaskRef, status: string): Promise<void> {
