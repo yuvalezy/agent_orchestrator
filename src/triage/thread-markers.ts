@@ -1,7 +1,15 @@
-// Per-thread "armed capture" markers (M2c ✏️ Edit, 🔁 Revise, and the scheduling
-// clarification). A marker means: "the founder's NEXT message in this topic is the
-// answer to something we asked", so whichever marker is armed decides who consumes
-// that message. Two invariants live here and nowhere else:
+// Per-thread "armed capture" markers (M2c ✏️ Edit, 🔁 Revise, the scheduling
+// clarification, and the askFounder question). A marker means: "the founder's NEXT
+// message in this topic is the answer to something we asked", so whichever marker is
+// armed decides who consumes that message.
+//
+// M5 task 1.2 raised the stakes: free text in a topic now FALLS THROUGH to the query
+// engine when nothing is armed. So "no marker" is no longer "ignore the message" — it
+// is "treat it as a question and answer it". A marker that fails to arm (or expires
+// early) therefore doesn't just drop an answer, it feeds it to a chatbot and silently
+// discards the thing we were waiting for. The two invariants below are what stop that.
+//
+// Two invariants live here and nowhere else:
 //
 //  1. MUTUAL EXCLUSION — a thread holds AT MOST ONE armed capture. Arming any kind
 //     CLEARS every other kind FIRST, so a crash between the two ops leaves NEITHER
@@ -20,14 +28,15 @@
 // expiry rules above are the whole point of this module, and they must be testable
 // without a database.
 
-export type MarkerKind = 'draft_edit' | 'draft_revise' | 'schedule';
+export type MarkerKind = 'draft_edit' | 'draft_revise' | 'schedule' | 'ask_founder';
 
-export const MARKER_KINDS: MarkerKind[] = ['draft_edit', 'draft_revise', 'schedule'];
+export const MARKER_KINDS: MarkerKind[] = ['draft_edit', 'draft_revise', 'schedule', 'ask_founder'];
 
 const MARKER_KEY_PREFIX: Record<MarkerKind, string> = {
   draft_edit: 'draft_edit_pending',
   draft_revise: 'draft_revise_pending',
   schedule: 'schedule_pending',
+  ask_founder: 'ask_founder_pending',
 };
 
 export const markerKey = (kind: MarkerKind, threadId: string): string =>

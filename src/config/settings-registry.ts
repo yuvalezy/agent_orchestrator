@@ -161,6 +161,17 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
   },
   {
+    key: 'QUERY_FREE_TEXT_ENABLED',
+    type: 'boolean',
+    category: KNOWLEDGE,
+    label: 'Answer plain messages (no /ask)',
+    description:
+      'Routes plain founder text in a topic to the query engine — scoped to that topic’s customer, or across all customers in the Admin topic. Runs only after every pending question/edit/schedule capture has declined the message. Requires bot group-privacy OFF.',
+    applyMode: 'restart',
+    default: false,
+    dependsOn: 'QUERY_ENGINE_ENABLED',
+  },
+  {
     key: 'SLASH_COMMANDS_ENABLED',
     type: 'boolean',
     category: KNOWLEDGE,

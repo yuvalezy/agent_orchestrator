@@ -4,6 +4,7 @@ import type { AudioTranscriptionInput } from '../../ports/audio-transcription.po
 import { TranscriptionError } from '../llm/openai-transcription.client';
 import { TelegramError } from './telegram-client';
 import { TelegramClient } from './telegram-client';
+import { parseOptionData } from '../../triage/decision-handler';
 
 // TelegramNotifier — the FounderNotifierPort adapter (design.md D7). One forum
 // supergroup, one topic per customer, one pinned admin topic.
@@ -19,6 +20,22 @@ export interface TelegramNotifierOptions {
   adminTopicId?: string;
   /** Resolve a customer's stored topic ref (agent_customers.telegram_topic_id). */
   resolveCustomerTopicId: (customerId: string) => Promise<string | null>;
+  /**
+   * Record that askFounder just asked a question in `threadId` and is awaiting an answer
+   * (M5 task 5.3). The composition root wires this to the thread-marker store; the
+   * serialized shape is core's (query/pending-ask.ts), so this adapter passes PARTS and
+   * owns none of it.
+   *
+   * Optional: a notifier wired without it asks and stores nothing — the pre-M5 behaviour,
+   * where only a button tap can answer. It matters once free-text query routing is on
+   * (QUERY_FREE_TEXT_ENABLED): without a marker, a TYPED answer to this question is
+   * indistinguishable from a new question and gets sent to the query engine.
+   */
+  armPendingAsk?: (input: {
+    threadId: string;
+    customerId: string;
+    options: Array<{ id: string; label: string }>;
+  }) => Promise<void>;
   recordNotificationRef?: (input: {
     chatId: string;
     messageId: number;
@@ -133,14 +150,32 @@ export class TelegramNotifier implements FounderNotifierPort {
     options: Array<{ id: string; label: string }>,
   ): Promise<void> {
     const topicId = await this.opts.resolveCustomerTopicId(customerId);
-    // SEND side only (DA flag 5): the buttons render, but nothing routes the tap
-    // back until M1.5b wires callback_query → onDecision. Do not await a reply.
+    const threadId = topicId ?? this.opts.adminTopicId;
+    // Taps route through dispatchCallback → onDecision (M1.5b). Whether a given option
+    // id has a registered handler is the composite router's business, not this adapter's.
     await this.client.sendMessage({
       chatId: this.opts.supergroupChatId,
-      messageThreadId: topicId ?? this.opts.adminTopicId,
+      messageThreadId: threadId,
       text: render(question),
       inlineKeyboard: [options.map((o) => ({ text: o.label, callback_data: o.id }))],
     });
+    // Arm AFTER the send, never before: a marker for a question that failed to post would
+    // capture the founder's next message as the answer to something they never saw.
+    if (threadId && this.opts.armPendingAsk) {
+      try {
+        await this.opts.armPendingAsk({ threadId, customerId, options });
+      } catch (err) {
+        // Best-effort by design. The question IS posted and its buttons work, so the
+        // founder is not stuck; what's lost is only the ability to answer by TYPING
+        // (that text would fall through to the query engine instead). Throwing would be
+        // worse: the caller retries an askFounder whose message already went out, and the
+        // founder gets the same question twice.
+        logger.warn(
+          { customerId, threadId, reason: (err as Error)?.message },
+          'askFounder: pending-ask marker not armed — a typed answer will not be captured',
+        );
+      }
+    }
   }
 
   /** Register the tap handler (M1.5b). The callback-poller (composition) drives
@@ -166,9 +201,10 @@ export class TelegramNotifier implements FounderNotifierPort {
       logger.warn('TelegramNotifier.dispatchCallback: no onDecision handler registered');
       return;
     }
-    const i = data.indexOf(':');
-    const optionId = i < 0 ? data : data.slice(0, i);
-    const notificationRef = i < 0 ? '' : data.slice(i + 1);
+    // parseOptionData is core's (triage/decision-handler.ts) so the askFounder free-text
+    // resolver builds the IDENTICAL DecisionEvent from the same option id — a typed
+    // answer and a tap must not route differently.
+    const { optionId, notificationRef } = parseOptionData(data);
     await this.decisionHandler({ notificationRef, optionId, by, threadId });
   }
 

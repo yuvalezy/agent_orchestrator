@@ -63,6 +63,7 @@ import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learni
 import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
 import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.worker';
 import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker';
+import { buildCalendarAdapter } from './adapters/calendar';
 import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
@@ -515,9 +516,12 @@ async function main(): Promise<void> {
     logger.info('weekly-patterns worker NOT registered (WEEKLY_PATTERNS_ENABLED=false)');
   }
 
-  // M5(b): daily founder briefing — registered ONLY when DAILY_BRIEFING_ENABLED AND
-  // Telegram is configured (it notifies the Admin topic). Read-only aggregation over the
-  // existing pending draft + backfill-proposal queues; idempotent per calendar day.
+  // M5(b) + task 3.1: daily founder briefing — registered ONLY when DAILY_BRIEFING_ENABLED AND
+  // Telegram is configured (it notifies the Admin topic). Read-only aggregation over the existing
+  // inbox/urgency/outbound/calendar/holiday reads; fires at DAILY_BRIEFING_HOUR (founder-local)
+  // and is idempotent per calendar day. The calendar reader is passed ONLY when CALENDAR_ENABLED
+  // — without it the digest omits today's meetings rather than claiming an empty day (holidays
+  // still render; they are a DB read).
   if (env.DAILY_BRIEFING_ENABLED) {
     if (!notifier) {
       logger.warn('⚠️  DAILY_BRIEFING_ENABLED=true but Telegram is unconfigured — the daily briefing has nowhere to post; NOT registering.');
@@ -528,12 +532,18 @@ async function main(): Promise<void> {
           readLastRun: () => getAppState('daily_briefing:last_run_day'),
           writeLastRun: (day) => setAppState('daily_briefing:last_run_day', day),
           tz: env.DAILY_BRIEFING_TZ,
+          hour: env.DAILY_BRIEFING_HOUR,
           topN: env.DAILY_BRIEFING_TOP_N,
+          urgentMinScore: env.DAILY_BRIEFING_URGENT_MIN_SCORE,
+          calendar: env.CALENDAR_ENABLED ? buildCalendarAdapter() : undefined,
           log: logger,
           intervalMs: env.DAILY_BRIEFING_INTERVAL_MS,
         }),
       );
-      logger.info('daily-briefing worker registered (DAILY_BRIEFING_ENABLED=true)');
+      logger.info(
+        { hour: env.DAILY_BRIEFING_HOUR, tz: env.DAILY_BRIEFING_TZ, calendar: env.CALENDAR_ENABLED },
+        'daily-briefing worker registered (DAILY_BRIEFING_ENABLED=true)',
+      );
     }
   } else {
     logger.info('daily-briefing worker NOT registered (DAILY_BRIEFING_ENABLED=false)');

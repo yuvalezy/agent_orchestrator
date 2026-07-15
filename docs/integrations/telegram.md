@@ -274,8 +274,33 @@ OFF** (same as the ✏️edit / 🔁 Revise capture — see [§6](#6-disable-the
 | `/pending` | `SLASH_COMMANDS_ENABLED` | Counts + oldest age of the pending draft-reply and backfill-proposal queues, replied in the requesting thread. |
 | `/briefing` | `SLASH_COMMANDS_ENABLED` | The [daily briefing](../configuration.md#intelligence--digests) on demand, posted to the requesting thread. |
 | `/help` | `SLASH_COMMANDS_ENABLED` | Lists the commands. |
+| *(plain text — no command)* | `QUERY_FREE_TEXT_ENABLED` | Answered as a question, **scoped by the topic**: a customer topic answers from that customer's `agent_memory` only; the **Admin topic** (bound to no customer) aggregates **across customers**. Requires `QUERY_ENGINE_ENABLED`. Runs **last** — see below. |
 
 `/ask` is its own handler; the others share a core router (`src/query/commands.ts`).
+
+### Free text: who gets the message
+
+The bot holds **one** message handler, so every free-text capture composes into a single
+ordered chain (`src/triage/founder-message-router.ts`): `/ask` → slash commands →
+**askFounder answer** → 🔁 Revise → ✏️ Edit → scheduling → **query engine (last)**.
+
+The order is a safety property. Every capture before the query engine exists because *we
+asked you something* and your next message in that thread is the answer. If the query
+engine ran earlier it would answer that reply as though it were a question — you'd get a
+fluent, plausible response, assume you'd been understood, and the edit / instruction /
+schedule / decision you typed would be dropped with no error and no record. So free text
+reaches the query engine **only** when every capture has declined it.
+
+Consequences worth knowing:
+
+- **A pending question owns its topic.** After an `askFounder` question, your next message
+  there is read as the answer — matched against the button **labels** (typing `Add contact`
+  works; a bare `yes` does not, deliberately: option order isn't guaranteed, so guessing
+  could fire the wrong irreversible action). An unmatched reply re-asks rather than falling
+  through to a query. The marker **expires after 30 min**, which is what releases the topic
+  if you never answer.
+- **A `/…` typo is never answered as prose.** Unknown commands fall through unanswered
+  rather than being interpreted as English.
 Both the daily briefing and the weekly-patterns digest also post **automatically**
 to the Admin topic when their workers are enabled (idempotent per day/week).
 

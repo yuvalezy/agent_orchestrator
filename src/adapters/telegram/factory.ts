@@ -5,6 +5,8 @@ import { TelegramClient } from './telegram-client';
 import { TelegramNotifier } from './telegram-notifier';
 import { recordTelegramNotificationRef } from '../../scheduling/scheduling-repo';
 import { buildOpenAiTranscriptionClient } from '../llm/openai-transcription.client';
+import { threadMarkers } from '../triage/thread-markers.instance';
+import { serializePendingAsk } from '../../query/pending-ask';
 
 /**
  * Build the TelegramNotifier from non-secret env + the lazily-resolved bot token
@@ -42,6 +44,13 @@ export function buildTelegramNotifier(): TelegramNotifier {
     resolveFounderUserIds: () =>
       String(env.TELEGRAM_FOUNDER_USER_IDS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     recordNotificationRef: recordTelegramNotificationRef,
+    // M5 task 5.3: an askFounder question ARMS its thread, so the founder's next message
+    // there is read as the ANSWER rather than handed to the query engine. Uses THE shared
+    // marker set, so arming this clears any ✏️ Edit / 🔁 Revise / schedule capture on the
+    // thread (and vice versa) — exactly one thing can own the next message.
+    armPendingAsk: async ({ threadId, customerId, options }) => {
+      await threadMarkers.arm('ask_founder', threadId, serializePendingAsk({ v: 1, customerId, options }));
+    },
     transcribeAudio: (input) => transcription.transcribe(input),
     resolveCustomerTopicId: async (customerId: string) => {
       const { rows } = await query<{ telegram_topic_id: string | null }>(

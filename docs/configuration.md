@@ -292,6 +292,7 @@ Outbound rate/gap/failure tuning (`OUTBOUND_DRAIN_INTERVAL_MS`,
 | `STYLE_LANE_MAX` | `12` | Max voice directives injected per draft (blast-radius guard), newest-first. Restart-read. |
 | `KNOWLEDGE_INTERNAL_ENABLED` | `false` | Register the hourly internal (Project Brain) re-sync worker. See [project-brain.md](./project-brain.md). |
 | `QUERY_ENGINE_ENABLED` | `false` | Wire Telegram `/ask <question>` → internal-knowledge search → LLM-synthesized **cited** answer in the founder topic. Reuses `KNOWLEDGE_INTERNAL_K` / `_MAX_DISTANCE`. Same privacy-mode OFF precondition. |
+| `QUERY_FREE_TEXT_ENABLED` | `false` | Answer **plain** founder text (no `/ask`) in a topic: scoped to that topic's customer, or **cross-customer** in the Admin topic. Requires `QUERY_ENGINE_ENABLED` (warns and stays dormant without it). Runs **last**, only after every pending-answer capture (askFounder question, ✏️ Edit, 🔁 Revise, scheduling clarification) has declined the message. Same privacy-mode OFF precondition. |
 | `SLASH_COMMANDS_ENABLED` | `false` | Wire the Telegram command router — `/pending` (queue counts + oldest age), `/briefing` (daily digest on demand), `/help` — replied in the requesting thread. `/ask` stays its own handler. Same privacy-mode OFF precondition. |
 
 Retrieval/knowledge tuning (`KNOWLEDGE_SYNC_INTERVAL_MS`,

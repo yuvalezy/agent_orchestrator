@@ -39,10 +39,18 @@ export function parseAskCommand(text: string): string | null {
   return question;
 }
 
-/** Render a QueryResult as the Telegram reply (answer + a "Sources" citation list). */
+/** Render a QueryResult as the Telegram reply (answer + a "Sources" citation list).
+ *  Shared with the free-text query handler (free-text.ts) — one answer rendering, so a
+ *  typed question and an `/ask` look identical. The scope label is never decoration: it
+ *  tells the founder WHICH corpus answered, and "All customers" vs "Customer: Acme" is
+ *  the difference between an aggregate and a scoped fact. */
 export function formatAnswer(result: QueryResult): string {
   const scopeLabel =
-    result.scope.kind === 'customer' ? `Customer: ${result.scope.customerName}` : 'Project Brain';
+    result.scope.kind === 'customer'
+      ? `Customer: ${result.scope.customerName}`
+      : result.scope.kind === 'all'
+        ? 'All customers'
+        : 'Project Brain';
 
   if (!result.answer) {
     return `🧠 ${scopeLabel}\n\nI couldn't find anything relevant in the knowledge base for that. Try rephrasing, or check that the corpus is synced.`;

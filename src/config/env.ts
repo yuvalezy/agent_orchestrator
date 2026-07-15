@@ -350,6 +350,28 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
+  // ── M5 task 1.2: FREE-TEXT query routing. With QUERY_ENGINE_ENABLED alone the founder
+  // must type `/ask`. This flag additionally routes a PLAIN sentence in a topic to the
+  // query engine — scoped to the topic's customer, or cross-customer in the Admin topic.
+  //
+  // Its OWN flag rather than riding QUERY_ENGINE_ENABLED, because the semantics differ in
+  // kind, not degree: `/ask` answers when EXPLICITLY invoked, whereas this makes the bot
+  // answer messages nobody addressed to it. Every founder aside in a customer topic gets
+  // an LLM reply (and an embed + synthesis spend). Folding that into the `/ask` flag would
+  // mean anyone who turned on `/ask` silently got a chatbot in every topic.
+  //
+  // Requires QUERY_ENGINE_ENABLED (there is no query engine to route to otherwise) — the
+  // composition warns and stays dormant if this is true while that is false. DORMANT by
+  // default (strict-bool, mirrors OUTBOUND_ENABLED): unset/"false"/anything else → false.
+  //
+  // ⚠︎ ROUTING ORDER (src/adapters/triage/callback-poller.factory.ts): this handler is
+  // LAST, after every pending-answer capture. See the note in src/query/free-text.ts —
+  // running it earlier feeds a founder's answer to a chatbot and silently drops it.
+  QUERY_FREE_TEXT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── M5(c): Telegram founder slash-command surface. A founder types a leading `/pending`
   // (counts + oldest age of the pending draft-reply + backfill-proposal queues), `/briefing`
   // (the daily digest on demand, posted to the requesting thread), or `/help` (the command
@@ -367,24 +389,44 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
-  // ── M5(b): daily founder briefing — a once-a-day admin digest of what is WAITING on
-  // the founder: pending draft replies + pending backfill task proposals (counts + the
-  // oldest item's age) and a ranked "who needs attention" list. Attacks decision
-  // throughput (who is waiting, how long). Kill-switch (mirrors ACCEPTANCE_REPORT_ENABLED
-  // strict-bool): the worker is registered ONLY when the literal "true"; unset/"false"/
-  // anything else → false. DORMANT by default. Idempotent per calendar day (an app_state
-  // last-run-day key) so the sub-daily interval posts EXACTLY ONCE per day. Requires
-  // Telegram (it notifies the Admin topic) — the worker is skipped if Telegram is
-  // unconfigured. Read-only aggregation (no new table) over the existing pending queues.
+  // ── M5(b) + task 3.1: daily founder briefing — a once-a-day admin digest posted at a
+  // CONFIGURED founder-local hour. Carries what happened overnight (untriaged inbox rows from
+  // the last 24h), what is on fire (the change-06 ranked urgent inbox), who has gone silent
+  // (tasks we replied on with no customer answer for > 3 days), what today holds (calendar
+  // meetings + agent_holidays), plus the pending draft-reply/backfill-proposal queues and the
+  // ranked "who needs attention" list. Attacks decision throughput (who is waiting, how long).
+  // Kill-switch (mirrors ACCEPTANCE_REPORT_ENABLED strict-bool): the worker is registered ONLY
+  // when the literal "true"; unset/"false"/anything else → false. DORMANT by default.
+  // Idempotent per calendar day (an app_state last-run-day key) so the poll interval posts
+  // EXACTLY ONCE per day. Requires Telegram (it notifies the Admin topic) — the worker is
+  // skipped if Telegram is unconfigured. Read-only aggregation (no new table).
   DAILY_BRIEFING_ENABLED: z
     .string()
     .optional()
     .transform((v) => v === 'true'),
-  DAILY_BRIEFING_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
-  // Timezone for the day boundary so "daily" is the founder's local day (not UTC).
+  // The founder-local hour (0–23) the briefing fires at (task 3.1's "configurable time").
+  // 8 = a morning digest waiting when the founder starts the day. A tick before this hour is a
+  // no-op; the first tick AT or AFTER it posts, so a process that was down at the hour posts
+  // late rather than skipping the day (see decideBriefingRun).
+  DAILY_BRIEFING_HOUR: z.coerce.number().int().min(0).max(23).default(8),
+  // POLL granularity, NOT the schedule — DAILY_BRIEFING_HOUR is the schedule. This is only how
+  // often the worker wakes to ask "is it time yet?", so it bounds how LATE a post can be: the
+  // briefing fires within one interval of the hour. 15m keeps that within a quarter hour (the
+  // pre-hour M5(b) default was 6h, which would have made "fires at the configured hour" mean
+  // "some time in the following six" — it was sized for a day-guard-only model). Each tick that
+  // is not due short-circuits on one app_state read, so a tight interval is nearly free.
+  DAILY_BRIEFING_INTERVAL_MS: z.coerce.number().int().positive().default(900_000), // 15m
+  // Timezone for the day boundary + the configured hour, so "daily at 8" is the founder's local
+  // day and local 8am (not UTC).
   DAILY_BRIEFING_TZ: z.string().default('America/Panama'),
-  // Max customers surfaced in the "needs attention" list (keeps the digest scannable).
+  // Max rows surfaced per ranked list (needs-attention, urgent, awaiting-reply) — keeps the
+  // digest scannable. Counts are always complete; only the printed lines are capped.
   DAILY_BRIEFING_TOP_N: z.coerce.number().int().positive().default(5),
+  // The cut on change 06's urgency scale for the briefing's "urgent" section. NOT a second
+  // score — a threshold on the ONE documented deterministic score
+  // (console-urgency-repo.ts: failed=1000, pending=500, processing=200, +age, +retries).
+  // 500 = "at least queued or broken", so a row merely mid-flight (200) does not cry wolf.
+  DAILY_BRIEFING_URGENT_MIN_SCORE: z.coerce.number().int().min(0).default(500),
 
   // ── Draft correction loop (🔁 Revise) + scoped correction memory. When the founder
   // taps 🔁 Revise on a draft and sends a correction INSTRUCTION, the agent regenerates

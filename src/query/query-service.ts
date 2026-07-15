@@ -15,6 +15,11 @@ import type { QueryScope, ScopeResolver, ResolveScopeOptions } from './scope';
 // retrievers are distinct injected deps over structurally-separate tables, so an
 // internal chunk can never leak into a customer-scoped answer and vice versa.
 //
+// The `all` scope (M5 task 1.2/5.2 — the Admin topic) calls ONLY retrieveAllCustomers,
+// a THIRD distinct dep. It is not a relaxation of the customer path: the composition
+// root implements it as a fan-out of EXACT-id retrievals that it merges. Adding it
+// cannot widen `customer`, because `customer` never calls it.
+//
 // ⚠︎ Founder tool → SURFACES failures (unlike the best-effort triage retriever): an
 // embed/search/LLM error PROPAGATES so the caller (the Telegram /ask handler) can
 // report it. An EMPTY retrieval is meaningfully different from a broken pipeline: it
@@ -49,6 +54,10 @@ export interface QueryServiceDeps {
   /** Customer-corpus retrieval (embedding + memoryRepo.search → agent_memory), scoped
    *  to the EXACT customerId (+ shared rows). */
   retrieveCustomer: (question: string, customerId: string) => Promise<QueryCitation[]>;
+  /** Cross-customer retrieval for the Admin topic (`all` scope): a fan-out of EXACT-id
+   *  customer retrievals, merged and ranked. Citations MUST name their customer (the
+   *  founder cannot act on an aggregate they can't attribute). */
+  retrieveAllCustomers: (question: string) => Promise<QueryCitation[]>;
   /** LLM synthesis (LlmRouter.synthesizeAnswer, role 'answer'). */
   synth: AnswerSynthesizerPort;
 }
@@ -84,7 +93,9 @@ export function buildQueryService(deps: QueryServiceDeps): QueryService {
       const citations =
         scope.kind === 'internal'
           ? await deps.retrieveInternal(question)
-          : await deps.retrieveCustomer(question, scope.customerId);
+          : scope.kind === 'all'
+            ? await deps.retrieveAllCustomers(question)
+            : await deps.retrieveCustomer(question, scope.customerId);
 
       // Nothing relevant → omit the answer gracefully. Do NOT call the LLM: with no
       // grounded sources any "answer" would be fabricated (the anti-hallucination gate,

@@ -1,15 +1,27 @@
 import type { WorkerDefinition } from '../../workers/worker-runner';
 import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
+import type { CalendarPort } from '../../ports/calendar.port';
 import type { SyncLogger } from '../../knowledge/sync';
 import { runDailyBriefing, type PendingItem } from '../../query/daily-briefing';
 import { listPendingDrafts, listPendingBackfillProposals } from '../console/console-approvals-repo';
+import {
+  buildFetchTodayMeetings,
+  fetchAwaitingReply,
+  fetchOvernightUnprocessed,
+  fetchTodayHolidays,
+  fetchUrgentItems,
+} from './briefing-repo';
 
 // Daily-briefing WORKER builder (ADAPTER). Wraps runDailyBriefing in a WorkerDefinition with
-// runImmediately:true (post at boot if today's briefing is still owed) and a sub-daily interval;
-// the core's last-run-day guard makes the interval safe (exactly one post per calendar day). This
-// builder only assembles deps + maps the console approvals-repo rows down to the PII-light
-// PendingItem the core consumes — the message/draft/proposal BODIES the repo returns are dropped
-// here and never reach the digest.
+// runImmediately:true (post at boot if today's briefing is still owed and the founder-local hour
+// has passed) and a POLL interval; the core's configured-hour gate + last-run-day guard make the
+// interval safe (exactly one post per calendar day, at/after the configured hour). This builder
+// only assembles deps + maps the console approvals-repo rows down to the PII-light PendingItem the
+// core consumes — the message/draft/proposal BODIES the repo returns are dropped here and never
+// reach the digest. Task 3.1's four section reads live in ./briefing-repo.
+//
+// The interval is POLL granularity, not the schedule: DAILY_BRIEFING_HOUR is the schedule, and the
+// interval only bounds how late a post can land (see env.ts DAILY_BRIEFING_INTERVAL_MS).
 
 export interface DailyBriefingWorkerDeps {
   notifier: Pick<FounderNotifierPort, 'notifyAdmin'>;
@@ -19,6 +31,14 @@ export interface DailyBriefingWorkerDeps {
   topN?: number;
   log: SyncLogger;
   intervalMs: number;
+  /** Founder-local hour (0–23) the briefing fires at (DAILY_BRIEFING_HOUR). */
+  hour: number;
+  /** Cut on change 06's urgency scale (DAILY_BRIEFING_URGENT_MIN_SCORE). */
+  urgentMinScore?: number;
+  /** The founder's calendar reader. OMITTED when CALENDAR_ENABLED=false — today's meetings are
+   *  then left out of the digest rather than reported as an empty day (holidays still render:
+   *  they are a DB read and do not depend on Google). */
+  calendar?: Pick<CalendarPort, 'listUpcomingEvents'>;
   /** Clock seam — defaults to the wall clock. */
   now?: () => Date;
 }
@@ -45,20 +65,32 @@ export async function fetchPendingProposals(): Promise<PendingItem[]> {
 
 export function buildDailyBriefingWorker(deps: DailyBriefingWorkerDeps): WorkerDefinition {
   const now = deps.now ?? (() => new Date());
+  const fetchTodayMeetings = deps.calendar
+    ? buildFetchTodayMeetings(deps.calendar, deps.tz)
+    : undefined;
   return {
     name: 'briefing:daily',
     intervalMs: deps.intervalMs,
-    runImmediately: true, // post today's briefing at boot if the last-run day guard allows
+    // Post at boot when today's briefing is still owed AND the configured hour has passed —
+    // the catch-up path for a process that was down at the hour (see decideBriefingRun).
+    runImmediately: true,
     run: async () => {
       await runDailyBriefing({
         fetchPendingDrafts,
         fetchPendingProposals,
+        fetchOvernightUnprocessed,
+        fetchUrgentItems,
+        fetchAwaitingReply,
+        fetchTodayHolidays,
+        fetchTodayMeetings,
         notifier: deps.notifier,
         readLastRun: deps.readLastRun,
         writeLastRun: deps.writeLastRun,
         now,
         tz: deps.tz,
+        hour: deps.hour,
         topN: deps.topN,
+        urgentMinScore: deps.urgentMinScore,
         log: deps.log,
       });
     },

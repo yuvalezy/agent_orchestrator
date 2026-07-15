@@ -250,6 +250,20 @@ test('a calendar write failure NEVER fails task creation, and releases the claim
   assert.deepEqual(h.completed, []);
 });
 
+test('a bookkeeping failure AFTER the event exists keeps the claim (no release → no duplicate)', async () => {
+  const h = harness();
+  h.deps.complete = async () => {
+    throw new Error('db blip');
+  };
+  const port = withDueDateCalendarEvents(fakeTarget(), h.deps);
+
+  const task = await port.createTask({ ...CREATE_INPUT, dueAt: new Date('2026-07-15T22:00:00Z') });
+
+  assert.equal(task.ref, 'task-1');
+  assert.equal(h.events.length, 1, 'the event was created');
+  assert.deepEqual(h.released, [], 'releasing here would re-create an event that already exists');
+});
+
 test('a ledger outage NEVER fails task creation', async () => {
   const h = harness();
   h.deps.claim = async () => {

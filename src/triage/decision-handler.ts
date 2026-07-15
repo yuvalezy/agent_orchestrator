@@ -11,6 +11,21 @@ import { claimOverride, findCustomerByTaskRef } from '../decisions/decisions';
 /** The callback option id that means "cancel this task" (callback_data 'x:<ref>'). */
 export const CANCEL_OPTION = 'x';
 
+/**
+ * THE inline-button data convention: `<optionId>:<notificationRef>`, split on the FIRST
+ * ':' (a ref may itself contain one; an option id may not). Lives here — core — because
+ * two surfaces must agree on it byte-for-byte: the Telegram adapter's dispatchCallback
+ * (a real tap) and the askFounder free-text resolver (M5 task 5.3), which turns a typed
+ * answer into the SAME DecisionEvent the tap would have produced. If these two ever
+ * drifted, a typed answer and a tapped one would route to different handlers.
+ */
+export function parseOptionData(data: string): { optionId: string; notificationRef: string } {
+  const i = data.indexOf(':');
+  return i < 0
+    ? { optionId: data, notificationRef: '' }
+    : { optionId: data.slice(0, i), notificationRef: data.slice(i + 1) };
+}
+
 export function buildCancelHandler(deps: {
   taskTarget: Pick<TaskTargetPort, 'setStatus'>;
   notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent'>;

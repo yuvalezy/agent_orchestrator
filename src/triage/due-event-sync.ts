@@ -175,7 +175,19 @@ async function syncDueEvent(task: TaskRef, customerRef: string, dueAt: Date, dep
       eventId: dueEventId(task.ref),
     });
 
-    await deps.complete(task.ref, created.id, target.calendarId);
+    // The event now EXISTS. From here the claim must STAND: recording where it landed is
+    // bookkeeping, and letting a failed UPDATE fall into the catch below would release the
+    // claim for an event we already created. (Even then the deterministic id would turn the
+    // retry into a 409 rather than a duplicate — but not relying on that is cheaper than
+    // depending on it.)
+    try {
+      await deps.complete(task.ref, created.id, target.calendarId);
+    } catch (err) {
+      logger.warn(
+        { taskRef: task.ref, reason: (err as Error)?.message },
+        'due-event: event created but recording its id failed — the event stands, the ledger lost its handle',
+      );
+    }
     logger.info(
       { taskRef: task.ref, allDay, alreadyExisted: created.alreadyExisted },
       created.alreadyExisted

@@ -1,9 +1,8 @@
 import { env } from '../../config/env';
 import { logger } from '../../logger';
-import { getAppState, setAppState, clearAppState } from '../../db/app-state';
+import { getAppState, setAppState } from '../../db/app-state';
 import { tryResolveCredential } from '../../config/credentials';
 import type { WorkerDefinition } from '../../workers/worker-runner';
-import type { MessageEvent } from '../../ports/founder-notifier.port';
 import type { KnowledgeRetriever } from '../../knowledge/retrieval';
 import type { TelegramNotifier } from '../telegram/telegram-notifier';
 import { buildEzyPortalGateway } from '../ezy-portal';
@@ -28,7 +27,8 @@ import {
 } from '../../outbound/outbound-repo';
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
 import { buildBackfillApproveHandler } from './backfill-approve.factory';
-import { buildThreadMarkers } from '../../triage/thread-markers';
+import { threadMarkers } from './thread-markers.instance';
+import { buildFounderMessageRouter } from '../../triage/founder-message-router';
 import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
 import { memoryRepo } from '../../knowledge/memory-repo';
@@ -41,7 +41,9 @@ import type { DecisionEvent, FounderNotifierPort } from '../../ports/founder-not
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildLlmRouter } from '../llm/factory';
 import { buildAskMessageHandler } from '../../query/ask-command';
+import { buildPendingAskHandler } from '../../query/pending-ask';
 import { buildQueryEngineService } from '../query/factory';
+import { buildFreeTextQueryGated } from '../query/free-text.factory';
 import { buildSlashCommandsHandler } from '../query/slash-commands.factory';
 import { buildSchedulingGated } from '../scheduling/factory';
 import { cancelScheduledAction } from '../../scheduling/scheduling-repo';
@@ -57,15 +59,6 @@ import { cancelScheduledAction } from '../../scheduling/scheduling-repo';
 // composition root; the boundary rule only forbids core → adapters).
 
 const OFFSET_KEY = 'telegram_update_offset';
-
-/** ONE marker set for the whole founder surface: arming any capture clears the others,
- *  and every marker expires. Both invariants live in thread-markers.ts — see the note
- *  there on why an un-expiring ✏️ Edit marker sends the founder's next message to the
- *  customer verbatim. */
-const threadMarkers = buildThreadMarkers(
-  { get: getAppState, set: setAppState, clear: clearAppState },
-  () => new Date(),
-);
 
 /**
  * Build the gated 🔁 Revise service (DraftReviserService | null). Needs its own LLM router +
@@ -196,7 +189,10 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // so a tap does nothing until the feature is on.
   const backfill = env.BACKFILL_ENABLED ? buildBackfillApproveHandler({ notifier }) : null;
 
-  notifier.onDecision(async (d) => {
+  // THE decision router. Named (not inlined into onDecision) because a second caller
+  // needs it: the askFounder free-text resolver turns a TYPED answer into a DecisionEvent
+  // and routes it here, so typing an option and tapping it land in the same handler.
+  const routeDecision = async (d: DecisionEvent): Promise<void> => {
     if (d.optionId === 'sc') {
       const result = await cancelScheduledAction(d.notificationRef);
       if (d.threadId) {
@@ -214,30 +210,50 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
     if (draft && isDraftOption(d.optionId)) return draft(d);
     if (revise && isCorrectionFlipOption(d.optionId)) return revise.flip(d);
     if (backfill && backfill.isBackfillOption(d.optionId)) return backfill.handle(d);
-  });
+  };
 
-  // COMPOSITE free-text router on onMessage (the notifier holds ONE message handler, so all
-  // captures MUST compose, not fork):
-  //   1. `/ask <question>` (M5(a)) — consumes only an /ask command; else falls through.
-  //   2. 🔁 Revise capture (correction loop) — consumes the founder's next message in a thread
-  //      ARMED for revision as the correction instruction (ignores unarmed threads).
-  //   3. ✏️ Edit capture (M2c) — consumes the next message in a thread ARMED for edit.
-  // Revise and edit markers are mutually exclusive per thread (arming one clears the other), so
-  // their order is safe; an explicit `/ask` still wins over both.
-  const ask = env.QUERY_ENGINE_ENABLED
-    ? (() => {
-        const service = buildQueryEngineService((msg) =>
-          notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
-        );
-        return service
-          ? buildAskMessageHandler({
-              query: service,
-              postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
-              log: logger,
-            })
-          : null;
-      })()
+  notifier.onDecision(routeDecision);
+
+  // ── The composite free-text chain on onMessage ────────────────────────────────────────
+  // WHICH links are wired is decided here (one per feature flag); the ORDER they run in —
+  // the safety property, and the reasoning behind it — lives in core with its own tests:
+  // src/triage/founder-message-router.ts. The short version: every capture below exists
+  // because we ASKED the founder something, so all of them must precede the query engine,
+  // which is the last resort.
+
+  // ONE engine for both query surfaces (/ask and free text): buildQueryEngineService builds
+  // an embedding adapter + an LLM router per call, and two would mean two failover state
+  // machines and two cost-cap notifiers behind one founder surface. Returns null (+ logs)
+  // when QUERY_ENGINE_ENABLED is false, so no env check is needed here.
+  const queryService = buildQueryEngineService((msg) =>
+    notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
+  );
+
+  const ask = queryService
+    ? buildAskMessageHandler({
+        query: queryService,
+        postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+        log: logger,
+      })
     : null;
+
+  // M5 task 1.2/5.2: plain text → the query engine, scoped by the topic's customer binding
+  // (Admin topic → cross-customer). Gated by its OWN flag (QUERY_FREE_TEXT_ENABLED) —
+  // answering unaddressed messages is a different proposition from answering `/ask`.
+  const freeTextQuery = buildFreeTextQueryGated(queryService, notifier);
+
+  // M5 task 5.3: a TYPED answer to a pending askFounder question resolves it, routed to the
+  // SAME decision router a button tap reaches. Always wired — it costs nothing when no
+  // question is armed (one marker read), and it is the gate that stops the query engine
+  // from eating an answer, so it must NOT be gated behind the query flags: it has to hold
+  // whether or not the thing it protects against is switched on.
+  const pendingAsk = buildPendingAskHandler({
+    readPending: (threadId) => threadMarkers.read('ask_founder', threadId),
+    clearPending: (threadId) => threadMarkers.clear('ask_founder', threadId),
+    dispatch: routeDecision,
+    postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+    log: logger,
+  });
 
   // M5(c): founder slash commands (/pending, /briefing, /status, /summary, /history, /draft email,
   // /backfill, /help) — gated by SLASH_COMMANDS_ENABLED (null when off); each command's own
@@ -265,15 +281,23 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
       })
     : null;
 
-  if (ask || slash || reviseCapture || draftEdit || scheduling) {
-    notifier.onMessage(async (m: MessageEvent) => {
-      if (ask && (await ask(m))) return; // /ask consumed it
-      if (slash && (await slash(m))) return; // /pending·/briefing·/help consumed it (M5(c))
-      if (reviseCapture && (await reviseCapture(m))) return;
-      if (draftEdit && (await draftEdit(m))) return;
-      if (scheduling) await scheduling.onMessage(m);
-    });
-  }
+  // Always registered: an askFounder question can be armed even with every other founder
+  // feature off, so there is always at least one link that must see founder messages.
+  notifier.onMessage(
+    buildFounderMessageRouter({
+      ask,
+      slash,
+      pendingAsk,
+      reviseCapture,
+      draftEdit,
+      // Scheduling declines exactly two things: a topic with no customer, and ordinary
+      // chatter with no clarification pending — which is precisely what a query is. It
+      // claims EVERY message while a clarification IS pending (including ones it failed to
+      // interpret), so a founder mid-clarify can never fall through to the query engine.
+      scheduling: scheduling ? (m) => scheduling.onMessage(m) : null,
+      freeTextQuery,
+    }),
+  );
 
   return {
     name: 'telegram:callbacks',
