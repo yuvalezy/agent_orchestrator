@@ -86,6 +86,7 @@ function fakes(
         if (opts.attachThrows) throw new Error('upload failed');
         attached.push({ taskRef: t.ref, filename, contentType, bytes: bytes.byteLength });
       },
+      listChangedTasks: async () => ({ tasks: [], nextCursor: '' }),
     },
     llm: {
       extractIntents: async () => intents,

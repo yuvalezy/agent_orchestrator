@@ -480,6 +480,26 @@ const envSchema = z.object({
   WEEKLY_PATTERNS_TOP_K: z.coerce.number().int().positive().default(5),
   // Hard cap on signals fetched per tick (blast-radius guard on the aggregation).
   WEEKLY_PATTERNS_MAX_SIGNALS: z.coerce.number().int().positive().default(2000),
+
+  // ── M4: proactive task-done resolution notifications. A worker polls each onboarded
+  // customer's portal project for tasks that moved to a terminal status; for every
+  // CUSTOMER-ORIGINATED done task it drafts ONE is_draft=true "your request is resolved"
+  // reply on the ORIGIN channel (founder approves/edits/rejects via the existing draft-review
+  // flow — NEVER auto-sent). Kill-switch (mirrors OUTBOUND_ENABLED strict-bool): the worker is
+  // registered ONLY when the literal "true"; unset/"false"/anything else → false. DORMANT by
+  // default so a boot never drafts resolution notices by surprise.
+  //
+  // FIRST-RUN WATERMARK: a customer's first tick stamps a now() cursor and skips — only
+  // transitions observed AFTER go-live notify, never the historical done backlog. Requires
+  // Telegram (drafts present in customer topics); the approved draft is drained by the outbound
+  // drainer (OUTBOUND_ENABLED, + email needs OUTBOUND_EMAIL_ENABLED). Composing the warm reply
+  // needs OPENAI_API_KEY / an LLM provider key (resolveCredential).
+  PROACTIVE_NOTIFICATIONS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Portal poll interval for the task-event worker (env tuning knob, like the other *_INTERVAL_MS).
+  TASK_EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(900_000), // 15m
 });
 
 const parsed = envSchema.safeParse(process.env);

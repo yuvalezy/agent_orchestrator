@@ -39,6 +39,7 @@ const KNOWLEDGE = 'Knowledge & Drafting';
 const BACKFILL = 'Backfill';
 const INTELLIGENCE = 'Intelligence & Digests';
 const TRIAGE = 'Triage';
+const PROACTIVE = 'Proactive';
 const LLM = 'LLM Routing';
 
 export const SETTINGS_REGISTRY: readonly SettingDef[] = [
@@ -278,6 +279,18 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     applyMode: 'restart',
     default: false,
     dependsOn: 'KNOWLEDGE_DRAFT_ENABLED',
+  },
+
+  // ── Proactive ────────────────────────────────────────────────────────────────
+  {
+    key: 'PROACTIVE_NOTIFICATIONS_ENABLED',
+    type: 'boolean',
+    category: PROACTIVE,
+    label: 'Task-done resolution notices',
+    description:
+      'Registers the worker that polls the portal for tasks moved to done and drafts one "your request is resolved" reply per customer-originated task on its origin channel (draft only, never auto-sent). First tick per customer only watermarks — no historical backlog.',
+    applyMode: 'restart',
+    default: false,
   },
 
   // ── Pass-2 tuning knobs (the values the founder actually tuned) ───────────────
