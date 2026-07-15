@@ -14,6 +14,54 @@ export class TranscriptionError extends Error {
   }
 }
 
+// OpenAI infers the audio container from the upload FILENAME's extension, not from
+// the part's Content-Type. The gpt-4o transcribe models accept a NARROWER set than
+// whisper-1 does — notably `.oga` is fine on whisper-1 but 400s on gpt-4o*, and
+// Telegram names every voice note `file_<n>.oga`. So the raw Telegram filename must
+// be rewritten to the mime type's canonical extension before upload.
+const SUPPORTED_EXTENSIONS = new Set(['flac', 'm4a', 'mp3', 'mp4', 'mpeg', 'mpga', 'ogg', 'wav', 'webm']);
+
+const MIME_EXTENSIONS: Record<string, string> = {
+  'audio/flac': 'flac',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'ogg',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/webm': 'webm',
+};
+
+/** Rewrite `name` so its extension is one OpenAI accepts, preferring the mime type's
+ *  canonical extension and leaving an already-supported extension untouched. */
+export function normalizeAudioFilename(name: string, mimeType: string): string {
+  const base = name.replace(/\.[^./\\]+$/, '') || 'audio';
+  const current = /\.([^./\\]+)$/.exec(name)?.[1]?.toLowerCase();
+  // `audio/ogg; codecs=opus` -> `audio/ogg`
+  const mime = mimeType.split(';')[0].trim().toLowerCase();
+  const fromMime = MIME_EXTENSIONS[mime];
+  if (fromMime) return `${base}.${fromMime}`;
+  if (current && SUPPORTED_EXTENSIONS.has(current)) return name;
+  return `${base}.ogg`;
+}
+
+/** Pull `error.message` out of an OpenAI error body, falling back to a raw snippet.
+ *  Capped so a stray HTML error page cannot flood the log or a Telegram reply. */
+function parseOpenAiErrorMessage(body: string): string {
+  if (!body.trim()) return '';
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: unknown } };
+    const message = parsed.error?.message;
+    if (typeof message === 'string' && message.trim()) return message.trim().slice(0, 300);
+  } catch {
+    // Not JSON — fall through to the raw snippet.
+  }
+  return body.trim().slice(0, 300);
+}
+
 export interface OpenAiTranscriptionOptions {
   resolveKey: () => string | undefined;
   baseUrl: string;
@@ -39,7 +87,11 @@ export function buildOpenAiTranscriptionClient(opts: OpenAiTranscriptionOptions)
           form.append('model', model);
           const bytes = new Uint8Array(input.data.byteLength);
           bytes.set(input.data);
-          form.append('file', new Blob([bytes.buffer], { type: input.mimeType }), input.filename);
+          form.append(
+            'file',
+            new Blob([bytes.buffer], { type: input.mimeType }),
+            normalizeAudioFilename(input.filename, input.mimeType),
+          );
           const started = Date.now();
           const res = await fetchImpl(`${baseUrl}/audio/transcriptions`, {
             method: 'POST',
@@ -52,8 +104,20 @@ export function buildOpenAiTranscriptionClient(opts: OpenAiTranscriptionOptions)
             const retryAfter = Number(res.headers.get('retry-after'));
             const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined;
             const retryable = res.status === 429 || res.status >= 500;
-            logger.warn({ provider: 'openai', model, status: res.status, durationMs }, 'audio transcription failed');
-            throw new TranscriptionError(`OpenAI transcription HTTP ${res.status}`, retryable, res.status, retryAfterMs);
+            // The body carries the only actionable detail (e.g. "Unsupported file
+            // format oga"); without it a 400 reaches the user as a bare status code.
+            const body = await res.text().catch(() => '');
+            const detail = parseOpenAiErrorMessage(body);
+            logger.warn(
+              { provider: 'openai', model, status: res.status, durationMs, detail },
+              'audio transcription failed',
+            );
+            throw new TranscriptionError(
+              detail ? `OpenAI transcription HTTP ${res.status}: ${detail}` : `OpenAI transcription HTTP ${res.status}`,
+              retryable,
+              res.status,
+              retryAfterMs,
+            );
           }
           logger.info({ provider: 'openai', model, status: res.status, durationMs }, 'audio transcription ok');
           return (await res.json()) as { text?: unknown };
