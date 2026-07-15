@@ -48,13 +48,23 @@ app gate is independent and fails closed when either secret is missing/invalid
 (`src/config/console.ts`, asserted in `src/adapters/console/console.router.test.ts:31-35`),
 and the console router only mounts when that config validates (`src/app.ts:73`). The
 session cookie is `Secure` (`src/adapters/console/console-session.ts:88`) and helmet
-adds HSTS (`src/app.ts:25`). *Not covered:* nothing in the process asserts its own
-network exposure — there is no IP filter, no tailnet identity header check, and no
-startup refusal to bind a routable interface. If port 3100 is published directly, a
-browser will refuse to store the `Secure` cookie over plain HTTP, but `POST
-/console/api/session` still accepts password guesses; bcrypt plus the login limiter are
-then the only barrier. The deployment topology is an operational promise, not an
-enforced invariant.
+adds HSTS (`src/app.ts:25`). The process binds **loopback only** — `app.listen(env.PORT,
+'127.0.0.1', …)` (`src/main.ts:685`) — so under `network_mode: host` it is not on the
+LAN at all; Tailscale Serve reaches it over `127.0.0.1:3100` (`docs/operations.md`).
+
+*History — do not regress this:* until 2026-07-15 the bind was `app.listen(env.PORT)`,
+i.e. `0.0.0.0`, which put `/console` on the founder's home LAN with no gate but the
+password. Note the failure mode, because it is a trap: a *browser* on the LAN looks
+safe — it refuses to store the `Secure` cookie over plain HTTP, so login appears to
+fail — while `curl` establishes a full session, because `Secure` is a browser contract
+the server never enforces. Testing that exposure from a phone browser yields a **false
+pass**; test it with `curl`.
+
+*Not covered:* the loopback bind is not asserted by a test, and nothing checks tailnet
+identity per-request — a process on the host itself still reaches the console over
+loopback, where bcrypt plus the login limiter are the only barrier. `PORT` is honoured
+but the host is hard-coded, so a deployment needing a different interface must change
+code, deliberately.
 
 **2. Session fixation.** *Threat:* an attacker plants a known session ID that survives
 the founder's login. *Mitigation:* structurally prevented — no pre-authentication

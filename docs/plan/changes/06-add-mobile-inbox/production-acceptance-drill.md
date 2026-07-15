@@ -159,15 +159,33 @@ The console fails closed — `loadConsoleConfig` returns `null` rather than a pa
 
 ### A7 — Negative check: inaccessible outside the tailnet
 
-Tailscale Serve/MagicDNS is the network gate — it is a deployment requirement, **not** an Express
-IP filter, so this can only be proven from a device that is genuinely off the tailnet.
+Tailscale Serve/MagicDNS is the network gate. You do **not** need a second device: toggle
+Tailscale off on your own phone (or drop to cellular) — that is a genuinely off-tailnet device.
 
-- [ ] From the **non-tailnet device**, open `https://<machine>.ts.net/console/`.
-- [ ] **Verify:** it does not resolve / does not connect. You must not reach a login page.
-- [ ] **Verify no public exposure:** from outside, confirm port 3100 is not reachable at the host's
-      public address, and that no tunnel (ngrok/Cloudflare/port-forward) is publishing it.
+> **Use `curl`, not a browser, for the LAN check.** A browser gives a *false pass*: it refuses to
+> store the `Secure` session cookie over plain HTTP, so login looks broken even when the port is
+> wide open. `curl` ignores cookie flags and shows the truth. This is not hypothetical — the LAN
+> was reachable this way until the loopback bind landed on 2026-07-15 (`src/main.ts:685`).
+
+- [ ] **The one that matters — LAN, no tailnet.** On home Wi-Fi with Tailscale **off**, from any
+      host on the LAN:
+      ```bash
+      curl -sS -m 5 -o /dev/null -w '%{http_code}\n' http://<host-LAN-IP>:3100/console/
+      curl -sS -m 5 -o /dev/null -w '%{http_code}\n' http://<host-LAN-IP>:3100/health
+      ```
+      **Verify:** both fail to connect (`Connection refused` / timeout) — *not* a `200`/`302`/`401`.
+      Any HTTP status at all means the process is on a routable interface: stop and check that
+      `app.listen` still pins `127.0.0.1` (`src/main.ts:685`).
+- [ ] Confirm the bind directly on the host — the authoritative check:
+      ```bash
+      ss -ltnp | grep 3100    # expect 127.0.0.1:3100, NEVER 0.0.0.0:3100 or *:3100
+      ```
+- [ ] From the **off-tailnet phone**, open `https://<machine>.ts.net/console/`.
+      **Verify:** does not resolve / does not connect. You must not reach a login page.
+- [ ] **Verify no public exposure** (expected to pass trivially behind NAT; cheap to confirm):
       ```bash
       tailscale serve status    # should show ONLY :443 → http://127.0.0.1:3100
+      curl -s ifconfig.me       # then, from cellular: http://<that-IP>:3100 must not connect
       ```
 - [ ] **Verify:** disconnecting the tailnet on the *enrolled* device also drops access — then
       reconnect.

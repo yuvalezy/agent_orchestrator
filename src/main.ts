@@ -677,7 +677,12 @@ async function main(): Promise<void> {
   }
 
   const app = buildApp(appDeps);
-  const server = app.listen(env.PORT, () => {
+  // Loopback ONLY, never 0.0.0.0. Under network_mode: host an all-interfaces bind puts
+  // /console on the LAN, where the tailnet gate does not apply and the session cookie's
+  // `secure` flag stops a browser but not curl. Tailscale Serve reaches us over loopback
+  // (operations.md), and whatsapp_manager/portal/pg are all localhost, so nothing needs
+  // an external interface. See design.md § Threat-model checklist, "Tailnet transport".
+  const server = app.listen(env.PORT, '127.0.0.1', () => {
     const base = `http://localhost:${env.PORT}`;
     startupLogger.info(`agent-orchestrator listening on ${base}`);
     if (consoleConfig) {
