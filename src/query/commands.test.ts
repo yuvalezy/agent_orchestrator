@@ -20,7 +20,7 @@ function collector() {
   return { posts, postAnswer: async (threadId: string, text: string) => void posts.push({ threadId, text }) };
 }
 
-const msg = (text: string): MessageEvent => ({ threadId: '77', text, by: 'founder' });
+const msg = (text: string): MessageEvent => ({ chatId: '-100', messageId: '1', threadId: '77', text, by: 'founder' });
 
 function deps(over: Partial<Parameters<typeof buildSlashCommandRouter>[0]> = {}) {
   const c = collector();

@@ -23,6 +23,7 @@ import { loadWebPushConfig } from './config/web-push';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
+import { buildScheduleDueWorker } from './adapters/scheduling/schedule.worker';
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
 import { seedHolidays } from './adapters/outbound/holiday-seeder';
 import { buildKnowledgeSyncWorker } from './adapters/knowledge/knowledge-sync.worker';
@@ -228,6 +229,15 @@ async function main(): Promise<void> {
     const telegram = buildTelegramNotifier();
     notifier = webPushNotifier ? new FanoutFounderNotifier(telegram, webPushNotifier) : telegram;
     triageWorkers.push(buildInboxProcessorWorker(notifier), buildCallbackPollerWorker(telegram));
+    if (env.TELEGRAM_SCHEDULING_ENABLED) {
+      triageWorkers.push(
+        buildScheduleDueWorker(
+          telegram,
+          env.TELEGRAM_SCHEDULING_INTERVAL_MS,
+          env.TELEGRAM_SCHEDULING_GRACE_MINUTES,
+        ),
+      );
+    }
     logger.info('money-loop workers registered (inbox processor + Telegram callback poller)');
   } catch (err) {
     logger.warn({ reason: (err as Error)?.message }, 'money-loop disabled — Telegram not configured');

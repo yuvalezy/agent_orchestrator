@@ -42,6 +42,8 @@ import { buildLlmRouter } from '../llm/factory';
 import { buildAskMessageHandler } from '../../query/ask-command';
 import { buildQueryEngineService } from '../query/factory';
 import { buildSlashCommandsHandler } from '../query/slash-commands.factory';
+import { buildScheduleMessageHandlerGated } from '../scheduling/factory';
+import { cancelScheduledAction } from '../../scheduling/scheduling-repo';
 
 // Composition: register the callback handlers on the notifier and drive its poll from
 // a persisted offset (app_state). The notifier owns the Telegram I/O
@@ -192,6 +194,18 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   const backfill = env.BACKFILL_ENABLED ? buildBackfillApproveHandler({ notifier }) : null;
 
   notifier.onDecision(async (d) => {
+    if (d.optionId === 'sc') {
+      const result = await cancelScheduledAction(d.notificationRef);
+      if (d.threadId) {
+        const text = result === 'cancelled'
+          ? '✅ Scheduled action cancelled.'
+          : result === 'too_late'
+            ? '⚠️ Too late to cancel; the action is already running or sending.'
+            : 'This scheduled action was already handled.';
+        await notifier.replyInThread(d.threadId, text);
+      }
+      return;
+    }
     if (d.optionId === CANCEL_OPTION) return cancel(d);
     if (draft && isDraftOption(d.optionId)) return draft(d);
     if (revise && isCorrectionFlipOption(d.optionId)) return revise.flip(d);
@@ -225,6 +239,7 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // (null when off). Consumes only a REGISTERED command; else falls through (so /ask and the
   // free-text captures still see the message). Runs alongside /ask, before revise/edit captures.
   const slash = buildSlashCommandsHandler(notifier);
+  const scheduling = buildScheduleMessageHandlerGated(notifier);
 
   const reviseCapture = revise
     ? buildDraftReviseMessageHandler({
@@ -243,12 +258,13 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
       })
     : null;
 
-  if (ask || slash || reviseCapture || draftEdit) {
+  if (ask || slash || reviseCapture || draftEdit || scheduling) {
     notifier.onMessage(async (m: MessageEvent) => {
       if (ask && (await ask(m))) return; // /ask consumed it
       if (slash && (await slash(m))) return; // /pending·/briefing·/help consumed it (M5(c))
-      if (reviseCapture) await reviseCapture(m); // 🔁 revise capture (ignores unarmed threads)
-      if (draftEdit) await draftEdit(m); // ✏️ edit capture (ignores unarmed threads)
+      if (reviseCapture && (await reviseCapture(m))) return;
+      if (draftEdit && (await draftEdit(m))) return;
+      if (scheduling) await scheduling(m);
     });
   }
 

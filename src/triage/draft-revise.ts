@@ -62,7 +62,11 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
   /** Present (or re-present) the revised draft with the SAME Approve/Edit/Reject/Revise
    *  buttons so the founder can approve, edit, reject, or revise AGAIN. Body never logged. */
   async function present(customerId: string, queueId: string, body: string, citations: string[], language: string, original?: string): Promise<void> {
-    await deps.notifier.notifyCustomerEvent(customerId, buildPresentation(body, citations, language, original), draftButtons(queueId, { revise: true }));
+    await deps.notifier.notifyCustomerEvent(
+      customerId,
+      { ...buildPresentation(body, citations, language, original), contextRef: { kind: 'outbound', ref: queueId } },
+      draftButtons(queueId, { revise: true }),
+    );
   }
 
   return {
@@ -206,17 +210,18 @@ export interface DraftReviseMessageHandlerDeps {
  *    lacks, DA B1), THEN regenerate. reviseFromInstruction never throws, so the message handler
  *    never throws → the poll offset advances (no replay).
  */
-export function buildDraftReviseMessageHandler(deps: DraftReviseMessageHandlerDeps): (m: { threadId: string; text: string; by: string }) => Promise<void> {
-  return async ({ threadId, text, by }): Promise<void> => {
+export function buildDraftReviseMessageHandler(deps: DraftReviseMessageHandlerDeps): (m: { threadId: string; text: string; by: string }) => Promise<boolean> {
+  return async ({ threadId, text, by }): Promise<boolean> => {
     const queueId = await deps.readArmedRevise(threadId);
-    if (!queueId) return; // unarmed → not a revise capture
+    if (!queueId) return false; // unarmed → not a revise capture
     if (!text.trim()) {
       logger.info({ queueId }, 'revise: empty instruction — held, marker still armed');
-      return;
+      return true;
     }
     // Clear BEFORE work: idempotent at-most-once (a re-delivered instruction finds nothing armed).
     await deps.clearArmedRevise(threadId);
     await deps.reviser.reviseFromInstruction({ queueId, instruction: text, by });
+    return true;
   };
 }
 

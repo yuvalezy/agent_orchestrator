@@ -126,7 +126,7 @@ export function buildResolutionNotifier(deps: ResolutionNotifierDeps): Resolutio
         //     by queueId (nothing task-specific downstream). Nothing sends without a tap.
         await deps.notifier.notifyCustomerEvent(
           origin.customerId,
-          buildPresentation(body, config.preferredLanguage),
+          { ...buildPresentation(body, config.preferredLanguage), contextRef: { kind: 'outbound', ref: queueId } },
           draftButtons(queueId),
         );
 

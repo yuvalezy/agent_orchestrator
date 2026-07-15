@@ -76,19 +76,22 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
     citations: string[],
     language: string,
     original?: string,
+    inboxMessageId?: string,
   ): Promise<void> {
+    const presentation = buildPresentation(body, citations, language, original);
+    if (inboxMessageId) presentation.contextRef = { kind: 'inbox', ref: inboxMessageId };
     await deps.notifier.notifyCustomerEvent(
       customerId,
-      buildPresentation(body, citations, language, original),
+      presentation,
       draftButtons(queueId, { revise: deps.reviseEnabled }),
     );
   }
 
   /** Re-present an existing OPEN draft (reclaim idempotency, must-fix #1) — reuses the
    *  linked decision's stored citations/language so we NEVER re-invoke the LLM. */
-  async function represent(existing: OpenDraftForInbox): Promise<void> {
+  async function represent(existing: OpenDraftForInbox, inboxMessageId: string): Promise<void> {
     const { citations, language } = readDraftMeta(existing.agentOutput);
-    await present(existing.customerId ?? '', existing.queueId, existing.body, citations, language);
+    await present(existing.customerId ?? '', existing.queueId, existing.body, citations, language, undefined, inboxMessageId);
   }
 
   return {
@@ -100,7 +103,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
       const existing = await deps.findOpenDraftByInbox(row.id);
       if (existing) {
         logger.info({ inboxId: row.id, queueId: existing.queueId }, 'drafter: open draft exists — re-presenting');
-        await represent(existing);
+        await represent(existing, row.id);
         return;
       }
 
@@ -181,14 +184,14 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
 
       // (6) Present with Approve/Edit/Reject. A failure here throws → the row is reclaimed
       //     and step (1) re-presents this same draft (no double).
-      await present(customerId, queueId, result.body, citations, config.preferredLanguage, assembleQuestion(row));
+      await present(customerId, queueId, result.body, citations, config.preferredLanguage, assembleQuestion(row), row.id);
     },
 
     async reconfirmOpenDraft(inboxMessageId: string): Promise<boolean> {
       const existing = await deps.findOpenDraftByInbox(inboxMessageId);
       if (!existing) return false;
       logger.info({ inboxId: inboxMessageId, queueId: existing.queueId }, 'drafter: reconfirm — re-presenting open draft');
-      await represent(existing);
+      await represent(existing, inboxMessageId);
       return true;
     },
   };

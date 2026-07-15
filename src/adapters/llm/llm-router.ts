@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
@@ -9,6 +9,7 @@ import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draf
 import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './answer-prompt';
 import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
+import { SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
 
@@ -37,7 +38,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftReviserPort, CorrectionClassifierPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftReviserPort, CorrectionClassifierPort, ScheduleInterpreterPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -238,6 +239,18 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftRevi
       maxTokens: 256,
       validate: parseCorrectionClass,
       customerId: null,
+    });
+  }
+
+  async interpretSchedule(input: ScheduleInterpretRequest, customerId: string): Promise<ScheduleInterpretation> {
+    return this.callStructured<ScheduleInterpretation>({
+      role: 'classify',
+      schema: SCHEDULE_SCHEMA,
+      system: SCHEDULE_SYSTEM,
+      messages: [{ role: 'user', content: scheduleUserMessage(input) }],
+      maxTokens: 512,
+      validate: parseScheduleInterpretation,
+      customerId,
     });
   }
 

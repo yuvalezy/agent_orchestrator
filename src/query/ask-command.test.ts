@@ -26,7 +26,7 @@ function collector() {
   return { posts, postAnswer: async (threadId: string, text: string) => void posts.push({ threadId, text }) };
 }
 
-const msg = (text: string): MessageEvent => ({ threadId: '77', text, by: 'founder' });
+const msg = (text: string): MessageEvent => ({ chatId: '-100', messageId: '1', threadId: '77', text, by: 'founder' });
 
 test('parseAskCommand: matches /ask, /ask@bot, case-insensitively; null for non-commands', () => {
   assert.equal(parseAskCommand('/ask how does dedup work?'), 'how does dedup work?');

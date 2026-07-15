@@ -65,6 +65,16 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
     dependsOn: 'OUTBOUND_ENABLED',
   },
+  {
+    key: 'TELEGRAM_SCHEDULING_ENABLED',
+    type: 'boolean',
+    category: OUTBOUND,
+    label: 'Telegram scheduling',
+    description:
+      'Interprets founder messages in the private Telegram customer forum as one-time reminders or scheduled customer sends.',
+    applyMode: 'restart',
+    default: false,
+  },
 
   // ── Knowledge & Drafting ─────────────────────────────────────────────────────
   {

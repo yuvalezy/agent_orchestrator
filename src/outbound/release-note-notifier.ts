@@ -167,7 +167,7 @@ export function buildReleaseNoteNotifier(deps: ReleaseNoteNotifierDeps): Release
           // handlers act on it by queueId — nothing release-note-specific downstream).
           await deps.notifier.notifyCustomerEvent(
             match.customerId,
-            buildPresentation(drafted.body, citations, config.preferredLanguage),
+            { ...buildPresentation(drafted.body, citations, config.preferredLanguage), contextRef: { kind: 'outbound', ref: queueId } },
             draftButtons(queueId),
           );
 

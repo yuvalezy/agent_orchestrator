@@ -16,6 +16,13 @@ export interface TelegramNotifierOptions {
   adminTopicId?: string;
   /** Resolve a customer's stored topic ref (agent_customers.telegram_topic_id). */
   resolveCustomerTopicId: (customerId: string) => Promise<string | null>;
+  recordNotificationRef?: (input: {
+    chatId: string;
+    messageId: number;
+    threadId: string;
+    customerId: string;
+    context: { kind: 'inbox' | 'outbound'; ref: string };
+  }) => Promise<void>;
 }
 
 function render(n: Notification): string {
@@ -58,12 +65,23 @@ export class TelegramNotifier implements FounderNotifierPort {
     if (!topicId) {
       throw new Error(`No Telegram topic for customer ${customerId} — onboard before notifying`);
     }
-    await this.client.sendMessage({
+    const sent = await this.client.sendMessage({
       chatId: this.opts.supergroupChatId,
       messageThreadId: topicId,
       text: render(n),
       inlineKeyboard: buttons ? [buttons.map((b) => ({ text: b.label, callback_data: b.id }))] : undefined,
     });
+    if (n.contextRef && this.opts.recordNotificationRef) {
+      await this.opts.recordNotificationRef({
+        chatId: this.opts.supergroupChatId,
+        messageId: sent.message_id,
+        threadId: topicId,
+        customerId,
+        context: n.contextRef,
+      }).catch((err) => {
+        logger.warn({ customerId, reason: (err as Error)?.message }, 'Telegram notification context ref write failed');
+      });
+    }
   }
 
   async notifyAdmin(n: Notification): Promise<void> {
@@ -142,9 +160,17 @@ export class TelegramNotifier implements FounderNotifierPort {
     for (const u of updates) {
       const cq = u.callback_query;
       if (cq?.data) {
+        const by = String(cq.from.id);
+        const callbackChatId = cq.message?.chat?.id !== undefined ? String(cq.message.chat.id) : undefined;
+        if (callbackChatId !== this.opts.supergroupChatId) {
+          logger.warn({ by, callbackChatId }, 'Telegram callback rejected — wrong chat');
+          await this.client.answerCallbackQuery(cq.id, 'Wrong chat').catch(() => undefined);
+          next = u.update_id + 1;
+          continue;
+        }
         try {
           const threadId = cq.message?.message_thread_id !== undefined ? String(cq.message.message_thread_id) : undefined;
-          await this.dispatchCallback(cq.data, String(cq.from.id), threadId);
+          await this.dispatchCallback(cq.data, by, threadId);
         } catch (err) {
           // Do NOT advance the offset past a FAILED dispatch (code-review #1):
           // getUpdates(offset) never re-delivers anything below `offset`, and there
@@ -163,11 +189,26 @@ export class TelegramNotifier implements FounderNotifierPort {
       // as callbacks: a failed dispatch must not silently lose the founder's edit.
       const msg = u.message;
       if (this.messageHandler && msg?.text && msg.message_thread_id !== undefined && !msg.from?.is_bot) {
+        const by = msg.from ? String(msg.from.id) : 'unknown';
+        const chatId = String(msg.chat.id);
+        if (chatId !== this.opts.supergroupChatId) {
+          logger.warn({ by, chatId }, 'Telegram message rejected — wrong chat');
+          next = u.update_id + 1;
+          continue;
+        }
         try {
           await this.messageHandler({
+            chatId,
+            messageId: String(msg.message_id),
             threadId: String(msg.message_thread_id),
             text: msg.text,
-            by: msg.from ? String(msg.from.id) : 'unknown',
+            by,
+            replyTo: msg.reply_to_message
+              ? {
+                  messageId: String(msg.reply_to_message.message_id),
+                  text: msg.reply_to_message.text ?? msg.reply_to_message.caption ?? null,
+                }
+              : undefined,
           });
         } catch (err) {
           logger.error({ reason: (err as Error)?.message }, 'Telegram message dispatch failed — holding offset for retry');

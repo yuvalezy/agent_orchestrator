@@ -156,6 +156,12 @@ export interface TelegramMessage {
   text?: string;
   from?: { id: number; is_bot?: boolean };
   chat: { id: number };
+  caption?: string;
+  reply_to_message?: {
+    message_id: number;
+    text?: string;
+    caption?: string;
+  };
 }
 
 export interface TelegramUpdate {

@@ -26,6 +26,8 @@ export interface ClaimedOutbound {
   faith: string | null; // customer faith (null → 'none')
   is_group: boolean | null; // from agent_customer_contacts (null → treat as 1:1)
   attachment_ref: OutboundAttachmentRef | null; // M2 Milestone B (JSONB → parsed object)
+  scheduled_action_id: string | null;
+  bypass_send_window: boolean;
 }
 
 /**
@@ -58,11 +60,13 @@ export async function claimDue(limit: number, channelTypes: string[]): Promise<C
            LIMIT $1
         )
         RETURNING id, customer_id, channel_instance_id, recipient_address, thread_key,
-                  in_reply_to, subject, body, retry_count, attachment_ref
+                  in_reply_to, subject, body, retry_count, attachment_ref,
+                  scheduled_action_id, bypass_send_window
      )
      SELECT c.id, c.customer_id, c.channel_instance_id, ci.channel_type,
             c.recipient_address, c.thread_key, c.in_reply_to, c.subject, c.body, c.retry_count,
-            c.attachment_ref, cust.timezone, cust.faith, cc.is_group
+            c.attachment_ref, c.scheduled_action_id, c.bypass_send_window,
+            cust.timezone, cust.faith, cc.is_group
        FROM claimed c
        JOIN channel_instances ci ON ci.id = c.channel_instance_id
        LEFT JOIN agent_customers cust ON cust.id = c.customer_id
@@ -90,11 +94,18 @@ const POSSIBLY_DELIVERED_PREFIX = 'possibly-delivered: ';
  */
 export async function reclaimStuck(stuckMinutes: number): Promise<string[]> {
   const { rows } = await query<{ id: string }>(
-    `UPDATE agent_outbound_queue
-        SET status = 'failed',
-            last_error = '${POSSIBLY_DELIVERED_PREFIX}stuck in sending — manual review'
-      WHERE status = 'sending' AND updated_at < now() - make_interval(mins => $1::int)
-      RETURNING id`,
+    `WITH stuck AS (
+       UPDATE agent_outbound_queue
+          SET status = 'failed',
+              last_error = '${POSSIBLY_DELIVERED_PREFIX}stuck in sending — manual review'
+        WHERE status = 'sending' AND updated_at < now() - make_interval(mins => $1::int)
+        RETURNING id, scheduled_action_id
+     ), synced AS (
+       UPDATE scheduled_actions SET status = 'failed', completed_at = now(),
+          last_error = '${POSSIBLY_DELIVERED_PREFIX}stuck in sending — manual review'
+        WHERE id IN (SELECT scheduled_action_id FROM stuck WHERE scheduled_action_id IS NOT NULL)
+     )
+     SELECT id FROM stuck`,
     [stuckMinutes],
   );
   return rows.map((r) => r.id);
@@ -102,7 +113,14 @@ export async function reclaimStuck(stuckMinutes: number): Promise<string[]> {
 
 export async function markSent(id: string, providerMessageId: string): Promise<void> {
   await query(
-    `UPDATE agent_outbound_queue SET status = 'sent', provider_message_id = $2, last_error = NULL WHERE id = $1`,
+    `WITH done AS (
+       UPDATE agent_outbound_queue
+          SET status = 'sent', provider_message_id = $2, last_error = NULL
+        WHERE id = $1
+        RETURNING scheduled_action_id
+     )
+     UPDATE scheduled_actions SET status = 'completed', completed_at = now(), last_error = NULL
+      WHERE id = (SELECT scheduled_action_id FROM done)`,
     [id, providerMessageId],
   );
 }
@@ -119,15 +137,21 @@ export async function retryLater(
   backoffMs: number,
 ): Promise<{ failed: boolean }> {
   const { rows } = await query<{ status: string }>(
-    `UPDATE agent_outbound_queue
-        SET retry_count = retry_count + 1,
-            status = CASE WHEN retry_count + 1 >= $3 THEN 'failed' ELSE 'approved' END,
-            send_after = CASE WHEN retry_count + 1 >= $3
-                              THEN send_after
-                              ELSE now() + ($4::double precision * interval '1 millisecond') END,
-            last_error = $2
-      WHERE id = $1
-      RETURNING status`,
+    `WITH retried AS (
+       UPDATE agent_outbound_queue
+          SET retry_count = retry_count + 1,
+              status = CASE WHEN retry_count + 1 >= $3 THEN 'failed' ELSE 'approved' END,
+              send_after = CASE WHEN retry_count + 1 >= $3
+                                THEN send_after
+                                ELSE now() + ($4::double precision * interval '1 millisecond') END,
+              last_error = $2
+        WHERE id = $1
+        RETURNING status, scheduled_action_id
+     ), synced AS (
+       UPDATE scheduled_actions SET status = 'failed', completed_at = now(), last_error = $2
+        WHERE id = (SELECT scheduled_action_id FROM retried WHERE status = 'failed')
+     )
+     SELECT status FROM retried`,
     [id, err, maxAttempts, backoffMs],
   );
   return { failed: rows[0]?.status === 'failed' };
@@ -147,10 +171,15 @@ export async function deferUntil(id: string, sendAfter: Date): Promise<void> {
  *  (F2). Permanent rejects (400/403) pass false → they DO count toward the breaker. */
 export async function failReview(id: string, reason: string, opts?: { possiblyDelivered?: boolean }): Promise<void> {
   const last = opts?.possiblyDelivered ? `${POSSIBLY_DELIVERED_PREFIX}${reason}` : reason;
-  await query(`UPDATE agent_outbound_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
-    id,
-    last,
-  ]);
+  await query(
+    `WITH failed AS (
+       UPDATE agent_outbound_queue SET status = 'failed', last_error = $2 WHERE id = $1
+       RETURNING scheduled_action_id
+     )
+     UPDATE scheduled_actions SET status = 'failed', completed_at = now(), last_error = $2
+      WHERE id = (SELECT scheduled_action_id FROM failed)`,
+    [id, last],
+  );
 }
 
 /** Count sends to a recipient since an ISO instant (rate limit — served by idx_agent_outbound_sent). */

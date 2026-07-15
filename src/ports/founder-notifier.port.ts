@@ -12,6 +12,8 @@ export interface Notification {
   body: string;
   severity?: 'info' | 'action' | 'warning';
   entityRef?: string; // opaque ref back to the originating inbox row / task
+  /** Optional durable origin used when the founder replies to this notification. */
+  contextRef?: { kind: 'inbox' | 'outbound'; ref: string };
   url?: string;
   /** Push is opt-in and only this explicit urgency may fan out beyond Telegram. */
   urgency?: 'routine' | 'urgent';
@@ -67,7 +69,10 @@ export interface DecisionEvent {
 
 /** A free-text founder message in a customer thread (the ✏️ Edit reply). */
 export interface MessageEvent {
+  chatId: string;
+  messageId: string;
   threadId: string;
   text: string;
   by: string;
+  replyTo?: { messageId: string; text: string | null };
 }

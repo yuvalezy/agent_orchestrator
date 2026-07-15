@@ -3,6 +3,7 @@ import { resolveCredential } from '../../config/credentials';
 import { query } from '../../db';
 import { TelegramClient } from './telegram-client';
 import { TelegramNotifier } from './telegram-notifier';
+import { recordTelegramNotificationRef } from '../../scheduling/scheduling-repo';
 
 /**
  * Build the TelegramNotifier from non-secret env + the lazily-resolved bot token
@@ -29,6 +30,7 @@ export function buildTelegramNotifier(): TelegramNotifier {
   return new TelegramNotifier(client, {
     supergroupChatId,
     adminTopicId: env.TELEGRAM_ADMIN_TOPIC_ID,
+    recordNotificationRef: recordTelegramNotificationRef,
     resolveCustomerTopicId: async (customerId: string) => {
       const { rows } = await query<{ telegram_topic_id: string | null }>(
         'SELECT telegram_topic_id FROM agent_customers WHERE id = $1',
