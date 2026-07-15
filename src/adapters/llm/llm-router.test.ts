@@ -14,7 +14,7 @@ const CANNED = {
 
 const VALID_INTENTS = {
   intents: [
-    { category: 'bug_report', summary: 'Export fails', suggested_title: 'Fix export', priority: 'high', confidence: 0.9, related_open_task_ref: null },
+    { category: 'bug_report', summary: 'Export fails', suggested_title: 'Fix export', priority: 'high', confidence: 0.9, explicit_action_request: true, related_open_task_ref: null },
   ],
 };
 

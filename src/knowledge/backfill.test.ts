@@ -22,6 +22,7 @@ const intentOf = (over: Partial<Intent> = {}): Intent => ({
   suggested_title: 'Build X',
   priority: 'medium',
   confidence: 0.9,
+  explicit_action_request: true,
   related_open_task_ref: null,
   ...over,
 });

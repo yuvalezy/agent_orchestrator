@@ -33,7 +33,7 @@ const draft = (over: Partial<DraftForRevise> = {}): DraftForRevise => ({
   priorBody: 'Yes, we have a QuickBooks integration.',
   inboxMessageId: 'inbox-1',
   agentOutput: {
-    intent: { category: 'question_existing', summary: 'Asked about QuickBooks', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+    intent: { category: 'question_existing', summary: 'Asked about QuickBooks', suggested_title: 't', priority: 'low', confidence: 0.9, explicit_action_request: true, related_open_task_ref: null },
     draft_body: 'Yes, we have a QuickBooks integration.',
     citations: [],
     language: 'en',

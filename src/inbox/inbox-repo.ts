@@ -124,3 +124,40 @@ export async function loadThreadMessages(threadId: string, limit: number): Promi
   );
   return rows;
 }
+
+export interface ThreadConversationTurn {
+  direction: 'inbound' | 'outbound';
+  body: string;
+  received_at: string;
+}
+
+/** Prior text turns on the exact channel instance + thread, ordered oldest first.
+ *  The current row is excluded by its (received_at,id) boundary. Including skipped
+ *  outbound rows is intentional: they reveal that the founder initiated the
+ *  exchange. The bounded lookback prevents an ancient WhatsApp chat from being
+ *  presented as the current conversation. */
+export async function loadPriorThreadConversation(input: {
+  instanceId: string;
+  threadId: string;
+  beforeReceivedAt: string;
+  beforeInboxId: string;
+  limit: number;
+}): Promise<ThreadConversationTurn[]> {
+  const { rows } = await query<ThreadConversationTurn>(
+    `SELECT direction, body, received_at
+       FROM (
+         SELECT direction, body, received_at, id
+           FROM agent_inbox
+          WHERE channel_instance_id = $1
+            AND channel_thread_id = $2
+            AND body IS NOT NULL
+            AND (received_at, id) < ($3::timestamptz, $4::bigint)
+            AND received_at >= $3::timestamptz - interval '48 hours'
+          ORDER BY received_at DESC, id DESC
+          LIMIT $5
+       ) prior
+      ORDER BY received_at ASC, id ASC`,
+    [input.instanceId, input.threadId, input.beforeReceivedAt, input.beforeInboxId, input.limit],
+  );
+  return rows;
+}

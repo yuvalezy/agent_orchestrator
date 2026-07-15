@@ -26,6 +26,17 @@ export interface TriageContext {
   message: { subject?: string; body: string | null; language?: string };
   customer?: { ref: string; displayName: string; preferredLanguage?: string };
   recentTasks?: Array<{ ref: string; title: string }>;
+  /** Prior turns from the current active exchange, in chronological order. Outbound
+   *  means the founder wrote it; inbound means the customer wrote it. Keeping the
+   *  timestamps lets the extractor distinguish an immediate acknowledgement from a
+   *  fresh request in a long-lived WhatsApp chat. */
+  recentConversation?: Array<{
+    direction: 'inbound' | 'outbound';
+    body: string;
+    sentAt: string;
+  }>;
+  /** Who sent the first message after the most recent conversation-sized gap. */
+  exchangeInitiator?: 'founder' | 'customer';
   /** Scoped RAG knowledge (customer-scoped + shared), cited. May be empty/absent
    *  (retrieval is additive — it never blocks triage). See src/knowledge/retrieval.ts. */
   knowledge?: KnowledgeChunk[];
@@ -51,6 +62,10 @@ export interface Intent {
   suggested_title: string;
   priority: 'low' | 'medium' | 'high' | 'urgent';
   confidence: number;
+  /** True only when the CURRENT customer message itself contains a concrete ask,
+   *  question, defect report, or status request. Context from earlier turns must
+   *  never make a greeting/thanks/acknowledgement explicit. */
+  explicit_action_request?: boolean;
   related_open_task_ref: string | null;
 }
 

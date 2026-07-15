@@ -45,7 +45,7 @@ after(async () => {
   await closePool();
 });
 
-const BUG: Intent = { category: 'bug_report', summary: 'Export fails', suggested_title: 'Fix export', priority: 'high', confidence: 0.9, related_open_task_ref: null };
+const BUG: Intent = { category: 'bug_report', summary: 'Export fails', suggested_title: 'Fix export', priority: 'high', confidence: 0.9, explicit_action_request: true, related_open_task_ref: null };
 
 function fakes(
   intents: Intent[],
@@ -212,6 +212,46 @@ test('create path: known sender → createTask + bridge + decision + notify(butt
   await f.svc.process(row);
   assert.equal(f.created.length, 1, 'R49: createTask NOT called again');
   assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
+});
+
+test('compliment is context-only and never falls through to createTask', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-compliment', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const thanks: Intent = {
+    category: 'compliment', summary: 'Customer says thanks', suggested_title: 'Thank customer',
+    priority: 'low', confidence: 0.99, explicit_action_request: false, related_open_task_ref: null,
+  };
+  const f = fakes([thanks], 'known');
+  const row = await seedInbox(`${TAG}-compliment`, 'Gracias Yuval');
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 0, 'context-only category cannot mutate the project');
+  assert.equal(f.notified.length, 0, 'a normal acknowledgement does not waste founder attention');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'processed');
+});
+
+test('actionable category without an explicit current-message request is held for confirmation', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-not-explicit', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const mistakenFollowUp: Intent = {
+    category: 'follow_up', summary: 'Customer acknowledges the congratulations', suggested_title: 'Follow up',
+    priority: 'low', confidence: 0.9, explicit_action_request: false, related_open_task_ref: null,
+  };
+  const f = fakes([mistakenFollowUp], 'known');
+  const row = await seedInbox(`${TAG}-not-explicit`, 'Gracias Yuval');
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 0, 'no task without an explicit ask in the current message');
+  assert.match(f.notified[0]?.title ?? '', /Confirm before creating/);
 });
 
 test('multi-intent message → two distinct tasks (no sibling collapse)', async (t) => {
