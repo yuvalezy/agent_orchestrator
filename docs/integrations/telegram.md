@@ -7,7 +7,7 @@ cross-customer notices. The money-loop posts triage notices into a customer's
 topic and attaches a one-tap **❌ cancel** inline button; tapping it cancels the
 task.
 
-This doc covers the one-time bot/supergroup setup, the three env vars, and the
+This doc covers the one-time bot/supergroup setup, runtime configuration, and the
 behaviors an operator needs to know. For the full env reference see
 [configuration.md § Telegram](../configuration.md#telegram); for the customer
 onboarding flow that creates a topic see [operations.md](../operations.md).
@@ -37,6 +37,40 @@ flowchart LR
   `callback_data` encodes the target task; tapping it lands as a `callback_query`
   that the `telegram:callbacks` poller routes back to cancel the task
   (`setStatus('cancelled')`). See [The ❌ callback loop](#the--callback-loop).
+
+## Natural-language scheduling
+
+When `TELEGRAM_SCHEDULING_ENABLED` is enabled, plain founder messages in an
+onboarded customer's topic are checked after `/ask`, slash commands, and armed
+draft edit/revise captures. Examples:
+
+- `Send her a WhatsApp message at 1:30 pm: what's up?`
+- `Remind me tomorrow at 9 am to follow up`
+- Reply to a draft or customer notice with `Send this Friday at 2 pm`.
+
+The bot requires every customer-message command to explicitly choose **WhatsApp**
+or **email**; it asks instead of falling back to a contact channel. It then confirms
+the exact local time, route, and body and adds a **Cancel schedule** button.
+Customer-facing wording must be copied exactly from the
+command or a mapped outbound draft; the AI never invents text that will be sent
+automatically. A replied notification reuses its original active contact,
+account, thread, and quote when available, otherwise the customer's primary
+one-to-one contact is used. Reminders return to the same customer topic.
+
+Scheduling is one-time only. A requested time without a date means its next
+occurrence in `TELEGRAM_SCHEDULING_TZ`. Actions more than the configured grace
+period late are marked missed instead of being delivered stale. Explicit
+customer schedules bypass business-hour/holiday deferral, but rate limits,
+account isolation, and delivery-failure protections still apply.
+
+### Voice and audio commands
+
+Voice notes and uploaded audio in a customer topic are downloaded from Telegram,
+transcribed with OpenAI (`gpt-4o-mini-transcribe`), and passed through the same
+command pipeline as typed text. This includes `/ask`, draft edit/revise, reminders,
+and scheduled customer messages. `OPENAI_API_KEY` must be configured in Connectors.
+Audio is limited to 10 minutes and 20 MB; wrong-chat and bot-authored media is
+rejected before download.
 
 ## One-time setup
 
@@ -94,7 +128,7 @@ This value is `TELEGRAM_SUPERGROUP_CHAT_ID` (non-secret env).
 This value is `TELEGRAM_ADMIN_TOPIC_ID` (non-secret env, optional). If you skip
 it, admin notices land in the supergroup's **General** topic.
 
-### 6. Disable the bot's privacy mode — required for the response drafter's ✏️edit
+### 6. Disable the bot's privacy mode — required for free-text features
 
 The **response drafter** (M2c) lets you **✏️edit** a draft by typing the replacement
 text as a plain message in the customer's topic. By default a bot's **privacy mode**
@@ -109,21 +143,28 @@ bot* — it would **never see** your free-text edit. The drafter's edit capture
    and add it back**, then **re-grant the "Manage Topics" admin** (step 3). Existing
    customer topics survive (they belong to the group, not the bot).
 
-Skip this only if you never enable `KNOWLEDGE_DRAFT_ENABLED` — the ❌-cancel and
-approve/reject **buttons** work with privacy mode on (they arrive as
-`callback_query`, not messages); **only the free-text ✏️edit** needs it off.
+Skip this only if you never enable any **message-reading** surface — the
+❌-cancel and approve/reject **buttons** work with privacy mode on (they arrive
+as `callback_query`, not messages). The free-text **✏️edit**, the **🔁 Revise**
+instruction capture, **`/ask`**, and the **`/pending` / `/briefing` / `/help`**
+commands, plus natural-language scheduling, all read plain `message` updates, so
+each needs privacy mode **OFF**.
 
 ## Configuration
 
 Verified against `src/config/env.ts` and `src/adapters/telegram/factory.ts`.
-Only the bot token is a secret (resolved through `resolveCredential`); the two
-forum ids are plain non-secret env.
+Only the bot token is a secret (resolved through `resolveCredential`); forum ids
+and scheduling knobs are non-secret.
 
 | Variable | Secret? | Required | Purpose |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | **secret** | yes (for Telegram) | Bot token from BotFather (`12345:AA…`). Resolved lazily via `resolveCredential('TELEGRAM_BOT_TOKEN')` — sealed store first, env fallback. Embedded in the Bot API request URL, so the client logs the method name only, never the URL. |
 | `TELEGRAM_SUPERGROUP_CHAT_ID` | no | yes (for Telegram) | The `-100…` supergroup chat id. **Optional in the zod schema** so the service still boots without Telegram, but `buildTelegramNotifier()` throws `TELEGRAM_SUPERGROUP_CHAT_ID is not set` the moment Telegram is actually used. |
 | `TELEGRAM_ADMIN_TOPIC_ID` | no | no | `message_thread_id` of the pinned Admin topic. Blank ⇒ admin notices go to the **General** topic. |
+| `TELEGRAM_SCHEDULING_ENABLED` | no | no | Settings-managed restart flag for natural-language scheduling. Default `false`. |
+| `TELEGRAM_SCHEDULING_TZ` | no | no | Founder timezone used to interpret and display schedule times. Default `America/Panama`. |
+| `TELEGRAM_SCHEDULING_INTERVAL_MS` | no | no | Due-action worker cadence. Default `15000`. |
+| `TELEGRAM_SCHEDULING_GRACE_MINUTES` | no | no | Maximum late execution window before an action is marked missed. Default `15`. |
 
 ```bash
 # In .env — the token is a secret; the two ids are not
@@ -175,6 +216,50 @@ The cancel button is a two-part contract between the notifier and the
 
 `answerCallbackQuery` is best-effort: a stale callback id (older than ~48h, or
 after a restart) fails harmlessly and is swallowed.
+
+## Draft approvals & the 🔁 Revise loop
+
+When the response drafter is on (`KNOWLEDGE_DRAFT_ENABLED`), an answerable
+`question_existing` intent produces a **cited draft reply** parked in the
+customer's topic with inline buttons. The same guarded decision records back the
+Telegram buttons and the console **Approvals** tab — only the first surface to
+act creates the task / flips the queue (see
+[operations.md § Cross-surface approvals](../operations.md#cross-surface-approvals)).
+
+| Button | Outcome |
+|---|---|
+| ✅ **Approve** | The draft is armed (`is_draft=false`) and the outbound drainer sends it (threaded, same-account for email). |
+| ✏️ **Edit** | Type the replacement text as a plain message in the topic; the next draft is replaced and approved. (Needs privacy mode **OFF**.) |
+| ❌ **Reject** | The draft is cancelled and the decision resolved `rejected`. |
+| 🔁 **Revise** *(needs `DRAFT_REVISE_ENABLED`)* | Type a correction **instruction** (e.g. "be warmer, mention the Tuesday meeting"); the drafter regenerates the draft grounded in the original inbound + prior draft + your directive, then re-presents a fresh draft for approve/edit/reject. The correction is learned into the right scope (a shared product fact for every customer, or one customer's preference) so it never repeats. |
+
+- **Nothing is ever auto-sent.** Revise re-presents a *draft* the founder still
+  approves/edits/rejects.
+- **Style/persona corrections** (tone, warmth, formality) have no lexical overlap
+  with any given question, so they'd never clear the retrieval distance gate. The
+  **style lane** (`STYLE_LANE_ENABLED`) injects all of a customer's active style
+  corrections into every draft as persistent voice guidance — a directive, never a
+  cited source.
+- **Calendar context** (`CALENDAR_ENABLED`): at draft time the drafter also pulls
+  the customer's upcoming meetings from the founder's Google Calendar and injects
+  them as context the reply may acknowledge ("see you Tuesday"), never a citation.
+
+## Founder commands (/ask, /pending, /briefing, /help)
+
+Three optional, default-off surfaces turn the founder topic into a query/command
+surface. All read `message` updates, so they need the bot's **group privacy mode
+OFF** (same as the ✏️edit / 🔁 Revise capture — see [§6](#6-disable-the-bots-privacy-mode--required-for-the-response-drafters-edit)).
+
+| Command | Gate | What it does |
+|---|---|---|
+| `/ask <question>` | `QUERY_ENGINE_ENABLED` | Semantic search over the **internal** Project Brain corpus (`internal_knowledge`) → LLM-synthesized **cited** answer posted back in the founder topic. Reuses `KNOWLEDGE_INTERNAL_K` / `_MAX_DISTANCE`. Isolation holds — the customer-drafting path still can't reach internal rows. See [project-brain.md](../project-brain.md). |
+| `/pending` | `SLASH_COMMANDS_ENABLED` | Counts + oldest age of the pending draft-reply and backfill-proposal queues, replied in the requesting thread. |
+| `/briefing` | `SLASH_COMMANDS_ENABLED` | The [daily briefing](../configuration.md#intelligence--digests) on demand, posted to the requesting thread. |
+| `/help` | `SLASH_COMMANDS_ENABLED` | Lists the commands. |
+
+`/ask` is its own handler; the others share a core router (`src/query/commands.ts`).
+Both the daily briefing and the weekly-patterns digest also post **automatically**
+to the Admin topic when their workers are enabled (idempotent per day/week).
 
 ## Telegram Bot API notes (client behavior)
 

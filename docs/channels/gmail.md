@@ -1,10 +1,20 @@
-# Gmail channel — configuring the two email accounts
+# Gmail channel — configuring email accounts
 
-This is the end-to-end guide to wiring your **two Gmail accounts** (personal + work)
-into the Agent Orchestrator so inbound mail feeds the money-loop. Follow it once per
-account. Do the [Google Cloud one-time setup](#2-google-cloud-one-time-setup) first,
-then repeat steps [3](#3-mint-the-refresh-tokens-once-per-account)–[4](#4-store-the-credential--set-the-account-email)
-for each account.
+This is the end-to-end guide to wiring your **Gmail accounts** into the Agent
+Orchestrator so inbound mail feeds the money-loop. There are two ways to add
+accounts:
+
+- **Connectors tab (preferred, dynamic).** Add, label, enable/disable, and remove
+  as many Gmail accounts as you like from the console — it runs the Google OAuth
+  flow in-browser and stores each token in the sealed credentials store. See
+  [§1b](#1b-add-accounts-from-the-console-connectors-tab). This is the primary
+  path day-to-day and the only way to add a third+ mailbox.
+- **Seed instances + CLI (legacy).** The two seeded rows
+  (`email:gmail:personal` / `email:gmail:work`) + `npm run gmail:oauth`. Still
+  works; documented in [§2](#2-google-cloud-one-time-setup)–[§4](#4-store-the-credential--set-the-account-email).
+
+Both paths share the same [Google Cloud one-time setup](#2-google-cloud-one-time-setup)
+(the OAuth client) — do that first, then pick one path per account.
 
 See also: [Configuration](../configuration.md) · [Operations](../operations.md).
 
@@ -13,16 +23,19 @@ See also: [Configuration](../configuration.md) · [Operations](../operations.md)
 ## 1. Overview
 
 Each Gmail account is one row in the `channel_instances` table. Two rows are seeded
-(migration `src/db/migrations/001_channel_instances.sql`):
+(migration `src/db/migrations/001_channel_instances.sql`) for the legacy path:
 
 | `name`                  | `channel_type` | `provider` | `credentials_ref`      | `config.accountEmail` (seed placeholder) |
 | ----------------------- | -------------- | ---------- | ---------------------- | ---------------------------------------- |
 | `email:gmail:personal`  | `email`        | `gmail`    | `GMAIL_PERSONAL_OAUTH` | `CHANGE_ME_personal@gmail.com`           |
 | `email:gmail:work`      | `email`        | `gmail`    | `GMAIL_WORK_OAUTH`     | `CHANGE_ME_work@example.com`             |
 
+The Connectors tab creates its own rows with a dedicated `credentials_ref` per
+account (no `CHANGE_ME` placeholders) — the seed rows are just the legacy defaults.
+
 At boot the channel registry (`src/adapters/channel-registry.ts`) builds one
-`EmailChannelAdapter` per row, and `main.ts` starts one **reconcile poller** per
-ready Gmail instance. Each poller pulls new inbox mail via the Gmail **History API**
+`EmailChannelAdapter` per ready row, and `main.ts` starts one **reconcile poller**
+per ready Gmail instance. Each poller pulls new inbox mail via the Gmail **History API**
 and ingests it into the same triage → dedup → notify money-loop that WhatsApp uses.
 
 ```mermaid
@@ -39,44 +52,101 @@ graph LR
   CMT --> TG
 ```
 
-Two things must be set per account before its poller runs (either one missing → the
-instance is **skipped** at boot, see [Troubleshooting](#7-troubleshooting)):
+A Gmail account is **ready** (gets a poller) once it has both:
 
-1. The **OAuth credential** (`GMAIL_PERSONAL_OAUTH` / `GMAIL_WORK_OAUTH`) — a JSON
-   blob `{client_id, client_secret, refresh_token}`.
-2. The instance's **`config.accountEmail`** — must be a real address (not the
-   `CHANGE_ME…` placeholder).
+1. An **OAuth credential** (a `{client_id, client_secret, refresh_token}` blob) —
+   stored under its `credentials_ref`. The Connectors tab stores this
+   automatically; the legacy path stores it via `/admin/credentials` or `.env`.
+2. A real **`config.accountEmail`** (not the `CHANGE_ME…` placeholder). The
+   Connectors tab captures it from the Google profile; the legacy path sets it
+   via SQL ([§4b](#4b-set-the-instances-account-email)).
+
+Either missing → the instance is **skipped** at boot (see
+[Troubleshooting](#7-troubleshooting)).
 
 ---
 
+## 1b. Add accounts from the console (Connectors tab)
+
+Once the [Google Cloud one-time setup](#2-google-cloud-one-time-setup) is done and
+the orchestrator is running with the console mounted, add accounts from the UI
+(**Connectors** tab). No CLI, no SQL.
+
+**One-time prerequisites:**
+
+1. Store a **"Web application"** Google OAuth client as the `GOOGLE_OAUTH_CLIENT`
+   credential (JSON `{"web":{"client_id":"…","client_secret":"…"}}`, or a flat
+   `{client_id,client_secret}`). This is the client the console drives the
+   redirect flow with. (If unset, the console falls back to reusing the client
+   embedded in any stored Gmail credential.)
+2. Register
+   `<CONSOLE_PUBLIC_URL>/console/api/connectors/oauth/callback` as an authorized
+   redirect URI for that Web client in GCP. `CONSOLE_PUBLIC_URL` is the public
+   origin the console is reached at (e.g. `https://<machine>.ts.net`).
+
+**Per account:** Connectors → Gmail → **Add account** → pick a label (e.g. *work*,
+*personal*) → the console opens the Google consent page (requesting
+`gmail.readonly` + `gmail.send`) → on consent Google redirects to the callback,
+the server exchanges the code, reads the connected account email from the Gmail
+profile, and stores the refresh-token blob + creates the `channel_instances` row.
+
+From the list you can **enable/disable** (a disabled account gets no poller but
+keeps its history), **relabel**, and **remove**. Removing an account that has
+ingestion history returns a friendly `409` (disable instead to stop ingesting
+without orphaning rows). Secrets show `last4` only — values are never returned.
+
+> The Google OAuth callback is a **public** top-level redirect (the
+> strict-sameSite session cookie is absent cross-site), so it authenticates via a
+> **signed `state`** (HMAC of `credentialName + service + accountId` with the
+> console session secret) — not the session. The same flow adds **Calendar**
+> accounts (scope `calendar.readonly`) for `CALENDAR_ENABLED`.
+
+Restart (or the next registry rebuild) so a newly-added account gets its poller.
+Confirm with the boot log: `email pollers registered {"emailInstances":N}` and no
+`instance skipped` warning for the new row.
+
+---
+
+
 ## 2. Google Cloud one-time setup
 
-Do this **once** for the project — the same OAuth client works for both accounts.
-These steps mirror the header of `scripts/gmail-oauth.ts`.
+Do this **once** for the project. These steps mirror the header of
+`scripts/gmail-oauth.ts`. The **CLI path** (`gmail:oauth`) uses a **Desktop-app**
+OAuth client (loopback redirect); the **Connectors tab** uses a **Web-application**
+client (see [§1b](#1b-add-accounts-from-the-console-connectors-tab)). You can
+create both client types in the same GCP project; the Gmail API enable + consent
+screen + scopes are shared.
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) → **create or
    select a project**.
 2. **APIs & Services → Library** → search for **"Gmail API"** → **Enable**.
 3. **APIs & Services → OAuth consent screen**:
    - User type: **External**.
-   - Under **Test users**, add **both** of your Gmail addresses (personal and work).
+   - Under **Test users**, add every Gmail address you'll connect (personal, work, …).
      (An unpublished External app only lets its listed test users authorize — you
      do not need to submit the app for verification.)
-   - Add the two scopes the tool requests:
+   - Add the scopes the tools request:
      - `https://www.googleapis.com/auth/gmail.readonly`
      - `https://www.googleapis.com/auth/gmail.send`
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
-   - Application type: **Desktop app**.
-   - Create it, then **Download JSON**. Keep this file safe — it holds the
-     `client_id` + `client_secret`.
+   - **CLI path:** Application type **Desktop app**. Create it, then **Download JSON**
+     — it holds the `client_id` + `client_secret` for `gmail:oauth` / `calendar:oauth`.
+   - **Connectors path:** Application type **Web application**. Add
+     `<CONSOLE_PUBLIC_URL>/console/api/connectors/oauth/callback` to its authorized
+     redirect URIs, then store the JSON as the `GOOGLE_OAUTH_CLIENT` credential.
 
-> Why "Desktop app": the minting script uses a **loopback redirect**
+> Why "Desktop app" for the CLI: the minting script uses a **loopback redirect**
 > (`http://localhost:<port>`), which Desktop clients allow with no redirect URI to
-> register. A "Web application" client would reject it.
+> register. A "Web application" client would reject it. The Connectors tab, by
+> contrast, is a server-side redirect flow and needs the Web client.
 
 ---
 
 ## 3. Mint the refresh tokens (once per account)
+
+> Using the **Connectors tab**? Skip §3–§4 — the console mints and stores the
+> token and sets the account email for you. This section is the **CLI/legacy**
+> path for the two seed instances.
 
 `npm run gmail:oauth` runs the loopback OAuth flow and prints a **refresh token** for
 one account. Run it **twice** — once per account — and pick the matching Google

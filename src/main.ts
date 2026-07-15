@@ -1,7 +1,7 @@
 import { env } from './config/env';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { logger } from './logger';
+import { logger, startupLogger } from './logger';
 import { runMigrations } from './db/migrate';
 import { closePool, withClient } from './db';
 import { buildApp, type AppDeps } from './app';
@@ -670,7 +670,13 @@ async function main(): Promise<void> {
 
   const app = buildApp(appDeps);
   const server = app.listen(env.PORT, () => {
-    logger.info(`agent-orchestrator listening on http://localhost:${env.PORT}`);
+    const base = `http://localhost:${env.PORT}`;
+    startupLogger.info(`agent-orchestrator listening on ${base}`);
+    if (consoleConfig) {
+      startupLogger.info(`founder console → ${base}/console`);
+    } else {
+      startupLogger.info('founder console unavailable (console secrets absent or invalid)');
+    }
   });
 
   // M1.3 ingestion pollers + M1.5b money-loop workers. (Heartbeat retired at M1.5b —

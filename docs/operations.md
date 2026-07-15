@@ -131,6 +131,29 @@ failures do not delay workflows, and lock screens receive only a generic alert
 that links to `/console`. On iOS, browser push support generally requires a
 Home-Screen web app; use Telegram when it is unavailable.
 
+### Settings & Connectors
+
+The console's **Settings** and **Connectors** tabs are the DB-authoritative
+editors for most runtime configuration (see [configuration.md § Settings &
+Connectors](./configuration.md#settings--connectors--the-db-authoritative-overlay)).
+
+- **Settings** toggles the `*_ENABLED` kill-switches and the pass-2 tuning knobs
+  (LLM routing/effort, backfill determinism, style-lane size). A setting marked
+  *live* applies to the next LLM call / next backfill sweep with no restart; one
+  marked *restart* takes effect after `./debug.sh` (it is read at worker
+  registration). First boot seeds every value from `.env`; thereafter the DB wins.
+- **Connectors** manages secrets and Google accounts in the encrypted credentials
+  store — add/label/enable/disable Gmail and Calendar accounts via an in-console
+  Google OAuth redirect flow (register
+  `<CONSOLE_PUBLIC_URL>/console/api/connectors/oauth/callback` as a redirect URI
+  in your GCP "Web application" client, stored as the `GOOGLE_OAUTH_CLIENT`
+  credential). Removing an account with ingestion history returns a friendly
+  `409` instead of silently orphaning it. Secrets show `last4` only.
+
+Use `npm run settings:import` to seed/migrate a settings snapshot from a file
+(never deletes rows). The raw credentials store is also reachable over
+`/admin/credentials` — see [configuration.md](./configuration.md).
+
 ## Background workers
 
 All workers run on an interval/backoff loop (recursive `setTimeout`; exponential backoff on consecutive failures, capped at 10× the interval). Each tick is isolated — one failure never blocks the others. Their live status is exposed on `/health`.
@@ -141,8 +164,37 @@ All workers run on an interval/backoff loop (recursive `setTimeout`; exponential
 | `email:reconcile:<instance>` | One per ready Gmail instance. Polls Gmail since the stored cursor and ingests; cursor advances only after every message ingests. Runs immediately at boot. | `EMAIL_RECONCILE_INTERVAL_MS` (default 60000 = 60 s) |
 | `inbox:processor` | The money-loop core. Claims a batch of pending `agent_inbox` rows, runs triage (LLM → EZY task create/update/comment → Telegram notify), and fails poison-pill rows after max attempts. | Fixed **10 s** (not env-configurable) |
 | `telegram:callbacks` | Polls Telegram `getUpdates` from a persisted offset and dispatches the **❌-cancel** decision to the cancel handler (sets the EZY task to `cancelled`). | Fixed **3 s** (not env-configurable) |
+| `schedule:due` | Claims durable due reminders/customer schedules; reminders post to the originating topic and customer messages enter the approved outbound queue exactly once. Registered only when Telegram scheduling is enabled. | `TELEGRAM_SCHEDULING_INTERVAL_MS` (default **15 s**) |
 
 The two money-loop workers (`inbox:processor`, `telegram:callbacks`) require Telegram to be configured. If it is not, they are skipped with a warning and **ingestion still runs** — but nothing gets triaged or notified.
+
+### Gated workers
+
+These register **only** when their flag is on (Settings tab; all default off, so
+a stock boot runs just ingestion + the money loop). Each is isolated — one
+failure never blocks the others — and most are idempotent per day/week. Full
+flag reference in [configuration.md § Feature flags](./configuration.md#feature-flags).
+
+| Worker | Gate | What it does | Interval |
+|--------|------|--------------|----------|
+| `outbound:drainer` | `OUTBOUND_ENABLED` | Claims approved queue rows and sends them (WhatsApp; + email when `OUTBOUND_EMAIL_ENABLED`). Rate/gap/failure-limited, holiday-aware. | `OUTBOUND_DRAIN_INTERVAL_MS` (5s) |
+| `knowledge:sync` | `KNOWLEDGE_SYNC_ENABLED` | Hash-controlled reconcile of folder-sourced customer docs → `agent_memory` (embeds only changed docs; tombstones removed). Advisory-locked. | `KNOWLEDGE_SYNC_INTERVAL_MS` (1h) |
+| `task-inventory:sync` | `TASK_INVENTORY_ENABLED` | Mirrors each customer's portal tasks (all statuses) into `agent_memory` as `memory_type='task'`. When `LIVE_DEDUP_FINGERPRINT_ENABLED` is also on, the same tick re-fingerprints OPEN tasks for live dedup. Advisory-locked. | `TASK_INVENTORY_SYNC_INTERVAL_MS` (20m) |
+| `internal:sync` | `KNOWLEDGE_INTERNAL_ENABLED` | Reconciles the Project Brain internal corpus into `internal_knowledge`. Advisory-locked. (The MCP server is a separate process; see [project-brain.md](./project-brain.md).) | `KNOWLEDGE_INTERNAL_SYNC_INTERVAL_MS` (1h) |
+| `release-note:notify` | `RELEASE_NOTE_DRAFTS_ENABLED` | Scans `RELEASE_NOTES_DIR`, matches each note to customers' history, drafts one cited notification per match (`is_draft=true`). Advisory-locked. | `RELEASE_NOTE_SYNC_INTERVAL_MS` (1h) |
+| `feedback-learning` | `FEEDBACK_LEARNING_ENABLED` | Embeds a customer-scoped feedback memory for each modified/rejected draft. | `FEEDBACK_LEARNING_INTERVAL_MS` (5m) |
+| `acceptance-report` | `ACCEPTANCE_REPORT_ENABLED` (+Telegram) | Daily draft-acceptance report (24h/7d/30d) to the Admin topic. Idempotent per calendar day. | `ACCEPTANCE_REPORT_INTERVAL_MS` (6h) |
+| `weekly-patterns` | `WEEKLY_PATTERNS_ENABLED` (+Telegram) | Weekly recurring-pattern digest (clusters stored signal embeddings). Read-only; idempotent per ISO week. | `WEEKLY_PATTERNS_INTERVAL_MS` (6h) |
+| `daily-briefing` | `DAILY_BRIEFING_ENABLED` (+Telegram) | Once-a-day "what's waiting on you" digest (pending drafts + backfill proposals + attention list). Idempotent per calendar day. | `DAILY_BRIEFING_INTERVAL_MS` (6h) |
+| `task-event` | `PROACTIVE_NOTIFICATIONS_ENABLED` (+Telegram) | Polls the portal for tasks moved to done; drafts one "your request is resolved" reply per customer-originated task. First tick per customer only watermarks (no backlog). | `TASK_EVENT_POLL_INTERVAL_MS` (15m) |
+
+> Dependency notes: the **drafter** (`KNOWLEDGE_DRAFT_ENABLED`) and the
+> **/ask + slash-command** surfaces (`QUERY_ENGINE_ENABLED` /
+> `SLASH_COMMANDS_ENABLED`) are wired into the money-loop callback poller, not
+> separate workers — they need the bot's group privacy mode OFF. The
+> **cross-channel dedup** and **calendar read** are inline in triage/drafting
+> (no worker). Embedding-dependent workers warn at boot if `OPENAI_API_KEY` is
+> unset and retry next tick.
 
 ## npm scripts
 
@@ -152,11 +204,27 @@ The two money-loop workers (`inbox:processor`, `telegram:callbacks`) require Tel
 | `migrate` | `npm run migrate` | Apply pending SQL migrations from `src/db/migrations`. |
 | `dev` | `npm run dev` | Run with `tsx watch` (auto-reload). Prefer `./debug.sh` for a stable run. |
 | `onboard` | `npm run onboard -- --bp-ref=<uuid> --project-ref=<uuid> [--work-item-type-ref=<uuid>]` | Onboard a customer — see [below](#onboarding-a-customer). |
-| `gmail:oauth` | `npm run gmail:oauth -- --client ~/Downloads/client_secret_XXX.json` | Mint a Gmail refresh token (readonly + send) for one account via the loopback flow. See [channels/gmail.md](./channels/gmail.md). |
+| `gmail:oauth` | `npm run gmail:oauth -- --client ~/Downloads/client_secret_XXX.json` | Mint a Gmail refresh token (readonly + send) for one account via the loopback flow. See [channels/gmail.md](./channels/gmail.md). (Prefer the **Connectors** tab for day-to-day account management.) |
+| `calendar:oauth` | `npm run calendar:oauth [-- --from-gmail work\|personal]` | Mint a read-only Google Calendar refresh token for one account (reuses the Gmail OAuth client). Prereq for `CALENDAR_ENABLED` (or use a Connectors Calendar account). |
 | `reconcile:once` | `npm run reconcile:once` | Run exactly one `whatsapp:reconcile` tick and exit (deterministic drills). Shares the same cursor as the worker. |
+| `knowledge:reconcile:once` | `npm run knowledge:reconcile:once` | One-shot embed of the **customer** KB (Layer B) without booting or flipping `KNOWLEDGE_SYNC_ENABLED`. |
+| `internal:reconcile:once` | `npm run internal:reconcile:once` | One-shot embed of the **Project Brain** internal corpus (needs `OPENAI_API_KEY`). See [project-brain.md](./project-brain.md). |
+| `task-inventory:reconcile:once` | `npm run task-inventory:reconcile:once` | One-shot mirror of every onboarded customer's portal tasks into `agent_memory` (Layer-1 backfill groundwork). |
+| `backfill:dry` | `npm run backfill:dry -- [--customer=<bpRef>]` | Dry-run the historical-thread → task reconcile (inbox + Gmail + WhatsApp + starred legs). Writes NOTHING — prints the reconciliation report. |
+| `backfill:run` | `npm run backfill:run -- [--customer=<bpRef>]` | Live backfill sweep — writes memory links, records proposals, posts one ✅/❌ Telegram card each (a tap creates the task). Idempotent via `app_state`. |
+| `backfill:recollapse` | `npm run backfill:recollapse -- --apply <distance>` | One-off: merge already-pending near-duplicate proposals (losers → `rejected`, `superseded_by` kept). Without `--apply` it only reports. |
+| `backfill:style-kind` | `npm run backfill:style-kind` | One-off: backfill the `kind='style'` metadata onto existing correction memories (for the style lane). |
+| `customer:identity` | `npm run customer:identity -- <bpRef\|customerId>` | Read-only customer identity-coverage report (flags `no_bp_ref`, `no_email_domain`, `zero_wa_messages`, `name_domain_mismatch`, …). |
+| `feedback:check` | `npm run feedback:check` | Verify each correction/feedback memory's trigger message clears the retrieval distance gate (reports cosine distance vs `KNOWLEDGE_RETRIEVAL_MAX_DISTANCE`). |
+| `settings:import` | `npm run settings:import -- <file>` | Seed/migrate a Settings snapshot into `app_settings` (never deletes rows). |
+| `mcp:project-brain` | `npm run mcp:project-brain` | Run the Project Brain stdio MCP server (the `claude mcp add` one-liner in [project-brain.md](./project-brain.md) wraps this). |
 | `smoke:webhook` | `npm run smoke:webhook -- [--id=<msgId>] [--body="text"] [--from=<number>] [--voice] [--outbound] [--tamper]` | POST a signed synthetic WhatsApp webhook to a running orchestrator; `--tamper` proves the 401 path. See [channels/whatsapp.md](./channels/whatsapp.md). |
 | `triage:sample` | `npm run triage:sample -- [--provider=openai]` | Run the LLM router on a canned message — prints extracted intents + the recorded `llm_costs` row. See [integrations/llm.md](./integrations/llm.md). |
 | `contract:ezy` | `npm run contract:ezy` | Live create → find → comment → status round-trip against the EZY test tenant (needs `TEST_PROJECT_REF`/`TEST_BP_REF`). See [integrations/ezy-portal.md](./integrations/ezy-portal.md). |
+| `build:console` | `npm run build:console` | Production-build the `web/` console (Vite). `npm run build` does the backend `tsc` + this. |
+| `typecheck` / `typecheck:console` | `npm run typecheck` · `npm run typecheck:console` | Type-check the backend / the `web/` console. |
+| `test` / `test:containers` | `npm run test` · `npm run test:containers` | Node test runner over `src/**/*.test.ts`; the container variant runs the postgres race-recovery drill (`RUN_CONTAINERS=true`). |
+| `lint` / `lint:boundary` | `npm run lint` · `npm run lint:boundary` | ESLint; the boundary check enforces the `src/core` ↔ `src/adapters` import rule (D1). |
 
 ## Onboarding a customer
 
