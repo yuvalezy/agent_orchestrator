@@ -1,6 +1,6 @@
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CheckCircle2, CircleAlert, Pencil, Send, Sparkles, X } from 'lucide-react';
+import { CheckCircle2, CircleAlert, LoaderCircle, Pencil, Send, Sparkles, X } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
 
 // The Approvals surface: clear pending draft replies + backfill task proposals in the UI instead of
@@ -97,7 +97,7 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
   const caps = useQuery({ queryKey: ['approvals', 'capabilities'], queryFn: () => api<{ data: { reviseEnabled: boolean } }>('/approvals/capabilities') });
   const reviseEnabled = caps.data?.data.reviseEnabled ?? false;
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
-  const [revising, setRevising] = useState<{ id: string; text: string } | null>(null);
+  const [revising, setRevising] = useState<{ id: string; text: string; generating: boolean } | null>(null);
   const { ask, dialog } = useConfirm();
   const refetch = (): void => void client.invalidateQueries({ queryKey: ['approvals', 'drafts'] });
   const { err, ok, run } = useActionState(refetch);
@@ -141,17 +141,31 @@ function DraftsTab({ query }: { query: ReturnType<typeof useQuery<{ data: DraftR
               </div>
             ) : isRevising ? (
               <div className="mt-3 space-y-2">
-                <input value={revising.text} onChange={(e) => setRevising({ id: d.queue_id, text: e.target.value })} placeholder="Instruction, e.g. 'be more concise and offer a call'" className="w-full rounded bg-zinc-950 p-3 text-xs text-zinc-200 outline-none ring-1 ring-zinc-800 focus:ring-emerald-500" />
+                <input value={revising.text} onChange={(e) => setRevising({ id: d.queue_id, text: e.target.value, generating: false })} readOnly={revising.generating} aria-readonly={revising.generating} placeholder="Instruction, e.g. 'be more concise and offer a call'" className="w-full rounded bg-zinc-950 p-3 text-xs text-zinc-200 outline-none ring-1 ring-zinc-800 read-only:cursor-wait read-only:text-zinc-500 focus:ring-emerald-500" />
+                {revising.generating && (
+                  <p className="flex items-center gap-2 text-xs text-violet-200" role="status" aria-live="polite">
+                    <LoaderCircle size={14} className="animate-spin" aria-hidden="true" />
+                    Generating a new message, please wait…
+                  </p>
+                )}
                 <div className="flex gap-2">
-                  <button disabled={!revising.text.trim()} onClick={() => run(post(`/approvals/drafts/${d.queue_id}/revise`, { instruction: revising.text }).then(() => { setRevising(null); refetch(); }), 'Revised — review the regenerated draft.')} className={`${btn} bg-violet-400 text-zinc-900`}>Regenerate</button>
-                  <button onClick={() => setRevising(null)} className={`${btn} bg-zinc-800 text-zinc-300`}>Cancel</button>
+                  <button disabled={!revising.text.trim() || revising.generating} onClick={() => {
+                    const instruction = revising.text;
+                    setRevising({ ...revising, generating: true });
+                    void run(post(`/approvals/drafts/${d.queue_id}/revise`, { instruction }).then(() => { setRevising(null); refetch(); }), 'Revised — review the regenerated draft.')
+                      .finally(() => setRevising((current) => current?.id === d.queue_id ? { ...current, generating: false } : current));
+                  }} className={`${btn} bg-violet-400 text-zinc-900`}>
+                    {revising.generating && <LoaderCircle size={12} className="mr-1 inline animate-spin" aria-hidden="true" />}
+                    {revising.generating ? 'Generating…' : 'Regenerate'}
+                  </button>
+                  <button disabled={revising.generating} onClick={() => setRevising(null)} className={`${btn} bg-zinc-800 text-zinc-300`}>Cancel</button>
                 </div>
               </div>
             ) : (
               <div className="mt-3 flex flex-wrap gap-2">
                 <button onClick={() => ask({ title: 'Send reply to customer?', message: `This sends the draft to ${d.customer_name ?? 'the customer'} via ${d.channel_name ?? d.channel_type ?? 'the channel'}.`, confirmLabel: 'Approve & send', tone: 'primary', onConfirm: () => void run(post(`/approvals/drafts/${d.queue_id}/approve`).then(refetch), 'Approved — sending.') })} className={`${btn} bg-emerald-400 text-zinc-900`}><Send size={12} className="mr-1 inline" />Approve &amp; send</button>
                 <button onClick={() => setEditing({ id: d.queue_id, text: d.draft_body ?? '' })} className={`${btn} bg-zinc-800 text-zinc-200`}><Pencil size={12} className="mr-1 inline" />Edit</button>
-                {reviseEnabled && <button onClick={() => setRevising({ id: d.queue_id, text: '' })} className={`${btn} bg-zinc-800 text-zinc-200`}><Sparkles size={12} className="mr-1 inline" />Revise</button>}
+                {reviseEnabled && <button onClick={() => setRevising({ id: d.queue_id, text: '', generating: false })} className={`${btn} bg-zinc-800 text-zinc-200`}><Sparkles size={12} className="mr-1 inline" />Revise</button>}
                 <button onClick={() => ask({ title: 'Reject this draft?', message: 'The draft will be cancelled and not sent.', confirmLabel: 'Reject', tone: 'danger', onConfirm: () => void run(post(`/approvals/drafts/${d.queue_id}/reject`).then(refetch), 'Rejected.') })} className={`${btn} bg-red-400/15 text-red-300`}><X size={12} className="mr-1 inline" />Reject</button>
               </div>
             )}
