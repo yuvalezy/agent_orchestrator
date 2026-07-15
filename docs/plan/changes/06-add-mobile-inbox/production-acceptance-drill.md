@@ -2,15 +2,17 @@
 
 > ## ⏸ Deferred — not runnable today (R53)
 >
-> **There is no deployment to run this against.** Tailscale is not installed on the host, so
-> there is no tailnet, no MagicDNS name, and no TLS. `/console` is bound to `127.0.0.1:3100`
-> (`src/main.ts:685`) and is reachable only from the `fedora` box. A phone cannot reach it over
-> `http://<lan-ip>:3100` either: the session cookie is `Secure`, so a browser drops it on a
-> plaintext origin and login cannot persist.
+> **There is no phone-reachable console to run this against.** This drill is specifically about
+> the *remote* experience; the console itself is fine and works from the host right now at
+> `http://localhost:3100/console/`. But Tailscale is not installed, so there is no tailnet, no
+> MagicDNS name, and no TLS. `/console` binds `127.0.0.1:3100` (`src/main.ts:685`). A phone
+> cannot substitute the LAN IP: `http://192.168.88.25:3100` is not a browser secure context, so
+> the `Secure` cookie is dropped and login cannot persist.
 >
 > **Unblock by choosing a TLS terminator** — Tailscale Serve (as `operations.md` intends) or the
-> nginx already on `:443` — as its own change. That choice rewrites § A7 below and the
-> "Tailnet transport" entry in [`design.md`](./design.md). Everything else on this page stays.
+> nginx already on `:443`. That is a config change on this same host, not a migration. It
+> rewrites § A7 below and the "Tailnet transport" entry in [`design.md`](./design.md).
+> Everything else on this page stays.
 >
 > **Already banked, don't redo:** A7's network-exposure half is verified — `192.168.88.25:3100`
 > refuses on `/console/` and `/health`, `127.0.0.1:3100/health` returns 200, `ss -ltnp` shows

@@ -64,17 +64,22 @@ same-origin by the Express process. It does not mount unless both console secret
 are configured. The browser gets an HttpOnly Secure SameSite session cookie; every
 mutation also requires the in-memory CSRF token returned at sign-in.
 
-> **Not deployed yet (R53) — this section is the intended target, not the current
-> state.** Tailscale is not installed on the dev host, so there is no tailnet and no
-> MagicDNS name. The app binds `127.0.0.1:3100` (`src/main.ts:685`), so today the
-> console is reachable **only from the host itself**. It cannot be reached from a phone
-> over `http://<lan-ip>:3100` either — and not as a matter of policy: the session cookie
-> is `Secure`, so a browser drops it on a plaintext origin and the next request 401s.
-> Serving the console needs a TLS terminator first. Choosing one (Tailscale Serve, as
-> below, or the nginx already on `:443`) is its own change, and it rewrites the
-> "Tailnet transport" entry in the threat-model checklist.
+**On the host, it just works — open `http://localhost:3100/console/`.** No TLS setup is
+needed for this: `localhost` is a browser *secure context*, so the `Secure` session
+cookie is honoured over plain HTTP. This is the current, supported way to use the
+console.
 
-Once deployed, expose it only through Tailscale Serve/MagicDNS HTTPS:
+> **Remote access is not set up (R53).** The rest of this section is the intended target,
+> not the current state. Tailscale is not installed on the dev host, so there is no
+> tailnet and no MagicDNS name. The app binds `127.0.0.1:3100` (`src/main.ts:685`), so
+> nothing but the host can reach it. Substituting a LAN IP does **not** work and is not a
+> policy call: `http://192.168.88.25:3100` is not a secure context, so the browser drops
+> the `Secure` cookie and the session cannot persist. Remote access needs a TLS
+> terminator in front — Tailscale Serve (below) or the nginx already on `:443`. That is a
+> config choice on this same host, not a migration, and it rewrites the "Tailnet
+> transport" entry in the threat-model checklist.
+
+To reach it from a phone, expose it through Tailscale Serve/MagicDNS HTTPS:
 
 ```bash
 tailscale serve --https=443 http://127.0.0.1:3100
