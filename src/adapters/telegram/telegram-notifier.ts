@@ -29,6 +29,15 @@ export interface TelegramNotifierOptions {
   transcribeAudio?: (input: AudioTranscriptionInput) => Promise<string>;
   maxAudioBytes?: number;
   maxAudioDurationSeconds?: number;
+  /** Telegram user ids allowed to command the bot. The supergroup check is a CHAT
+   *  check, not an identity one, so without this every group member can schedule
+   *  customer sends and approve drafts. Empty → allow any member (the prior
+   *  behaviour); populated → everyone else is rejected before dispatch.
+   *
+   *  Resolved per update, not captured at construction: it is settings-managed
+   *  (applyMode 'live'), so revoking someone from the console takes effect on the next
+   *  poll instead of waiting for a restart. Mirrors the lazy `resolveToken`. */
+  resolveFounderUserIds?: () => string[];
 }
 
 const DEFAULT_MAX_AUDIO_BYTES = 20 * 1024 * 1024;
@@ -46,6 +55,12 @@ type MessageHandler = (m: MessageEvent) => Promise<void>;
 export class TelegramNotifier implements FounderNotifierPort {
   private decisionHandler: DecisionHandler | null = null;
   private messageHandler: MessageHandler | null = null;
+
+  /** An empty/absent allowlist authorizes everyone — see `resolveFounderUserIds`. */
+  private isAuthorized(by: string): boolean {
+    const allowed = this.opts.resolveFounderUserIds?.();
+    return !allowed || allowed.length === 0 || allowed.includes(by);
+  }
 
   constructor(
     private readonly client: TelegramClient,
@@ -177,6 +192,12 @@ export class TelegramNotifier implements FounderNotifierPort {
           next = u.update_id + 1;
           continue;
         }
+        if (!this.isAuthorized(by)) {
+          logger.warn({ by }, 'Telegram callback rejected — not an allowlisted founder');
+          await this.client.answerCallbackQuery(cq.id, 'Not authorized').catch(() => undefined);
+          next = u.update_id + 1; // a rejected tap is DECIDED, not lost — never re-deliver it
+          continue;
+        }
         try {
           const threadId = cq.message?.message_thread_id !== undefined ? String(cq.message.message_thread_id) : undefined;
           await this.dispatchCallback(cq.data, by, threadId);
@@ -204,6 +225,11 @@ export class TelegramNotifier implements FounderNotifierPort {
         if (chatId !== this.opts.supergroupChatId) {
           logger.warn({ by, chatId }, 'Telegram message rejected — wrong chat');
           next = u.update_id + 1;
+          continue;
+        }
+        if (!this.isAuthorized(by)) {
+          logger.warn({ by }, 'Telegram message rejected — not an allowlisted founder');
+          next = u.update_id + 1; // stays silent: do not confirm the bot to a stranger
           continue;
         }
         try {
@@ -237,14 +263,23 @@ export class TelegramNotifier implements FounderNotifierPort {
               : undefined,
           });
         } catch (err) {
-          const permanentAudioFailure = audio && (
-            (err instanceof TranscriptionError && !err.retryable)
-            || (err instanceof TelegramError && !err.retryable)
-          );
-          if (permanentAudioFailure) {
-            logger.warn({ reason: (err as Error).message }, 'Telegram audio rejected permanently');
-            await this.replyInThread(String(msg.message_thread_id), `⚠️ I could not process that audio: ${(err as Error).message}`)
-              .catch(() => undefined);
+          // Holding the offset is right for TRANSIENT failures only — the update
+          // re-delivers and succeeds. For a PERMANENT one it is a guaranteed wedge:
+          // the same update re-delivers every poll forever, re-running the handler
+          // (and its paid LLM calls) each time, with every later callback, ❌ Cancel
+          // and draft approval stuck behind it — recoverable only by hand-editing
+          // app_state. So the escape hatch keys on the error being permanent, NOT on
+          // it being audio: a permanent non-audio failure (e.g. sendMessage 400 on an
+          // over-long body) used to wedge the whole Telegram surface.
+          const permanent = (err instanceof TranscriptionError && !err.retryable)
+            || (err instanceof TelegramError && !err.retryable);
+          if (permanent) {
+            const reason = (err as Error).message;
+            logger.warn({ reason, hadAudio: Boolean(audio) }, 'Telegram message rejected permanently — skipping');
+            await this.replyInThread(
+              String(msg.message_thread_id),
+              audio ? `⚠️ I could not process that audio: ${reason}` : `⚠️ I could not process that message: ${reason}`,
+            ).catch(() => undefined);
             next = u.update_id + 1;
             continue;
           }

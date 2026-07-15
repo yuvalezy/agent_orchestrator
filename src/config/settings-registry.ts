@@ -75,6 +75,16 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     applyMode: 'restart',
     default: false,
   },
+  {
+    key: 'TELEGRAM_FOUNDER_USER_IDS',
+    type: 'string',
+    category: OUTBOUND,
+    label: 'Telegram founder allowlist',
+    description:
+      'Comma-separated Telegram USER ids allowed to command the bot. Blank = any member of the supergroup can schedule customer sends and approve drafts, because the supergroup id is a chat check and not an identity one. Re-read on every update, so revoking takes effect without a restart.',
+    applyMode: 'live',
+    default: '',
+  },
 
   // ── Knowledge & Drafting ─────────────────────────────────────────────────────
   {

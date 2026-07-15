@@ -31,6 +31,18 @@ export class TelegramError extends Error {
   }
 }
 
+/** Telegram rejects a sendMessage body over 4096 chars with a PERMANENT 400. Callers
+ *  build text from model output and DB rows, so cap here rather than trusting each
+ *  one — an uncapped body is a permanent send failure, and a permanent failure in the
+ *  poll loop's handler is what wedges the update offset. */
+export const TELEGRAM_MAX_TEXT = 4096;
+
+export function truncateForTelegram(text: string): string {
+  if (text.length <= TELEGRAM_MAX_TEXT) return text;
+  const suffix = '\n… (truncated)';
+  return `${text.slice(0, TELEGRAM_MAX_TEXT - suffix.length)}${suffix}`;
+}
+
 export interface InlineKeyboardButton {
   text: string;
   callback_data: string;
@@ -121,7 +133,7 @@ export class TelegramClient {
   }
 
   async sendMessage(input: SendMessageInput): Promise<{ message_id: number }> {
-    const params: Record<string, unknown> = { chat_id: input.chatId, text: input.text };
+    const params: Record<string, unknown> = { chat_id: input.chatId, text: truncateForTelegram(input.text) };
     if (input.messageThreadId !== undefined) params.message_thread_id = Number(input.messageThreadId);
     if (input.inlineKeyboard) params.reply_markup = { inline_keyboard: input.inlineKeyboard };
     return this.call('sendMessage', params);

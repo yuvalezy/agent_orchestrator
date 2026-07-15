@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { MessageEvent } from '../../ports/founder-notifier.port';
-import type { TelegramClient, TelegramUpdate } from './telegram-client';
+import { TelegramError, type TelegramClient, type TelegramUpdate } from './telegram-client';
 import { TelegramNotifier } from './telegram-notifier';
 
 function makeNotifier(
   updates: TelegramUpdate[],
-  opts?: { transcribeAudio?: (input: { data: Uint8Array; filename: string; mimeType: string }) => Promise<string> },
+  opts?: {
+    transcribeAudio?: (input: { data: Uint8Array; filename: string; mimeType: string }) => Promise<string>;
+    founderUserIds?: string[];
+    resolveFounderUserIds?: () => string[];
+  },
 ) {
   const sent: unknown[] = [];
   const answered: Array<{ id: string; text?: string }> = [];
@@ -23,6 +27,7 @@ function makeNotifier(
     resolveCustomerTopicId: async () => '42',
     recordNotificationRef: async (input) => { refs.push(input); },
     transcribeAudio: opts?.transcribeAudio,
+    resolveFounderUserIds: opts?.resolveFounderUserIds ?? (opts?.founderUserIds ? () => opts.founderUserIds! : undefined),
   });
   return { notifier, sent, answered, refs };
 }
@@ -86,6 +91,86 @@ test('updates from a different chat are ignored while the offset advances', asyn
   assert.equal(await notifier.poll(0), 4);
   assert.equal(decisions, 0);
   assert.deepEqual(answered, [{ id: 'cb', text: 'Wrong chat' }]);
+});
+
+// The supergroup check is a CHAT check — without an identity allowlist every member
+// of the group can schedule customer sends and approve drafts.
+test('a non-allowlisted group member cannot command the bot or tap its buttons', async () => {
+  const { notifier, answered } = makeNotifier([
+    {
+      update_id: 20,
+      message: { message_id: 19, message_thread_id: 42, text: 'send it now', from: { id: 99 }, chat: { id: -1001 } },
+    },
+    {
+      update_id: 21,
+      callback_query: { id: 'cb9', from: { id: 99 }, data: 'da:5', message: { chat: { id: -1001 }, message_thread_id: 42 } },
+    },
+  ], { founderUserIds: ['7'] });
+  let handled = 0;
+  let decisions = 0;
+  notifier.onMessage(async () => { handled += 1; });
+  notifier.onDecision(async () => { decisions += 1; });
+  assert.equal(await notifier.poll(0), 22); // rejected is DECIDED — never re-delivered
+  assert.equal(handled, 0);
+  assert.equal(decisions, 0);
+  assert.deepEqual(answered, [{ id: 'cb9', text: 'Not authorized' }]);
+});
+
+test('the allowlisted founder is still dispatched, and an empty allowlist authorizes anyone', async () => {
+  const update: TelegramUpdate[] = [{
+    update_id: 30,
+    message: { message_id: 29, message_thread_id: 42, text: 'ok', from: { id: 7 }, chat: { id: -1001 } },
+  }];
+  for (const founderUserIds of [['7'], [], undefined]) {
+    const { notifier } = makeNotifier(update, { founderUserIds });
+    let handled = 0;
+    notifier.onMessage(async () => { handled += 1; });
+    await notifier.poll(0);
+    assert.equal(handled, 1, `founderUserIds=${JSON.stringify(founderUserIds)} should dispatch`);
+  }
+});
+
+// The allowlist is settings-managed with applyMode 'live', which only holds if it is
+// re-read per update rather than captured when the notifier was constructed.
+test('revoking the allowlist from settings applies without a restart', async () => {
+  let allowed = ['7', '99'];
+  const { notifier } = makeNotifier([{
+    update_id: 60,
+    message: { message_id: 59, message_thread_id: 42, text: 'ok', from: { id: 99 }, chat: { id: -1001 } },
+  }], { resolveFounderUserIds: () => allowed });
+  let handled = 0;
+  notifier.onMessage(async () => { handled += 1; });
+  await notifier.poll(0);
+  assert.equal(handled, 1);
+
+  allowed = ['7']; // the founder removes 99 in the console — same live notifier
+  await notifier.poll(0);
+  assert.equal(handled, 1, 'the revoked id is rejected on the very next poll');
+});
+
+// Regression: holding the offset on a PERMANENT failure re-delivers the same update
+// every poll forever and blocks every later update behind it.
+test('a permanent non-audio dispatch failure is skipped instead of wedging the offset', async () => {
+  const { notifier, sent } = makeNotifier([{
+    update_id: 40,
+    message: { message_id: 39, message_thread_id: 42, text: 'hi', from: { id: 7 }, chat: { id: -1001 } },
+  }]);
+  notifier.onMessage(async () => {
+    throw new TelegramError('sendMessage', 400, 'message is too long', false);
+  });
+  assert.equal(await notifier.poll(0), 41);
+  assert.match(String((sent[0] as { text: string }).text), /could not process that message/i);
+});
+
+test('a transient dispatch failure still holds the offset for retry', async () => {
+  const { notifier } = makeNotifier([{
+    update_id: 50,
+    message: { message_id: 49, message_thread_id: 42, text: 'hi', from: { id: 7 }, chat: { id: -1001 } },
+  }]);
+  notifier.onMessage(async () => {
+    throw new TelegramError('sendMessage', 503, 'upstream down', true);
+  });
+  assert.equal(await notifier.poll(0), 0); // held — the update must re-deliver
 });
 
 test('customer notification records its Telegram message to typed origin mapping best-effort', async () => {

@@ -161,6 +161,7 @@ and scheduling knobs are non-secret.
 | `TELEGRAM_BOT_TOKEN` | **secret** | yes (for Telegram) | Bot token from BotFather (`12345:AA…`). Resolved lazily via `resolveCredential('TELEGRAM_BOT_TOKEN')` — sealed store first, env fallback. Embedded in the Bot API request URL, so the client logs the method name only, never the URL. |
 | `TELEGRAM_SUPERGROUP_CHAT_ID` | no | yes (for Telegram) | The `-100…` supergroup chat id. **Optional in the zod schema** so the service still boots without Telegram, but `buildTelegramNotifier()` throws `TELEGRAM_SUPERGROUP_CHAT_ID is not set` the moment Telegram is actually used. |
 | `TELEGRAM_ADMIN_TOPIC_ID` | no | no | `message_thread_id` of the pinned Admin topic. Blank ⇒ admin notices go to the **General** topic. |
+| `TELEGRAM_FOUNDER_USER_IDS` | no | no | **Settings-managed** (console → Settings → Outbound; `applyMode: 'live'`, no restart). CSV of Telegram **user** ids allowed to command the bot. Blank ⇒ **any member of the supergroup** may schedule sends and approve drafts, because the supergroup id is a *chat* check, not an identity one. Set it if anyone else is ever in the group. |
 | `TELEGRAM_SCHEDULING_ENABLED` | no | no | Settings-managed restart flag for natural-language scheduling. Default `false`. |
 | `TELEGRAM_SCHEDULING_TZ` | no | no | Founder timezone used to interpret and display schedule times. Default `America/Panama`. |
 | `TELEGRAM_SCHEDULING_INTERVAL_MS` | no | no | Due-action worker cadence. Default `15000`. |
@@ -172,6 +173,12 @@ TELEGRAM_BOT_TOKEN=            # 12345:AA… from BotFather
 TELEGRAM_SUPERGROUP_CHAT_ID=   # -100XXXXXXXXXX forum supergroup id
 TELEGRAM_ADMIN_TOPIC_ID=       # optional; blank = General topic
 ```
+
+> `TELEGRAM_FOUNDER_USER_IDS` and `TELEGRAM_SCHEDULING_ENABLED` are **settings-managed**
+> — set them on the console Settings page, not in `.env`. The DB overlay
+> (`app_settings`, migration 025) is authoritative: `loadAndOverlay()` seeds each key
+> from the current env on first boot and then overwrites `env` before composition, so a
+> value in `.env` is only ever the initial seed.
 
 > **Boots without Telegram.** Because the supergroup id is optional in the
 > schema, the service starts even when Telegram isn't configured — but the

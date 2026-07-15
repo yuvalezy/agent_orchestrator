@@ -39,6 +39,11 @@ const envSchema = z.object({
   // is missing when Telegram is actually used (onboarding CLI).
   TELEGRAM_SUPERGROUP_CHAT_ID: z.string().optional(),
   TELEGRAM_ADMIN_TOPIC_ID: z.string().optional(),
+  // CSV of Telegram user ids allowed to command the bot. The supergroup chat id is
+  // NOT an identity check — every member of that group can otherwise schedule sends
+  // and approve customer-facing drafts. UNSET = allow any member (prior behaviour),
+  // so an existing deploy keeps working; set it to lock the bot to the founder.
+  TELEGRAM_FOUNDER_USER_IDS: z.string().optional(),
   TELEGRAM_SCHEDULING_TZ: z.string().default('America/Panama'),
   TELEGRAM_SCHEDULING_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
   TELEGRAM_SCHEDULING_GRACE_MINUTES: z.coerce.number().int().positive().default(15),

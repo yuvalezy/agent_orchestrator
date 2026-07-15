@@ -35,6 +35,10 @@ export function buildTelegramNotifier(): TelegramNotifier {
   return new TelegramNotifier(client, {
     supergroupChatId,
     adminTopicId: env.TELEGRAM_ADMIN_TOPIC_ID,
+    // Read through `env` on every update rather than closed over at boot: the settings
+    // store overlays this same object, so a console edit applies without a restart.
+    resolveFounderUserIds: () =>
+      String(env.TELEGRAM_FOUNDER_USER_IDS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     recordNotificationRef: recordTelegramNotificationRef,
     transcribeAudio: (input) => transcription.transcribe(input),
     resolveCustomerTopicId: async (customerId: string) => {
