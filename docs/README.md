@@ -25,9 +25,15 @@ A sender is only actioned if it **resolves to a known customer contact** (`agent
 | 3 | **EZY Portal tenant + scoped key** | Default `http://localhost:5040`. A scoped `ten_…` API key (`EZY_PORTAL_API_KEY`) with task write rights. |
 | 4 | **Telegram bot + forum supergroup** | A BotFather token (`TELEGRAM_BOT_TOKEN`) and a **forum-enabled** supergroup (`TELEGRAM_SUPERGROUP_CHAT_ID`); the loop notifies you there and creates a topic per customer. |
 | 5 | **≥1 LLM provider key** | `ANTHROPIC_API_KEY` **and** one of `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` (for failover). See [integrations/llm.md](./integrations/llm.md). |
-| 6 | **Gmail OAuth** *(optional)* | Only if you ingest email. One refresh token per account via `npm run gmail:oauth`. See [channels/gmail.md](./channels/gmail.md). |
+| 6 | **Gmail OAuth** *(optional)* | Only if you ingest email. Add accounts from the console **Connectors** tab (preferred) or mint a token per account via `npm run gmail:oauth`. See [channels/gmail.md](./channels/gmail.md). |
 
 Without Telegram the service still boots, but the **money-loop workers are disabled** (ingestion only). Without a resolvable customer contact, ingested messages are skipped.
+
+Beyond the core money-loop, optional default-off surfaces (managed in the console
+**Settings** tab) layer on: cited **draft replies** you approve/edit/revise,
+scoped **knowledge RAG**, **historical backfill**, **daily/weekly digests**,
+**proactive task-done notices**, and a founder **`/ask` Project Brain** query. See
+[configuration.md § Feature flags](./configuration.md#feature-flags).
 
 ## Quickstart
 
@@ -51,6 +57,10 @@ TELEGRAM_BOT_TOKEN=          # from BotFather
 TELEGRAM_SUPERGROUP_CHAT_ID= # -100… forum supergroup id
 ANTHROPIC_API_KEY=           # + one of OPENAI_API_KEY / DEEPSEEK_API_KEY
 ```
+
+> These secrets (and the `*_ENABLED` feature flags) can instead be managed from
+> the console **Connectors** / **Settings** tabs once the service is up — `.env`
+> is the seed/fallback. See [configuration.md § Settings & Connectors](./configuration.md#settings--connectors--the-db-authoritative-overlay).
 
 ```bash
 # 3. Create the database (idempotent) and run migrations

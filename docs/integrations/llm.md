@@ -1,13 +1,13 @@
 # LLM Gateway
 
 The Agent Orchestrator sends **every** model call — triage, dedup classification,
-draft generation — through a single multi-provider gateway, the `LlmRouter`
-(`src/adapters/llm/llm-router.ts`). This doc covers how to point it at providers,
-tune routing and reasoning effort, and cap spend.
+draft generation, founder-query answer synthesis — through a single multi-provider
+gateway, the `LlmRouter` (`src/adapters/llm/llm-router.ts`). This doc covers how to
+point it at providers, tune routing and reasoning effort, and cap spend.
 
 ## Overview
 
-For a given **role** (`triage` / `classify` / `draft`) the router:
+For a given **role** (`triage` / `classify` / `draft` / `answer`) the router:
 
 1. Resolves the model for the preferred provider (per-`(provider, role)`).
 2. Calls the **default provider**; on a hard failure (or schema-invalid output)
@@ -118,13 +118,18 @@ and filtered to providers that exist.
 
 Override any `(provider, role)` model with `LLM_MODEL_<PROVIDER>_<ROLE>`
 (`<PROVIDER>` = `ANTHROPIC` / `OPENAI` / `DEEPSEEK`; `<ROLE>` = `TRIAGE` /
-`CLASSIFY` / `DRAFT`). Defaults from `factory.ts`:
+`CLASSIFY` / `DRAFT` / `ANSWER`). Defaults from `factory.ts`:
 
-| Provider  | `triage`          | `classify`         | `draft`           |
-| --------- | ----------------- | ------------------ | ----------------- |
-| anthropic | `claude-sonnet-5` | `claude-haiku-4-5` | `claude-sonnet-5` |
-| openai    | `gpt-4.1`         | `gpt-4.1-mini`     | `gpt-4.1`         |
-| deepseek  | `deepseek-chat`   | `deepseek-chat`    | `deepseek-chat`   |
+| Provider  | `triage`          | `classify`         | `draft`           | `answer`          |
+| --------- | ----------------- | ------------------ | ----------------- | ----------------- |
+| anthropic | `claude-sonnet-5` | `claude-haiku-4-5` | `claude-sonnet-5` | `claude-sonnet-5` |
+| openai    | `gpt-4.1`         | `gpt-4.1-mini`     | `gpt-4.1`         | `gpt-4.1`         |
+| deepseek  | `deepseek-chat`   | `deepseek-chat`    | `deepseek-chat`   | `deepseek-chat`   |
+
+The `answer` role synthesizes cited founder-query replies for Telegram `/ask`
+(`QUERY_ENGINE_ENABLED`) and the console query view. It is segregated from
+`AgentLlmPort` as `AnswerSynthesizerPort` so the customer-drafting path can't
+accidentally route through it.
 
 ```bash
 # e.g. drive triage with opus, keep the cheap classify model
@@ -137,13 +142,13 @@ LLM_MODEL_ANTHROPIC_TRIAGE=claude-opus-4-8
 
 ### Reasoning effort
 
-Effort is **opt-in** and applies to the `triage` and `draft` roles **only** — not
-`classify`, because the default classify models (`claude-haiku-4-5`,
+Effort is **opt-in** and applies to the `triage`, `draft`, and `answer` roles
+**only** — not `classify`, because the default classify models (`claude-haiku-4-5`,
 `gpt-4.1-mini`) have no reasoning/adaptive-thinking mode and would `400`.
 
 | Var                                | Scope                                  |
 | ---------------------------------- | -------------------------------------- |
-| `LLM_<PROVIDER>_EFFORT`            | Provider default for `triage` + `draft`. |
+| `LLM_<PROVIDER>_EFFORT`            | Provider default for `triage` + `draft` + `answer`. |
 | `LLM_EFFORT_<PROVIDER>_<ROLE>`    | Fine-grained; overrides the provider default for that one role. |
 
 Documented values: `low` \| `medium` \| `high` \| `xhigh` \| `max` (passed
@@ -163,7 +168,7 @@ How each provider consumes it:
   (`deepseek-chat` vs `deepseek-reasoner`) via `LLM_MODEL_DEEPSEEK_*`.
 
 ```bash
-LLM_ANTHROPIC_EFFORT=low                 # provider default for triage + draft
+LLM_ANTHROPIC_EFFORT=low                 # provider default for triage + draft + answer
 # LLM_EFFORT_ANTHROPIC_TRIAGE=high       # bump triage only
 # LLM_EFFORT_ANTHROPIC_DRAFT=            # set-but-empty disables effort for draft
 ```

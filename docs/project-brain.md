@@ -8,6 +8,10 @@ instead of grepping markdown, and it can be queried from Telegram too.
 It reuses the same RAG engine as the customer knowledge base (embeddings + pgvector
 cosine search), but over a **separate, isolated corpus**.
 
+> Telegram `/ask <question>` reaches this corpus too, behind the default-off
+> `QUERY_ENGINE_ENABLED` flag (a founder-only surface — it does **not** weaken the
+> customer-drafting isolation). See [integrations/telegram.md § Founder commands](./integrations/telegram.md#founder-commands-ask-pending-briefing-help).
+
 ## Add the MCP server (copy one line)
 
 Prereq (once): embed the corpus — `npm run migrate && OPENAI_API_KEY=… npm run internal:reconcile:once` — and keep `OPENAI_API_KEY` resolvable. The `cd` wrapper is required so `.env` loads.

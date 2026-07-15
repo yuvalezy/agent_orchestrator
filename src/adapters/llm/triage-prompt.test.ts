@@ -44,6 +44,7 @@ test('parseIntents accepts a valid payload', () => {
         suggested_title: 'Fix export',
         priority: 'high',
         confidence: 0.9,
+        explicit_action_request: true,
         related_open_task_ref: null,
       },
     ],
@@ -56,7 +57,7 @@ test('parseIntents rejects out-of-range confidence (zod range guard)', () => {
   assert.throws(() =>
     parseIntents({
       intents: [
-        { category: 'bug_report', summary: 's', suggested_title: 't', priority: 'high', confidence: 1.5, related_open_task_ref: null },
+        { category: 'bug_report', summary: 's', suggested_title: 't', priority: 'high', confidence: 1.5, explicit_action_request: true, related_open_task_ref: null },
       ],
     }),
   );
@@ -66,7 +67,7 @@ test('parseIntents rejects an unknown category', () => {
   assert.throws(() =>
     parseIntents({
       intents: [
-        { category: 'nope', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.5, related_open_task_ref: null },
+        { category: 'nope', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.5, explicit_action_request: true, related_open_task_ref: null },
       ],
     }),
   );
@@ -74,6 +75,16 @@ test('parseIntents rejects an unknown category', () => {
 
 test('parseIntents accepts an empty intents array', () => {
   assert.deepEqual(parseIntents({ intents: [] }), []);
+});
+
+test('parseIntents requires the explicit-action safety signal', () => {
+  assert.throws(() =>
+    parseIntents({
+      intents: [
+        { category: 'compliment', summary: 'Says thanks', suggested_title: 'No task', priority: 'low', confidence: 0.99, related_open_task_ref: null },
+      ],
+    }),
+  );
 });
 
 // ── M2a(b): the injected "Relevant knowledge" section (cited RAG chunks) ──
@@ -106,4 +117,17 @@ test('triageUserMessage renders an explicit (none) when knowledge is empty or ab
   for (const m of [withEmpty, withAbsent]) {
     assert.match(m, /Relevant knowledge \(may be empty\):\n\(none\)/, 'header + (none) so the model knows nothing matched');
   }
+});
+
+test('triageUserMessage renders timestamped speaker context and the exchange initiator', () => {
+  const msg = triageUserMessage(baseCtx({
+    exchangeInitiator: 'founder',
+    recentConversation: [
+      { direction: 'outbound', body: 'Congratulations on the opening', sentAt: '2026-07-14T20:42:00.000Z' },
+    ],
+    message: { body: 'Gracias Yuval' },
+  }));
+  assert.match(msg, /Active exchange initiated by: founder/);
+  assert.match(msg, /2026-07-14T20:42:00\.000Z Founder: Congratulations/);
+  assert.match(msg, /CURRENT customer message: Gracias Yuval/);
 });

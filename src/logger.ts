@@ -38,3 +38,11 @@ export const logger = pino({
 });
 
 export type Logger = typeof logger;
+
+/**
+ * Boot banner channel. Its own level floors at `trace`, so the lines the founder
+ * needs to actually use the process (the console URL) survive any LOG_LEVEL —
+ * including `silent`. Use ONLY for boot announcements; everything else honours
+ * LOG_LEVEL via `logger`.
+ */
+export const startupLogger = logger.child({}, { level: 'trace' });

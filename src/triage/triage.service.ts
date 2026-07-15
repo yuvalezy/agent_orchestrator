@@ -10,7 +10,7 @@ import { resolveContact, proposeAddContact, type ContactResolutionQueries } from
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
 import { recordTaskBridge, findTaskByInbox, recordTriageDecision, findCustomerByTaskRef } from '../decisions/decisions';
-import { markProcessed, markSkipped, setInboxCustomer, type ClaimedInbox } from '../inbox/inbox-repo';
+import { loadPriorThreadConversation, markProcessed, markSkipped, setInboxCustomer, type ClaimedInbox } from '../inbox/inbox-repo';
 
 // Triage pipeline (tasks 6.2-6.5, CORE — injected ports + db only, imports NO
 // adapter, D1). process() is the per-inbox-row money-loop: resolve → load context
@@ -23,6 +23,13 @@ const cancelButton = (taskRef: string) => [{ id: `${CANCEL_PREFIX}${taskRef}`, l
 
 /** Categories that represent an explicit ask (→ a task). The rest are context. */
 export const ACTIONABLE = new Set(['bug_report', 'new_feature_request', 'custom_development', 'question_existing', 'follow_up']);
+export function taskMutationGate(
+  intent: Pick<Intent, 'category' | 'explicit_action_request'>,
+): 'context' | 'confirm' | 'act' {
+  if (!ACTIONABLE.has(intent.category)) return 'context';
+  if (intent.explicit_action_request === false) return 'confirm';
+  return 'act';
+}
 /** Below this the intent is too uncertain to act on unprompted (→ askFounder,
  *  or context-only when CC'd). */
 const CONFIDENCE_MIN = 0.5;
@@ -256,7 +263,16 @@ export class TriageService {
     // M2a(b): scope RAG retrieval to THIS customer (customerId is the resolved,
     // known customer — never null here). Additive: [] when disabled or on error.
     const knowledge = await this.retrieveKnowledge(row, customerId);
-    const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks, knowledge);
+    const priorTurns = row.channel_thread_id
+      ? await loadPriorThreadConversation({
+          instanceId: row.channel_instance_id,
+          threadId: row.channel_thread_id,
+          beforeReceivedAt: row.received_at,
+          beforeInboxId: row.id,
+          limit: 12,
+        })
+      : [];
+    const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks, knowledge, priorTurns);
     const intents = await this.deps.llm.extractIntents(context);
 
     if (intents.length === 0) {
@@ -455,6 +471,34 @@ export class TriageService {
         title: '❓ Needs your input',
         body: `An unclear message from ${config.displayName} (${intent.category}). Please review:\n“${intent.summary}”`,
         severity: 'action',
+        contextRef: { kind: 'inbox', ref: inboxId },
+      });
+      return;
+    }
+
+    // Context categories are terminal. Previously they fell through into dedup +
+    // createTask, so even a correctly classified "thanks" / compliment created a
+    // project task. ACTIONABLE was documented as the allow-list but was only used
+    // by the CC rule; enforce it at the mutation boundary for every channel.
+    const mutationGate = taskMutationGate(intent);
+    if (mutationGate === 'context') {
+      await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'accepted' });
+      return;
+    }
+
+    // A category alone is not authority to mutate the project. The extractor must
+    // affirm that the CURRENT customer message contains the ask; conversation
+    // history can explain a reply but cannot donate actionability to "thanks" or an
+    // emoji. Any contradictory actionable classification is held for review.
+    // Undefined is accepted only for legacy/injected AgentLlmPort implementations;
+    // every built-in provider is schema-validated and always returns the boolean.
+    if (mutationGate === 'confirm') {
+      await recordTriageDecision({ customerId, inboxMessageId: inboxId, agentOutput: intent, outcome: 'pending' });
+      await this.deps.notifier.notifyCustomerEvent(customerId, {
+        title: '❓ Confirm before creating a task',
+        body: `${config.displayName}: the message was classified as ${intent.category}, but it contains no explicit request. No project task was created.\n“${intent.summary}”`,
+        severity: 'action',
+        contextRef: { kind: 'inbox', ref: inboxId },
       });
       return;
     }

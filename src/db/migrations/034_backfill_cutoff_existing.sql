@@ -1,7 +1,14 @@
--- 033: give every EXISTING customer a backfill_cutoff, so Part 4's WhatsApp pull is safe to reach.
+-- 034: give every EXISTING customer a backfill_cutoff, so Part 4's WhatsApp pull is safe to reach.
 --
--- Numbered 033: 030 (telegram scheduling) and 031 (founder push subscription actor) are taken on
--- master, and 032 is this branch's docs_root migration.
+-- Numbered 034: 030/031 are master's (telegram scheduling, founder push subscription actor), 032 is
+-- this branch's docs_root migration, and 033 is master's task_transition_ledger — renumbered there
+-- from 029 to clear its collision with 029_founder_push_subscriptions. This file was briefly 033 too;
+-- it moved because master's 033 is already applied on the shared dev DB while this one was not, so
+-- this was the side of the collision that was free to move.
+--
+-- Idempotent by construction (the WHERE guard), which matters on a shared DB: re-running never
+-- re-stamps a customer whose cutoff is already set. Re-stamping would be actively harmful — it would
+-- retroactively mute everything sent between the first stamp and the re-run.
 --
 -- WHY THIS EXISTS
 -- backfill_cutoff is the live-triage watermark: triage.service.ts skips any inbox row older than
