@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { env } from '../src/config/env';
 import { resolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { computeSignature } from '../src/adapters/whatsapp-manager/signature';
 
 // Post a signed synthetic whatsapp_manager webhook to a running orchestrator —
@@ -21,6 +22,8 @@ function arg(name: string, fallback?: string): string | undefined {
 }
 
 async function main(): Promise<void> {
+  // Secrets live in the encrypted store now — load it before resolving WEBHOOK_SECRET (store-first).
+  await credentialsStore.load();
   const id = arg('id', `smoke-${Date.now()}`)!;
   const isVoice = arg('voice') === 'true';
   const message = {

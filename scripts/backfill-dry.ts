@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { runBackfill } from '../src/knowledge/backfill';
 import { settingsStore } from '../src/config/settings-store';
 import { createBackfillCore } from './lib-backfill';
@@ -19,6 +20,8 @@ async function main(): Promise<void> {
   // DB is authoritative for the backfill knobs (JUDGE_VOTES / COLLAPSE_MAX_DISTANCE) — overlay
   // before the sweep reads them so a console change is reflected in the dry-run report too.
   await settingsStore.loadAndOverlay();
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) {
     logger.error('OPENAI_API_KEY not resolvable — cannot embed');
     process.exitCode = 1;

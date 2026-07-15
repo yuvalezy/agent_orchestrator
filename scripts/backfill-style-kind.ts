@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { pool, query } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildLlmRouter } from '../src/adapters/llm/factory';
 
 // One-off backfill: tag pre-existing tone corrections metadata.kind='style' (Style-Correction
@@ -35,6 +36,9 @@ async function main(): Promise<void> {
   // Dry-run is the SAFE default: an explicit --apply (or --no-dry-run) is required to write.
   const apply = args.includes('--apply') || args.includes('--no-dry-run');
   const dryRun = !apply;
+
+  // Secrets live in the encrypted store now — load it before resolving ANTHROPIC_API_KEY / OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
 
   // The classifier is an LLM call — it needs a resolvable provider key (classify role default is
   // Anthropic haiku; the router fails over per its chain). Warn early rather than fail every row.

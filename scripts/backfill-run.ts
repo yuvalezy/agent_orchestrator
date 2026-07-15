@@ -4,6 +4,7 @@ import { env } from '../src/config/env';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { memoryRepo } from '../src/knowledge/memory-repo';
 import { buildTelegramNotifier } from '../src/adapters/telegram/factory';
 import { recordBackfillProposal } from '../src/decisions/decisions';
@@ -31,6 +32,8 @@ async function main(): Promise<void> {
   // DB is authoritative for the backfill flags + knobs (BACKFILL_ENABLED / JUDGE_VOTES /
   // COLLAPSE_MAX_DISTANCE) — overlay before reading them so a console change applies here.
   await settingsStore.loadAndOverlay();
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!env.BACKFILL_ENABLED) {
     logger.error('BACKFILL_ENABLED is not true — refusing to run the live sweep');
     process.exitCode = 1;

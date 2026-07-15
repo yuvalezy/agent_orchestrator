@@ -3,6 +3,7 @@ import { env } from '../src/config/env';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildFsDocSource } from '../src/adapters/knowledge/fs-doc-source';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from '../src/knowledge/memory-repo';
@@ -23,6 +24,8 @@ import { chunkMarkdown } from '../src/knowledge/chunker';
 // (skipped) — never falling back to shared. Requires migrations applied + OPENAI_API_KEY.
 
 async function main(): Promise<void> {
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) {
     logger.error('OPENAI_API_KEY is not resolvable (sealed store + env both empty) — cannot embed');
     process.exitCode = 1;

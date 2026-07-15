@@ -3,6 +3,7 @@ import { env } from '../src/config/env';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildInternalDocSource } from '../src/adapters/knowledge/internal-doc-source';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { internalKnowledgeRepo } from '../src/knowledge/internal-repo';
@@ -18,6 +19,8 @@ import { reconcileInternalKnowledge } from '../src/knowledge/internal-sync';
 // 016 migration to have run and OPENAI_API_KEY to be resolvable.
 
 async function main(): Promise<void> {
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) {
     logger.error('OPENAI_API_KEY is not resolvable (sealed store + env both empty) — cannot embed');
     process.exitCode = 1;

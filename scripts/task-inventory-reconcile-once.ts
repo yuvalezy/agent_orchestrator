@@ -3,6 +3,7 @@ import { env } from '../src/config/env';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildPortalTaskSource } from '../src/adapters/knowledge/portal-task-source';
 import { buildEzyPortalGateway } from '../src/adapters/ezy-portal/factory';
 import { listTaskInventoryCustomers } from '../src/customers/task-inventory-customers';
@@ -24,6 +25,8 @@ import { chunkMarkdown } from '../src/knowledge/chunker';
 // OPENAI_API_KEY, and a reachable EZY_PORTAL_BASE_URL with a valid tenant key.
 
 async function main(): Promise<void> {
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) {
     logger.error('OPENAI_API_KEY is not resolvable (sealed store + env both empty) — cannot embed');
     process.exitCode = 1;

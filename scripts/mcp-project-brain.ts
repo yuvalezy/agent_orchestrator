@@ -49,6 +49,11 @@ async function main(): Promise<void> {
   const { reconcileInternalKnowledge, reconcileInternalDoc } = await import('../src/knowledge/internal-sync');
   const { withClient } = await import('../src/db');
   const { logger } = await import('../src/logger');
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  // Dynamic-imported (like the app modules above) so LOG_LEVEL=silent applies before its
+  // logger/env chain evaluates — a static import would corrupt the stdio JSON-RPC stream.
+  const { credentialsStore } = await import('../src/config/credentials-store');
+  await credentialsStore.load();
 
   // Read-only QUERY embed: a no-op cost sink (no llm_costs writes for query-time embeds).
   const embedding = buildEmbeddingAdapter(() => tryResolveCredential('OPENAI_API_KEY'), env.OPENAI_BASE_URL, {

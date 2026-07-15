@@ -3,6 +3,7 @@ import { env } from '../src/config/env';
 import { pool, query } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from '../src/knowledge/memory-repo';
 
@@ -18,6 +19,8 @@ import { memoryRepo } from '../src/knowledge/memory-repo';
 interface MemRow { id: string; content: string; customer_id: string | null; memory_type: string; decision_id: string | null }
 
 async function main(): Promise<void> {
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) throw new Error('OPENAI_API_KEY not resolvable');
   const gate = env.KNOWLEDGE_RETRIEVAL_MAX_DISTANCE;
   const embedder = buildEmbeddingAdapter(

@@ -3,6 +3,7 @@ import { env } from '../src/config/env';
 import { pool, query } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { clusterByEmbedding, type EmbeddedItem } from '../src/knowledge/proposal-collapse';
 
@@ -23,6 +24,8 @@ async function main(): Promise<void> {
   const apply = applyIdx >= 0;
   const threshold = apply ? Number(process.argv[applyIdx + 1]) : NaN;
   if (apply && !(threshold > 0)) throw new Error('--apply needs a numeric threshold, e.g. --apply 0.3');
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) throw new Error('OPENAI_API_KEY not resolvable');
 
   const embedder = buildEmbeddingAdapter(

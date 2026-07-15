@@ -3,6 +3,7 @@ import { env } from '../src/config/env';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { buildLlmRouter } from '../src/adapters/llm/factory';
 import { buildEmbeddingAdapter } from '../src/adapters/knowledge/openai-embeddings.client';
 import { memoryRepo } from '../src/knowledge/memory-repo';
@@ -32,6 +33,8 @@ const threads: HistoricalThread[] = [
 ];
 
 async function main(): Promise<void> {
+  // Secrets live in the encrypted store now — load it before resolving OPENAI_API_KEY (store-first).
+  await credentialsStore.load();
   if (!tryResolveCredential('OPENAI_API_KEY')) {
     logger.error('OPENAI_API_KEY not resolvable — cannot embed');
     process.exitCode = 1;

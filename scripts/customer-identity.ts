@@ -3,6 +3,7 @@ import { pool, query } from '../src/db';
 import { logger } from '../src/logger';
 import { env } from '../src/config/env';
 import { tryResolveCredential } from '../src/config/credentials';
+import { credentialsStore } from '../src/config/credentials-store';
 import { getCustomerDirectoryInfo } from '../src/customers/customer-directory';
 import { getCustomerEmailIdentity } from '../src/customers/email-identity';
 import { buildWhatsAppDirectoryClient, buildWaHistoryClient } from '../src/adapters/whatsapp-manager/factory';
@@ -55,6 +56,9 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+
+  // Secrets live in the encrypted store now — load it before resolving GMAIL_*_OAUTH (store-first).
+  await credentialsStore.load();
 
   const info = await getCustomerDirectoryInfo(customerId);
   if (!info) {
