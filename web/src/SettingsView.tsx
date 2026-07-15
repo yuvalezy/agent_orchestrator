@@ -2,6 +2,7 @@ import { type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CircleAlert, RotateCw } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
+import { PushNotificationsPanel } from './PushNotificationsPanel';
 
 // Settings surface (Contract B3 + pass-2 tuning knobs): render the DB-authoritative config
 // grouped by category. Booleans are toggles; enums are selects; numbers/strings are inputs that
@@ -183,6 +184,7 @@ export function SettingsView(): ReactElement {
           </div>
         </Panel>
       </div>
+      <PushNotificationsPanel />
     </section>
   );
 }

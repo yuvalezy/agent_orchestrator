@@ -19,6 +19,7 @@ import { buildAdminRouter } from './adapters/admin/admin.router';
 import { buildConsoleRouter } from './adapters/console/console.router';
 import { buildQueryEngineService } from './adapters/query/factory';
 import { loadConsoleConfig } from './config/console';
+import { loadWebPushConfig } from './config/web-push';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
@@ -63,6 +64,8 @@ import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker
 import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
+import { FanoutFounderNotifier, WebPushNotifier } from './adapters/push/web-push-notifier';
+import { pushSubscriptionStorageEnabled } from './adapters/push/web-push-repo';
 
 // M2a: advisory-lock namespace for the knowledge-sync reconcile ('know' as int32).
 const KNOWLEDGE_SYNC_LOCK_KEY = 0x6b6e6f77;
@@ -131,6 +134,18 @@ async function main(): Promise<void> {
   }
 
   const consoleConfig = loadConsoleConfig();
+  const webPushConfig = loadWebPushConfig();
+  let webPushNotifier: WebPushNotifier | null = null;
+  if (webPushConfig && pushSubscriptionStorageEnabled()) {
+    try {
+      webPushNotifier = new WebPushNotifier(webPushConfig);
+      logger.info('web push fan-out enabled for explicit urgent founder notifications');
+    } catch {
+      logger.warn('web push disabled (VAPID configuration invalid)');
+    }
+  } else if (process.env.CONSOLE_WEB_PUSH_ENABLED === 'true') {
+    logger.warn('web push disabled (missing/invalid VAPID configuration or encryption key)');
+  }
   if (consoleConfig) {
     // Production copies Vite output to dist/web; tsx development serves the
     // separately built web/dist directory from the repository root.
@@ -147,6 +162,7 @@ async function main(): Promise<void> {
       // Reuse the same isolated founder query service used by Telegram /ask. The
       // console renders failures itself, so it intentionally has no Telegram alert.
       query: buildQueryEngineService(async () => {}),
+      webPush: webPushNotifier ? webPushConfig : null,
     });
     logger.info('founder console router mounted at /console');
   } else {
@@ -210,8 +226,8 @@ async function main(): Promise<void> {
   let notifier: FounderNotifierPort | null = null;
   try {
     const telegram = buildTelegramNotifier();
-    notifier = telegram;
-    triageWorkers.push(buildInboxProcessorWorker(telegram), buildCallbackPollerWorker(telegram));
+    notifier = webPushNotifier ? new FanoutFounderNotifier(telegram, webPushNotifier) : telegram;
+    triageWorkers.push(buildInboxProcessorWorker(notifier), buildCallbackPollerWorker(telegram));
     logger.info('money-loop workers registered (inbox processor + Telegram callback poller)');
   } catch (err) {
     logger.warn({ reason: (err as Error)?.message }, 'money-loop disabled — Telegram not configured');

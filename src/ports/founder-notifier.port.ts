@@ -13,6 +13,8 @@ export interface Notification {
   severity?: 'info' | 'action' | 'warning';
   entityRef?: string; // opaque ref back to the originating inbox row / task
   url?: string;
+  /** Push is opt-in and only this explicit urgency may fan out beyond Telegram. */
+  urgency?: 'routine' | 'urgent';
 }
 
 export interface FounderNotifierPort {

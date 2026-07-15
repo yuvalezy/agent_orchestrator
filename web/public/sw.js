@@ -1,22 +1,24 @@
-const CACHE = 'ao-console-shell-v1';
-const SHELL = ['/console/', '/console/manifest.webmanifest', '/console/icon.svg'];
-
-self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
+// Notification-only worker. It intentionally handles NO fetch events and keeps NO
+// cache: installable/offline PWA support is deferred, while push delivery still
+// needs a same-origin service worker.
+self.addEventListener('install', (event) => event.waitUntil(self.skipWaiting()));
+self.addEventListener('activate', (event) => event.waitUntil(
+  caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith('ao-console-shell-')).map((key) => caches.delete(key)))).then(() => self.clients.claim()),
+));
+self.addEventListener('push', (event) => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch { /* ignore malformed payload */ }
+  const route = typeof data.route === 'string' && data.route.startsWith('/console') ? data.route : '/console/';
+  const tag = typeof data.tag === 'string' ? data.tag : 'founder-console';
+  event.waitUntil(self.registration.showNotification('Founder attention needed', {
+    body: 'Open the private console to review.', tag, data: { route }, renotify: false,
+  }));
 });
-
-self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
-});
-
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
-  if (event.request.method !== 'GET' || url.origin !== self.location.origin || url.pathname.startsWith('/console/api/')) return;
-  if (url.pathname === '/console/' || url.pathname.startsWith('/console/assets/') || url.pathname === '/console/manifest.webmanifest' || url.pathname === '/console/icon.svg') {
-    event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
-      const copy = response.clone();
-      void caches.open(CACHE).then((cache) => cache.put(event.request, copy));
-      return response;
-    })));
-  }
+self.addEventListener('notificationclick', (event) => {
+  const route = typeof event.notification.data?.route === 'string' ? event.notification.data.route : '/console/';
+  event.notification.close();
+  event.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
+    const existing = windows.find((client) => new URL(client.url).pathname.startsWith('/console'));
+    return existing ? existing.focus().then(() => existing.navigate(route)) : clients.openWindow(route);
+  }));
 });

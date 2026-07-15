@@ -50,6 +50,24 @@ test('console query requires CSRF and uses the injected founder query service', 
   }, { query: { answer: async (question, opts) => { calls.push({ question, opts }); return { scope: { kind: 'internal' as const }, answer: 'grounded', citations: [] }; } } });
 });
 
+test('web-push status stays session-bound, exposes only the public VAPID key, and registration requires CSRF', async () => {
+  await withConsole(async (baseUrl) => {
+    assert.equal((await fetch(`${baseUrl}/console/api/push/status`)).status, 401);
+    const login = await fetch(`${baseUrl}/console/api/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }) });
+    const cookie = login.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie);
+    const status = await fetch(`${baseUrl}/console/api/push/status`, { headers: { cookie } });
+    assert.equal(status.status, 200);
+    const body = await status.json() as { data: { configured: boolean; registrationAvailable: boolean; publicKey: string | null } };
+    assert.equal(body.data.configured, true);
+    assert.equal(typeof body.data.registrationAvailable, 'boolean');
+    assert.equal(body.data.publicKey, 'public-key-only');
+    assert.equal(JSON.stringify(body).includes('private-key-never-returned'), false);
+    const rejected = await fetch(`${baseUrl}/console/api/push/subscription`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({}) });
+    assert.equal(rejected.status, 403);
+  }, { webPush: { publicKey: 'public-key-only', privateKey: 'private-key-never-returned', subject: 'mailto:founder@example.com' } });
+});
+
 test('console failure projection omits an attached payload and exception message', () => {
   const secret = 'customer body: private@example.com';
   const failure = Object.assign(new Error(secret), { body: secret, providerPayload: { secret } });

@@ -116,6 +116,10 @@ orchestrator database and does not replace Telegram's draft-approval authority.
 | `CONSOLE_SESSION_TTL_MS` | | `43200000` | Session lifetime (12h); restart always invalidates sessions. |
 | `CONSOLE_LOGIN_WINDOW_MS` | | `900000` | Login rate-limit window (15 min). |
 | `CONSOLE_LOGIN_MAX_ATTEMPTS` | | `5` | Failed login attempts allowed per source address/window. |
+| `CONSOLE_WEB_PUSH_ENABLED` | | `false` | Set literally `true` only after VAPID and encrypted subscription storage are configured. |
+| `WEB_PUSH_VAPID_SUBJECT` | | *(unset)* | VAPID contact URI, normally `mailto:...`; required with web push. |
+| `WEB_PUSH_VAPID_PUBLIC_KEY` | | *(unset)* | Browser VAPID public key; returned only to authenticated console sessions. |
+| `WEB_PUSH_VAPID_PRIVATE_KEY` | yes | *(unset)* | VAPID private key; server-only and never logged or returned. |
 
 ### Channels — WhatsApp, Gmail, EZY Portal
 

@@ -110,6 +110,27 @@ handled and makes no queue change, task, or duplicate Telegram confirmation.
 If a portal task is created but the final decision update fails, its claim stays
 in place to prevent another task; review that exceptional row before intervening.
 
+### Optional web push
+
+Web push is separate from the deferred PWA/offline feature. Its notification-only
+service worker performs no fetch interception and keeps no cache. To enable it,
+generate a VAPID key pair, set `CONSOLE_WEB_PUSH_ENABLED=true`,
+`WEB_PUSH_VAPID_SUBJECT`, `WEB_PUSH_VAPID_PUBLIC_KEY`, and the server-only
+`WEB_PUSH_VAPID_PRIVATE_KEY`, and ensure `CREDENTIALS_ENCRYPTION_KEY` is set for
+encrypted device registrations. The browser permission prompt appears only after
+the founder chooses **Enable urgent alerts** in Settings.
+
+Generate the keys once with `npx web-push generate-vapid-keys`; keep the private
+key out of source control and rotate it by replacing both VAPID keys, restarting,
+then re-registering browsers. At most ten active browser registrations are kept
+for the single founder account.
+
+Only notifications explicitly marked urgent can fan out to push, and Telegram is
+still sent first. Push is best effort: expired endpoints are disabled, transient
+failures do not delay workflows, and lock screens receive only a generic alert
+that links to `/console`. On iOS, browser push support generally requires a
+Home-Screen web app; use Telegram when it is unavailable.
+
 ## Background workers
 
 All workers run on an interval/backoff loop (recursive `setTimeout`; exponential backoff on consecutive failures, capped at 10× the interval). Each tick is isolated — one failure never blocks the others. Their live status is exposed on `/health`.

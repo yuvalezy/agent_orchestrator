@@ -209,7 +209,7 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
       const failedIds = await failStuck();
       if (failedIds.length) {
         await notifier
-          .notifyAdmin({ title: 'Triage: rows failed', body: `${failedIds.length} inbox row(s) exceeded max attempts and were marked failed.`, severity: 'warning' })
+          .notifyAdmin({ title: 'Triage: rows failed', body: `${failedIds.length} inbox row(s) exceeded max attempts and were marked failed.`, severity: 'warning', urgency: 'urgent' })
           .catch((err) => logger.error({ reason: (err as Error)?.message }, 'failStuck admin alert failed'));
       }
       // Claim a batch and process SEQUENTIALLY (concurrency 1 → R43 soft-cap holds).
@@ -234,7 +234,7 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
             // EARLY warning — one per episode, so the founder knows there's an issue
             // immediately (not 30 min later). Never logs/sends a message body.
             await notifier
-              .notifyAdmin({ title: '⚠️ Triage failing', body: `${count} consecutive triage failures — likely a dependency issue (portal / LLM / DB). Latest error: ${reason}. Rows are retrying; a permanent-failure alert follows if unresolved.`, severity: 'warning' })
+              .notifyAdmin({ title: '⚠️ Triage failing', body: `${count} consecutive triage failures — likely a dependency issue (portal / LLM / DB). Latest error: ${reason}. Rows are retrying; a permanent-failure alert follows if unresolved.`, severity: 'warning', urgency: 'urgent' })
               .catch((e) => logger.error({ reason: (e as Error)?.message }, 'triage early-warning alert failed'));
           }
         }

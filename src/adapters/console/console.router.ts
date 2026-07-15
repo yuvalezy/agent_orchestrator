@@ -18,6 +18,8 @@ import {
 import type { EmbeddingPort } from '../../ports/embedding.port';
 import type { QueryService } from '../../query/query-service';
 import { listUrgencyInbox } from './console-urgency-repo';
+import { buildConsolePushRouter } from './console-push.router';
+import type { WebPushConfig } from '../../config/web-push';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
   res.set('Cache-Control', 'no-store');
@@ -69,6 +71,8 @@ export interface ConsoleRouterDeps {
   embedding?: EmbeddingPort;
   /** Existing founder query engine; absent when QUERY_ENGINE_ENABLED is off. */
   query?: QueryService | null;
+  /** Optional web-push configuration. Private VAPID data stays server-side. */
+  webPush?: WebPushConfig | null;
 }
 
 function parseGuidanceBody(value: unknown): { scope: GuidanceScope; customerId: string | null; kind: GuidanceKind; fact: string } | null {
@@ -422,6 +426,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, de
   });
 
   router.use('/api/approvals', buildConsoleApprovalsRouter());
+  router.use('/api/push', buildConsolePushRouter(deps.webPush ?? null));
   router.use('/api/settings', buildConsoleSettingsRouter());
   router.use('/api/connectors', buildConsoleConnectorsRouter({ sessionSecret: config.sessionSecret }));
 
