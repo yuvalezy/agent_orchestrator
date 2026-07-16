@@ -78,6 +78,23 @@ export interface SearchResult {
   distance: number;
 }
 
+/** WP4 hybrid search signature. SAME return shape as KnowledgeRepo['search'] (KnowledgeChunk
+ *  consumers are unchanged) but ALSO takes the raw query text (the FTS leg needs it). Injected
+ *  into the retriever ONLY when HYBRID_RETRIEVAL_ENABLED — its absence is the vector-only path. */
+export type HybridSearchFn = (
+  embedding: number[],
+  queryText: string,
+  customerId: string | null,
+  opts: SearchOptions,
+) => Promise<Array<{ content: string; metadata: Record<string, unknown> | null; memoryType: string; distance: number }>>;
+
+/** WP4: hybrid (vector + FTS, RRF-fused) memory search. Kept as its OWN capability so the
+ *  vector-only KnowledgeRepo.search is untouched; the composition root injects this into the
+ *  retriever only when the flag is on. Same STRICT customer/shared isolation as search(). */
+export interface HybridSearchRepo {
+  hybridSearch: HybridSearchFn;
+}
+
 export interface KnowledgeRepo {
   /** Full Layer-B manifest (active + tombstoned) for the reconcile diff. */
   listDocuments(): Promise<KnowledgeDocumentRow[]>;
@@ -291,6 +308,180 @@ export function buildSearchSql(input: BuildSearchSqlInput): { text: string; valu
   return { text, values: [vec, customerId, maxDistance, kCustomer, kShared] };
 }
 
+// ── WP4: HYBRID retrieval (vector + Postgres FTS, RRF fusion) over agent_memory ──────
+// The vector-only path (buildSearchSql, above) has a hard maxDistance gate, so a row that
+// is lexically a dead-on match but embeds slightly beyond the ceiling is dropped (the
+// style-lane exists as a hand-built patch for one such blind spot). The keyword leg below
+// admits those hits; RRF fusion (fuseByRrf) merges the two rankings. buildSearchSql stays
+// FROZEN — the flag-off path runs it byte-identically; hybrid uses these separate builders.
+
+/** How many keyword candidates the FTS leg pulls before fusion. A cap (not an all-rows scan)
+ *  so a hot generic term can't drag thousands of rows into memory; RRF re-ranks within it. */
+export const KEYWORD_CANDIDATE_CAP = 2000;
+
+/** ⚠︎ PURE SQL builder for the HYBRID vector leg — buildSearchSql with the row `id` added to
+ *  the projection (RRF dedupes by row id). Kept SEPARATE from the frozen buildSearchSql so the
+ *  flag-off path's SQL is provably unchanged. SAME isolation shape: customer leg (customer_id=$2)
+ *  + shared leg (customer_id IS NULL), both maxDistance-gated; shared-only when customerId null. */
+export function buildHybridVectorSql(input: BuildSearchSqlInput): { text: string; values: unknown[] } {
+  const { embedding, customerId, kCustomer, kShared, maxDistance } = input;
+  const vec = toVectorLiteral(embedding);
+  const projection = 'id, content, metadata, memory_type, (embedding <=> $1::vector) AS distance';
+
+  if (customerId === null) {
+    const text = `SELECT ${projection}
+       FROM agent_memory
+       WHERE customer_id IS NULL
+         AND lifecycle_status = 'active'
+         AND (embedding <=> $1::vector) <= $2
+       ORDER BY embedding <=> $1::vector
+       LIMIT $3`;
+    return { text, values: [vec, maxDistance, kShared] };
+  }
+
+  const text = `(
+      SELECT ${projection}
+       FROM agent_memory
+       WHERE customer_id = $2
+         AND lifecycle_status = 'active'
+         AND (embedding <=> $1::vector) <= $3
+       ORDER BY embedding <=> $1::vector
+       LIMIT $4
+    )
+    UNION ALL
+    (
+      SELECT ${projection}
+       FROM agent_memory
+       WHERE customer_id IS NULL
+         AND lifecycle_status = 'active'
+         AND (embedding <=> $1::vector) <= $3
+       ORDER BY embedding <=> $1::vector
+       LIMIT $5
+    )
+    ORDER BY distance ASC`;
+  return { text, values: [vec, customerId, maxDistance, kCustomer, kShared] };
+}
+
+/** ⚠︎ PURE SQL builder for the HYBRID keyword (FTS) leg. websearch_to_tsquery('simple', $2) —
+ *  'simple' MATCHES migration 039's generated content_tsv config (no stemming; multilingual
+ *  es/en/he). User text is bound as PARAMETER $2 and NEVER interpolated (no tsquery-injection
+ *  surface — a malformed query yields an empty tsquery, which matches nothing). SAME isolation
+ *  shape as buildSearchSql/buildHybridVectorSql — customer leg (customer_id=$3) + shared leg
+ *  (customer_id IS NULL), shared-only when customerId null. NOT maxDistance-gated (the whole
+ *  point: a lexical hit beyond the vector ceiling is still admitted). The projection carries the
+ *  real cosine distance so a keyword-only hit returns an honest distance in the result shape;
+ *  ordering is by ts_rank (relevance), capped at $ (KEYWORD_CANDIDATE_CAP) — RRF re-ranks. */
+export function buildKeywordSearchSql(input: {
+  embedding: number[];
+  queryText: string;
+  customerId: string | null;
+  maxCandidates: number;
+}): { text: string; values: unknown[] } {
+  const { embedding, queryText, customerId, maxCandidates } = input;
+  const vec = toVectorLiteral(embedding);
+  const projection = 'id, content, metadata, memory_type, (embedding <=> $1::vector) AS distance';
+  const tsquery = `websearch_to_tsquery('simple', $2)`;
+
+  if (customerId === null) {
+    const text = `SELECT ${projection}
+       FROM agent_memory
+       WHERE customer_id IS NULL
+         AND lifecycle_status = 'active'
+         AND content_tsv @@ ${tsquery}
+       ORDER BY ts_rank(content_tsv, ${tsquery}) DESC
+       LIMIT $3`;
+    return { text, values: [vec, queryText, maxCandidates] };
+  }
+
+  const text = `(
+      SELECT ${projection}
+       FROM agent_memory
+       WHERE customer_id = $3
+         AND lifecycle_status = 'active'
+         AND content_tsv @@ ${tsquery}
+       ORDER BY ts_rank(content_tsv, ${tsquery}) DESC
+       LIMIT $4
+    )
+    UNION ALL
+    (
+      SELECT ${projection}
+       FROM agent_memory
+       WHERE customer_id IS NULL
+         AND lifecycle_status = 'active'
+         AND content_tsv @@ ${tsquery}
+       ORDER BY ts_rank(content_tsv, ${tsquery}) DESC
+       LIMIT $4
+    )
+    ORDER BY distance ASC`;
+  return { text, values: [vec, queryText, customerId, maxCandidates] };
+}
+
+/** One fusion candidate — a row from either leg, keyed by its agent_memory `id` (the RRF dedup
+ *  key). `distance` is the real cosine distance (both legs compute it) surfaced in the result. */
+export interface HybridCandidate {
+  id: string;
+  content: string;
+  metadata: Record<string, unknown> | null;
+  memoryType: string;
+  distance: number;
+}
+
+/** ⚠︎ PURE fusion — Reciprocal Rank Fusion of the vector + keyword legs, unit-testable without a
+ *  DB. score(row) = Σ 1/(rrfK + rank_i) over the legs it appears in (rank is 1-based POSITION in
+ *  that leg's ordered list, not the raw distance/ts_rank). Dedupes by row id, returns the top-k.
+ *
+ *  KEYWORD-ONLY ADMISSION CAP: a keyword-only hit (absent from the vector leg) is the point of
+ *  hybrid, but must not DISPLACE ALL vector hits — so at most `keywordOnlyCap` (default ⌊k/2⌋) of
+ *  the k output slots may be keyword-only, guaranteeing vector hits keep at least ⌈k/2⌉ slots when
+ *  that many exist. Ties break by cosine distance (nearer first) then id (stable/deterministic). */
+export function fuseByRrf(
+  vectorHits: HybridCandidate[],
+  keywordHits: HybridCandidate[],
+  opts: { k: number; rrfK?: number; keywordOnlyCap?: number },
+): HybridCandidate[] {
+  const rrfK = opts.rrfK ?? 60;
+  const keywordOnlyCap = opts.keywordOnlyCap ?? Math.floor(opts.k / 2);
+
+  interface Acc {
+    cand: HybridCandidate;
+    score: number;
+    inVector: boolean;
+    distance: number;
+  }
+  const byId = new Map<string, Acc>();
+  const addLeg = (hits: HybridCandidate[], inVector: boolean): void => {
+    hits.forEach((cand, i) => {
+      const contribution = 1 / (rrfK + i + 1);
+      const existing = byId.get(cand.id);
+      if (existing) {
+        existing.score += contribution;
+        existing.inVector = existing.inVector || inVector;
+        if (inVector) existing.distance = cand.distance; // prefer the vector leg's gated distance
+      } else {
+        byId.set(cand.id, { cand, score: contribution, inVector, distance: cand.distance });
+      }
+    });
+  };
+  addLeg(vectorHits, true);
+  addLeg(keywordHits, false);
+
+  const sorted = [...byId.values()].sort(
+    (a, b) => b.score - a.score || a.distance - b.distance || a.cand.id.localeCompare(b.cand.id),
+  );
+
+  const out: HybridCandidate[] = [];
+  let keywordOnlyUsed = 0;
+  for (const entry of sorted) {
+    if (out.length >= opts.k) break;
+    if (!entry.inVector) {
+      if (keywordOnlyUsed >= keywordOnlyCap) continue; // vector hits keep the reserved slots
+      keywordOnlyUsed += 1;
+    }
+    out.push({ ...entry.cand, distance: entry.distance });
+  }
+  return out;
+}
+
 /** ⚠︎ PURE SQL builder for the release-note → customer match (M2(e)) — extracted so the
  *  scope rule (customer_id IS NOT NULL, one row per customer via DISTINCT ON, the
  *  maxDistance confidence gate, the memory-type filter) is unit-testable WITHOUT a DB.
@@ -451,9 +642,16 @@ interface SearchDbRow {
   distance: number | string;
 }
 
+/** A hybrid-leg row (buildHybridVectorSql / buildKeywordSearchSql) — SearchDbRow + the row id
+ *  RRF dedupes by. id is a BIGSERIAL, driver-typed as a string. */
+interface HybridDbRow extends SearchDbRow {
+  id: string;
+}
+
 /** Concrete repo bound to the shared pool via query()/withClient. NEVER logs content
  *  or vectors. */
 export const memoryRepo: KnowledgeRepo &
+  HybridSearchRepo &
   FeedbackMemoryRepo &
   ReleaseNoteMatchRepo &
   CorrectionMemoryRepo &
@@ -703,6 +901,52 @@ export const memoryRepo: KnowledgeRepo &
       memoryType: r.memory_type,
       distance: Number(r.distance),
     }));
+  },
+
+  async hybridSearch(
+    embedding: number[],
+    queryText: string,
+    customerId: string | null,
+    opts: SearchOptions,
+  ): Promise<Array<{ content: string; metadata: Record<string, unknown> | null; memoryType: string; distance: number }>> {
+    // WP4: vector leg (maxDistance-gated, SAME isolation as search()) fused with a keyword FTS
+    // leg by RRF. Both legs run the SAME scope isolation (buildHybridVectorSql /
+    // buildKeywordSearchSql). NEVER logs content or vectors.
+    const toCand = (r: HybridDbRow): HybridCandidate => ({
+      id: String(r.id),
+      content: r.content,
+      metadata: r.metadata,
+      memoryType: r.memory_type,
+      distance: Number(r.distance),
+    });
+
+    const vec = buildHybridVectorSql({
+      embedding,
+      customerId,
+      kCustomer: opts.kCustomer,
+      kShared: opts.kShared,
+      maxDistance: opts.maxDistance,
+    });
+    const vectorRows = (await query<HybridDbRow>(vec.text, vec.values)).rows.map(toCand);
+
+    // Empty/whitespace query → NO keyword leg (a pure vector-only result). A non-empty but
+    // "garbage" query still runs, but websearch_to_tsquery('simple', …) yields an empty tsquery
+    // that matches nothing → 0 keyword rows → RRF degrades to vector-only. Safe either way.
+    const trimmed = queryText?.trim() ?? '';
+    let keywordRows: HybridCandidate[] = [];
+    if (trimmed.length > 0) {
+      const kw = buildKeywordSearchSql({
+        embedding,
+        queryText: trimmed,
+        customerId,
+        maxCandidates: KEYWORD_CANDIDATE_CAP,
+      });
+      keywordRows = (await query<HybridDbRow>(kw.text, kw.values)).rows.map(toCand);
+    }
+
+    // Top-k parity with the vector-only path: it returns up to kCustomer+kShared rows.
+    const fused = fuseByRrf(vectorRows, keywordRows, { k: opts.kCustomer + opts.kShared });
+    return fused.map((c) => ({ content: c.content, metadata: c.metadata, memoryType: c.memoryType, distance: c.distance }));
   },
 
   async matchCustomersByHistory(

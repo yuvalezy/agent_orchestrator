@@ -204,6 +204,18 @@ const envSchema = z.object({
   // chunks beyond it are dropped as too weak to cite. Lower = stricter.
   KNOWLEDGE_RETRIEVAL_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.5),
 
+  // ── WP4: hybrid retrieval (vector + Postgres FTS, RRF fusion) over agent_memory. The
+  // vector-only path has a hard maxDistance gate that structurally drops lexically-exact but
+  // slightly-distant hits; the keyword leg admits them and RRF fuses the two rankings. Kill-switch
+  // (mirrors KNOWLEDGE_RETRIEVAL_ENABLED strict-bool): only the literal "true" makes the
+  // composition root inject memoryRepo.hybridSearch into the RAG retriever. OFF/unset/anything-else
+  // → the vector-only path runs BYTE-IDENTICAL. DEPENDENCY: the keyword leg needs migration 039
+  // (agent_memory.content_tsv + GIN) applied on ao-postgres; retrieval stays additive/best-effort.
+  HYBRID_RETRIEVAL_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── M2a(c): response drafter — cited DRAFT replies for ANSWERABLE
   // 'question_existing' intents. Kill-switch (mirrors OUTBOUND_ENABLED /
   // KNOWLEDGE_SYNC_ENABLED): the drafter is injected into triage ONLY when the

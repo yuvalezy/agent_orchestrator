@@ -132,6 +132,8 @@ export function buildSlashCommandsHandler(
   const retriever = buildKnowledgeRetriever({
     embedding,
     search: memoryRepo.search.bind(memoryRepo),
+    // WP4: hybrid (vector + FTS, RRF) only when flagged on — else vector-only, byte-identical.
+    hybridSearch: env.HYBRID_RETRIEVAL_ENABLED ? memoryRepo.hybridSearch.bind(memoryRepo) : undefined,
     options: {
       kCustomer: env.KNOWLEDGE_RETRIEVAL_K_CUSTOMER,
       kShared: env.KNOWLEDGE_RETRIEVAL_K_SHARED,

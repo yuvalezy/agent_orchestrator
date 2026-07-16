@@ -98,6 +98,17 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
   },
   {
+    key: 'HYBRID_RETRIEVAL_ENABLED',
+    type: 'boolean',
+    category: KNOWLEDGE,
+    label: 'Hybrid retrieval (vector + keyword)',
+    description:
+      'Adds a Postgres full-text keyword leg to knowledge retrieval and fuses it with the vector leg by Reciprocal Rank Fusion, so a lexically-exact hit the vector distance gate would drop still surfaces. Off: vector-only retrieval, unchanged. Needs migration 039 applied.',
+    applyMode: 'restart',
+    default: false,
+    dependsOn: 'KNOWLEDGE_RETRIEVAL_ENABLED',
+  },
+  {
     key: 'KNOWLEDGE_DRAFT_ENABLED',
     type: 'boolean',
     category: KNOWLEDGE,

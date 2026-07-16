@@ -1,7 +1,7 @@
 import { logger } from '../logger';
 import type { EmbeddingPort } from '../ports/embedding.port';
 import type { KnowledgeChunk } from '../ports/llm.port';
-import type { KnowledgeRepo, SearchResult } from './memory-repo';
+import type { HybridSearchFn, KnowledgeRepo, SearchResult } from './memory-repo';
 
 // Scoped RAG retrieval INTO the triage context (change 02 §2.2, sub-milestone b).
 // CORE — ports + the core memory repo only; the concrete embedding ADAPTER is
@@ -38,6 +38,10 @@ export interface KnowledgeRetrieverDeps {
   embedding: EmbeddingPort;
   /** The scoped cosine search (memoryRepo.search) — injected so this is unit-testable. */
   search: KnowledgeRepo['search'];
+  /** WP4: the hybrid (vector + FTS, RRF-fused) search (memoryRepo.hybridSearch). Injected ONLY
+   *  when HYBRID_RETRIEVAL_ENABLED. When present, retrieve() calls it (passing the query text the
+   *  FTS leg needs) instead of `search`; when ABSENT the vector-only path runs byte-identically. */
+  hybridSearch?: HybridSearchFn;
   options: KnowledgeRetrievalOptions;
 }
 
@@ -63,8 +67,13 @@ export function buildKnowledgeRetriever(deps: KnowledgeRetrieverDeps): Knowledge
       try {
         const [embedding] = await deps.embedding.embed([text]);
         if (!embedding || embedding.length === 0) return [];
-        // customerId is the EXACT resolved customer — isolation is enforced in search().
-        const results = await deps.search(embedding, customerId, deps.options);
+        // customerId is the EXACT resolved customer — isolation is enforced in the repo (both the
+        // vector-only search() and the hybrid legs apply the SAME customer/shared scoping). When
+        // hybridSearch is injected (flag on) it runs vector+FTS fused by RRF; otherwise the
+        // vector-only path is byte-identical to before WP4.
+        const results = deps.hybridSearch
+          ? await deps.hybridSearch(embedding, text, customerId, deps.options)
+          : await deps.search(embedding, customerId, deps.options);
         return results.map(toChunk);
       } catch (err) {
         // Best-effort context — a retrieval miss must NEVER fail triage. Counts/flags

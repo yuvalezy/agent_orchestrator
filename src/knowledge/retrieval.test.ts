@@ -114,6 +114,72 @@ test('empty/whitespace query → [] without embedding or searching', async () =>
   assert.equal(search.calls.length, 0, 'no search for an empty query');
 });
 
+// ── WP4: hybrid dep seam ───────────────────────────────────────────────────────────
+// The retriever chooses hybridSearch (flag on, injected by the factory) over search (flag off).
+// When hybridSearch is ABSENT the vector-only path is byte-identical to the pre-WP4 behavior
+// (asserted above by the whole suite still using `search`). These cover the injected-dep branch.
+
+interface HybridSpy {
+  fn: NonNullable<Parameters<typeof buildKnowledgeRetriever>[0]['hybridSearch']>;
+  calls: Array<{ embedding: number[]; queryText: string; customerId: string | null; opts: KnowledgeRetrievalOptions }>;
+}
+function makeHybrid(hits: SearchHit[]): HybridSpy {
+  const spy: HybridSpy = { fn: null as unknown as HybridSpy['fn'], calls: [] };
+  spy.fn = async (embedding, queryText, customerId, opts) => {
+    spy.calls.push({ embedding, queryText, customerId, opts });
+    return hits;
+  };
+  return spy;
+}
+
+test('flag ON: retrieve() calls hybridSearch WITH the query text, not the vector-only search', async () => {
+  const emb = makeEmbedding([[0.1, 0.2, 0.3]]);
+  const search = makeSearch([{ content: 'vector-only', metadata: {}, memoryType: 'guide', distance: 0.9 }]);
+  const hybrid = makeHybrid([
+    { content: 'fused hit', metadata: { title: 'T', route: '/r', section: 'S' }, memoryType: 'guide', distance: 0.4 },
+  ]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, hybridSearch: hybrid.fn, options: OPTS });
+
+  const chunks = await r.retrieve('how do I export?', 'CUST-9');
+
+  assert.equal(search.calls.length, 0, 'the vector-only search is NOT used when hybrid is injected');
+  assert.equal(hybrid.calls.length, 1);
+  assert.deepEqual(hybrid.calls[0].embedding, [0.1, 0.2, 0.3], 'query vector passed through');
+  assert.equal(hybrid.calls[0].queryText, 'how do I export?', 'the trimmed query TEXT is passed for the FTS leg');
+  assert.equal(hybrid.calls[0].customerId, 'CUST-9', 'scoped to the EXACT resolved customer');
+  assert.deepEqual(hybrid.calls[0].opts, OPTS, 'k + maxDistance forwarded');
+  assert.deepEqual(chunks, [{ content: 'fused hit', title: 'T', route: '/r', section: 'S', distance: 0.4 }]);
+});
+
+test('flag OFF (no hybridSearch dep): retrieve() uses the vector-only search unchanged', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([{ content: 'vec', metadata: {}, memoryType: 'guide', distance: 0.2 }]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, options: OPTS });
+  const chunks = await r.retrieve('q', 'CUST-1');
+  assert.equal(search.calls.length, 1, 'vector-only search used when hybrid is absent');
+  assert.deepEqual(chunks, [{ content: 'vec', title: null, route: null, section: null, distance: 0.2 }]);
+});
+
+test('flag ON: a hybridSearch error is swallowed → [] (best-effort, triage proceeds)', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([]);
+  const failingHybrid: HybridSpy['fn'] = async () => {
+    throw new Error('content_tsv missing');
+  };
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, hybridSearch: failingHybrid, options: OPTS });
+  assert.deepEqual(await r.retrieve('q', 'CUST-1'), []);
+});
+
+test('flag ON: an empty/whitespace query never embeds or hybrid-searches', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([]);
+  const hybrid = makeHybrid([{ content: 'x', metadata: {}, memoryType: 'guide', distance: 0.1 }]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, hybridSearch: hybrid.fn, options: OPTS });
+  assert.deepEqual(await r.retrieve('   ', 'CUST-1'), []);
+  assert.equal(emb.calls.length, 0, 'no embed for empty query');
+  assert.equal(hybrid.calls.length, 0, 'no hybrid search for empty query');
+});
+
 test('missing/blank citation metadata maps to null fields (no throw)', async () => {
   const emb = makeEmbedding([[1, 2, 3]]);
   const search = makeSearch([

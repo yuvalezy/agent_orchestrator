@@ -58,10 +58,15 @@ function buildTriageKnowledgeRetriever(): KnowledgeRetriever | undefined {
     env.OPENAI_BASE_URL,
     { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
   );
-  logger.info('triage knowledge retrieval wired (KNOWLEDGE_RETRIEVAL_ENABLED=true)');
+  logger.info(
+    { hybrid: env.HYBRID_RETRIEVAL_ENABLED },
+    'triage knowledge retrieval wired (KNOWLEDGE_RETRIEVAL_ENABLED=true)',
+  );
   return buildKnowledgeRetriever({
     embedding,
     search: memoryRepo.search.bind(memoryRepo),
+    // WP4: hybrid (vector + FTS, RRF) only when flagged on — else vector-only, byte-identical.
+    hybridSearch: env.HYBRID_RETRIEVAL_ENABLED ? memoryRepo.hybridSearch.bind(memoryRepo) : undefined,
     options: {
       kCustomer: env.KNOWLEDGE_RETRIEVAL_K_CUSTOMER,
       kShared: env.KNOWLEDGE_RETRIEVAL_K_SHARED,
