@@ -522,6 +522,22 @@ const envSchema = z.object({
   // block starting at the deadline; an all-day deadline ignores this. Default 30.
   CALENDAR_DUE_EVENT_DURATION_MINUTES: z.coerce.number().int().positive().default(30),
 
+  // ── Meeting scheduling: a customer asking to TALK books a call, not a task ─────────────────
+  // When true, a `meeting_request` intent asks the founder for a duration and a slot (computed
+  // from REAL free/busy across every enabled calendar), books it on the meeting-host account with
+  // a Google Meet link, invites the customer, and auto-sends a templated confirmation. When
+  // false the dep is not wired and a meeting_request creates a task like any other actionable
+  // category — the pre-feature behavior, byte-for-byte.
+  //
+  // Availability needs only calendar.readonly, so slot proposal works today; BOOKING needs
+  // calendar.events, which every currently-stored calendar credential predates. Until they are
+  // re-connected in the console, every write 403s → the founder is told to re-consent and the ask
+  // survives as a task. Independent of CALENDAR_WRITE_ENABLED (that one gates task-dueAt events).
+  MEETING_SCHEDULING_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── M3(e): weekly pattern detection — a weekly digest that clusters the week's Layer-A
   // signal memories (founder corrections + customer conversation/task themes) by their
   // ALREADY-STORED embeddings and posts the top RECURRING patterns to the Telegram Admin

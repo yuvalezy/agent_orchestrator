@@ -26,6 +26,7 @@ import { buildLlmRouter } from '../llm/factory';
 import type { AgentLlmPort } from '../../ports/llm.port';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildGroupSummaryAdapter, buildRecipientProfileAdapter } from '../whatsapp-manager/factory';
+import { buildMeetingSchedulerGated } from './meeting-scheduler.factory';
 
 // Composition (imports adapters + core): build the TriageService with the real
 // EZY gateway + LLM router + Telegram notifier, and the inbox-processor worker
@@ -214,6 +215,11 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
   });
 
   const triage = new TriageService({
+    // A customer asking to talk books a call instead of minting a task (gated; dormant by
+    // default). Given the UNDECORATED task target on purpose: its fallback creates the task a
+    // failed scheduling would have been, and a "we couldn't book you a meeting" task has no
+    // dueAt — so the due-event decorator would have nothing to do anyway.
+    meetingScheduler: buildMeetingSchedulerGated(taskTarget, notifier)?.scheduler,
     taskTarget,
     llm,
     notifier,

@@ -83,7 +83,7 @@ function harness(opts: { claim?: boolean; createEvent?: (i: CreateEventInput) =>
               writer: {
                 createEvent: async (i: CreateEventInput): Promise<CreatedEvent> => {
                   events.push(i);
-                  return opts.createEvent ? opts.createEvent(i) : { id: 'ev-1', htmlLink: null, alreadyExisted: false };
+                  return opts.createEvent ? opts.createEvent(i) : { id: 'ev-1', htmlLink: null, meetLink: null, alreadyExisted: false };
                 },
               },
             },
@@ -204,7 +204,7 @@ test('idempotency: a second call for the SAME task does not double-create (the l
       writer: {
         createEvent: async (i) => {
           events.push(i);
-          return { id: 'ev-1', htmlLink: null, alreadyExisted: false };
+          return { id: 'ev-1', htmlLink: null, meetLink: null, alreadyExisted: false };
         },
       },
     }),
@@ -223,7 +223,7 @@ test('idempotency: a second call for the SAME task does not double-create (the l
 });
 
 test('idempotency: a duplicate deterministic id (Google 409) is reported, not thrown', async () => {
-  const h = harness({ createEvent: async (i) => ({ id: i.eventId ?? '', htmlLink: null, alreadyExisted: true }) });
+  const h = harness({ createEvent: async (i) => ({ id: i.eventId ?? '', htmlLink: null, meetLink: null, alreadyExisted: true }) });
   const port = withDueDateCalendarEvents(fakeTarget(), h.deps);
 
   const task = await port.createTask({ ...CREATE_INPUT, dueAt: new Date('2026-07-15T22:00:00Z') });

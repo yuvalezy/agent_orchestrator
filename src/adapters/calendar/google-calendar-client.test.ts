@@ -133,7 +133,7 @@ test('createEvent: a timed event posts {dateTime,timeZone} and returns the creat
     eventId: 'ao1234',
   });
 
-  assert.deepEqual(out, { id: 'ev-1', htmlLink: 'https://cal/ev-1', alreadyExisted: false });
+  assert.deepEqual(out, { id: 'ev-1', htmlLink: 'https://cal/ev-1', meetLink: null, alreadyExisted: false });
   assert.match(posts[0].url, /calendars\/work%40primary\/events/);
   assert.deepEqual(posts[0].body.start, { dateTime: '2026-07-15T22:00:00.000Z', timeZone: 'America/Panama' });
   assert.equal(posts[0].body.id, 'ao1234', 'the deterministic id must reach Google — it is what makes the insert idempotent');
@@ -167,7 +167,10 @@ test('createEvent: a duplicate id (409) reports alreadyExisted instead of throwi
     eventId: 'aodup',
   });
 
-  assert.deepEqual(out, { id: 'aodup', htmlLink: null, alreadyExisted: true });
+  // No conference requested (the dueAt path) → nulls, and crucially NO follow-up re-read: this
+  // caller ignores htmlLink, so a GET would buy nothing. The MEETING path's 409 re-read is
+  // covered separately ('createEvent 409 RE-READS the existing event…').
+  assert.deepEqual(out, { id: 'aodup', htmlLink: null, meetLink: null, alreadyExisted: true });
   assert.equal(posts.length, 1, 'a 409 is a decision, not a blip — it must NOT be retried');
 });
 
@@ -227,4 +230,142 @@ test('dateInTz: projects an instant onto the LOCAL day, not the UTC one', () => 
   // 03:00Z on the 16th is still the 15th in Panama (UTC-5) — the projection must not slip a day.
   assert.equal(dateInTz(new Date('2026-07-16T03:00:00Z'), 'America/Panama'), '2026-07-15');
   assert.equal(dateInTz(new Date('2026-07-16T03:00:00Z'), 'UTC'), '2026-07-16');
+});
+
+// ── createEvent: Meet + sendUpdates (the two SILENT-failure traps) ────────────────
+
+/** Route token / freeBusy / events.insert / events.get. Records every request so a test can
+ *  assert on the QUERY STRING — which is where both silent-failure traps live. */
+function mockWrite(opts: {
+  insert?: { status: number; body: unknown };
+  get?: { status: number; body: unknown };
+  freeBusy?: { status: number; body: unknown };
+}): { fetchImpl: typeof fetch; reqs: Array<{ url: string; body: unknown }> } {
+  const reqs: Array<{ url: string; body: unknown }> = [];
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    const u = String(url);
+    if (u.includes('oauth2.googleapis.com/token')) return res(200, { access_token: 'tok', expires_in: 3600 });
+    reqs.push({ url: u, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (u.includes('/freeBusy')) return res(opts.freeBusy?.status ?? 200, opts.freeBusy?.body ?? { calendars: {} });
+    if (init?.method === 'POST') return res(opts.insert?.status ?? 200, opts.insert?.body ?? { id: 'ev-1' });
+    return res(opts.get?.status ?? 200, opts.get?.body ?? {});
+  }) as unknown as typeof fetch;
+  return { fetchImpl, reqs };
+}
+
+const client = (fetchImpl: typeof fetch): GoogleCalendarClient =>
+  new GoogleCalendarClient(() => CRED, () => NOW, fetchImpl);
+
+const EVENT = {
+  title: 'Call',
+  startsAt: new Date('2026-07-16T14:00:00Z'),
+  endsAt: new Date('2026-07-16T14:30:00Z'),
+  timeZone: 'America/Panama',
+};
+
+test('createEvent WITHOUT conference/attendees sends NEITHER trap param (dueAt path unchanged)', async () => {
+  const m = mockWrite({});
+  await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123' });
+  const insert = m.reqs[0];
+  assert.ok(!insert.url.includes('conferenceDataVersion'), 'no conference requested → no version param');
+  assert.ok(!insert.url.includes('sendUpdates'), 'no attendees → Google must stay silent (deadline markers never email)');
+  assert.equal((insert.body as Record<string, unknown>).conferenceData, undefined);
+});
+
+test('createEvent WITH conference sends conferenceDataVersion=1 (without it Google SILENTLY drops the link)', async () => {
+  const m = mockWrite({ insert: { status: 200, body: { id: 'ev-1', hangoutLink: 'https://meet.google.com/abc-defg-hij' } } });
+  const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
+  assert.ok(m.reqs[0].url.includes('conferenceDataVersion=1'));
+  const body = m.reqs[0].body as { conferenceData?: { createRequest?: { requestId?: string; conferenceSolutionKey?: { type?: string } } } };
+  assert.equal(body.conferenceData?.createRequest?.conferenceSolutionKey?.type, 'hangoutsMeet');
+  assert.equal(body.conferenceData?.createRequest?.requestId, 'abc123', 'requestId derives from the deterministic event id so a retry reuses the conference');
+  assert.equal(out.meetLink, 'https://meet.google.com/abc-defg-hij');
+});
+
+test('createEvent WITH attendees sends sendUpdates=all (without it the customer is never invited)', async () => {
+  const m = mockWrite({});
+  await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', attendeeEmails: ['Cust@Acme.com'], sendUpdates: 'all' });
+  assert.ok(m.reqs[0].url.includes('sendUpdates=all'));
+  assert.deepEqual((m.reqs[0].body as { attendees: unknown }).attendees, [{ email: 'cust@acme.com' }]);
+});
+
+test('createEvent with attendees but sendUpdates none stays silent', async () => {
+  const m = mockWrite({});
+  await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', attendeeEmails: ['a@b.com'] });
+  assert.ok(!m.reqs[0].url.includes('sendUpdates'), 'the default must not email anyone');
+});
+
+test('createEvent falls back to the video entryPoint when hangoutLink is absent', async () => {
+  const m = mockWrite({
+    insert: { status: 200, body: { id: 'ev-1', conferenceData: { entryPoints: [{ entryPointType: 'phone', uri: 'tel:+1' }, { entryPointType: 'video', uri: 'https://meet.google.com/xyz' }] } } },
+  });
+  const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
+  assert.equal(out.meetLink, 'https://meet.google.com/xyz');
+});
+
+test('createEvent re-reads the event when the conference is still PENDING (async mint)', async () => {
+  const m = mockWrite({
+    insert: { status: 200, body: { id: 'ev-1', conferenceData: { createRequest: { status: { statusCode: 'pending' } } } } },
+    get: { status: 200, body: { id: 'ev-1', hangoutLink: 'https://meet.google.com/late-link' } },
+  });
+  const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
+  assert.equal(out.meetLink, 'https://meet.google.com/late-link', 'a pending conference must be resolved by one re-read');
+  assert.equal(m.reqs.length, 2, 'exactly one re-read');
+});
+
+test('createEvent tolerates a conference that never mints a link (book anyway, say so)', async () => {
+  const m = mockWrite({
+    insert: { status: 200, body: { id: 'ev-1' } },
+    get: { status: 200, body: { id: 'ev-1' } },
+  });
+  const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
+  assert.equal(out.meetLink, null, 'no link is not a failure — the meeting is still booked');
+  assert.equal(out.id, 'ev-1');
+});
+
+test('createEvent 409 RE-READS the existing event so the link is not lost on a replay', async () => {
+  const m = mockWrite({
+    insert: { status: 409, body: { error: 'duplicate' } },
+    get: { status: 200, body: { id: 'abc123', htmlLink: 'https://cal/e/abc123', hangoutLink: 'https://meet.google.com/existing' } },
+  });
+  const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
+  assert.equal(out.alreadyExisted, true);
+  assert.equal(out.meetLink, 'https://meet.google.com/existing', 'a replayed tap must still be able to quote the real link');
+  assert.equal(out.htmlLink, 'https://cal/e/abc123');
+});
+
+test('createEvent 409 with an unreadable event degrades to nulls rather than throwing', async () => {
+  const m = mockWrite({ insert: { status: 409, body: {} }, get: { status: 500, body: {} } });
+  const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
+  assert.equal(out.alreadyExisted, true);
+  assert.equal(out.meetLink, null);
+});
+
+// ── queryFreeBusy: FAIL-CLOSED ───────────────────────────────────────────────────
+
+test('queryFreeBusy returns the busy intervals for the calendar', async () => {
+  const m = mockWrite({
+    freeBusy: { status: 200, body: { calendars: { primary: { busy: [{ start: '2026-07-16T14:00:00Z', end: '2026-07-16T15:00:00Z' }] } } } },
+  });
+  const busy = await client(m.fetchImpl).queryFreeBusy({ timeMin: new Date('2026-07-16T00:00:00Z'), timeMax: new Date('2026-07-17T00:00:00Z') });
+  assert.equal(busy.length, 1);
+  assert.equal(busy[0].start.toISOString(), '2026-07-16T14:00:00.000Z');
+});
+
+test('queryFreeBusy THROWS on a per-calendar error instead of reporting the founder as free', async () => {
+  const m = mockWrite({
+    freeBusy: { status: 200, body: { calendars: { primary: { errors: [{ reason: 'notFound' }] } } } },
+  });
+  await assert.rejects(
+    () => client(m.fetchImpl).queryFreeBusy({ timeMin: new Date('2026-07-16T00:00:00Z'), timeMax: new Date('2026-07-17T00:00:00Z') }),
+    /freeBusy reported errors/,
+    'an errored calendar must never read as "no busy time" — that is a double-booking',
+  );
+});
+
+test('queryFreeBusy THROWS when the response omits the calendar entirely', async () => {
+  const m = mockWrite({ freeBusy: { status: 200, body: { calendars: {} } } });
+  await assert.rejects(() =>
+    client(m.fetchImpl).queryFreeBusy({ timeMin: new Date('2026-07-16T00:00:00Z'), timeMax: new Date('2026-07-17T00:00:00Z') }),
+  );
 });

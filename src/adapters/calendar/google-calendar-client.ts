@@ -1,10 +1,13 @@
 import { DEFAULT_RETRY, withRetry } from '../shared/retry';
 import type {
+  BusyInterval,
   CalendarEvent,
+  CalendarFreeBusyPort,
   CalendarPort,
   CalendarWriterPort,
   CreateEventInput,
   CreatedEvent,
+  FreeBusyInput,
   ListUpcomingEventsInput,
 } from '../../ports/calendar.port';
 
@@ -52,9 +55,25 @@ interface GoogleEvent {
   end?: { dateTime?: string; date?: string };
   organizer?: { email?: string };
   attendees?: Array<{ email?: string }>;
+  htmlLink?: string;
+  hangoutLink?: string;
+  conferenceData?: {
+    createRequest?: { status?: { statusCode?: string } };
+    entryPoints?: Array<{ entryPointType?: string; uri?: string }>;
+  };
 }
 
-export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort {
+/** Read the Meet join URL out of an event: `hangoutLink` when Google filled it, else the video
+ *  entry point. Null while a conference is still being minted (createRequest 'pending') or when
+ *  policy declined one — the caller books anyway and says the link is missing. */
+export function meetLinkOf(e: GoogleEvent | null | undefined): string | null {
+  if (!e) return null;
+  if (e.hangoutLink) return e.hangoutLink;
+  const video = e.conferenceData?.entryPoints?.find((p) => p.entryPointType === 'video');
+  return video?.uri ?? null;
+}
+
+export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, CalendarFreeBusyPort {
   private accessToken: string | null = null;
   private tokenExpiresMs = 0;
 
@@ -140,23 +159,116 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort {
     };
     if (input.eventId) body.id = input.eventId;
     if (input.description) body.description = input.description;
-    if (input.attendeeEmails?.length) {
-      body.attendees = [...new Set(input.attendeeEmails.map((e) => e.trim().toLowerCase()).filter(Boolean))].map((email) => ({ email }));
+    const attendees = [...new Set((input.attendeeEmails ?? []).map((e) => e.trim().toLowerCase()).filter(Boolean))];
+    if (attendees.length) {
+      body.attendees = attendees.map((email) => ({ email }));
+    }
+    if (input.conference) {
+      // requestId is Google's OWN idempotency key for the conference. Deriving it from the
+      // deterministic event id means a retried insert re-uses the same conference instead of
+      // minting a second one.
+      body.conferenceData = {
+        createRequest: {
+          requestId: input.eventId ?? `${calendarId}-${input.startsAt.getTime()}`,
+          conferenceSolutionKey: { type: 'hangoutsMeet' },
+        },
+      };
     }
 
+    // Two query params, both silent-failure traps:
+    //  • conferenceDataVersion=1 — WITHOUT it Google ignores conferenceData entirely and returns
+    //    200 with no link and no error.
+    //  • sendUpdates — events.insert defaults to emailing NOBODY, so an invitation without this
+    //    adds the customer to the event and never tells them. Only sent when there is actually
+    //    someone to notify, so the dueAt path (no attendees) keeps its silent default.
+    const qs = new URLSearchParams();
+    if (input.conference) qs.set('conferenceDataVersion', '1');
+    const sendUpdates = input.sendUpdates ?? 'none';
+    if (attendees.length && sendUpdates !== 'none') qs.set('sendUpdates', sendUpdates);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+
     try {
-      const created = await this.post<{ id?: string; htmlLink?: string }>(
-        `/calendars/${encodeURIComponent(calendarId)}/events`,
-        body,
-      );
-      return { id: created.id ?? input.eventId ?? '', htmlLink: created.htmlLink ?? null, alreadyExisted: false };
+      const created = await this.post<GoogleEvent>(`/calendars/${encodeURIComponent(calendarId)}/events${suffix}`, body);
+      const id = created.id ?? input.eventId ?? '';
+      let meetLink = meetLinkOf(created);
+
+      // Conference creation is ASYNC: a 'pending' createRequest means the link is not in this
+      // response. One re-read usually resolves it. Best-effort — a missing link never fails a
+      // booked meeting, it just makes the confirmation say so.
+      if (input.conference && !meetLink && id) {
+        meetLink = await this.reReadMeetLink(calendarId, id);
+      }
+      return { id, htmlLink: created.htmlLink ?? null, meetLink, alreadyExisted: false };
     } catch (err) {
       if (err instanceof CalendarHttpError && err.status === 409 && input.eventId) {
         // Duplicate deterministic id — the event this call would have created is already there.
-        return { id: input.eventId, htmlLink: null, alreadyExisted: true };
+        //
+        // Re-read ONLY when a conference was requested. A meeting's confirmation has to quote a
+        // real Meet link, and the ALREADY-BOOKED event is the truth (if a crash lost our ack it
+        // may not even match what this call would have written). The dueAt path asks for no
+        // conference and ignores htmlLink, so re-reading for it would buy nothing and cost up to
+        // 3 retried GETs (this.get retries everything) inside the caller's critical path.
+        if (input.conference) {
+          const existing = await this.tryGetEvent(calendarId, input.eventId);
+          return {
+            id: input.eventId,
+            htmlLink: existing?.htmlLink ?? null,
+            meetLink: meetLinkOf(existing),
+            alreadyExisted: true,
+          };
+        }
+        return { id: input.eventId, htmlLink: null, meetLink: null, alreadyExisted: true };
       }
       throw err;
     }
+  }
+
+  /** events.get, or null when it cannot be read. Needs only calendar.readonly. */
+  async getEvent(calendarId: string, eventId: string): Promise<GoogleEvent | null> {
+    return this.tryGetEvent(calendarId?.trim() || 'primary', eventId);
+  }
+
+  private async tryGetEvent(calendarId: string, eventId: string): Promise<GoogleEvent | null> {
+    try {
+      return await this.get<GoogleEvent>(
+        `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}?conferenceDataVersion=1`,
+      );
+    } catch {
+      return null; // best-effort: the event exists, we just couldn't re-read its link
+    }
+  }
+
+  private async reReadMeetLink(calendarId: string, eventId: string): Promise<string | null> {
+    return meetLinkOf(await this.tryGetEvent(calendarId, eventId));
+  }
+
+  /**
+   * freebusy.query for ONE credential's calendar. FAIL-CLOSED by contract: a transport error
+   * propagates, AND a per-calendar `errors[]` in an otherwise-200 body is raised rather than
+   * read as "no busy time". Google reports a broken calendar that way — treating it as free is
+   * exactly the double-booking this port exists to prevent.
+   */
+  async queryFreeBusy(input: FreeBusyInput): Promise<BusyInterval[]> {
+    const calendarId = input.calendarId?.trim() || 'primary';
+    const res = await this.post<{
+      calendars?: Record<string, { busy?: Array<{ start?: string; end?: string }>; errors?: Array<{ reason?: string }> }>;
+    }>('/freeBusy', {
+      timeMin: input.timeMin.toISOString(),
+      timeMax: input.timeMax.toISOString(),
+      items: [{ id: calendarId }],
+    });
+
+    const entry = res.calendars?.[calendarId];
+    if (!entry) {
+      throw new CalendarHttpError(502, `freeBusy returned no entry for calendar ${calendarId}`);
+    }
+    if (entry.errors?.length) {
+      const reasons = entry.errors.map((e) => e.reason ?? 'unknown').join(',');
+      throw new CalendarHttpError(502, `freeBusy reported errors for ${calendarId}: ${reasons}`);
+    }
+    return (entry.busy ?? [])
+      .filter((b) => b.start && b.end)
+      .map((b) => ({ start: new Date(b.start as string), end: new Date(b.end as string) }));
   }
 
   async listUpcomingEvents(input: ListUpcomingEventsInput): Promise<CalendarEvent[]> {

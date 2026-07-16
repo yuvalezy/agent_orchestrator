@@ -56,31 +56,64 @@ function isHoliday(dateIso: string, holidays: Holiday[], faith: string | null): 
   );
 }
 
-export function computeSendWindow(input: SendWindowInput): SendWindowResult {
-  const { nowUtc, tz, businessHours, holidays, faith } = input;
+/** Index business hours by day-of-week. Shared so a second consumer cannot re-derive the
+ *  0=Sunday convention (F5) differently. */
+export function businessHoursByDow(businessHours: BusinessHour[]): Map<number, BusinessHour> {
   const byDow = new Map<number, BusinessHour>();
   for (const bh of businessHours) byDow.set(bh.dayOfWeek, bh);
+  return byDow;
+}
 
-  const zone = DateTime.local().setZone(tz).isValid ? tz : 'utc';
-  const now = DateTime.fromJSDate(nowUtc, { zone });
+/**
+ * The open window on ONE local day, or null when that day is closed (non-working, a missing
+ * day_of_week row → fail-safe non-working per F5, or a relevant holiday). `day` may be any
+ * DateTime on the target day — the returned instants are set from its date.
+ *
+ * Extracted so the meeting-slot engine (src/triage/meeting-slots.ts) can enumerate open windows
+ * across N days WITHOUT re-implementing the `weekday % 7` mapping, the missing-row fail-safe, or
+ * the holiday-faith rule. computeSendWindow answers "is THIS instant inside a window"; slot
+ * generation needs "every window in a range" — different questions, one source of truth for what
+ * a window IS.
+ */
+export function openWindowForDay(
+  day: DateTime,
+  byDow: Map<number, BusinessHour>,
+  holidays: Holiday[],
+  faith: string | null,
+): { open: DateTime; close: DateTime } | null {
+  const row = byDow.get(day.weekday % 7); // luxon 1=Mon..7=Sun → 0=Sun..6=Sat
+  if (!row || !row.isWorkingDay) return null;
+  if (isHoliday(day.toISODate() ?? '', holidays, faith)) return null;
+  const s = parseTime(row.startTime);
+  const e = parseTime(row.endTime);
+  return {
+    open: day.set({ hour: s.hour, minute: s.minute, second: 0, millisecond: 0 }),
+    close: day.set({ hour: e.hour, minute: e.minute, second: 0, millisecond: 0 }),
+  };
+}
 
-  // Is `now` inside an open window today?
-  const todayDow = now.weekday % 7; // luxon 1=Mon..7=Sun → 0=Sun..6=Sat
-  const todayRow = byDow.get(todayDow);
+/** Resolve a tz name to a luxon-usable zone, falling back to UTC for an invalid name. */
+export function safeZone(tz: string): string {
+  return DateTime.local().setZone(tz).isValid ? tz : 'utc';
+}
+
+export function computeSendWindow(input: SendWindowInput): SendWindowResult {
+  const { nowUtc, tz, businessHours, holidays, faith } = input;
+  const byDow = businessHoursByDow(businessHours);
+
+  const now = DateTime.fromJSDate(nowUtc, { zone: safeZone(tz) });
+
+  // Is `now` inside an open window today? The holiday check is kept separate from
+  // openWindowForDay's (which folds both into a null) because the REASON is user-visible.
   const todayIsHoliday = isHoliday(now.toISODate() ?? '', holidays, faith);
   let allowed = false;
   let reason: 'off_hours' | 'holiday' | undefined;
 
   if (todayIsHoliday) {
     reason = 'holiday';
-  } else if (!todayRow || !todayRow.isWorkingDay) {
-    reason = 'off_hours';
   } else {
-    const s = parseTime(todayRow.startTime);
-    const e = parseTime(todayRow.endTime);
-    const open = now.set({ hour: s.hour, minute: s.minute, second: 0, millisecond: 0 });
-    const close = now.set({ hour: e.hour, minute: e.minute, second: 0, millisecond: 0 });
-    if (now >= open && now < close) allowed = true;
+    const today = openWindowForDay(now, byDow, holidays, faith);
+    if (today && now >= today.open && now < today.close) allowed = true;
     else reason = 'off_hours';
   }
 
@@ -89,14 +122,10 @@ export function computeSendWindow(input: SendWindowInput): SendWindowResult {
   // Forward-scan (capped) for the next open window start.
   for (let d = 0; d < SCAN_CAP_DAYS; d += 1) {
     const day = now.plus({ days: d }).startOf('day');
-    const dow = day.weekday % 7;
-    const row = byDow.get(dow);
-    if (!row || !row.isWorkingDay) continue;
-    if (isHoliday(day.toISODate() ?? '', holidays, faith)) continue;
-    const s = parseTime(row.startTime);
-    const open = day.set({ hour: s.hour, minute: s.minute, second: 0, millisecond: 0 });
-    if (open > now) {
-      return { allowed: false, nextOpenUtc: open.toUTC().toJSDate(), reason };
+    const w = openWindowForDay(day, byDow, holidays, faith);
+    if (!w) continue;
+    if (w.open > now) {
+      return { allowed: false, nextOpenUtc: w.open.toUTC().toJSDate(), reason };
     }
   }
 

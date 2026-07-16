@@ -27,6 +27,7 @@ import {
 } from '../../outbound/outbound-repo';
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
 import { buildBackfillApproveHandler } from './backfill-approve.factory';
+import { buildMeetingSchedulerGated } from './meeting-scheduler.factory';
 import { threadMarkers } from './thread-markers.instance';
 import { buildFounderMessageRouter } from '../../triage/founder-message-router';
 import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
@@ -189,6 +190,13 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // so a tap does nothing until the feature is on.
   const backfill = env.BACKFILL_ENABLED ? buildBackfillApproveHandler({ notifier }) : null;
 
+  // Meeting duration/slot taps. A SECOND scheduler instance (the inbox processor builds its own
+  // to ASK the questions; this one ANSWERS them). That is safe rather than sloppy: the scheduler
+  // holds no state — every transition is a guarded write against agent_meeting_requests — so the
+  // two instances cannot disagree, and wiring one across two independent worker factories would
+  // couple them for nothing.
+  const meeting = buildMeetingSchedulerGated(taskTarget, notifier)?.decisions ?? null;
+
   // THE decision router. Named (not inlined into onDecision) because a second caller
   // needs it: the askFounder free-text resolver turns a TYPED answer into a DecisionEvent
   // and routes it here, so typing an option and tapping it land in the same handler.
@@ -210,6 +218,7 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
     if (draft && isDraftOption(d.optionId)) return draft(d);
     if (revise && isCorrectionFlipOption(d.optionId)) return revise.flip(d);
     if (backfill && backfill.isBackfillOption(d.optionId)) return backfill.handle(d);
+    if (meeting && meeting.isMeetingOption(d.optionId)) return meeting.handle(d);
   };
 
   notifier.onDecision(routeDecision);

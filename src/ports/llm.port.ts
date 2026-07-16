@@ -56,6 +56,7 @@ export interface Intent {
     | 'bug_report'
     | 'question_existing'
     | 'follow_up'
+    | 'meeting_request'
     | 'info_provided'
     | 'compliment'
     | 'unclear'
