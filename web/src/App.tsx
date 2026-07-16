@@ -143,10 +143,12 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
   const logout = useMutation({ mutationFn: () => api<void>('/session', { method: 'DELETE' }), onSettled: onLogout });
   const choose = (next: View) => { setView(next); setMenuOpen(false); };
   return <div className="min-h-screen bg-zinc-950 text-zinc-100">
-    <aside className={cn('fixed inset-y-0 z-20 w-64 border-r border-zinc-800 bg-zinc-950 p-4 transition-transform md:translate-x-0', menuOpen ? 'translate-x-0' : '-translate-x-full')}>
-      <div className="mb-7 flex items-center gap-3 px-2"><div className="grid size-8 place-items-center rounded-lg bg-emerald-400 text-zinc-950"><Activity size={18} /></div><span className="font-semibold">AO Console</span></div>
-      <nav className="space-y-1">{nav.map(([key, label, Icon]) => <button key={key} onClick={() => choose(key)} className={cn('flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition', view === key ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100')}><Icon size={17} />{label}</button>)}</nav>
-      <button onClick={() => logout.mutate()} className="absolute bottom-5 flex items-center gap-3 px-3 text-sm text-zinc-400 hover:text-white"><LogOut size={17} />Sign out</button>
+    <aside className={cn('fixed inset-y-0 z-20 flex w-64 min-h-0 flex-col border-r border-zinc-800 bg-zinc-950 p-4 transition-transform md:translate-x-0', menuOpen ? 'translate-x-0' : '-translate-x-full')}>
+      <div className="mb-7 flex shrink-0 items-center gap-3 px-2"><div className="grid size-8 place-items-center rounded-lg bg-emerald-400 text-zinc-950"><Activity size={18} /></div><span className="font-semibold">AO Console</span></div>
+      <nav aria-label="Console navigation" className="console-sidebar-nav min-h-0 flex-1 space-y-1 overflow-y-auto pr-2">{nav.map(([key, label, Icon]) => <button key={key} onClick={() => choose(key)} className={cn('flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition', view === key ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100')}><Icon size={17} />{label}</button>)}</nav>
+      <div className="mt-4 shrink-0 border-t border-zinc-800 pt-4">
+        <button onClick={() => logout.mutate()} className="flex items-center gap-3 px-3 text-sm text-zinc-400 hover:text-white"><LogOut size={17} />Sign out</button>
+      </div>
     </aside>
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">

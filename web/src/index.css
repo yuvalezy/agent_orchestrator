@@ -8,3 +8,14 @@
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
 button, input { font: inherit; }
+
+/* Keep the footer reachable while the menu itself scrolls on short viewports. */
+.console-sidebar-nav {
+  scrollbar-color: #52525b #18181b;
+  scrollbar-width: thin;
+}
+
+.console-sidebar-nav::-webkit-scrollbar { width: 0.5rem; }
+.console-sidebar-nav::-webkit-scrollbar-track { background: #18181b; border-radius: 9999px; }
+.console-sidebar-nav::-webkit-scrollbar-thumb { background: #52525b; border: 2px solid #18181b; border-radius: 9999px; }
+.console-sidebar-nav::-webkit-scrollbar-thumb:hover { background: #71717a; }
