@@ -1,6 +1,13 @@
 import { logger } from '../../logger';
 import { DEFAULT_RETRY, withRetry } from '../shared/retry';
-import type { LlmMessage, LlmProviderClient, TokenUsage } from '../../ports/llm.port';
+import type {
+  CompleteWithToolsRequest,
+  CompleteWithToolsResult,
+  LlmMessage,
+  LlmProviderClient,
+  TokenUsage,
+  ToolLoopMessage,
+} from '../../ports/llm.port';
 import { LlmProviderError, kindForStatus } from './errors';
 
 // Anthropic Messages API provider (DM4-4). Raw fetch, no SDK. Structured output =
@@ -17,16 +24,23 @@ import { LlmProviderError, kindForStatus } from './errors';
 const ANTHROPIC_VERSION = '2023-06-01';
 
 interface ContentBlock {
-  type: string; // 'thinking' | 'text' | …
+  type: string; // 'thinking' | 'text' | 'tool_use' | …
   text?: string;
+  // tool_use block fields (WP8): the model's requested tool call.
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
 }
 interface MessagesResponse {
   content: ContentBlock[];
   usage?: { input_tokens?: number; output_tokens?: number };
+  stop_reason?: string;
 }
 
 export class AnthropicClient implements LlmProviderClient {
   readonly provider = 'anthropic';
+  // WP8: Anthropic supports the read-only tool loop via tool_use content blocks.
+  readonly supportsTools = true;
   private readonly baseUrl: string;
   private readonly resolveKey: () => string | undefined;
   private readonly fetchImpl: typeof fetch;
@@ -142,4 +156,55 @@ export class AnthropicClient implements LlmProviderClient {
       throw new LlmProviderError('anthropic', 'schema', 'structured output was not valid JSON');
     }
   }
+
+  /**
+   * WP8: ONE turn of the read-only tool loop. Translates the provider-neutral ToolLoopMessage[]
+   * into Anthropic content blocks, sends the tools, and reports whether the model asked for tool
+   * calls (tool_use blocks present) or produced final text. The LOOP itself lives in the router.
+   *
+   * Adaptive thinking is deliberately NOT enabled here: with thinking on, Anthropic requires the
+   * thinking blocks to be echoed back verbatim on every subsequent assistant turn — a fragile
+   * multi-turn signature we avoid by omitting `thinking`/`effort`, which is also portable across
+   * every model (Fable-5 rejects thinking:{disabled}). NEVER logs the messages or tool results.
+   */
+  async completeWithTools(req: CompleteWithToolsRequest): Promise<CompleteWithToolsResult> {
+    const body: Record<string, unknown> = {
+      model: req.model,
+      max_tokens: req.maxTokens,
+      system: req.system,
+      messages: toToolMessages(req.messages),
+      tools: req.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })),
+    };
+    const res = await this.post(body);
+    const usage = this.usageOf(res);
+    const toolUse = res.content.filter((b) => b.type === 'tool_use');
+    if (toolUse.length > 0) {
+      return {
+        kind: 'tool_calls',
+        toolCalls: toolUse.map((b) => ({ id: b.id ?? '', name: b.name ?? '', input: b.input ?? {} })),
+        text: this.textOf(res),
+        usage,
+      };
+    }
+    return { kind: 'final', text: this.textOf(res), usage };
+  }
+}
+
+/** Translate the provider-neutral tool-loop turns into Anthropic content-block messages. An
+ *  assistant turn re-emits its text (if any) then its tool_use blocks; a tool_results turn is an
+ *  Anthropic `user` turn of tool_result blocks. (No thinking blocks — see completeWithTools.) */
+function toToolMessages(messages: ToolLoopMessage[]): Array<{ role: string; content: unknown }> {
+  return messages.map((m) => {
+    if (m.role === 'user') return { role: 'user', content: m.content };
+    if (m.role === 'assistant') {
+      const blocks: Array<Record<string, unknown>> = [];
+      if (m.text && m.text.trim()) blocks.push({ type: 'text', text: m.text });
+      for (const tc of m.toolCalls) blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input });
+      return { role: 'assistant', content: blocks };
+    }
+    return {
+      role: 'user',
+      content: m.results.map((r) => ({ type: 'tool_result', tool_use_id: r.id, content: r.content })),
+    };
+  });
 }

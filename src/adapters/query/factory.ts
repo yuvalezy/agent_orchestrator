@@ -5,10 +5,19 @@ import { tryResolveCredential } from '../../config/credentials';
 import { memoryRepo } from '../../knowledge/memory-repo';
 import { internalKnowledgeRepo } from '../../knowledge/internal-repo';
 import { buildInternalKnowledgeSearch } from '../../knowledge/internal-search';
-import { buildScopeResolver, type ResolvedCustomer } from '../../query/scope';
+import { buildScopeResolver, type QueryScope, type ResolvedCustomer } from '../../query/scope';
 import { buildQueryService, type QueryCitation, type QueryService } from '../../query/query-service';
+import { buildAgenticQueryService } from '../../query/agentic-query-service';
+import { buildAgenticToolset, type AgenticToolDeps, type AgenticToolSource } from '../../query/agentic-tools';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildLlmRouter } from '../llm/factory';
+import { buildEzyPortalGateway } from '../ezy-portal';
+import { buildCalendarAdapter } from '../calendar/factory';
+import { loadCustomerConfig } from '../../triage/context-loader';
+import { fetchPendingDrafts, fetchPendingProposals } from './daily-briefing.worker';
+import { fetchAwaitingReply } from './briefing-repo';
+import { listAllOpenCommitments, listOpenCommitmentsForCustomer } from '../../commitments/commitment-repo';
+import { getCustomerBrief } from '../../knowledge/customer-brief-repo';
 
 // Composition root for the M5(a) founder query engine (imports adapters + core; the
 // D1 boundary only forbids core → adapters, and this is a wiring module). Assembles:
@@ -144,8 +153,53 @@ export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<vo
     });
   };
 
+  const scopeResolver = buildScopeResolver({ findCustomer: findCustomerByName });
+
+  // ── Cross-customer fan-out (Admin topic, task 1.2/5.2) ────────────────────────────────
+  // Hoisted to a const (WP8 reuses it for the cross-customer search_memory tool). A FAN-OUT of
+  // the exact-id search — one embedding, N isolated searches, merged and ranked by distance. Not
+  // a widened query: every leg still names ONE customer, so this cannot return a row that
+  // customer's own scope wouldn't. SHARED ROWS ARE THE SUBTLETY: memoryRepo.search returns a
+  // customer's rows PLUS the shared ones (customer_id IS NULL), so a naive merge would return each
+  // shared chunk once PER customer. So the shared leg is fetched ONCE (customerId null → shared
+  // only) and subtracted from every customer leg by content; a customer row byte-identical to a
+  // shared row is attributed to the shared corpus.
+  const retrieveAllCustomers = async (question: string): Promise<QueryCitation[]> => {
+    const vec = await embedQuestion(question);
+    if (!vec) return [];
+
+    const [shared, customers] = await Promise.all([searchMemory(vec, null), listCustomers()]);
+    const sharedContent = new Set(shared.map((h) => h.content));
+
+    const fanned = customers.slice(0, MAX_CROSS_CUSTOMER_FANOUT);
+    const perCustomer = await Promise.all(
+      fanned.map(async (c) => {
+        const hits = await searchMemory(vec, c.customerId); // EXACT id — isolation holds
+        return hits
+          .filter((h) => !sharedContent.has(h.content))
+          // Attribution is not decoration here: an aggregate the founder can't trace back to a
+          // customer isn't actionable.
+          .map((h) => ({ label: `${c.customerName} › ${h.label}`, snippet: snippet(h.content), distance: h.distance }));
+      }),
+    );
+
+    const merged = [
+      ...shared.map((h) => ({ label: `Shared › ${h.label}`, snippet: snippet(h.content), distance: h.distance })),
+      ...perCustomer.flat(),
+    ]
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, CROSS_CUSTOMER_K);
+
+    // Counts + flags ONLY — never the question, never a snippet.
+    logger.info(
+      { customers: fanned.length, skipped: customers.length - fanned.length, cited: merged.length },
+      'query: cross-customer fan-out',
+    );
+    return merged;
+  };
+
   const service = buildQueryService({
-    scopeResolver: buildScopeResolver({ findCustomer: findCustomerByName }),
+    scopeResolver,
 
     // Internal corpus → InternalKnowledgeCitation → QueryCitation.
     retrieveInternal: async (question: string): Promise<QueryCitation[]> => {
@@ -165,56 +219,172 @@ export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<vo
       return hits.map((h) => ({ label: h.label, snippet: snippet(h.content), distance: h.distance }));
     },
 
-    // ── Cross-customer (Admin topic, task 1.2/5.2) ────────────────────────────────────
-    // A FAN-OUT of the exact-id search above — one embedding, N isolated searches, merged
-    // and ranked by distance. Not a widened query: every leg still names ONE customer, so
-    // this cannot return a row that customer's own scope wouldn't.
-    //
-    // SHARED ROWS ARE THE SUBTLETY. memoryRepo.search returns a customer's rows PLUS the
-    // shared ones (customer_id IS NULL), so a naive merge would return each shared chunk
-    // once PER customer — N near-identical citations crowding the real per-customer hits
-    // out of the ranked window, each falsely attributed to a customer that doesn't own it.
-    // So the shared leg is fetched ONCE explicitly (customerId null → shared only) and
-    // subtracted from every customer leg by content. A customer row whose content is
-    // byte-identical to a shared row is dropped as shared — it is still represented, just
-    // attributed to the shared corpus, which is the more useful reading of a duplicate.
-    retrieveAllCustomers: async (question: string): Promise<QueryCitation[]> => {
-      const vec = await embedQuestion(question);
-      if (!vec) return [];
-
-      const [shared, customers] = await Promise.all([searchMemory(vec, null), listCustomers()]);
-      const sharedContent = new Set(shared.map((h) => h.content));
-
-      const fanned = customers.slice(0, MAX_CROSS_CUSTOMER_FANOUT);
-      const perCustomer = await Promise.all(
-        fanned.map(async (c) => {
-          const hits = await searchMemory(vec, c.customerId); // EXACT id — isolation holds
-          return hits
-            .filter((h) => !sharedContent.has(h.content))
-            // Attribution is not decoration here: an aggregate the founder can't trace
-            // back to a customer isn't actionable.
-            .map((h) => ({ label: `${c.customerName} › ${h.label}`, snippet: snippet(h.content), distance: h.distance }));
-        }),
-      );
-
-      const merged = [
-        ...shared.map((h) => ({ label: `Shared › ${h.label}`, snippet: snippet(h.content), distance: h.distance })),
-        ...perCustomer.flat(),
-      ]
-        .sort((a, b) => a.distance - b.distance)
-        .slice(0, CROSS_CUSTOMER_K);
-
-      // Counts + flags ONLY — never the question, never a snippet.
-      logger.info(
-        { customers: fanned.length, skipped: customers.length - fanned.length, cited: merged.length },
-        'query: cross-customer fan-out',
-      );
-      return merged;
-    },
+    retrieveAllCustomers,
 
     synth,
   });
 
-  logger.info('founder query engine wired (QUERY_ENGINE_ENABLED=true) — /ask internal Project Brain channel active');
-  return service;
+  // WP8: when the agentic loop is off, the single-shot engine above IS the query engine (byte-
+  // identical to before this feature). When on, DECORATE it — the loop tries first and falls back
+  // to `service` on unavailable/failure — so the single-shot path stays the default and fallback.
+  if (!env.QUERY_AGENTIC_ENABLED) {
+    logger.info('founder query engine wired (QUERY_ENGINE_ENABLED=true) — single-shot /ask + free-text');
+    return service;
+  }
+
+  const toolDeps = buildAgenticToolDeps({ embedQuestion, retrieveAllCustomers, internalSearch, findCustomerByName });
+  const agenticService = buildAgenticQueryService({
+    scopeResolver,
+    buildToolset: (scope: QueryScope) => buildAgenticToolset(toolDeps, scope),
+    agentic: synth,
+    inner: service,
+    log: logger,
+  });
+  logger.info('founder query engine wired + AGENTIC loop (QUERY_AGENTIC_ENABLED=true) — read-only tool loop, single-shot fallback');
+  return agenticService;
+}
+
+// ── WP8: the concrete read-only tool deps (adapter reads) the CORE toolset is assembled from ──────
+// Each is a bounded read that returns numbered sources; the CORE (agentic-tools.ts) owns the scope
+// pinning that decides WHICH customer id to pass. A missing capability (calendar off) is passed as
+// null → the tool reports 'unavailable'. NEVER logs content.
+
+/** Founder-private conversation snippet cap (chars) — same private surface as a draft card. */
+const CONVERSATION_SNIPPET_CHARS = 160;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface AgenticToolDepsInput {
+  embedQuestion: (q: string) => Promise<number[] | null>;
+  retrieveAllCustomers: (question: string) => Promise<QueryCitation[]>;
+  internalSearch: { search: (q: string, k?: number) => Promise<Array<{ repo: string; path: string; section: string | null; snippet: string }>> };
+  findCustomerByName: (question: string) => Promise<ResolvedCustomer | null>;
+}
+
+function buildAgenticToolDeps(input: AgenticToolDepsInput): AgenticToolDeps {
+  const taskTarget = buildEzyPortalGateway();
+  const calendar = env.CALENDAR_ENABLED ? buildCalendarAdapter() : null;
+
+  const memoryLabel = (metadata: Record<string, unknown> | null, memoryType: string): string => {
+    const md = (metadata ?? {}) as Record<string, unknown>;
+    const s = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
+    return [s(md.title), s(md.section)].filter((x): x is string => !!x).join(' › ') || memoryType;
+  };
+
+  /** One customer's open portal tasks via its bound projectRef (R46: findOpenTasks needs a
+   *  projectRef; customerRef is not a portal filter). Empty when no project is bound. */
+  const openTasksForCustomer = async (customerId: string): Promise<AgenticToolSource[]> => {
+    const config = await loadCustomerConfig(customerId);
+    if (!config?.projectRef) return [];
+    const tasks = await taskTarget.findOpenTasks({ projectRef: config.projectRef });
+    return tasks.map((t) => ({
+      label: `${t.code ?? t.ref}: ${t.title}`,
+      content: `${t.title} — status: ${t.status}${t.priority ? `, priority: ${t.priority}` : ''}`,
+    }));
+  };
+
+  return {
+    // customer + shared memory search, k-aware (hybrid when HYBRID_RETRIEVAL_ENABLED — WP4).
+    searchCustomerMemory: async (queryText, k, customerId) => {
+      const vec = await input.embedQuestion(queryText);
+      if (!vec) return [];
+      const opts = { kCustomer: k, kShared: Math.max(1, Math.ceil(k / 2)), maxDistance: env.KNOWLEDGE_RETRIEVAL_MAX_DISTANCE };
+      const results = env.HYBRID_RETRIEVAL_ENABLED
+        ? await memoryRepo.hybridSearch(vec, queryText, customerId, opts)
+        : await memoryRepo.search(vec, customerId, opts);
+      return results.map((r) => ({ label: memoryLabel(r.metadata, r.memoryType), content: snippet(r.content) }));
+    },
+    // cross-customer fan-out (reuses the single-shot Admin-topic retriever).
+    searchAllMemory: async (queryText) => {
+      const hits = await input.retrieveAllCustomers(queryText);
+      return hits.map((h) => ({ label: h.label, content: h.snippet }));
+    },
+    // internal Project-Brain corpus (structurally separate from customer data).
+    searchInternalKnowledge: async (queryText, k) => {
+      const hits = await input.internalSearch.search(queryText, k);
+      return hits.map((h) => ({
+        label: [h.repo, h.path, h.section].filter((s): s is string => !!s).join(' › '),
+        content: h.snippet,
+      }));
+    },
+    listOpenTasks: async (customerId) => {
+      if (customerId) return openTasksForCustomer(customerId);
+      // Cross-customer: a BOUNDED fan-out over onboarded customers (a founder tool, so bounded).
+      const customers = (await listCustomers()).slice(0, MAX_CROSS_CUSTOMER_FANOUT);
+      const per = await Promise.all(
+        customers.map(async (c) =>
+          (await openTasksForCustomer(c.customerId)).map((s) => ({ label: `${c.customerName} › ${s.label}`, content: s.content })),
+        ),
+      );
+      return per.flat();
+    },
+    recentConversation: async (customerId, limit) => {
+      const { rows } = await query<{ direction: string; subject: string | null; body: string | null; received_at: Date }>(
+        `SELECT direction, subject, body, received_at
+           FROM agent_inbox
+          WHERE customer_id = $1
+          ORDER BY received_at DESC
+          LIMIT $2`,
+        [customerId, limit],
+      );
+      return rows.map((r) => {
+        const text = [r.subject, r.body].filter((s): s is string => !!s).join(' — ').replace(/\s+/g, ' ').trim();
+        const capped = text.length > CONVERSATION_SNIPPET_CHARS ? `${text.slice(0, CONVERSATION_SNIPPET_CHARS - 1).trimEnd()}…` : text;
+        const who = r.direction === 'outbound' ? 'You' : 'Customer';
+        return { label: `${who} · ${new Date(r.received_at).toISOString().slice(0, 10)}`, content: capped || '(no text)' };
+      });
+    },
+    pendingApprovals: async () => {
+      const [drafts, proposals] = await Promise.all([fetchPendingDrafts(), fetchPendingProposals()]);
+      const src: AgenticToolSource[] = [];
+      for (const d of drafts) {
+        src.push({
+          label: `Pending draft reply${d.customerName ? ` · ${d.customerName}` : ''}`,
+          content: `Draft reply awaiting approval${d.customerName ? ` for ${d.customerName}` : ''} (since ${d.createdAt.toISOString().slice(0, 10)})`,
+        });
+      }
+      for (const p of proposals) {
+        src.push({
+          label: `Pending task proposal${p.customerName ? ` · ${p.customerName}` : ''}`,
+          content: `Backfill task proposal awaiting approval${p.customerName ? ` for ${p.customerName}` : ''} (since ${p.createdAt.toISOString().slice(0, 10)})`,
+        });
+      }
+      return src;
+    },
+    awaitingReply: async () => {
+      const rows = await fetchAwaitingReply(new Date());
+      const now = Date.now();
+      return rows.map((r) => {
+        const days = Math.max(0, Math.floor((now - r.lastOutboundAt.getTime()) / DAY_MS));
+        return {
+          label: `Awaiting reply${r.customerName ? ` · ${r.customerName}` : ''}`,
+          content: `${r.customerName ?? 'A customer'} has not replied for ${days} day(s)${r.taskTitle ? ` on: ${r.taskTitle}` : ''}`,
+        };
+      });
+    },
+    openCommitments: async (customerId) => {
+      const rows = customerId ? await listOpenCommitmentsForCustomer(customerId) : await listAllOpenCommitments();
+      return rows.map((c) => {
+        const customerName = 'customerName' in c ? c.customerName : null;
+        return {
+          label: `Commitment${customerName ? ` · ${customerName}` : ''}`,
+          content: `${c.text}${c.dueAt ? ` (due ${c.dueAt.toISOString().slice(0, 10)})` : ''}`,
+        };
+      });
+    },
+    upcomingMeetings: calendar
+      ? async (days) => {
+          const events = await calendar.listUpcomingEvents({ lookaheadDays: days, matchEmails: [], maxEvents: 20 });
+          return events.map((e) => ({
+            label: `Meeting · ${new Date(e.startsAt).toISOString().slice(0, 16).replace('T', ' ')}`,
+            content: `${e.title}${e.allDay ? ' (all day)' : ''}`,
+          }));
+        }
+      : null,
+    customerBrief: async (customerId) => {
+      const brief = await getCustomerBrief(customerId);
+      return brief ? [{ label: 'Relationship brief', content: brief }] : [];
+    },
+    listCustomers: async () => (await listCustomers()).map((c) => ({ label: c.customerName, content: c.customerName })),
+    resolveCustomer: async (name) => input.findCustomerByName(name),
+  };
 }

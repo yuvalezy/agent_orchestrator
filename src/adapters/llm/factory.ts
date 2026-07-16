@@ -65,5 +65,11 @@ export function buildLlmRouter(opts: BuildLlmRouterOptions): LlmRouter {
     effortFor,
     dailyCapUsd: env.LLM_DAILY_COST_CAP_USD,
     notifyAdmin: opts.notifyAdmin,
+    // WP8 agentic loop tuning (only read by answerAgentically; harmless for every other role).
+    agentic: {
+      maxIterations: env.QUERY_AGENTIC_MAX_ITERATIONS,
+      maxCostUsd: env.QUERY_AGENTIC_MAX_COST_USD,
+      maxTokens: 1500,
+    },
   });
 }

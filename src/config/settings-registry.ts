@@ -183,6 +183,17 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     dependsOn: 'QUERY_ENGINE_ENABLED',
   },
   {
+    key: 'QUERY_AGENTIC_ENABLED',
+    type: 'boolean',
+    category: KNOWLEDGE,
+    label: 'Agentic query (read-only tools)',
+    description:
+      'Answers founder questions with a chief-of-staff analyst LOOP: the model calls read-only tools (memory/tasks/conversations/approvals/commitments/meetings/briefs, plus internal knowledge for /ask) across several turns, then writes a cited answer. Founder-only and strictly read-only. Requires the query engine on and a tool-capable provider (Anthropic); falls back to the single-shot engine when unavailable.',
+    applyMode: 'restart',
+    default: false,
+    dependsOn: 'QUERY_ENGINE_ENABLED',
+  },
+  {
     key: 'SLASH_COMMANDS_ENABLED',
     type: 'boolean',
     category: KNOWLEDGE,

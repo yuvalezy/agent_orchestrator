@@ -162,3 +162,53 @@ test('daily cost cap kill-switch throws before any provider call', async (t) => 
   await assert.rejects(router.extractIntents(CANNED), CostCapExceeded);
   assert.equal(called, false);
 });
+
+// ── WP8: answerAgentically (agentic loop) provider selection + cost ─────────────────────────────────
+
+test('answerAgentically: no tool-capable provider in the chain → null (→ single-shot fallback)', async () => {
+  // fakeClient sets neither supportsTools nor completeWithTools → the loop reports unavailable.
+  const router = buildRouter({ anthropic: fakeClient('anthropic', 'ok'), openai: fakeClient('openai', 'ok') });
+  const out = await router.answerAgentically({ question: 'anything', scope: { kind: 'internal' }, tools: [] });
+  assert.equal(out, null);
+});
+
+test('answerAgentically: tool-capable provider runs the loop and records cost per turn', async (t) => {
+  if (!(await ensureDb())) return t.skip('no db');
+  await query(`DELETE FROM llm_costs WHERE created_at > now() - interval '1 min'`);
+
+  const usage = { inputTokens: 100, outputTokens: 20 };
+  let toolTurns = 0;
+  const toolClient: LlmProviderClient = {
+    provider: 'anthropic',
+    supportsTools: true,
+    complete: async () => ({ text: '', usage }),
+    completeStructured: async <T>() => ({ value: { answer: 'Grounded answer.', used_sources: [0] } as unknown as T, usage }),
+    completeWithTools: async () => {
+      toolTurns += 1;
+      // First turn asks for a tool; second turn yields (final).
+      return toolTurns === 1
+        ? { kind: 'tool_calls', toolCalls: [{ id: 'a', name: 'search_memory', input: { query: 'x' } }], usage }
+        : { kind: 'final', text: 'done', usage };
+    },
+  };
+  const router = buildRouter({ anthropic: toolClient });
+  const tools = [
+    {
+      name: 'search_memory',
+      description: 'x',
+      parameters: { type: 'object', additionalProperties: false, required: [], properties: {} },
+      invoke: async () => ({ kind: 'sources' as const, items: [{ label: 'mem', content: 'x' }] }),
+    },
+  ];
+
+  const out = await router.answerAgentically({ question: 'q', scope: { kind: 'internal' }, tools });
+  assert.ok(out, 'the loop returned an answer');
+  assert.equal(out!.body, 'Grounded answer.');
+  assert.deepEqual(out!.usedSourceIndexes, [0]);
+  assert.equal(out!.toolCallCount, 1);
+  const { rows } = await query<{ n: string }>(
+    `SELECT count(*) n FROM llm_costs WHERE role = 'answer' AND created_at > now() - interval '1 min'`,
+  );
+  // 2 completeWithTools turns + 1 closing completeStructured = 3 cost rows.
+  assert.ok(Number(rows[0].n) >= 3, 'cost recorded per provider call (2 loop turns + closing)');
+});

@@ -33,6 +33,12 @@ export interface OpenAiCompatibleOptions {
 
 export class OpenAiCompatibleClient implements LlmProviderClient {
   readonly provider: string;
+  // WP8: the read-only agentic tool loop is implemented for Anthropic only (tool_use content
+  // blocks). OpenAI chat/completions supports `tools` too, but wiring the multi-turn tool_call/
+  // tool message round-trip through this shared base was left out of WP8's scope — so both OpenAI
+  // and DeepSeek report supportsTools=false and the loop cleanly falls back to the single-shot
+  // engine when the tool-capable provider (Anthropic) is unavailable. completeWithTools is absent.
+  readonly supportsTools = false;
   private readonly baseUrl: string;
   private readonly resolveKey: () => string | undefined;
   private readonly structuredMode: StructuredMode;

@@ -687,9 +687,138 @@ export interface CommitmentExtractorPort {
   extractCommitments(input: { customerName: string; messages: string[] }): Promise<CommitmentExtractionResult>;
 }
 
+// ── WP8: agentic founder query loop (read-only tools) ────────────────────────────────
+// A founder-facing analyst loop: the model calls READ-ONLY tools to gather evidence, then
+// a closing structured synthesis produces a cited answer. The provider-neutral wire types
+// below are the ONLY tool-use shapes the loop/router touch — the CORE (agentic-tools.ts)
+// never sees an Anthropic/OpenAI content block. SECURITY: this surface is founder-only and
+// strictly read-only; tool results carry customer-authored text, so the loop's system prompt
+// treats every tool result as DATA, never instructions, and citations are rendered from OUR
+// accumulated source list by index (never a free-text citation).
+
+/** A provider-neutral tool definition handed to the model (name + description + input JSON
+ *  Schema). The router translates this into each provider's wire tool shape. */
+export interface ToolDef {
+  name: string;
+  description: string;
+  /** JSON Schema for the tool's input object. */
+  inputSchema: object;
+}
+
+/** One tool invocation the model requested (provider-neutral). */
+export interface ToolCall {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/** One tool result fed back to the model (provider-neutral). */
+export interface ToolResultInput {
+  /** The id of the ToolCall this answers. */
+  id: string;
+  content: string;
+}
+
+/** A provider-neutral conversation turn for the tool loop. Distinct from LlmMessage (plain
+ *  text) because tool use needs structured tool_use / tool_result content. */
+export type ToolLoopMessage =
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; text?: string; toolCalls: ToolCall[] }
+  | { role: 'tool_results'; results: ToolResultInput[] };
+
+export interface CompleteWithToolsRequest {
+  model: string;
+  system: string;
+  messages: ToolLoopMessage[];
+  tools: ToolDef[];
+  maxTokens: number;
+  effort?: string;
+}
+
+/** One turn of the tool loop: either the model asked for tool calls, or it produced final
+ *  text (no tool calls). `usage` is always present for cost accounting. */
+export interface CompleteWithToolsResult {
+  kind: 'tool_calls' | 'final';
+  toolCalls?: ToolCall[];
+  text?: string;
+  usage: TokenUsage;
+}
+
+/** One numbered source the accumulated source list registers — `content` is the text the
+ *  model reads (and that backs the citation); `label` is what the founder-facing citation
+ *  list renders. Produced by the CORE read-only tools; never a provider wire shape. */
+export interface AgenticToolSource {
+  label: string;
+  content: string;
+}
+
+/** The typed result of ONE read-only tool call. A tool NEVER throws into the loop: a missing
+ *  capability, an unresolved argument, or an internal error becomes kind:'unavailable', which
+ *  the loop feeds back to the model as DATA. */
+export type AgenticToolResult =
+  | { kind: 'sources'; items: AgenticToolSource[] }
+  | { kind: 'unavailable'; reason: string };
+
+/** One read-only tool the CORE exposes to the loop, already scope-pinned by the core builder.
+ *  Provider-neutral: `parameters` is a JSON Schema the router translates to a wire ToolDef. */
+export interface AgenticTool {
+  name: string;
+  description: string;
+  /** JSON Schema for the tool input. */
+  parameters: object;
+  /** Run the read. NEVER throws into the loop — returns kind:'unavailable' on any problem. */
+  invoke(input: Record<string, unknown>): Promise<AgenticToolResult>;
+}
+
+/** The read-only toolset for ONE query, already scope-pinned (customer scope pins every tool
+ *  to that customerId; 'all' allows cross-customer; 'internal' additionally exposes internal
+ *  knowledge search). Built by src/query/agentic-tools.ts. */
+export type AgenticToolset = AgenticTool[];
+
+/** Which corpus a founder question targets — mirrors src/query/scope.ts QueryScope structurally
+ *  (a QueryScope is assignable to this) so the port stays a leaf (no core import). The router
+ *  reads `customerId` (cost attribution) + a human label (the analyst system prompt). */
+export type AgenticScope =
+  | { kind: 'internal' }
+  | { kind: 'customer'; customerId: string; customerName: string }
+  | { kind: 'all' };
+
+export interface AgenticAnswerInput {
+  question: string;
+  scope: AgenticScope;
+  /** The scope-pinned read-only toolset (built by the CORE). */
+  tools: AgenticToolset;
+}
+
+/** The founder-facing agentic answer. `sources` is the accumulated source list (in registration
+ *  order); `usedSourceIndexes` are the (already clamped + deduped) indexes into it the closing
+ *  synthesis relied on — the caller renders the citation list from OUR sources at those indexes,
+ *  so a hallucinated citation is impossible (mirrors AnswerResult / DraftResult). */
+export interface AgenticAnswerResult {
+  body: string;
+  sources: Array<{ label: string }>;
+  usedSourceIndexes: number[];
+  /** How many tool calls the loop executed (observability; never logged with content). */
+  toolCallCount: number;
+}
+
+/**
+ * Agentic founder query loop (WP8). SEPARATE from AgentLlmPort (interface segregation, like the
+ * other synthesizer ports): the agentic query wrapper depends only on this, and existing fakes are
+ * untouched. Implemented by the LlmRouter (role 'answer'). Returns null when the loop is unavailable
+ * (no tool-capable provider) OR fails for ANY reason — the caller then falls back to the single-shot
+ * query engine. NEVER logs the question, the tool results, or the answer.
+ */
+export interface AgenticAnswerPort {
+  answerAgentically(input: AgenticAnswerInput): Promise<AgenticAnswerResult | null>;
+}
+
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */
 export interface LlmProviderClient {
   readonly provider: string; // 'anthropic' | 'openai' | 'deepseek' | future
+  /** WP8: does this provider support the read-only tool loop (completeWithTools)? Absent/false =
+   *  the agentic loop skips it (a non-supporting provider like DeepSeek cleanly reports unavailable). */
+  readonly supportsTools?: boolean;
   complete(req: {
     model: string;
     system: string;
@@ -709,6 +838,9 @@ export interface LlmProviderClient {
     schema: object;
     effort?: string;
   }): Promise<{ value: T; usage: TokenUsage }>;
+  /** WP8: ONE turn of the read-only tool loop (the LOOP lives in the router, not the client).
+   *  Present only on providers with supportsTools=true. */
+  completeWithTools?(req: CompleteWithToolsRequest): Promise<CompleteWithToolsResult>;
 }
 
 /** Implements AgentLlmPort: role → provider:model resolution + fallback chain + cost accounting. */

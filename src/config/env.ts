@@ -384,6 +384,32 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
+  // ── WP8: AGENTIC founder query loop (read-only tools). With the query engine on, a founder question
+  // is answered in ONE shot from a single retrieval. This flag instead runs a chief-of-staff analyst
+  // LOOP: the model calls READ-ONLY tools (search_memory, list_open_tasks, recent_conversation,
+  // pending_approvals, awaiting_reply, open_commitments, upcoming_meetings, customer_brief,
+  // list_customers, and — internal scope only — search_internal_knowledge) to gather evidence across
+  // several turns, then a closing structured synthesis writes a CITED answer from the accumulated
+  // sources. Founder-only + strictly read-only (no send/enqueue/write); tool results are treated as
+  // DATA, never instructions; citations render from OUR source list by index (no free-text citation).
+  //
+  // Its OWN flag rather than riding QUERY_ENGINE_ENABLED because it changes cost/latency in kind (many
+  // provider turns + tool reads vs one synthesis). DORMANT by default (strict-bool, mirrors
+  // OUTBOUND_ENABLED): unset/"false"/anything else → false. Requires QUERY_ENGINE_ENABLED (there is no
+  // engine to wrap otherwise) and a TOOL-CAPABLE provider in the 'answer' chain (Anthropic today;
+  // DeepSeek/OpenAI report supportsTools=false). When unavailable OR the loop fails for any reason it
+  // falls back to the single-shot engine — which stays the default and the fallback, byte-identical
+  // when this flag is off.
+  QUERY_AGENTIC_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Max provider tool-gathering turns before a forced closing synthesis (blast-radius / cost guard).
+  QUERY_AGENTIC_MAX_ITERATIONS: z.coerce.number().int().positive().default(6),
+  // ⚠︎ Per-query accumulated-cost ceiling (USD): the loop stops gathering (and does its closing
+  // synthesis with what it has) once this query's spend crosses it. Distinct from the DAILY cap.
+  QUERY_AGENTIC_MAX_COST_USD: z.coerce.number().nonnegative().default(0.15),
+
   // ── M5(c): Telegram founder slash-command surface. A founder types a leading `/pending`
   // (counts + oldest age of the pending draft-reply + backfill-proposal queues), `/briefing`
   // (the daily digest on demand, posted to the requesting thread), or `/help` (the command

@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, CommitmentExtractionResult, CommitmentExtractorPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, MeetingPrepRequest, MeetingPrepResult, MeetingPrepSynthesizerPort, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
+import type { AgentLlmPort, AgenticAnswerInput, AgenticAnswerPort, AgenticAnswerResult, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, CommitmentExtractionResult, CommitmentExtractorPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, MeetingPrepRequest, MeetingPrepResult, MeetingPrepSynthesizerPort, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
 import { costUsd } from './pricing';
+import { runAgenticLoop } from './agentic-loop';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
 import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draft-prompt';
@@ -36,7 +37,18 @@ export interface LlmRouterDeps {
   dailyCapUsd: number;
   /** Admin-topic notifier (injected — the router never imports the Telegram adapter). */
   notifyAdmin: (msg: string) => Promise<void>;
+  /** WP8 agentic loop tuning (defaults applied when absent). */
+  agentic?: {
+    /** Max provider tool-gathering turns before a forced closing synthesis. */
+    maxIterations: number;
+    /** Per-query accumulated-cost ceiling (USD): stop gathering when crossed. */
+    maxCostUsd: number;
+    /** Per-turn token ceiling. */
+    maxTokens: number;
+  };
 }
+
+const AGENTIC_DEFAULTS = { maxIterations: 6, maxCostUsd: 0.15, maxTokens: 1500 } as const;
 
 /**
  * LlmRouter implements AgentLlmPort (D10): per-(provider,role) model resolution +
@@ -44,7 +56,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, MeetingPrepSynthesizerPort, CommitmentExtractorPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, MeetingPrepSynthesizerPort, CommitmentExtractorPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort, AgenticAnswerPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -422,6 +434,48 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
         return parsed.scores;
       },
       customerId: null,
+    });
+  }
+
+  /**
+   * WP8: agentic founder query loop (role 'answer'). Picks the FIRST provider in the 'answer' chain
+   * that supports the tool loop (Anthropic today; DeepSeek/OpenAI report supportsTools=false) and runs
+   * the read-only tool loop on it — enforceCap + recordCost PER turn, a per-query cost ceiling, and a
+   * closing structured synthesis over the accumulated sources. Returns null (→ caller falls back to the
+   * single-shot query engine) when no provider supports tools OR the loop fails for ANY reason. Cost is
+   * billed to the scope's customer when pinned, else null. NEVER logs the question or the answer.
+   */
+  async answerAgentically(input: AgenticAnswerInput): Promise<AgenticAnswerResult | null> {
+    const picked = this.chainFor('answer')
+      .map((provider) => ({ provider, client: this.deps.providers[provider] }))
+      .find((p) => p.client.supportsTools && typeof p.client.completeWithTools === 'function');
+    if (!picked) {
+      logger.info('agentic: no tool-capable provider in the answer chain → single-shot fallback');
+      return null;
+    }
+
+    const model = this.deps.modelFor(picked.provider, 'answer');
+    const customerId = input.scope.kind === 'customer' ? input.scope.customerId : null;
+    const cfg = this.deps.agentic ?? AGENTIC_DEFAULTS;
+    const client = picked.client;
+
+    return runAgenticLoop({
+      // completeWithTools is present (guarded above); completeStructured is on every client.
+      client: {
+        completeWithTools: (req) => client.completeWithTools!(req),
+        completeStructured: (req) => client.completeStructured(req),
+      },
+      model,
+      question: input.question,
+      scope: input.scope,
+      tools: input.tools,
+      maxIterations: cfg.maxIterations,
+      maxCostUsd: cfg.maxCostUsd,
+      maxTokens: cfg.maxTokens,
+      enforceCap: () => this.enforceCap(),
+      recordCost: (usage) => this.recordCost(picked.provider, model, 'answer', usage, customerId),
+      costOf: (usage) => costUsd(picked.provider, model, usage),
+      log: logger,
     });
   }
 }
