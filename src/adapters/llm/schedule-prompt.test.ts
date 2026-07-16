@@ -14,13 +14,36 @@ import {
 
 test('schedule schema is strict-output compatible and parses the closed action set', () => {
   assert.equal(SCHEDULE_SCHEMA.additionalProperties, false);
-  assert.deepEqual(SCHEDULE_SCHEMA.required, ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification']);
+  assert.deepEqual(SCHEDULE_SCHEMA.required, ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification', 'recurrence']);
   const parsed = parseScheduleInterpretation({
     kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'follow up',
-    delivery_channel: 'none', clarification: null,
+    delivery_channel: 'none', clarification: null, recurrence: null,
   });
   assert.equal(parsed.kind, 'reminder');
   assert.throws(() => parseScheduleInterpretation({ kind: 'send_everything' }));
+});
+
+// WP5(b): recurrence rides on the interpretation. The model recognizes "every day/Monday/1st";
+// the handler derives the authoritative pattern + does the arithmetic.
+test('recurrence parses (daily/weekly/monthly) and one-shot regression keeps recurrence:null', () => {
+  const base = {
+    kind: 'reminder' as const, execute_at: '2026-07-20T09:00:00-05:00', explicit_date: true,
+    body: 'call the plumber', delivery_channel: 'none' as const, clarification: null,
+  };
+  assert.deepEqual(
+    parseScheduleInterpretation({ ...base, recurrence: { kind: 'weekly', dow: 1, dom: null, hour: 9, minute: 0 } }).recurrence,
+    { kind: 'weekly', dow: 1, dom: null, hour: 9, minute: 0 },
+  );
+  assert.equal(parseScheduleInterpretation({ ...base, recurrence: { kind: 'daily', dow: null, dom: null, hour: 8, minute: 30 } }).recurrence?.kind, 'daily');
+  assert.equal(parseScheduleInterpretation({ ...base, recurrence: { kind: 'monthly', dow: null, dom: 1, hour: 9, minute: 0 } }).recurrence?.dom, 1);
+  assert.equal(parseScheduleInterpretation({ ...base, recurrence: null }).recurrence, null, 'one-shot preserved');
+  assert.throws(() => parseScheduleInterpretation({ ...base, recurrence: { kind: 'yearly', dow: null, dom: null, hour: 9, minute: 0 } }));
+});
+
+test('the system prompt teaches recurrence recognition and reminders-only scope', () => {
+  assert.match(SCHEDULE_SYSTEM, /every Monday/);
+  assert.match(SCHEDULE_SYSTEM, /recurrence/);
+  assert.match(SCHEDULE_SYSTEM, /system will decline it/i);
 });
 
 // body_source used to be a model output that selected its own enforcement level.
@@ -29,7 +52,7 @@ test('the model cannot declare its own body_source', () => {
   assert.ok(!SCHEDULE_SCHEMA.required.includes('body_source' as never));
   const parsed = parseScheduleInterpretation({
     kind: 'customer_message', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'hi',
-    delivery_channel: 'whatsapp', clarification: null, body_source: 'command',
+    delivery_channel: 'whatsapp', clarification: null, recurrence: null, body_source: 'command',
   });
   assert.ok(!('body_source' in parsed), 'a smuggled body_source is stripped, not honoured');
 });

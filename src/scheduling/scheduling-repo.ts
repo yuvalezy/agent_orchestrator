@@ -51,6 +51,10 @@ export interface ScheduledAction {
   in_reply_to: string | null;
   subject: string | null;
   retry_count: number;
+  /** NULL = one-shot (the pre-WP5 behavior); set = the worker re-arms to the next occurrence. */
+  recurrence_kind: 'daily' | 'weekly' | 'monthly' | null;
+  /** The derived recurrence pattern the re-arm reads ({kind,dow,dom,hour,minute}); NULL one-shot. */
+  recurrence_detail: unknown;
 }
 
 export async function findCustomerByTelegramTopic(
@@ -263,14 +267,17 @@ export async function createScheduledAction(input: {
   body: string;
   contextSnapshot?: unknown;
   route?: ScheduleRoute | null;
+  /** WP5(b): NULL one-shot; set → the worker re-arms to the next occurrence after each fire. */
+  recurrenceKind?: 'daily' | 'weekly' | 'monthly' | null;
+  recurrenceDetail?: unknown;
 }): Promise<{ action: ScheduledAction; created: boolean }> {
   const { rows } = await query<ScheduledAction>(
     `INSERT INTO scheduled_actions
        (source_chat_id, source_message_id, source_thread_id, created_by, customer_id,
         action_kind, execute_at, expires_at, timezone, body, context_snapshot,
         channel_instance_id, channel_type, recipient_address, recipient_label,
-        thread_key, in_reply_to, subject)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18)
+        thread_key, in_reply_to, subject, recurrence_kind, recurrence_detail)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb)
      ON CONFLICT (source_chat_id, source_message_id) DO NOTHING
      RETURNING *`,
     [
@@ -280,6 +287,8 @@ export async function createScheduledAction(input: {
       input.route?.channelInstanceId ?? null, input.route?.channelType ?? null,
       input.route?.recipientAddress ?? null, input.route?.recipientLabel ?? null,
       input.route?.threadKey ?? null, input.route?.inReplyTo ?? null, input.route?.subject ?? null,
+      input.recurrenceKind ?? null,
+      input.recurrenceDetail === undefined || input.recurrenceDetail === null ? null : JSON.stringify(input.recurrenceDetail),
     ],
   );
   if (rows[0]) return { action: rows[0], created: true };
@@ -345,6 +354,36 @@ export async function completeReminder(actionId: string): Promise<void> {
       WHERE id = $1 AND status = 'running'`,
     [actionId],
   );
+}
+
+/**
+ * Re-arm a RECURRING reminder after it fired: reset the SAME row from 'running' back to
+ * 'pending' with the next occurrence (execute_at + a fresh grace expires_at), clearing the
+ * claim + retry state. Re-arming IN PLACE (rather than inserting a successor) is deliberate:
+ *   • it keeps ONE row per series, so the existing "❌ Cancel schedule" button (guarded on
+ *     status='pending') cancels the WHOLE series, not just the next firing;
+ *   • the unique (source_chat_id, source_message_id) anchor is preserved (a successor row would
+ *     collide with it);
+ *   • the guard `WHERE status='running'` gives the SAME exactly-once discipline the one-shot
+ *     path has — a replayed re-arm (row already pending for the next fire) matches 0 rows, and a
+ *     crash BETWEEN the send and this re-arm leaves the row 'running', where reclaimStuck marks it
+ *     failed (the series stops with an admin alert) rather than the worker double-firing it.
+ * Returns true iff THIS call re-armed the row.
+ */
+export async function rearmRecurringReminder(
+  actionId: string,
+  nextExecuteAt: Date,
+  nextExpiresAt: Date,
+): Promise<boolean> {
+  const { rowCount } = await query(
+    `UPDATE scheduled_actions
+        SET status = 'pending', execute_at = $2, expires_at = $3,
+            claimed_at = NULL, retry_count = 0, last_error = NULL
+      WHERE id = $1 AND status = 'running'
+        AND action_kind = 'reminder' AND recurrence_kind IS NOT NULL`,
+    [actionId, nextExecuteAt, nextExpiresAt],
+  );
+  return (rowCount ?? 0) > 0;
 }
 
 export async function releaseActionForRetry(actionId: string, reason: string): Promise<void> {

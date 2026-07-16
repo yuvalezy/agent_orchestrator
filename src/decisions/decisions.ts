@@ -149,6 +149,28 @@ export async function recordReleaseNoteDraftDecision(input: {
 }
 
 /**
+ * Open a draft_reply audit row for a FOUNDER-INITIATED `/draft email` (WP5(a)) — no inbound
+ * message, so inbox_message_id is NULL (nullable, mig 007). STRUCTURALLY identical to
+ * recordReleaseNoteDraftDecision (both are founder-initiated drafts with no inbound); kept as its
+ * own named opener so the two call sites read clearly, and so the agent_output shape
+ * ({ kind:'slash_draft', draft_body, citations, language, customer_name }) stays self-documenting.
+ * The approve/edit/reject path (resolveDraftDecisionTx, via the queue flip) is IDENTICAL to an
+ * inbound draft. Returns the new decision id (the queue draft row FKs to it).
+ */
+export async function recordFounderDraftDecision(input: {
+  customerId: string;
+  agentOutput: unknown;
+}): Promise<{ decisionId: string }> {
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, outcome)
+     VALUES ($1, NULL, 'draft_reply', $2::jsonb, 'pending')
+     RETURNING id`,
+    [input.customerId, JSON.stringify(input.agentOutput ?? null)],
+  );
+  return { decisionId: rows[0].id };
+}
+
+/**
  * Record a BACKFILL task proposal (Layer 2) — a historical thread that matched no existing
  * task and carries a work-request ask. decision_type='backfill_task_proposal', outcome='pending';
  * on approval the callback creates the task (with a source triple so it's dedup-visible), on

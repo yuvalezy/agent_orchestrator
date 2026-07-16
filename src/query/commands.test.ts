@@ -331,41 +331,50 @@ test('/history: PII posture — logs the command name + per-leg COUNTS, never th
 
 // ── /draft email ────────────────────────────────────────────────────────────────────────────────
 
-test('/draft email <prompt>: drafts for the topic customer and posts the body + citations', async () => {
+test('/draft email <prompt>: enqueues for the topic customer and confirms it is queued for approval', async () => {
   const { c, router } = deps({
     resolveThreadCustomer: async () => ACME,
     draftEmail: async ({ prompt, customer }) => {
       assert.equal(prompt, 'tell them the invoice is late', 'the subcommand token is stripped from the prompt');
       assert.equal(customer.customerId, 'cus_1');
-      return { body: 'Hola, la factura está vencida.', citations: ['Billing › Terms'], grounded: true };
+      return { ok: true, recipient: 'Acme Billing', grounded: true, citations: ['Billing › Terms'] };
     },
   });
 
   assert.equal(await router(msg('/draft email tell them the invoice is late')), true);
   const text = c.posts[0].text;
-  assert.match(text, /Draft — Acme/);
-  assert.match(text, /Hola, la factura está vencida./);
-  assert.match(text, /Based on:/);
-  assert.match(text, /• Billing › Terms/);
-  assert.match(text, /Not sent and not queued/, 'the founder is told nothing was sent');
+  assert.match(text, /Draft to Acme Billing queued for approval/);
+  assert.match(text, /Approve .* Edit .* Reject/);
+  assert.match(text, /nothing sends until you approve/);
+  assert.match(text, /Grounded in 1 source/);
 });
 
 test('/draft email: an ungrounded draft says so rather than implying it is sourced', async () => {
   const { c, router } = deps({
     resolveThreadCustomer: async () => ACME,
-    draftEmail: async () => ({ body: 'Some phrasing.', citations: [], grounded: false }),
+    draftEmail: async () => ({ ok: true, recipient: 'Acme', grounded: false, citations: [] }),
   });
 
   assert.equal(await router(msg('/draft email anything')), true);
   assert.match(c.posts[0].text, /Ungrounded — I found no matching knowledge/);
 });
 
+test('/draft email: no email contact/account → an honest in-topic refusal, nothing queued', async () => {
+  const { c, router } = deps({
+    resolveThreadCustomer: async () => ACME,
+    draftEmail: async () => ({ ok: false, reason: 'no_email_route' }),
+  });
+
+  assert.equal(await router(msg('/draft email hi')), true);
+  assert.match(c.posts[0].text, /can't draft an email to Acme — they have no email contact or sending account/);
+});
+
 test('/draft email: usage for a missing/unknown subcommand or prompt; customer topic required', async () => {
-  const noSub = deps({ draftEmail: async () => ({ body: 'b', citations: [], grounded: true }) });
+  const noSub = deps({ draftEmail: async () => ({ ok: true, recipient: 'x', grounded: true, citations: [] }) });
   assert.equal(await noSub.router(msg('/draft')), true);
   assert.match(noSub.c.posts[0].text, /Usage: \/draft email <what to say>/);
 
-  const noPrompt = deps({ draftEmail: async () => ({ body: 'b', citations: [], grounded: true }) });
+  const noPrompt = deps({ draftEmail: async () => ({ ok: true, recipient: 'x', grounded: true, citations: [] }) });
   assert.equal(await noPrompt.router(msg('/draft email')), true);
   assert.match(noPrompt.c.posts[0].text, /tell me what the email should say/);
 
@@ -399,7 +408,7 @@ test('/draft email: PII posture — logs flags/counts only, never the prompt or 
   const { router } = deps({
     log: spy.log,
     resolveThreadCustomer: async () => ACME,
-    draftEmail: async () => ({ body: 'CONFIDENTIAL DRAFT BODY', citations: ['Billing'], grounded: true }),
+    draftEmail: async () => ({ ok: true, recipient: 'Acme', grounded: true, citations: ['Billing'] }),
   });
 
   await router(msg('/draft email mention the secret-project-codename'));
@@ -409,7 +418,6 @@ test('/draft email: PII posture — logs flags/counts only, never the prompt or 
   assert.match(serialized, /"grounded":true/);
   assert.match(serialized, /"cited":1/);
   assert.doesNotMatch(serialized, /secret-project-codename/, 'the prompt is never logged');
-  assert.doesNotMatch(serialized, /CONFIDENTIAL DRAFT BODY/, 'the drafted body is never logged');
 });
 
 // ── /backfill ───────────────────────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import type { ReplyOrigin } from './scheduling-repo';
+import type { Recurrence } from './recurrence';
 
 // The state that makes a scheduling clarification CONVERSATIONAL.
 //
@@ -33,6 +34,9 @@ export interface PendingDraft {
   composed: boolean;
   /** Set only once the founder has actually chosen (or a single option was resolved). */
   channel?: string;
+  /** WP5(b): the derived recurrence pattern for a RECURRING reminder; null/absent = one-shot.
+   *  Only reminders carry it (a recurring customer_message is refused before a draft is built). */
+  recurrence?: Recurrence | null;
 }
 
 export interface PendingClarification {

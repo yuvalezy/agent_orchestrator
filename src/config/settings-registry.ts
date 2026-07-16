@@ -271,6 +271,16 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
   },
   {
+    key: 'WEEKLY_REVIEW_ENABLED',
+    type: 'boolean',
+    category: INTELLIGENCE,
+    label: 'Weekly business review',
+    description:
+      'A Friday chief-of-staff review posted to the Admin topic: per-customer 7-day facts (inbound/outbound volume, drafts approved/rejected, open tasks, awaiting-reply) plus next week’s meetings, synthesized into highlights, per-customer state + next action, and where to focus. Idempotent per ISO week; a synthesis failure posts the deterministic facts. Needs an LLM provider key.',
+    applyMode: 'restart',
+    default: false,
+  },
+  {
     key: 'ACCEPTANCE_REPORT_ENABLED',
     type: 'boolean',
     category: INTELLIGENCE,

@@ -204,6 +204,23 @@ export interface ScheduleInterpretation {
   body: string | null;
   delivery_channel: 'whatsapp' | 'email' | 'none';
   clarification: string | null;
+  /**
+   * Present when the founder asked to REPEAT ("every day / every Monday / every 1st"); null for a
+   * one-shot. `execute_at` remains the FIRST occurrence; this only names the repeat pattern. The
+   * model reports the kind (and the fields it read); the handler DERIVES the authoritative pattern
+   * from the validated first occurrence (recurrence.ts deriveRecurrence) and does ALL next-
+   * occurrence arithmetic in code — the model never rolls a date. v1 supports recurrence only for
+   * reminders (a recurring customer_message is refused).
+   */
+  recurrence: {
+    kind: 'daily' | 'weekly' | 'monthly';
+    /** Weekday 1–7 (Mon=1 … Sun=7) for 'weekly'; null/omitted otherwise. */
+    dow?: number | null;
+    /** Day of month 1–31 for 'monthly'; null/omitted otherwise. */
+    dom?: number | null;
+    hour: number;
+    minute: number;
+  } | null;
 }
 
 export interface ComposeMessageRequest {
@@ -325,6 +342,69 @@ export interface BriefingSynthesisResult {
  */
 export interface BriefingSynthesizerPort {
   synthesizeBriefing(input: BriefingSynthesisRequest): Promise<BriefingSynthesisResult>;
+}
+
+/**
+ * One customer's 7-day facts for the weekly business review (WP5(c)). PII-light: a display name +
+ * counts only, never a message body. `openTasks` / `awaitingReplyDays` are null when that fact was
+ * unavailable for the customer (the source failed or is not wired) — the model must not read a null
+ * as a zero. These are the SAME numbers the deterministic facts digest renders; the synthesis
+ * judges over them and never invents a customer or a count.
+ */
+export interface WeeklyReviewCustomerFact {
+  customer: string;
+  /** Inbound messages received from the customer in the window. */
+  inbound: number;
+  /** Messages sent to the customer in the window. */
+  outbound: number;
+  /** Drafts approved (accepted or edited-then-approved) for the customer in the window. */
+  draftsApproved: number;
+  /** Drafts rejected for the customer in the window. */
+  draftsRejected: number;
+  /** Whole days the customer has been silent on a task we replied on; null when none / unavailable. */
+  awaitingReplyDays: number | null;
+  /** Open portal tasks for the customer; null when the task source was unavailable. */
+  openTasks: number | null;
+}
+
+/**
+ * The facts handed to the weekly-review synthesis (WP5(c), LLM role 'answer'). `perCustomer` are the
+ * per-customer 7-day facts; `upcomingMeetings` is the count on the founder's calendar for the week
+ * AHEAD (null when CALENDAR_ENABLED is off or the read failed). NEVER logged (counts only elsewhere).
+ */
+export interface WeeklyReviewRequest {
+  weekLabel: string;
+  perCustomer: WeeklyReviewCustomerFact[];
+  upcomingMeetings: number | null;
+}
+
+/** One customer's assessment in the weekly review: a one-line health state + a suggested action. */
+export interface WeeklyReviewCustomerAssessment {
+  customer: string;
+  state: string;
+  suggestedAction: string;
+}
+
+/**
+ * The chief-of-staff weekly read. `highlights` are the week's few notable items; `perCustomer` is a
+ * per-customer state + suggested action; `focusNextWeek` is where to spend attention. Grounded ONLY
+ * in the facts — the model never invents a customer, a number, or a meeting not in the request.
+ */
+export interface WeeklyReviewResult {
+  highlights: string[];
+  perCustomer: WeeklyReviewCustomerAssessment[];
+  focusNextWeek: string[];
+}
+
+/**
+ * Weekly business-review synthesis (WP5(c)). SEPARATE from AgentLlmPort (interface segregation,
+ * like AnswerSynthesizerPort / BriefingSynthesizerPort): the weekly review depends only on this,
+ * and existing fakes are untouched. Implemented by the LlmRouter (role 'answer'). Judges over the
+ * structured 7-day facts of an ALREADY-gathered review; a failure must never block the deterministic
+ * facts digest. NEVER logs the facts or the judgment.
+ */
+export interface WeeklyReviewSynthesizerPort {
+  synthesizeWeeklyReview(input: WeeklyReviewRequest): Promise<WeeklyReviewResult>;
 }
 
 /**

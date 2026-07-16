@@ -1,13 +1,14 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
 import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draft-prompt';
 import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './answer-prompt';
 import { BRIEFING_SCHEMA, BRIEFING_SYSTEM, briefingUserMessage, parseBriefingSynthesis } from './briefing-prompt';
+import { WEEKLY_REVIEW_SCHEMA, WEEKLY_REVIEW_SYSTEM, parseWeeklyReview, weeklyReviewUserMessage } from './weekly-review-prompt';
 import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
 import { VERIFY_SCHEMA, VERIFY_SYSTEM, parseVerdict, verifyUserMessage } from './verify-prompt';
@@ -40,7 +41,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -222,6 +223,26 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       // thinking + output combined (R44) — a tight budget could truncate the JSON.
       maxTokens: 1500,
       validate: parseBriefingSynthesis,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Weekly business-review synthesis (WP5(c), role 'answer'). Judges over the per-customer 7-day
+   * FACTS the deterministic review already gathered, against WEEKLY_REVIEW_SCHEMA, and never invents
+   * a customer or a number. customerId null: the review spans all customers, so it is not billed to
+   * any one. Best-effort at the call site (a throw falls back to the deterministic facts digest).
+   * NEVER logs the facts or the judgment. maxTokens is roomier than the briefing — the review can
+   * carry a per-customer line each.
+   */
+  async synthesizeWeeklyReview(input: WeeklyReviewRequest): Promise<WeeklyReviewResult> {
+    return this.callStructured<WeeklyReviewResult>({
+      role: 'answer',
+      schema: WEEKLY_REVIEW_SCHEMA,
+      system: WEEKLY_REVIEW_SYSTEM,
+      messages: [{ role: 'user', content: weeklyReviewUserMessage(input) }],
+      maxTokens: 2500,
+      validate: parseWeeklyReview,
       customerId: null,
     });
   }

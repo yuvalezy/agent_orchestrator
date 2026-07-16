@@ -10,7 +10,7 @@ import type { ComposeMessageRequest, ScheduleInterpretRequest, ScheduleInterpret
 export const SCHEDULE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification'],
+  required: ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification', 'recurrence'],
   properties: {
     kind: { type: 'string', enum: ['none', 'clarify', 'customer_message', 'reminder'] },
     execute_at: { type: ['string', 'null'] },
@@ -18,6 +18,20 @@ export const SCHEDULE_SCHEMA = {
     body: { type: ['string', 'null'] },
     delivery_channel: { type: 'string', enum: ['whatsapp', 'email', 'none'] },
     clarification: { type: ['string', 'null'] },
+    // null for a one-shot. dow/dom are nullable (they only apply to weekly/monthly) but stay in
+    // `required` so the object is strict-output-clean across every provider (no min/max/format).
+    recurrence: {
+      type: ['object', 'null'],
+      additionalProperties: false,
+      required: ['kind', 'dow', 'dom', 'hour', 'minute'],
+      properties: {
+        kind: { type: 'string', enum: ['daily', 'weekly', 'monthly'] },
+        dow: { type: ['integer', 'null'] },
+        dom: { type: ['integer', 'null'] },
+        hour: { type: 'integer' },
+        minute: { type: 'integer' },
+      },
+    },
   },
 } as const;
 
@@ -28,6 +42,15 @@ const ResultSchema = z.object({
   body: z.string().nullable(),
   delivery_channel: z.enum(['whatsapp', 'email', 'none']),
   clarification: z.string().nullable(),
+  recurrence: z
+    .object({
+      kind: z.enum(['daily', 'weekly', 'monthly']),
+      dow: z.number().int().nullable(),
+      dom: z.number().int().nullable(),
+      hour: z.number().int(),
+      minute: z.number().int(),
+    })
+    .nullable(),
 });
 
 export function parseScheduleInterpretation(value: unknown): ScheduleInterpretation {
@@ -78,6 +101,16 @@ export const SCHEDULE_SYSTEM = [
   'Set explicit_date=false when they gave only a clock time ("at 8am", "at 1:30 pm") with no day. In that case',
   'put that clock time on TODAY\'s date and do not worry about whether it has already passed — the system rolls',
   'it to the next occurrence. Missing AM/PM when ambiguous and invalid/nonexistent local times need clarify.',
+  '',
+  'recurrence: set it when the founder asked to REPEAT ("every day", "every Monday", "each morning",',
+  '"on the 1st of every month"); set null for a one-time action.',
+  '  - "every day at 8am"            -> recurrence: {kind:"daily",   dow:null, dom:null, hour:8, minute:0}',
+  '  - "every Monday at 9am"         -> recurrence: {kind:"weekly",  dow:1,    dom:null, hour:9, minute:0}',
+  '  - "on the 1st of every month at 9am" -> recurrence: {kind:"monthly", dow:null, dom:1, hour:9, minute:0}',
+  'dow is the weekday 1–7 (Monday=1 … Sunday=7); dom is the day of month 1–31. Still set execute_at to the',
+  'FIRST occurrence (the next matching day/time) and explicit_date=true — the system computes every later',
+  'occurrence itself. Recurrence is only for reminders you send the founder; if the founder asks to repeat a',
+  'CUSTOMER message, still classify it (kind=customer_message, recurrence set) and the system will decline it.',
 ].join('\n');
 
 export function scheduleUserMessage(input: ScheduleInterpretRequest): string {

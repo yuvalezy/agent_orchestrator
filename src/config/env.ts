@@ -613,6 +613,33 @@ const envSchema = z.object({
   // Hard cap on signals fetched per tick (blast-radius guard on the aggregation).
   WEEKLY_PATTERNS_MAX_SIGNALS: z.coerce.number().int().positive().default(2000),
 
+  // ── WP5(c): weekly BUSINESS REVIEW — a chief-of-staff weekly digest posted to the Telegram Admin
+  // topic every Friday. Gathers per-customer 7-day FACTS from existing reads (inbox in/out volume,
+  // draft approvals/rejections from agent_decisions, open portal tasks, awaiting-reply items, and —
+  // when CALENDAR_ENABLED — the upcoming week's meetings), runs ONE LLM synthesis (role 'answer')
+  // into {highlights, perCustomer:[{customer,state,suggestedAction}], focusNextWeek}, and renders it.
+  // Kill-switch (mirrors WEEKLY_PATTERNS_ENABLED strict-bool): registered ONLY when the literal
+  // "true"; unset/"false"/anything else → false. DORMANT by default. Requires Telegram (it notifies
+  // the founder) — skipped if Telegram is unconfigured. Idempotent per ISO week (an app_state
+  // last-run-week key) AND gated to Friday at/after WEEKLY_REVIEW_HOUR, so the sub-weekly interval
+  // posts EXACTLY ONCE per week. Tri-state sections like the daily briefing (a failed source renders
+  // "unavailable"); a synthesis failure posts the deterministic facts digest rather than nothing.
+  WEEKLY_REVIEW_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // The founder-local hour (0–23) the review fires at on Friday. 16 = a Friday-afternoon wrap-up.
+  // A tick before Friday-at-this-hour is a no-op; the first tick at/after it posts (post late,
+  // never skip — the ISO-week guard keeps a late post from doubling).
+  WEEKLY_REVIEW_HOUR: z.coerce.number().int().min(0).max(23).default(16),
+  // POLL granularity (NOT the schedule — Friday + WEEKLY_REVIEW_HOUR is the schedule). Bounds how
+  // late a post can land; each non-due tick short-circuits on one app_state read.
+  WEEKLY_REVIEW_INTERVAL_MS: z.coerce.number().int().positive().default(900_000), // 15m
+  // Timezone for the ISO-week boundary + the Friday/hour gate (founder's local week, not UTC).
+  WEEKLY_REVIEW_TZ: z.string().default('America/Panama'),
+  // Look-back window (days) for the per-customer facts. 7 = the trailing week.
+  WEEKLY_REVIEW_WINDOW_DAYS: z.coerce.number().int().positive().default(7),
+
   // ── M4: proactive task-done resolution notifications. A worker polls each onboarded
   // customer's portal project for tasks that moved to a terminal status; for every
   // CUSTOMER-ORIGINATED done task it drafts ONE is_draft=true "your request is resolved"

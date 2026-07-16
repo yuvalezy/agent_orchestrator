@@ -19,6 +19,10 @@ import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildLlmRouter } from '../llm/factory';
 import { renderCitations } from '../../triage/response-drafter';
+import { buildDraftEmailPresenter } from '../../query/draft-email';
+import { enqueueDraft } from '../../outbound/outbound-repo';
+import { recordFounderDraftDecision } from '../../decisions/decisions';
+import { resolveScheduleRoute } from '../../scheduling/scheduling-repo';
 import { buildWaHistoryClient } from '../whatsapp-manager/factory';
 import { runLiveSweep } from '../knowledge/backfill-run.factory';
 
@@ -188,30 +192,55 @@ export function buildSlashCommandsHandler(
   // `/draft email` — REUSES change 02's drafter primitives: the LLM router's 'draft' role
   // (llm.draftReply, the same call the inbox drafter makes) + the drafter's own renderCitations
   // (indexes validated/clamped against OUR chunks → a hallucinated citation is impossible).
-  // It deliberately does NOT go through draftAndPresent: that path answers an INBOUND message
-  // (it needs a ClaimedInbox row) and enqueues a customer-facing draft. `/draft email` is a
-  // founder compose aid with no inbound message — it writes NO outbound row and sends NOTHING.
+  // WP5(a): the composed reply now gets the STANDARD draft fate — enqueued is_draft=true to the
+  // customer's email account (resolveScheduleRoute, the reply-from account the scheduling email
+  // path uses), an audit decision opened, and an Approve/Edit/Reject card presented in the
+  // customer's topic (routed by the same buildDraftDecisionHandler wired below under the same
+  // KNOWLEDGE_DRAFT_ENABLED gate). NEVER auto-sent — the drainer skips is_draft=true. The
+  // enqueue/decision/present orchestration lives in the CORE presenter (src/query/draft-email.ts);
+  // this only wires the concrete route/compose/repo primitives.
   const draftEnabled = env.KNOWLEDGE_DRAFT_ENABLED;
   const llm = draftEnabled ? buildLlmRouter({
     notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
   }) : null;
   const draftEmail = llm
-    ? async (input: { prompt: string; customer: ResolvedCustomerRef }) => {
-        const config = await loadCustomerConfig(input.customer.customerId);
-        const knowledge = await retriever.retrieve(input.prompt, input.customer.customerId);
-        const result = await llm.draftReply({
-          question: input.prompt,
-          language: config?.preferredLanguage ?? 'en',
-          customerName: input.customer.customerName,
-          knowledge,
-        });
-        return {
-          body: result.body,
-          // No knowledge → no citations (renderCitations' fallback would otherwise cite nothing).
-          citations: knowledge.length > 0 ? renderCitations(knowledge, result.usedSourceIndexes) : [],
-          grounded: knowledge.length > 0,
-        };
-      }
+    ? buildDraftEmailPresenter({
+        // The customer's email SEND route (reply-from account + primary email contact). A NEW mail,
+        // so no reply origin → resolveScheduleRoute falls to the primary 1:1 email route.
+        resolveEmailRoute: async (customerId) => {
+          const route = await resolveScheduleRoute(customerId, ['email'], null);
+          return route
+            ? {
+                channelInstanceId: route.channelInstanceId,
+                channelType: route.channelType,
+                recipientAddress: route.recipientAddress,
+                recipientLabel: route.recipientLabel,
+              }
+            : null;
+        },
+        compose: async ({ prompt, customer }) => {
+          const config = await loadCustomerConfig(customer.customerId);
+          const language = config?.preferredLanguage ?? 'en';
+          const knowledge = await retriever.retrieve(prompt, customer.customerId);
+          const result = await llm.draftReply({
+            question: prompt,
+            language,
+            customerName: customer.customerName,
+            knowledge,
+          });
+          return {
+            body: result.body,
+            // No knowledge → no citations (renderCitations' fallback would otherwise cite nothing).
+            citations: knowledge.length > 0 ? renderCitations(knowledge, result.usedSourceIndexes) : [],
+            grounded: knowledge.length > 0,
+            language,
+          };
+        },
+        enqueueDraft,
+        recordDraftDecision: recordFounderDraftDecision,
+        notifier,
+        log: logger,
+      })
     : undefined;
   if (!draftEnabled) logger.info('slash /draft email NOT wired (KNOWLEDGE_DRAFT_ENABLED=false)');
 

@@ -14,6 +14,7 @@ import {
   type PendingDraft,
 } from './pending-clarification';
 import type { ReplyOrigin, ScheduleRoute, ScheduledAction } from './scheduling-repo';
+import { deriveRecurrence, parseRecurrenceDetail, type Recurrence, type RecurrenceKind } from './recurrence';
 
 // Founder scheduling commands ("send this at 8am", "remind me tomorrow"), driven from a
 // customer's Telegram topic. Two properties are load-bearing:
@@ -87,6 +88,8 @@ export interface ScheduleHandlerDeps {
     body: string;
     contextSnapshot?: unknown;
     route?: ScheduleRoute | null;
+    recurrenceKind?: RecurrenceKind | null;
+    recurrenceDetail?: Recurrence | null;
   }) => Promise<{ action: ScheduledAction; created: boolean }>;
   readPending: (threadId: string) => Promise<string | null>;
   armPending: (threadId: string, value: string) => Promise<void>;
@@ -159,9 +162,25 @@ export function verbatimBody(
   return null;
 }
 
+/** Human phrasing for a recurrence, e.g. "every day at 9:00 AM" / "every Monday at 9:00 AM" /
+ *  "on the 15th of every month at 9:00 AM". Reads the DERIVED pattern (recurrence_detail). */
+function describeRecurrence(rec: Recurrence): string {
+  const t = DateTime.fromObject({ hour: rec.hour, minute: rec.minute }).toFormat('h:mm a');
+  if (rec.kind === 'daily') return `every day at ${t}`;
+  if (rec.kind === 'weekly') {
+    const day = rec.dow ? DateTime.fromObject({ weekday: rec.dow as 1 | 2 | 3 | 4 | 5 | 6 | 7 }).toFormat('cccc') : 'week';
+    return `every ${day} at ${t}`;
+  }
+  const dom = rec.dom ?? 1;
+  const ord = dom + (dom % 10 === 1 && dom !== 11 ? 'st' : dom % 10 === 2 && dom !== 12 ? 'nd' : dom % 10 === 3 && dom !== 13 ? 'rd' : 'th');
+  return `on the ${ord} of every month at ${t}`;
+}
+
 function renderConfirmation(action: ScheduledAction, isGroup: boolean): string {
   const when = DateTime.fromJSDate(new Date(action.execute_at), { zone: action.timezone }).toFormat("ccc LLL d, yyyy 'at' h:mm a ZZZZ");
   if (action.action_kind === 'reminder') {
+    const rec = parseRecurrenceDetail(action.recurrence_detail);
+    if (rec) return `🔁 Recurring reminder set — ${describeRecurrence(rec)}\nNext: ${when}\n\n${action.body}`;
     return `⏰ Reminder scheduled\n${when}\n\n${action.body}`;
   }
   // Spell out the address and group-ness: a group's display name renders exactly like a
@@ -294,6 +313,10 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
       body: draft.body,
       contextSnapshot: { origin, composed: draft.composed },
       route,
+      // Recurrence is only ever set on reminders (a recurring customer_message is refused
+      // upstream). One-shots pass null → an ordinary single-fire action.
+      recurrenceKind: draft.recurrence?.kind ?? null,
+      recurrenceDetail: draft.recurrence ?? null,
     });
     await deps.clearPending(ctx.threadId);
 
@@ -457,6 +480,25 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
       return askAndArm(ctx, merged, `What future date and time should I use? Times are interpreted in ${deps.timezone}.`, origin, anchor);
     }
 
+    // Recurrence v1 is reminders-only. A standing message to a CUSTOMER needs more thought than v1
+    // should assume (which contact, what cadence of un-approved sends, when to stop), so a recurring
+    // customer_message is declined with a clear next step rather than half-supported.
+    if (interpreted.recurrence && interpreted.kind === 'customer_message') {
+      await deps.clearPending(m.threadId);
+      await deps.postAnswer(
+        m.threadId,
+        "I can't set up a recurring message to a customer yet — a standing customer send needs more thought than I want to assume. I can schedule a one-time message, or a recurring reminder to you.",
+      );
+      return true;
+    }
+    // Derive the authoritative recurrence pattern from the VALIDATED first occurrence (never the
+    // model's fields) so the pattern can't disagree with the instant the founder confirmed. Only
+    // reminders reach a recurring finalize; the customer_message case was refused just above.
+    const recurrence =
+      interpreted.recurrence && interpreted.kind === 'reminder'
+        ? deriveRecurrence(executeAt, interpreted.recurrence.kind, deps.timezone)
+        : null;
+
     const explicitChannel = interpreted.delivery_channel !== 'none' ? interpreted.delivery_channel : null;
     if (explicitChannel && !deps.allowedChannelTypes.includes(explicitChannel)) {
       await deps.clearPending(m.threadId);
@@ -475,7 +517,7 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
     const quoted = verbatimBody(interpreted.kind, interpreted.body, merged, mappedOutboundBody);
     if (quoted) {
       const draft: PendingDraft = { kind: interpreted.kind, executeAt: executeAt.toISOString(), body: quoted, composed: false };
-      if (interpreted.kind === 'reminder') return finalize(ctxWithAnchor, { ...draft, channel: null }, origin);
+      if (interpreted.kind === 'reminder') return finalize(ctxWithAnchor, { ...draft, channel: null, recurrence }, origin);
       return resolveChannel(ctxWithAnchor, draft, explicitChannel, origin);
     }
 

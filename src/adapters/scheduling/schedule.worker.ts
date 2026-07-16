@@ -7,12 +7,47 @@ import {
   completeReminder,
   dispatchCustomerMessage,
   markActionTerminal,
+  rearmRecurringReminder,
   reclaimStuck,
   releaseActionForRetry,
+  type ScheduledAction,
 } from '../../scheduling/scheduling-repo';
+import { nextOccurrence, parseRecurrenceDetail } from '../../scheduling/recurrence';
 
 const CLAIM_BATCH = 25;
 const STUCK_MINUTES = 10;
+
+/**
+ * Settle a reminder that JUST fired: RE-ARM a recurring one to its next occurrence, or COMPLETE a
+ * one-shot. Exported + repo-fn-injected so the branch decision (recurring → re-arm; one-shot →
+ * complete) and the computed next instant are unit-testable without a DB.
+ *
+ * The next occurrence is computed from `now` (not execute_at) so a process that was down for a
+ * while resumes at the next FUTURE grid point rather than replaying a backlog. Re-arming IN PLACE
+ * keeps ONE row per series (so the existing cancel button cancels the whole series), and the
+ * exactly-once discipline lives in rearmRecurringReminder's SQL guard (WHERE status='running') — a
+ * crash between the send and the re-arm leaves the row 'running' for reclaimStuck to fail (the
+ * series stops, never double-fires).
+ */
+export async function settleFiredReminder(
+  action: Pick<ScheduledAction, 'id' | 'recurrence_kind' | 'recurrence_detail' | 'timezone'>,
+  now: Date,
+  graceMinutes: number,
+  repo: {
+    rearm: (id: string, nextExecuteAt: Date, nextExpiresAt: Date) => Promise<boolean>;
+    complete: (id: string) => Promise<void>;
+  },
+): Promise<{ kind: 'completed' } | { kind: 'rearmed' | 'rearm_missed'; next: Date }> {
+  const rec = action.recurrence_kind ? parseRecurrenceDetail(action.recurrence_detail) : null;
+  if (!rec) {
+    await repo.complete(action.id);
+    return { kind: 'completed' };
+  }
+  const next = nextOccurrence(now, rec, action.timezone);
+  const nextExpires = new Date(next.getTime() + graceMinutes * 60_000);
+  const rearmed = await repo.rearm(action.id, next, nextExpires);
+  return { kind: rearmed ? 'rearmed' : 'rearm_missed', next };
+}
 
 export function buildScheduleDueWorker(
   notifier: Pick<TelegramNotifier, 'replyInThread' | 'notifyCustomerEvent' | 'notifyAdmin'>,
@@ -55,7 +90,16 @@ export function buildScheduleDueWorker(
             if (!dispatched) throw new Error('customer dispatch precondition failed');
           } else {
             await notifier.replyInThread(action.source_thread_id, `⏰ Reminder\n\n${action.body}`);
-            await completeReminder(action.id);
+            // WP5(b): a recurring reminder re-arms to its next occurrence; a one-shot completes.
+            const settled = await settleFiredReminder(action, now, graceMinutes, {
+              rearm: rearmRecurringReminder,
+              complete: completeReminder,
+            });
+            if (settled.kind === 'rearmed') {
+              logger.info({ actionId: action.id, next: settled.next.toISOString() }, 'schedule: recurring reminder re-armed');
+            } else if (settled.kind === 'rearm_missed') {
+              logger.warn({ actionId: action.id }, 'schedule: recurring reminder re-arm found no running row — not re-armed');
+            }
           }
         } catch (err) {
           const beforeExpiry = Date.now() <= new Date(action.expires_at).getTime();

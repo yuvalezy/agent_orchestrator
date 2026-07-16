@@ -29,9 +29,10 @@ import {
 // definition — that is their entire point — so the posture is now split by axis:
 //   • DESTINATION: content may be posted ONLY back to the founder's own Telegram topic (the thread
 //     the command came from). That is the same surface where change 02 already presents full draft
-//     bodies for review, so a founder-requested snippet/draft there discloses nothing new. Content
-//     never reaches a customer from here: `/draft email` composes text for the founder to read and
-//     copy — it does NOT enqueue an outbound draft and NOTHING is ever sent.
+//     bodies for review, so a founder-requested snippet/draft there discloses nothing new. `/draft
+//     email` now ENQUEUES the composed reply as a DRAFT (is_draft=true) to the customer's email and
+//     presents it with Approve/Edit/Reject — structurally un-sendable until the founder approves
+//     (the drainer skips is_draft=true), exactly like every other customer-facing draft.
 //   • LOGGING: unchanged and ABSOLUTE. We log the command NAME + counts/flags ONLY — never the
 //     command text (args), never a snippet, never a draft/answer body. Dispatch is reached only for
 //     a REGISTERED command name, so the name itself is never free text.
@@ -67,14 +68,30 @@ export interface HistoryLegResult {
   capped?: boolean;
 }
 
-/** `/draft email` output — reuses change 02's drafter (llm.draftReply + renderCitations). */
-export interface DraftEmailResult {
-  body: string;
-  /** Human "Based on:" labels rendered from OUR chunks (never a hallucinated citation). */
-  citations: string[];
-  /** False when retrieval found nothing — the draft is ungrounded and the reply says so. */
-  grounded: boolean;
+/** `/draft email` request — what to say, to which resolved customer. */
+export interface DraftEmailInput {
+  prompt: string;
+  customer: ResolvedCustomerRef;
 }
+
+/**
+ * Outcome of `/draft email`. On success the draft was ENQUEUED (is_draft=true) to the
+ * customer's email, an audit decision opened, and an Approve/Edit/Reject card presented in
+ * the customer's topic — `ok:true` carries the preview the command echoes back as a
+ * confirmation. `no_email_route` means the customer has no email contact / sending account,
+ * so nothing was composed or queued (the command says so in-topic).
+ */
+export type DraftEmailResult =
+  | {
+      ok: true;
+      /** The email recipient's display name (or address) — for the founder confirmation. */
+      recipient: string;
+      /** False when retrieval found nothing — the confirmation flags the draft as ungrounded. */
+      grounded: boolean;
+      /** Human "Based on:" labels rendered from OUR chunks (never a hallucinated citation). */
+      citations: string[];
+    }
+  | { ok: false; reason: 'no_email_route' };
 
 /** Outcome of asking the change-03 sweep to start. `already-running` is NOT an error (one sweep
  *  per customer fills the same memory — mirrors the WA history client's 409 handling). */
@@ -116,8 +133,10 @@ export interface SlashCommandDeps {
   searchMemoryHistory?: (keyword: string, customerId: string | null) => Promise<HistoryLegResult>;
   /** `/history` leg: the whatsapp_manager archive. */
   searchWhatsAppHistory?: (keyword: string, customerId: string | null) => Promise<HistoryLegResult>;
-  /** `/draft email` (change 02's drafter). Composes only — never enqueues, never sends. */
-  draftEmail?: (input: { prompt: string; customer: ResolvedCustomerRef }) => Promise<DraftEmailResult>;
+  /** `/draft email` — composes, ENQUEUES the draft (is_draft=true) to the customer's email,
+   *  opens the audit decision, and presents Approve/Edit/Reject in the customer's topic. NEVER
+   *  auto-sent (the drainer skips is_draft=true). Returns the preview / a no-route refusal. */
+  draftEmail?: (input: DraftEmailInput) => Promise<DraftEmailResult>;
   /** `/backfill` — start the change-03 sweep for a customer, reporting back to `threadId` when it
    *  finishes. Returns as soon as the sweep is ACCEPTED (it runs in the background and posts its
    *  own report): a sweep takes minutes, and the Telegram poll loop awaits this handler, so
@@ -407,16 +426,15 @@ async function runHistory(ctx: CommandContext): Promise<void> {
 
 // ── /draft email ────────────────────────────────────────────────────────────────────────────────
 
-function formatDraftEmail(customer: ResolvedCustomerRef, result: DraftEmailResult): string {
-  const lines = [`✉️ Draft — ${customer.customerName}`, '', result.body];
-  if (!result.grounded) {
-    lines.push('', '⚠️ Ungrounded — I found no matching knowledge, so this is phrasing only. Check the facts.');
+/** The founder confirmation after a `/draft email` is queued. The full draft + buttons are
+ *  presented on the card just above (same topic); this is a short ack, not a second copy. */
+function formatDraftEmailQueued(recipient: string, grounded: boolean, cited: number): string {
+  const lines = [`✉️ Draft to ${recipient} queued for approval.`, 'Use ✅ Approve / ✏️ Edit / 🚫 Reject on the card above — nothing sends until you approve.'];
+  if (!grounded) {
+    lines.push('⚠️ Ungrounded — I found no matching knowledge, so it is phrasing only. Check the facts before approving.');
+  } else if (cited > 0) {
+    lines.push(`Grounded in ${cited} source${cited === 1 ? '' : 's'} (listed on the card).`);
   }
-  if (result.citations.length > 0) {
-    lines.push('', 'Based on:');
-    for (const c of result.citations) lines.push(`• ${c}`);
-  }
-  lines.push('', '_Not sent and not queued — copy it, or reply here to keep iterating._');
   return lines.join('\n');
 }
 
@@ -448,12 +466,23 @@ async function runDraft(ctx: CommandContext): Promise<void> {
     return;
   }
   const result = await deps.draftEmail({ prompt, customer: scope.customer });
-  // Counts/flags ONLY — never the prompt, never the drafted body.
+  if (!result.ok) {
+    // No email contact / no sending account → an honest in-topic refusal (nothing composed
+    // or queued), mirroring how the command surfaces every other missing prerequisite.
+    deps.log.info({ command: 'draft', kind: 'email', enqueued: false, reason: result.reason }, 'slash: draft email no route');
+    await deps.postAnswer(
+      ctx.threadId,
+      `⚠️ I can't draft an email to ${scope.customer.customerName} — they have no email contact or sending account configured.`,
+    );
+    return;
+  }
+  // Counts/flags ONLY — never the prompt, never the drafted body. The draft card + buttons
+  // were already presented in this topic; here we just confirm it is queued for approval.
   deps.log.info(
-    { command: 'draft', kind: 'email', grounded: result.grounded, cited: result.citations.length },
+    { command: 'draft', kind: 'email', enqueued: true, grounded: result.grounded, cited: result.citations.length },
     'slash: draft email',
   );
-  await deps.postAnswer(ctx.threadId, formatDraftEmail(scope.customer, result));
+  await deps.postAnswer(ctx.threadId, formatDraftEmailQueued(result.recipient, result.grounded, result.citations.length));
 }
 
 // ── /backfill ───────────────────────────────────────────────────────────────────────────────────
@@ -515,7 +544,7 @@ const COMMANDS: readonly CommandSpec[] = [
   {
     name: 'draft',
     usage: 'email <prompt>',
-    summary: 'Draft a customer email (shown here only — never sent).',
+    summary: 'Draft a customer email → Approve/Edit/Reject card (never auto-sent).',
     run: runDraft,
   },
   {

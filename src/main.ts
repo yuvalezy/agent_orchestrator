@@ -62,6 +62,7 @@ import { fetchUnprocessedFeedbackDecisions, fetchResolvedDraftDecisions } from '
 import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learning.worker';
 import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
 import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.worker';
+import { buildWeeklyReviewWorker } from './adapters/feedback/weekly-review.worker';
 import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker';
 import { buildCalendarAdapter } from './adapters/calendar';
 import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
@@ -516,6 +517,43 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('weekly-patterns worker NOT registered (WEEKLY_PATTERNS_ENABLED=false)');
+  }
+
+  // WP5(c): weekly BUSINESS review — registered ONLY when WEEKLY_REVIEW_ENABLED AND Telegram is
+  // configured (it notifies the Admin topic). Gathers per-customer 7-day facts from existing reads
+  // (inbox in/out volume, draft approvals/rejections, open tasks, awaiting-reply) plus the upcoming
+  // week's meetings (CALENDAR_ENABLED), runs ONE LLM synthesis into a chief-of-staff read, and posts
+  // it every Friday at/after WEEKLY_REVIEW_HOUR. Idempotent per ISO week; tri-state facts; a synthesis
+  // failure degrades to the deterministic facts digest. DORMANT by default.
+  if (env.WEEKLY_REVIEW_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  WEEKLY_REVIEW_ENABLED=true but Telegram is unconfigured — the weekly review has nowhere to post; NOT registering.');
+    } else {
+      const reviewNotifier = notifier; // const capture: narrowed non-null inside the synthesizer closure
+      feedbackWorkers.push(
+        buildWeeklyReviewWorker({
+          notifier: reviewNotifier,
+          readLastRun: () => getAppState('weekly_review:last_run_week'),
+          writeLastRun: (week) => setAppState('weekly_review:last_run_week', week),
+          tz: env.WEEKLY_REVIEW_TZ,
+          hour: env.WEEKLY_REVIEW_HOUR,
+          windowDays: env.WEEKLY_REVIEW_WINDOW_DAYS,
+          intervalMs: env.WEEKLY_REVIEW_INTERVAL_MS,
+          // Upcoming meetings render only with a calendar reader; without it the fact is "unavailable".
+          calendar: env.CALENDAR_ENABLED ? buildCalendarAdapter() : undefined,
+          // The synthesizer is the LLM router (role 'answer'); its failover/cap notices go to the
+          // Admin topic. A synthesis failure degrades to the deterministic facts digest.
+          synthesizer: buildLlmRouter({ notifyAdmin: (msg) => reviewNotifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }) }),
+          log: logger,
+        }),
+      );
+      logger.info(
+        { hour: env.WEEKLY_REVIEW_HOUR, tz: env.WEEKLY_REVIEW_TZ, calendar: env.CALENDAR_ENABLED },
+        'weekly-review worker registered (WEEKLY_REVIEW_ENABLED=true)',
+      );
+    }
+  } else {
+    logger.info('weekly-review worker NOT registered (WEEKLY_REVIEW_ENABLED=false)');
   }
 
   // M5(b) + task 3.1: daily founder briefing — registered ONLY when DAILY_BRIEFING_ENABLED AND

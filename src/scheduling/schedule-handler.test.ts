@@ -34,12 +34,18 @@ function action(input: Parameters<ScheduleHandlerDeps['createAction']>[0]): Sche
     recipient_address: input.route?.recipientAddress ?? null, recipient_label: input.route?.recipientLabel ?? null,
     thread_key: input.route?.threadKey ?? null, in_reply_to: input.route?.inReplyTo ?? null,
     subject: input.route?.subject ?? null, retry_count: 0,
+    recurrence_kind: input.recurrenceKind ?? null, recurrence_detail: input.recurrenceDetail ?? null,
   };
 }
 
+/** An interpretation literal for a test, with `recurrence` defaulted to null (one-shot) so the
+ *  many existing fixtures need not spell it out; recurring tests pass it explicitly. */
+type InterpInput = Omit<ScheduleInterpretation, 'recurrence'> & { recurrence?: ScheduleInterpretation['recurrence'] };
+
 /** `result` may be a single interpretation or one per successive turn. */
-function harness(result: ScheduleInterpretation | ScheduleInterpretation[], composed = 'Hi Ana, hope you are well!') {
-  const results = Array.isArray(result) ? [...result] : [result];
+function harness(result: InterpInput | InterpInput[], composed = 'Hi Ana, hope you are well!') {
+  const norm = (r: InterpInput): ScheduleInterpretation => ({ ...r, recurrence: r.recurrence ?? null });
+  const results = (Array.isArray(result) ? result : [result]).map(norm);
   const posts: string[] = [];
   const notices: Array<{ n: Notification; buttons?: Array<{ id: string; label: string }> }> = [];
   const creates: Array<Parameters<ScheduleHandlerDeps['createAction']>[0]> = [];
@@ -498,4 +504,52 @@ test('only scheduling button ids are claimed', () => {
   for (const id of ['scw', 'sce', 'sca', 'scx', 'scc']) assert.equal(isScheduleOption(id), true);
   // 'sc' (cancel a scheduled action) stays with its own handler.
   for (const id of ['sc', 'da', 'de', 'x', 'bfok']) assert.equal(isScheduleOption(id), false);
+});
+
+// ── WP5(b): recurring reminders ───────────────────────────────────────────────────────────────
+
+test('a recurring reminder persists its derived pattern on ONE action row', async () => {
+  // "every Monday at 9am" — Mon 2026-07-20 09:00 Panama is the first occurrence.
+  const h = harness({
+    kind: 'reminder', execute_at: '2026-07-20T09:00:00-05:00', explicit_date: true,
+    body: 'review the numbers', delivery_channel: 'none', clarification: null,
+    recurrence: { kind: 'weekly', dow: 1, dom: null, hour: 9, minute: 0 },
+  });
+  const consumed = await h.onMessage(message('every Monday at 9am remind me to review the numbers'));
+  assert.equal(consumed, true);
+  // Exactly one row is created — the property that lets the single "❌ Cancel schedule" button
+  // cancel the WHOLE series (the worker re-arms this same row rather than inserting successors).
+  assert.equal(h.creates.length, 1);
+  assert.equal(h.creates[0].kind, 'reminder');
+  assert.equal(h.creates[0].recurrenceKind, 'weekly');
+  // The pattern is DERIVED from the validated first occurrence, not the model's fields.
+  assert.deepEqual(h.creates[0].recurrenceDetail, { kind: 'weekly', dow: 1, dom: null, hour: 9, minute: 0 });
+  // The confirmation says it recurs, and carries the ❌ cancel button (cancels the series).
+  assert.match(h.notices[0].n.body, /Recurring reminder/);
+  assert.equal(h.notices[0].buttons?.[0].id, 'sc:12');
+});
+
+test('a one-shot reminder is unchanged: no recurrence persisted', async () => {
+  const h = harness({
+    kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true,
+    body: 'call the bank', delivery_channel: 'none', clarification: null,
+  });
+  await h.onMessage(message('remind me tomorrow at 9am to call the bank'));
+  assert.equal(h.creates.length, 1);
+  assert.equal(h.creates[0].recurrenceKind ?? null, null);
+  assert.equal(h.creates[0].recurrenceDetail ?? null, null);
+  assert.doesNotMatch(h.notices[0].n.body, /Recurring/);
+});
+
+test('a recurring CUSTOMER message is refused with a clear next step — nothing scheduled', async () => {
+  const h = harness({
+    kind: 'customer_message', execute_at: '2026-07-20T09:00:00-05:00', explicit_date: true,
+    body: 'good morning', delivery_channel: 'whatsapp', clarification: null,
+    recurrence: { kind: 'daily', dow: null, dom: null, hour: 9, minute: 0 },
+  });
+  const consumed = await h.onMessage(message('every day at 9am send Ana good morning'));
+  assert.equal(consumed, true);
+  assert.equal(h.creates.length, 0, 'a recurring customer send is not created in v1');
+  assert.match(h.posts[0], /recurring message to a customer/i);
+  assert.equal(h.peekPending(), null);
 });
