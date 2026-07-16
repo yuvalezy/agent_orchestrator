@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { BusinessHour, Holiday } from '../outbound/send-window';
-import { generateSlots, isSlotFree, mergeBusy } from './meeting-slots';
+import { generateSlots, isSlotFree, mergeBusy, slotConflicts } from './meeting-slots';
 
 // Pure unit tests — frozen clock, no db, no network (mirrors schedule-handler.test.ts's NOW).
 // Panama is UTC-5 year-round with NO DST, which is why the DST cases below deliberately use
@@ -204,4 +204,41 @@ test('isSlotFree treats back-to-back as free (a meeting may abut a busy block)',
   const slot = { startsAt: new Date('2026-07-14T16:00:00Z'), endsAt: new Date('2026-07-14T16:30:00Z') };
   const ctx = { ...base, busy: [iv('2026-07-14T14:00:00Z', '2026-07-14T16:00:00Z')] };
   assert.ok(isSlotFree(slot, ctx), 'busy ending exactly when the slot starts is not an overlap');
+});
+
+// ── slotConflicts: the BUSY half, split out for founder-TYPED times ───────────────────
+// A time we PROPOSE must fit the working day; a time the founder NAMES must not be vetoed by
+// it (19:00 on their own calendar is their call), but must still respect a real conflict.
+
+test('slotConflicts returns the colliding interval, and null when clear', () => {
+  const busy = [{ start: new Date('2026-07-16T14:00:00Z'), end: new Date('2026-07-16T15:00:00Z') }];
+  const clash = slotConflicts(
+    { startsAt: new Date('2026-07-16T14:30:00Z'), endsAt: new Date('2026-07-16T15:30:00Z') },
+    busy,
+  );
+  assert.equal(clash?.start.toISOString(), '2026-07-16T14:00:00.000Z', 'returns WHICH meeting, so the founder can be told');
+  assert.equal(
+    slotConflicts({ startsAt: new Date('2026-07-16T16:00:00Z'), endsAt: new Date('2026-07-16T16:30:00Z') }, busy),
+    null,
+  );
+});
+
+test('slotConflicts ignores business hours entirely — that is the point of the split', () => {
+  // 22:00 on a Sunday: isSlotFree rejects it, slotConflicts does not care.
+  const midnightSunday = { startsAt: new Date('2026-07-20T03:00:00Z'), endsAt: new Date('2026-07-20T03:30:00Z') };
+  assert.equal(slotConflicts(midnightSunday, []), null, 'no busy interval → no conflict, whatever the day');
+  assert.equal(
+    isSlotFree(midnightSunday, { tz: TZ, busy: [], businessHours: HOURS, holidays: [] }),
+    false,
+    'while the proposal predicate still refuses it',
+  );
+});
+
+test('slotConflicts treats touching intervals as free, not busy', () => {
+  // [14:00,15:00) then a slot at exactly 15:00 — back-to-back is legal, overlapping is not.
+  const busy = [{ start: new Date('2026-07-16T14:00:00Z'), end: new Date('2026-07-16T15:00:00Z') }];
+  assert.equal(
+    slotConflicts({ startsAt: new Date('2026-07-16T15:00:00Z'), endsAt: new Date('2026-07-16T15:30:00Z') }, busy),
+    null,
+  );
 });

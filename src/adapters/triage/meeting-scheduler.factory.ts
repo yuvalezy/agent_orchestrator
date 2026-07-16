@@ -5,10 +5,11 @@ import { findTriageIntent, recordTaskBridge, recordTriageDecision, resolveTriage
 import { loadBusinessHours, loadHolidays } from '../../outbound/outbound-repo';
 import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import type { TaskTargetPort } from '../../ports/task-target.port';
-import type { Intent } from '../../ports/llm.port';
+import type { Intent, ScheduleInterpreterPort } from '../../ports/llm.port';
 import { loadCustomerConfig } from '../../triage/context-loader';
 import { dueEventId } from '../../triage/due-event-sync';
 import { buildMeetingDecisionHandler, type MeetingDecisionHandler } from '../../triage/meeting-decision-handler';
+import { buildMeetingFreeTextHook } from '../../triage/meeting-free-text';
 import { buildMeetingScheduler, type MeetingScheduler } from '../../triage/meeting-scheduler';
 import type { MeetingRequest } from '../../triage/meeting-repo';
 import {
@@ -92,6 +93,10 @@ function buildTaskFallback(taskTarget: TaskTargetPort, deepLink: (ref: string) =
 export interface MeetingWiring {
   scheduler: MeetingScheduler;
   decisions: MeetingDecisionHandler;
+  /** The pending-ask `onUnmatched` hook, so a founder can answer "📅 Pick a time" by TYPING one.
+   *  Only present when an LLM is supplied to parse the time (the callback poller has one; the
+   *  inbox processor does not need this hook at all — it never reads founder messages). */
+  freeText?: ReturnType<typeof buildMeetingFreeTextHook>;
 }
 
 /**
@@ -102,6 +107,20 @@ export interface MeetingWiring {
 export function buildMeetingSchedulerGated(
   taskTarget: TaskTargetPort,
   notifier: FounderNotifierPort,
+  /**
+   * Supply to let the founder answer "📅 Pick a time" in words. Omitted → buttons only, which is
+   * right for the inbox processor: it builds a scheduler to START conversations and never reads
+   * a founder message, so wiring an LLM there would buy nothing and cost a router per boot.
+   */
+  freeTextDeps?: {
+    /** A THUNK, not the router: it is called once, past the feature gate, so a boot with
+     *  meeting scheduling off does not construct an LLM router (and its failover/cost-cap
+     *  machinery) for a hook that will never run. */
+    llm: () => Pick<ScheduleInterpreterPort, 'interpretSchedule'>;
+    /** Reply in the founder's thread. Not on FounderNotifierPort — the port speaks in
+     *  Notifications; this is a plain line back into the same topic. */
+    postAnswer: (threadId: string, text: string) => Promise<void>;
+  },
 ): MeetingWiring | undefined {
   if (!env.MEETING_SCHEDULING_ENABLED) {
     logger.info({}, 'meeting scheduling NOT wired (MEETING_SCHEDULING_ENABLED=false) — a meeting_request creates a task');
@@ -168,5 +187,46 @@ export function buildMeetingSchedulerGated(
     slotOptions: { count: 4, leadMinutes: 60, horizonDays: HORIZON_DAYS },
   });
 
-  return { scheduler, decisions: buildMeetingDecisionHandler(scheduler) };
+  return {
+    scheduler,
+    decisions: buildMeetingDecisionHandler(scheduler),
+    freeText: freeTextDeps
+      ? buildMeetingFreeTextHook(((interpreter) => ({
+          onTypedTime: (meetingId, startsAt, by) => scheduler.onTypedTime(meetingId, startsAt, by),
+          postAnswer: freeTextDeps.postAnswer,
+          parseTime: async ({ text, meetingId }) => {
+            const m = await getMeetingRequest(meetingId);
+            if (!m) return null;
+            const tz = m.founder_tz ?? env.CALENDAR_TZ;
+            const config = await loadCustomerConfig(m.customer_id);
+            // Reuses the SAME interpreter the founder's own scheduling commands go through,
+            // rather than a second time parser: it already carries the timezone handling, the
+            // weekday rules, and the merge semantics — including the fix for Spanish weekday
+            // names, which drifted a day forward and would have booked real customers on the
+            // wrong date. Two parsers would mean two sets of those rules to keep true.
+            //
+            // Framing it as the answer to OUR question is what lets a bare "thursday 3pm" — no
+            // verb, no action — resolve to an instant rather than to a clarify. Measured, not
+            // assumed: 4/5 phrasings parsed correctly this way before the weekday fix, 10/10
+            // after (3 runs each).
+            const r = await interpreter.interpretSchedule(
+              {
+                commandText: text,
+                priorCommandText: `set up a ${m.duration_minutes ?? 30} minute meeting with this customer`,
+                priorClarification: 'Pick a time — when should the call be?',
+                repliedText: null,
+                mappedOutboundBody: null,
+                customerName: config?.displayName ?? 'the customer',
+                nowIso: DateTime.now().setZone(tz).toISO() ?? new Date().toISOString(),
+                timezone: tz,
+              },
+              m.customer_id,
+            );
+            // A clarify (or anything with no instant) means "no time in there" — the hook says
+            // so and keeps the question. Never guess at a time that books a real meeting.
+            return r.execute_at ? new Date(r.execute_at) : null;
+          },
+        }))(freeTextDeps.llm()))
+      : undefined,
+  };
 }

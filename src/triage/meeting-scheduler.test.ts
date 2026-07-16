@@ -474,3 +474,94 @@ test('confirmationBody renders the customer language and zone, with no model inv
   assert.match(en, /we can talk on/);
   assert.ok(!en.includes('Meet link'), 'no link → no dangling label');
 });
+
+// ── onTypedTime: the founder REPLIES with a time instead of tapping ───────────────────
+// The offered slots are the founder's FREE time, not necessarily the time they want. These
+// pin the one asymmetry that matters: a time WE propose must fit the working day; a time
+// THEY name must not be vetoed by it — but must still respect a real conflict.
+
+const AWAITING_SLOT: Partial<MeetingRequest> = {
+  status: 'awaiting_slot',
+  duration_minutes: 30,
+  slots: [{ startsAt: '2026-07-16T14:00:00.000Z', endsAt: '2026-07-16T14:30:00.000Z' }] as MeetingSlot[],
+};
+// Thu 2026-07-16, 15:00 Panama — a normal working-day time, well after NOW.
+const TYPED = new Date('2026-07-16T20:00:00.000Z');
+
+test('a typed time books the meeting, with the Meet link and the invitation', async () => {
+  const h = harness({ row: AWAITING_SLOT });
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', TYPED, 'founder'), true);
+
+  assert.equal(h.events.length, 1, 'exactly one event');
+  assert.equal(h.events[0].startsAt.toISOString(), TYPED.toISOString(), 'booked at the time they typed');
+  assert.equal(h.events[0].endsAt.toISOString(), new Date(TYPED.getTime() + 30 * 60_000).toISOString(), 'duration honoured');
+  assert.equal(h.events[0].conference, true);
+  assert.deepEqual(h.events[0].attendeeEmails, ['iyelinek@holadocmed.com']);
+  assert.equal(h.events[0].sendUpdates, 'all', 'the customer is actually invited');
+  assert.equal(h.enqueued.length, 1, 'the customer confirmation is queued');
+  assert.match(h.notices.at(-1)!.title, /booked/i);
+});
+
+// The whole point of the split from isSlotFree.
+test('a typed time OUTSIDE business hours is booked — the founder owns their calendar', async () => {
+  const h = harness({ row: AWAITING_SLOT });
+  const evening = new Date('2026-07-17T02:00:00.000Z'); // Thu 21:00 Panama — outside 09:00–18:00
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', evening, 'founder'), true);
+  assert.equal(h.events.length, 1, 'no working-day veto on a time the founder named');
+  assert.equal(h.events[0].startsAt.toISOString(), evening.toISOString());
+});
+
+test('a typed time on a WEEKEND is booked too', async () => {
+  const h = harness({ row: AWAITING_SLOT });
+  const sunday = new Date('2026-07-19T15:00:00.000Z'); // Sun 10:00 Panama
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', sunday, 'founder'), true);
+  assert.equal(h.events.length, 1);
+});
+
+// ...but a REAL conflict still stops it. This is invariant 2, and the reason the busy check
+// survives the business-hours split.
+test('a typed time that collides with a real meeting is refused, naming the clash', async () => {
+  const h = harness({
+    row: AWAITING_SLOT,
+    busy: [{ start: new Date('2026-07-16T19:45:00.000Z'), end: new Date('2026-07-16T20:15:00.000Z') }],
+  });
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', TYPED, 'founder'), false, 'not done — ask again');
+  assert.equal(h.events.length, 0, 'NOT double-booked');
+  assert.match(h.notices.at(-1)!.title, /busy/i);
+  assert.match(h.notices.at(-1)!.body, /overlaps/i, 'says what it collides with');
+  assert.match(h.notices.at(-1)!.body, /tap one of the free slots/i, 'and points at the working escape');
+});
+
+test('a typed time in the PAST is refused', async () => {
+  const h = harness({ row: AWAITING_SLOT });
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', new Date('2026-07-13T15:00:00.000Z'), 'founder'), false);
+  assert.equal(h.events.length, 0);
+  assert.match(h.notices.at(-1)!.title, /passed/i);
+});
+
+// Invariant 2 again: an unreadable calendar is not an empty one.
+test('FAIL-CLOSED: an unreadable calendar refuses a typed time rather than booking blind', async () => {
+  const h = harness({ row: AWAITING_SLOT, freeBusyThrows: true });
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', TYPED, 'founder'), false);
+  assert.equal(h.events.length, 0, 'never book when we cannot see the calendar');
+  assert.match(h.notices.at(-1)!.body, /double-booking/i);
+});
+
+test('a typed time is ignored once the meeting is no longer awaiting a slot', async () => {
+  // Returns TRUE (= done with) so a late reply after booking does not re-arm the question.
+  const h = harness({ row: { status: 'scheduled', duration_minutes: 30 } });
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', TYPED, 'founder'), true);
+  assert.equal(h.events.length, 0);
+});
+
+test('a typed time shares the double-book gate with the tapped path', async () => {
+  const h = harness({ row: AWAITING_SLOT, claimForCreating: false });
+  assert.equal(await buildMeetingScheduler(h.deps).onTypedTime('m1', TYPED, 'founder'), true);
+  assert.equal(h.events.length, 0, 'the claim already lost — no second event');
+});
+
+test('a 403 on a typed booking still funnels the ask into a task', async () => {
+  const h = harness({ row: AWAITING_SLOT, createThrows: Object.assign(new Error('forbidden'), { status: 403 }) });
+  await buildMeetingScheduler(h.deps).onTypedTime('m1', TYPED, 'founder');
+  assert.deepEqual(h.tasks, ['m1'], 'invariant 1: the ask is never dropped');
+});

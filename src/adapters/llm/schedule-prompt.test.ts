@@ -92,6 +92,23 @@ test('the prior turn is carried as authoritative founder speech to merge', () =>
   assert.match(SCHEDULE_SYSTEM, /Do NOT clarify merely because the channel is absent/);
 });
 
+// Measured, not assumed: a SPANISH weekday drifted a day forward — "el lunes 11am" resolved to
+// Tue 07-21 (3/3) and "el viernes" to Sat 07-18, while the English "monday"/"friday" were right.
+// This was NOT introduced by the slot-answer framing: the shipped customer_message path
+// ("el lunes a las 11am mandale un mensaje") drifted identically 3/3 with no prior turn, i.e. a
+// founder writing Spanish had their customer messaged a day late. With this rule: 10/10 cases
+// (including every previously-passing one) held across 3 runs each.
+test('the prompt pins weekday names to the NEXT occurrence, and names them in Spanish', () => {
+  assert.match(SCHEDULE_SYSTEM, /NEXT occurrence at or after nowIso/);
+  assert.match(SCHEDULE_SYSTEM, /never the day after it/i);
+  // The mapping itself must be present — the drift was the model's own es→weekday step.
+  for (const day of ['lunes=Monday', 'martes=Tuesday', 'viernes=Friday', 'domingo=Sunday']) {
+    assert.ok(SCHEDULE_SYSTEM.includes(day), `${day} must be spelled out for the model`);
+  }
+  // The worked example is load-bearing: the rule alone did not fix it in earlier drafts.
+  assert.match(SCHEDULE_SYSTEM, /2026-07-20 \(NOT the 21st\)/);
+});
+
 // The composer's payload is the security boundary: while the model only copied founder
 // words, injected customer text had no expressive surface. Composition hands it one, so
 // the composer is kept blind rather than asked to resist.

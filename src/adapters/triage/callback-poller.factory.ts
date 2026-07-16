@@ -195,7 +195,17 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // holds no state — every transition is a guarded write against agent_meeting_requests — so the
   // two instances cannot disagree, and wiring one across two independent worker factories would
   // couple them for nothing.
-  const meeting = buildMeetingSchedulerGated(taskTarget, notifier)?.decisions ?? null;
+  //
+  // Unlike the inbox processor's instance, this one gets the free-text deps: this factory owns
+  // the founder's MESSAGES, so it is the only place a typed "thursday 3pm" can be read.
+  const meetingWiring = buildMeetingSchedulerGated(taskTarget, notifier, {
+    llm: () =>
+      buildLlmRouter({
+        notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
+      }),
+    postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+  });
+  const meeting = meetingWiring?.decisions ?? null;
 
   // THE decision router. Named (not inlined into onDecision) because a second caller
   // needs it: the askFounder free-text resolver turns a TYPED answer into a DecisionEvent
@@ -261,6 +271,10 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
     clearPending: (threadId) => threadMarkers.clear('ask_founder', threadId),
     dispatch: routeDecision,
     postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+    // "📅 Pick a time" accepts a typed time as well as a tap. Runs ONLY when the text matched no
+    // button label, and declines every question that isn't a meeting's — so every other
+    // askFounder keeps its exact closed-choice behavior.
+    onUnmatched: meetingWiring?.freeText,
     log: logger,
   });
 

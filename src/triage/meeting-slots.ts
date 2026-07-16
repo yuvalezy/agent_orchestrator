@@ -108,9 +108,25 @@ export function isSlotFree(
   // The whole slot must fit before close — a 30-min slot at 17:45 does not.
   if (DateTime.fromJSDate(slot.endsAt, { zone }) > w.close) return false;
 
+  return !slotConflicts(slot, input.busy);
+}
+
+/**
+ * The BUSY half of isSlotFree, on its own — returns the interval a slot collides with, or null.
+ *
+ * Split out for the founder-TYPED time ("book thursday 3pm" instead of tapping an offered slot).
+ * A time WE propose must respect the founder's working day; a time THEY name must not be vetoed
+ * by it — 19:00, or a Saturday, is their call to make about their own calendar, and silently
+ * refusing it would be the tool arguing with its owner. A real double-booking is a different
+ * thing entirely, so that check stays.
+ *
+ * Returns the conflicting interval rather than a boolean so the founder can be told WHAT it
+ * clashes with; "that time is busy" is not actionable when they cannot see which meeting.
+ */
+export function slotConflicts(slot: Slot, busy: BusyInterval[]): BusyInterval | null {
   const s = slot.startsAt.getTime();
   const e = slot.endsAt.getTime();
-  return !mergeBusy(input.busy).some((b) => overlaps(s, e, b.start.getTime(), b.end.getTime()));
+  return mergeBusy(busy).find((b) => overlaps(s, e, b.start.getTime(), b.end.getTime())) ?? null;
 }
 
 /**
