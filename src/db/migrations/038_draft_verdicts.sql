@@ -1,0 +1,24 @@
+-- 038: WP3 draft verifier — persist the self-critique verdict on the draft's decision row.
+--
+-- Every customer-facing draft is graded by a cheap LLM verifier BEFORE it is presented to the
+-- founder (src/triage/response-drafter.ts) and, on a manual 🔁 Revise, the regenerated draft is
+-- graded too (src/triage/draft-revise.ts). Recording the verdict alongside the draft_reply
+-- decision lets acceptance analytics correlate a verdict (pass / which failures / whether an
+-- auto-revise fired) with the founder's eventual accept/edit/reject — the signal that later
+-- gates unattended auto-send.
+--
+-- Nullable, no default: a draft written with the verifier OFF (or one whose best-effort grade
+-- threw) simply has verifier_verdict = NULL, indistinguishable from the pre-feature rows. The
+-- column lives on agent_decisions (the draft_reply audit row, decisions.ts) — the same row the
+-- feedback + acceptance readers already join on. Forward-only, transactional (the migrate runner
+-- wraps each file in BEGIN/COMMIT).
+--
+-- Shape written: { "pass": bool, "failures": [{ "code": "...", "detail": "..." }], "revised": bool }
+--   • pass     — true only when the verifier found zero failures.
+--   • failures — the flagged problems (ungrounded_claim | wrong_language | style_violation |
+--                invented_capability | other), each with a one-sentence detail.
+--   • revised  — true when a FAILED verdict triggered the one-shot auto-revise on the drafter path
+--                (the persisted verdict is then the RE-verify of the regenerated draft); false on a
+--                manual-revise grade (no auto-revise loop there).
+ALTER TABLE agent_decisions
+  ADD COLUMN IF NOT EXISTS verifier_verdict JSONB;

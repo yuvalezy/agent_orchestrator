@@ -24,7 +24,7 @@ import { enqueueDraft, findOpenDraftByInbox } from '../../outbound/outbound-repo
 import { recordDraftDecision } from '../../decisions/decisions';
 import { buildEzyPortalGateway } from '../ezy-portal';
 import { buildLlmRouter } from '../llm/factory';
-import type { AgentLlmPort } from '../../ports/llm.port';
+import type { AgentLlmPort, DraftReviserPort, DraftVerifierPort } from '../../ports/llm.port';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildGroupSummaryAdapter, buildRecipientProfileAdapter } from '../whatsapp-manager/factory';
 import { buildMeetingSchedulerGated } from './meeting-scheduler.factory';
@@ -81,7 +81,7 @@ function buildTriageKnowledgeRetriever(): KnowledgeRetriever | undefined {
  * (diagnosable via this log).
  */
 function buildResponseDrafterGated(
-  llm: Pick<AgentLlmPort, 'draftReply'>,
+  llm: Pick<AgentLlmPort, 'draftReply'> & DraftVerifierPort & DraftReviserPort,
   notifier: FounderNotifierPort,
 ): ResponseDrafter | undefined {
   if (!env.KNOWLEDGE_DRAFT_ENABLED) {
@@ -92,7 +92,7 @@ function buildResponseDrafterGated(
     logger.warn('⚠️  KNOWLEDGE_DRAFT_ENABLED=true but KNOWLEDGE_RETRIEVAL_ENABLED=false — the drafter is DORMANT (no retrieved knowledge → question_existing keeps creating tasks). Enable retrieval too.');
   }
   logger.info(
-    { retrieval: env.KNOWLEDGE_RETRIEVAL_ENABLED, revise: env.DRAFT_REVISE_ENABLED, styleLane: env.STYLE_LANE_ENABLED },
+    { retrieval: env.KNOWLEDGE_RETRIEVAL_ENABLED, revise: env.DRAFT_REVISE_ENABLED, styleLane: env.STYLE_LANE_ENABLED, verifier: env.DRAFT_VERIFIER_ENABLED },
     'response drafter wired (KNOWLEDGE_DRAFT_ENABLED=true)',
   );
   return buildResponseDrafter({
@@ -103,6 +103,10 @@ function buildResponseDrafterGated(
     findOpenDraftByInbox,
     // Draft correction loop: append the 🔁 Revise button on presented drafts when enabled.
     reviseEnabled: env.DRAFT_REVISE_ENABLED,
+    // WP3 draft self-critique: grade every draft before presenting + auto-revise once on a fail
+    // (gated; the SAME LLM router implements both ports). Undefined when off → no verification.
+    verifier: env.DRAFT_VERIFIER_ENABLED ? llm : undefined,
+    reviser: env.DRAFT_VERIFIER_ENABLED ? llm : undefined,
     // Recipient gender from the founder's WhatsApp whitelist, so a reply in a gendered
     // language agrees with the person instead of hedging ("Bienvenido/a"). Best-effort:
     // a miss or an outage just yields neutral phrasing.

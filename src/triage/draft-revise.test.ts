@@ -5,7 +5,7 @@ import {
   buildDraftReviseMessageHandler,
   type DraftReviserDeps,
 } from './draft-revise';
-import type { KnowledgeChunk, ReviseRequest, ReviseResult } from '../ports/llm.port';
+import type { DraftVerdict, KnowledgeChunk, ReviseRequest, ReviseResult, VerifyDraftRequest } from '../ports/llm.port';
 import type { Notification } from '../ports/founder-notifier.port';
 import type { DraftForRevise, RevisedDraft } from '../outbound/outbound-repo';
 import type { StyleLane } from '../knowledge/style-lane';
@@ -46,10 +46,11 @@ interface Cap {
   reviseReqs: ReviseRequest[];
   retrieveCalls: Array<{ q: string; customerId: string | null }>;
   inboxReads: string[];
-  reviseDraftCalls: Array<{ queueId: string; body: string; agentOutput: unknown; revision: { instruction: string; by: string } }>;
+  reviseDraftCalls: Array<{ queueId: string; body: string; agentOutput: unknown; revision: { instruction: string; by: string }; verifierVerdict?: unknown }>;
   notifies: Array<{ customerId: string; n: Notification; buttons?: Array<{ id: string; label: string }> }>;
   learns: unknown[];
   styleLaneCalls: Array<string | null>;
+  verifyReqs: VerifyDraftRequest[];
 }
 
 function makeDeps(over?: {
@@ -63,8 +64,11 @@ function makeDeps(over?: {
   /** When set, a StyleLane stub returning these directives (a throw when `styleLaneThrows`). */
   guidance?: string[];
   styleLaneThrows?: boolean;
+  /** WP3 verifier: the verdict verifyDraft returns for the regenerated draft, or throw. */
+  verdict?: DraftVerdict;
+  verifyThrows?: boolean;
 }): { deps: DraftReviserDeps; cap: Cap } {
-  const cap: Cap = { reviseReqs: [], retrieveCalls: [], inboxReads: [], reviseDraftCalls: [], notifies: [], learns: [], styleLaneCalls: [] };
+  const cap: Cap = { reviseReqs: [], retrieveCalls: [], inboxReads: [], reviseDraftCalls: [], notifies: [], learns: [], styleLaneCalls: [], verifyReqs: [] };
   const styleLane: StyleLane | undefined =
     over?.guidance !== undefined || over?.styleLaneThrows
       ? {
@@ -96,12 +100,23 @@ function makeDeps(over?: {
       },
     },
     getDraftForRevise: async () => (over?.getDraft === undefined ? draft() : over.getDraft),
-    reviseDraft: async (queueId, body, agentOutput, revision) => {
-      cap.reviseDraftCalls.push({ queueId, body, agentOutput, revision });
+    reviseDraft: async (queueId, body, agentOutput, revision, verifierVerdict) => {
+      cap.reviseDraftCalls.push({ queueId, body, agentOutput, revision, verifierVerdict });
       return over?.revised === undefined
         ? { queueId, oldDecisionId: 'd1', newDecisionId: 'd2', customerId: 'cust-1' }
         : over.revised;
     },
+    ...(over?.verdict || over?.verifyThrows
+      ? {
+          verifier: {
+            verifyDraft: async (input: VerifyDraftRequest): Promise<DraftVerdict> => {
+              cap.verifyReqs.push(input);
+              if (over?.verifyThrows) throw new Error('verifier down');
+              return over!.verdict!;
+            },
+          },
+        }
+      : {}),
     getInboxSubjectBody: async (id) => {
       cap.inboxReads.push(id);
       return over?.inbox === undefined ? { subject: null, body: 'Do you integrate with QuickBooks?' } : over.inbox;
@@ -263,6 +278,52 @@ test('reviseFromInstruction: a style lane failure NEVER breaks revise (best-effo
   assert.deepEqual(cap.reviseReqs[0].voiceGuidance, [], 'a lane throw degrades to empty guidance');
   assert.equal(cap.reviseDraftCalls.length, 1, 'revise commits despite the lane fault');
   assert.match(cap.notifies[0].n.title, /revised/i);
+});
+
+// ── WP3: verify the regenerated draft (record + annotate; no auto-revise loop) ───
+
+test('verify: the regenerated draft is graded, the verdict rides onto reviseDraft, and it is annotated', async () => {
+  const verdict: DraftVerdict = { pass: false, failures: [{ code: 'ungrounded_claim', detail: 'The 30-day trial is not in any source.' }] };
+  const { deps, cap } = makeDeps({ knowledge: [chunk()], verdict, reviseResult: { body: 'Regenerated reply.', usedSourceIndexes: [0] } });
+  const svc = buildDraftReviser(deps);
+
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'mention the trial', by: 'u' });
+
+  // Graded once, on the REGENERATED body — no auto-revise loop on this path.
+  assert.equal(cap.verifyReqs.length, 1);
+  assert.equal(cap.verifyReqs[0].draftBody, 'Regenerated reply.');
+  // The verdict is threaded into reviseDraft so it lands on the NEW decision's verifier_verdict
+  // column; revised:false — a manual revise is not the drafter's one-shot auto-revise gate.
+  assert.deepEqual(cap.reviseDraftCalls[0].verifierVerdict, { pass: false, failures: verdict.failures, revised: false });
+  // Annotated on the re-presentation.
+  assert.match(cap.notifies[0].n.body, /⚠️ Verifier: ungrounded_claim/);
+});
+
+test('verify: a passing verdict on the regenerated draft → a check annotation, verdict recorded', async () => {
+  const { deps, cap } = makeDeps({ knowledge: [chunk()], verdict: { pass: true, failures: [] } });
+  const svc = buildDraftReviser(deps);
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'x', by: 'u' });
+  assert.deepEqual(cap.reviseDraftCalls[0].verifierVerdict, { pass: true, failures: [], revised: false });
+  assert.match(cap.notifies[0].n.body, /✅ Verifier: passed/);
+});
+
+test('verify: a verifier throw NEVER breaks the committed revise — presented UNANNOTATED, no verdict', async () => {
+  const { deps, cap } = makeDeps({ knowledge: [chunk()], verifyThrows: true });
+  const svc = buildDraftReviser(deps);
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'x', by: 'u' }); // must not reject
+  assert.equal(cap.reviseDraftCalls.length, 1, 'the revise still commits');
+  assert.equal(cap.reviseDraftCalls[0].verifierVerdict, undefined, 'no verdict when the grade threw');
+  assert.equal(cap.notifies.length, 1);
+  assert.doesNotMatch(cap.notifies[0].n.body, /Verifier/);
+});
+
+test('verify: no verifier wired → no grade, no verdict, no annotation (byte-identical)', async () => {
+  const { deps, cap } = makeDeps({ knowledge: [chunk()] });
+  const svc = buildDraftReviser(deps);
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'x', by: 'u' });
+  assert.equal(cap.verifyReqs.length, 0);
+  assert.equal(cap.reviseDraftCalls[0].verifierVerdict, undefined);
+  assert.doesNotMatch(cap.notifies[0].n.body, /Verifier/);
 });
 
 // ── capture handler (clear-marker-first idempotency) ─────────────────────────

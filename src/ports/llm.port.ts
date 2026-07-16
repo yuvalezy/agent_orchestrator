@@ -405,6 +405,55 @@ export interface CorrectionClassifierPort {
   classifyCorrection(input: { instruction: string; priorDraft: string; language?: string }): Promise<CorrectionClass>;
 }
 
+/**
+ * Request to VERIFY a drafted customer reply BEFORE it is presented to the founder (draft
+ * self-critique gate, LLM role 'classify'). The verifier grades `draftBody` against the customer
+ * `question`, the numbered `knowledge` sources it was meant to be grounded in, the requested
+ * `language`, and any `voiceGuidance` style directives — it produces a verdict, never a rewrite.
+ * The SAME grounding contract as the drafter holds: absence of a source is NOT evidence a
+ * capability exists. NEVER logs bodies.
+ */
+export interface VerifyDraftRequest {
+  /** The customer message the draft answers (subject + body, already assembled). */
+  question: string;
+  /** The drafted reply text under review. */
+  draftBody: string;
+  /** The language the reply was required to be written in (e.g. 'es'). */
+  language: string;
+  /** The numbered knowledge sources the draft was grounded in (every factual claim must trace here). */
+  knowledge: KnowledgeChunk[];
+  /** Optional style/voice directives the draft was required to honor (the always-on style lane). */
+  voiceGuidance?: string[];
+}
+
+/** One failure the verifier found in a draft. `code` buckets it; `detail` is ONE sentence. */
+export interface DraftVerdictFailure {
+  code: 'ungrounded_claim' | 'wrong_language' | 'style_violation' | 'invented_capability' | 'other';
+  /** A one-sentence description of the specific problem (clamped by the validator). */
+  detail: string;
+}
+
+/**
+ * The verdict on a drafted reply. `pass` is true ONLY when `failures` is empty — the validator
+ * derives it from the list, never trusting a model that reports pass:true alongside failures.
+ * Doubles as an auto-send gate signal (a passing verdict = safe to send unattended, later).
+ */
+export interface DraftVerdict {
+  pass: boolean;
+  failures: DraftVerdictFailure[];
+}
+
+/**
+ * Draft self-critique (LLM role 'classify'). SEPARATE from AgentLlmPort (interface segregation,
+ * like AnswerSynthesizerPort / DraftReviserPort): the drafter + reviser depend only on this, and
+ * existing fakes are untouched. Implemented by the LlmRouter. A cheap graded check on every
+ * customer-facing draft — BEST-EFFORT at the call site (a throw must never block or delay the
+ * draft). NEVER logs bodies.
+ */
+export interface DraftVerifierPort {
+  verifyDraft(input: VerifyDraftRequest): Promise<DraftVerdict>;
+}
+
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */
 export interface LlmProviderClient {
   readonly provider: string; // 'anthropic' | 'openai' | 'deepseek' | future

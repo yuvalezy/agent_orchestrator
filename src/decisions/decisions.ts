@@ -102,19 +102,27 @@ export async function resolveTriageDecision(
 
 /**
  * Open a draft_reply audit row (outcome='pending'). `agentOutput` = { intent,
- * draft_body, citations, language }. Returns the new decision id — the queue draft
- * row FKs to it. Never stores/logs the raw inbound body.
+ * draft_body, citations, language }. `verifierVerdict` (WP3, optional) records the draft
+ * self-critique { pass, failures, revised } on the nullable verifier_verdict column (mig 038)
+ * — omitted (→ NULL) when the verifier is off or its best-effort grade threw. Returns the new
+ * decision id — the queue draft row FKs to it. Never stores/logs the raw inbound body.
  */
 export async function recordDraftDecision(input: {
   customerId: string;
   inboxMessageId: string;
   agentOutput: unknown;
+  verifierVerdict?: unknown;
 }): Promise<{ decisionId: string }> {
   const { rows } = await query<{ id: string }>(
-    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, outcome)
-     VALUES ($1, $2, 'draft_reply', $3::jsonb, 'pending')
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, verifier_verdict, outcome)
+     VALUES ($1, $2, 'draft_reply', $3::jsonb, $4::jsonb, 'pending')
      RETURNING id`,
-    [input.customerId, input.inboxMessageId, JSON.stringify(input.agentOutput ?? null)],
+    [
+      input.customerId,
+      input.inboxMessageId,
+      JSON.stringify(input.agentOutput ?? null),
+      input.verifierVerdict !== undefined ? JSON.stringify(input.verifierVerdict) : null,
+    ],
   );
   return { decisionId: rows[0].id };
 }
@@ -324,18 +332,24 @@ export async function resolveDraftDecisionTx(
  * new row COPIES customer_id + inbox_message_id from `fromDecisionId` (an inbound draft's
  * inbox_message_id is preserved; a founder-initiated release-note draft's NULL is preserved
  * too) so the M3(c)/M3(d) queries keep working unchanged. `agentOutput` = { intent,
- * draft_body, citations, language, customer_name, revised_from }. Returns the new decision id.
+ * draft_body, citations, language, customer_name, revised_from }. `verifierVerdict` (WP3,
+ * optional) records the self-critique of the REGENERATED draft on the new row's verifier_verdict
+ * column (mig 038) — omitted (→ NULL) when the verifier is off or threw. Returns the new decision id.
  */
 export async function insertRevisedDraftDecisionTx(
   client: PoolClient,
-  input: { fromDecisionId: string; agentOutput: unknown },
+  input: { fromDecisionId: string; agentOutput: unknown; verifierVerdict?: unknown },
 ): Promise<{ decisionId: string }> {
   const { rows } = await client.query<{ id: string }>(
-    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, outcome)
-     SELECT customer_id, inbox_message_id, 'draft_reply', $2::jsonb, 'pending'
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, agent_output, verifier_verdict, outcome)
+     SELECT customer_id, inbox_message_id, 'draft_reply', $2::jsonb, $3::jsonb, 'pending'
        FROM agent_decisions WHERE id = $1
      RETURNING id`,
-    [input.fromDecisionId, JSON.stringify(input.agentOutput ?? null)],
+    [
+      input.fromDecisionId,
+      JSON.stringify(input.agentOutput ?? null),
+      input.verifierVerdict !== undefined ? JSON.stringify(input.verifierVerdict) : null,
+    ],
   );
   return { decisionId: rows[0].id };
 }

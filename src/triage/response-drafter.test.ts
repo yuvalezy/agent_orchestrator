@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResponseDrafter, emailReplySubject, meetingMatchEmails, renderCitations, type ResponseDrafterDeps } from './response-drafter';
+import { buildResponseDrafter, emailReplySubject, meetingMatchEmails, renderCitations, verifierAnnotation, type ResponseDrafterDeps } from './response-drafter';
 import type { ClaimedInbox } from '../inbox/inbox-repo';
-import type { KnowledgeChunk, DraftRequest, DraftResult } from '../ports/llm.port';
+import type { DraftVerdict, KnowledgeChunk, DraftRequest, DraftResult, ReviseRequest, ReviseResult, VerifyDraftRequest } from '../ports/llm.port';
 import type { Notification } from '../ports/founder-notifier.port';
 import type { EnqueueDraftInput, OpenDraftForInbox } from '../outbound/outbound-repo';
 
@@ -45,12 +45,14 @@ const row = (over: Partial<ClaimedInbox> = {}): ClaimedInbox => ({
 
 interface Captured {
   draftReqs: DraftRequest[];
-  records: Array<{ customerId: string; inboxMessageId: string; agentOutput: unknown }>;
+  records: Array<{ customerId: string; inboxMessageId: string; agentOutput: unknown; verifierVerdict?: unknown }>;
   enqueues: EnqueueDraftInput[];
   notifies: Array<{ customerId: string; n: Notification; buttons?: Array<{ id: string; label: string }> }>;
   findInboxIds: string[];
   styleCustomerIds: Array<string | null>;
   meetingCalls: Array<{ customerId: string | null; matchEmails: string[] }>;
+  verifyReqs: VerifyDraftRequest[];
+  reviseReqs: ReviseRequest[];
 }
 
 function makeDeps(over?: {
@@ -62,9 +64,39 @@ function makeDeps(over?: {
   styleGuidanceFor?: (customerId: string | null) => Promise<string[]>;
   meetings?: string[];
   resolveGender?: (channelType: string, address: string) => Promise<'male' | 'female' | null>;
+  /** WP3 verifier: return a verdict per verifyDraft call (consumed in order; last repeats), or throw. */
+  verdicts?: DraftVerdict[];
+  verifyThrows?: boolean;
+  /** WP3 auto-revise reviser: the regenerated result, or throw. */
+  reviseResult?: ReviseResult;
+  reviseThrows?: boolean;
 }): { deps: ResponseDrafterDeps; cap: Captured } {
-  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [], meetingCalls: [] };
+  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [], meetingCalls: [], verifyReqs: [], reviseReqs: [] };
   const deps: ResponseDrafterDeps = {
+    ...(over?.verdicts || over?.verifyThrows
+      ? {
+          verifier: {
+            verifyDraft: async (input: VerifyDraftRequest): Promise<DraftVerdict> => {
+              cap.verifyReqs.push(input);
+              if (over?.verifyThrows) throw new Error('verifier down');
+              const i = cap.verifyReqs.length - 1;
+              const list = over?.verdicts ?? [];
+              return list[Math.min(i, list.length - 1)];
+            },
+          },
+        }
+      : {}),
+    ...(over?.reviseResult || over?.reviseThrows
+      ? {
+          reviser: {
+            reviseReply: async (input: ReviseRequest): Promise<ReviseResult> => {
+              cap.reviseReqs.push(input);
+              if (over?.reviseThrows) throw new Error('reviser down');
+              return over?.reviseResult ?? { body: '', usedSourceIndexes: [] };
+            },
+          },
+        }
+      : {}),
     ...(over?.styleGuidance || over?.styleGuidanceFor
       ? {
           styleLane: {
@@ -421,6 +453,118 @@ test('meetingMatchEmails: email sender → [lowercased]; phone/blank → []', ()
   assert.deepEqual(meetingMatchEmails(row({ sender_address: 'Cust@Acme.com' })), ['cust@acme.com']);
   assert.deepEqual(meetingMatchEmails(row({ sender_address: '+15551230000' })), []);
   assert.deepEqual(meetingMatchEmails(row({ sender_address: null })), []);
+});
+
+// ── WP3: draft self-critique verifier + one auto-revise ──────────────────────────
+
+const intentFull = { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null } as never;
+
+test('verifier: a passing verdict → no auto-revise, annotation present, verdict persisted (revised:false)', async () => {
+  const { deps, cap } = makeDeps({ verdicts: [{ pass: true, failures: [] }] });
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  });
+  // Graded once, on the drafted body in the required language; never auto-revised on a pass.
+  assert.equal(cap.verifyReqs.length, 1);
+  assert.equal(cap.verifyReqs[0].draftBody, 'El export nocturno corre a las 02:00 UTC.');
+  assert.equal(cap.verifyReqs[0].language, 'es');
+  assert.equal(cap.reviseReqs.length, 0, 'a pass never auto-revises');
+  // Verdict persisted on the decision row.
+  assert.deepEqual(cap.records[0].verifierVerdict, { pass: true, failures: [], revised: false });
+  // Annotation present on the founder notification.
+  assert.match(cap.notifies[0].n.body, /✅ Verifier: passed/);
+});
+
+test('verifier: a failing verdict → exactly ONE auto-revise → re-verify → present regenerated draft + annotation', async () => {
+  const fail: DraftVerdict = { pass: false, failures: [{ code: 'invented_capability', detail: 'Claims a Slack integration no source confirms.' }] };
+  const { deps, cap } = makeDeps({
+    verdicts: [fail, { pass: true, failures: [] }],
+    reviseResult: { body: 'Regenerated grounded reply.', usedSourceIndexes: [0] },
+  });
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  });
+  // Verify, then EXACTLY ONE revise, then a single re-verify.
+  assert.equal(cap.reviseReqs.length, 1, 'exactly one auto-revise');
+  assert.equal(cap.verifyReqs.length, 2, 're-verify after the single revise');
+  // The revise instruction is built from the failure detail; it corrects the ORIGINAL draft.
+  assert.match(cap.reviseReqs[0].instruction, /^Fix: Claims a Slack integration/);
+  assert.equal(cap.reviseReqs[0].priorDraft, 'El export nocturno corre a las 02:00 UTC.');
+  // The REGENERATED body is what gets enqueued + recorded + presented.
+  assert.equal(cap.enqueues[0].body, 'Regenerated grounded reply.');
+  assert.equal((cap.records[0].agentOutput as { draft_body: string }).draft_body, 'Regenerated grounded reply.');
+  // The persisted verdict is the RE-verify (now passing) with revised:true.
+  assert.deepEqual(cap.records[0].verifierVerdict, { pass: true, failures: [], revised: true });
+  assert.match(cap.notifies[0].n.body, /✅ Verifier: passed after auto-revise/);
+});
+
+test('verifier: an auto-revise that still fails re-verify → annotated with the remaining codes (revised:true)', async () => {
+  const fail: DraftVerdict = { pass: false, failures: [{ code: 'wrong_language', detail: 'Reply is in English.' }] };
+  const { deps, cap } = makeDeps({ verdicts: [fail, fail], reviseResult: { body: 'Still wrong.', usedSourceIndexes: [] } });
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  });
+  assert.equal(cap.reviseReqs.length, 1, 'still only ONE auto-revise even when it does not fix it');
+  assert.deepEqual(cap.records[0].verifierVerdict, { pass: false, failures: fail.failures, revised: true });
+  assert.match(cap.notifies[0].n.body, /⚠️ Verifier: wrong_language \(auto-revised, still flagged\)/);
+});
+
+test('verifier: a failing verdict with NO reviser injected → no revise, annotated, verdict persisted (revised:false)', async () => {
+  const fail: DraftVerdict = { pass: false, failures: [{ code: 'ungrounded_claim', detail: 'No source backs the 24/7 support claim.' }] };
+  const { deps, cap } = makeDeps({ verdicts: [fail] }); // no reviseResult → no reviser wired
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  });
+  assert.equal(cap.reviseReqs.length, 0, 'no reviser → no auto-revise');
+  assert.equal(cap.verifyReqs.length, 1, 'graded once, no re-verify');
+  assert.equal(cap.enqueues[0].body, 'El export nocturno corre a las 02:00 UTC.', 'original body stands');
+  assert.deepEqual(cap.records[0].verifierVerdict, { pass: false, failures: fail.failures, revised: false });
+  assert.match(cap.notifies[0].n.body, /⚠️ Verifier: ungrounded_claim/);
+});
+
+test('verifier: an auto-revise throw → the ORIGINAL draft is presented with the failing verdict (revised:false)', async () => {
+  const fail: DraftVerdict = { pass: false, failures: [{ code: 'other', detail: 'Salutation is wrong.' }] };
+  const { deps, cap } = makeDeps({ verdicts: [fail], reviseThrows: true });
+  await assert.doesNotReject(buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  }));
+  assert.equal(cap.reviseReqs.length, 1, 'the revise was attempted');
+  assert.equal(cap.verifyReqs.length, 1, 'no re-verify — the revise threw');
+  assert.equal(cap.enqueues[0].body, 'El export nocturno corre a las 02:00 UTC.', 'the original body is presented');
+  assert.deepEqual(cap.records[0].verifierVerdict, { pass: false, failures: fail.failures, revised: false });
+});
+
+test('verifier: a verifier throw NEVER blocks the draft — presented UNANNOTATED, no verdict persisted', async () => {
+  const { deps, cap } = makeDeps({ verifyThrows: true });
+  await assert.doesNotReject(buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  }));
+  assert.equal(cap.enqueues.length, 1, 'the draft still went out');
+  assert.equal(cap.records[0].verifierVerdict, undefined, 'no verdict recorded when the grade threw');
+  assert.doesNotMatch(cap.notifies[0].n.body, /Verifier/);
+});
+
+test('verifier: none injected → byte-identical (no grade, no verdict, no annotation)', async () => {
+  const { deps, cap } = makeDeps();
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 't', knowledge: [chunk()], intent: intentFull,
+  });
+  assert.equal(cap.verifyReqs.length, 0);
+  assert.equal(cap.records[0].verifierVerdict, undefined);
+  assert.doesNotMatch(cap.notifies[0].n.body, /Verifier/);
+});
+
+test('verifierAnnotation: pass/fail/revised phrasings', () => {
+  assert.equal(verifierAnnotation({ pass: true, failures: [] }, false), '✅ Verifier: passed');
+  assert.equal(verifierAnnotation({ pass: true, failures: [] }, true), '✅ Verifier: passed after auto-revise');
+  assert.equal(
+    verifierAnnotation({ pass: false, failures: [{ code: 'wrong_language', detail: 'x' }, { code: 'other', detail: 'y' }] }, false),
+    '⚠️ Verifier: wrong_language, other',
+  );
+  assert.equal(
+    verifierAnnotation({ pass: false, failures: [{ code: 'invented_capability', detail: 'x' }] }, true),
+    '⚠️ Verifier: invented_capability (auto-revised, still flagged)',
+  );
 });
 
 // ── renderCitations ────────────────────────────────────────────────────────────

@@ -576,6 +576,7 @@ export async function reviseDraft(
   newBody: string,
   newAgentOutput: unknown,
   revision: { instruction: string; by: string },
+  verifierVerdict?: unknown,
 ): Promise<RevisedDraft | null> {
   return withClient(async (client) => {
     try {
@@ -605,6 +606,7 @@ export async function reviseDraft(
       const { decisionId: newDecisionId } = await insertRevisedDraftDecisionTx(client, {
         fromDecisionId: row.decision_id,
         agentOutput: newAgentOutput,
+        verifierVerdict,
       });
       await client.query(`UPDATE agent_outbound_queue SET decision_id = $2 WHERE id = $1`, [row.id, newDecisionId]);
       await client.query('COMMIT');

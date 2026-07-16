@@ -239,6 +239,17 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     dependsOn: 'DAILY_BRIEFING_ENABLED',
   },
   {
+    key: 'DRAFT_VERIFIER_ENABLED',
+    type: 'boolean',
+    category: INTELLIGENCE,
+    label: 'Draft verifier',
+    description:
+      'Grades every customer-facing draft before it reaches the founder: claims must trace to a source, language must match, style directives honored, no invented capability/price/date. A failing verdict auto-revises the draft once, then re-checks; the verdict is shown on the draft and recorded for acceptance analytics. Best-effort — never blocks a draft. Only affects the drafter.',
+    applyMode: 'restart',
+    default: false,
+    dependsOn: 'KNOWLEDGE_DRAFT_ENABLED',
+  },
+  {
     key: 'WEEKLY_PATTERNS_ENABLED',
     type: 'boolean',
     category: INTELLIGENCE,

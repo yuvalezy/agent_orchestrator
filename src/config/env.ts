@@ -468,6 +468,27 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
+  // ── WP3: draft self-critique verifier. When ON, a cheap LLM pass (role 'classify') grades EVERY
+  // customer-facing draft BEFORE it is presented to the founder — every factual claim must trace to
+  // a numbered source (absence of a source is not evidence a capability exists), the reply language
+  // must match, style directives must be honored, and no capability/integration/date/price may be
+  // invented. On the drafter path a FAILING verdict triggers exactly ONE auto-revise (via the
+  // existing revise LLM path) then a re-verify; the final draft is presented REGARDLESS (the founder
+  // still approves), with the verdict annotated on the Telegram notification and persisted on the
+  // decision row (verifier_verdict, mig 038) so acceptance analytics can correlate it — the signal a
+  // later unattended auto-send would gate on. On the 🔁 Revise path the regenerated draft is graded
+  // too (recorded + annotated; no auto-revise loop — the founder is already iterating). Kill-switch
+  // (mirrors OUTBOUND_ENABLED strict-bool): the verifier is injected ONLY when the literal "true";
+  // unset/"false"/anything else → false. DORMANT by default so drafting is byte-identical until
+  // flipped. BEST-EFFORT everywhere: a verifier/reviser throw never blocks or delays a draft.
+  //
+  // DEPENDENCY: only affects the drafter/reviser when KNOWLEDGE_DRAFT_ENABLED is on (there are no
+  // drafts to grade otherwise). The grading call needs an LLM provider key (resolveCredential).
+  DRAFT_VERIFIER_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // ── Style-Correction Always-On lane. Fact corrections are retrievable at draft time (they
   // share words with the customer's question, clearing the retrieval distance gate) but TONE/
   // STYLE/persona corrections are NOT — a directive like "be warmer / less formal" has no lexical

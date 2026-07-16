@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
@@ -10,6 +10,7 @@ import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './
 import { BRIEFING_SCHEMA, BRIEFING_SYSTEM, briefingUserMessage, parseBriefingSynthesis } from './briefing-prompt';
 import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
+import { VERIFY_SCHEMA, VERIFY_SYSTEM, parseVerdict, verifyUserMessage } from './verify-prompt';
 import { COMPOSE_SCHEMA, COMPOSE_SYSTEM, SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, composeUserMessage, parseComposedBody, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
@@ -39,7 +40,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, DraftReviserPort, CorrectionClassifierPort, ScheduleInterpreterPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -261,6 +262,26 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       messages: [{ role: 'user', content: correctionClassifyUserMessage(input) }],
       maxTokens: 256,
       validate: parseCorrectionClass,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Verify a drafted customer reply (WP3 draft self-critique, role 'classify'). Reuses the golden
+   * structured-call path — cost accounting, ordered failover, daily cap — with VERIFY_SCHEMA. The
+   * verdict's `pass` is DERIVED from the failure list in parseVerdict (never trusted from the model).
+   * customerId null: the check is not billed to any one customer. BEST-EFFORT at the call site (a
+   * throw here must never block or delay the draft — see response-drafter.ts / draft-revise.ts).
+   * Never logs the body.
+   */
+  async verifyDraft(input: VerifyDraftRequest): Promise<DraftVerdict> {
+    return this.callStructured<DraftVerdict>({
+      role: 'classify',
+      schema: VERIFY_SCHEMA,
+      system: VERIFY_SYSTEM,
+      messages: [{ role: 'user', content: verifyUserMessage(input) }],
+      maxTokens: 512,
+      validate: parseVerdict,
       customerId: null,
     });
   }

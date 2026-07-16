@@ -1,4 +1,4 @@
-import type { DraftReviserPort, Intent, ReviseRequest } from '../ports/llm.port';
+import type { DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, ReviseRequest, VerifyDraftRequest } from '../ports/llm.port';
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
 import type { StyleLane } from '../knowledge/style-lane';
@@ -6,7 +6,7 @@ import type { getDraftForRevise, reviseDraft, DraftForRevise } from '../outbound
 import type { getInboxSubjectBody } from '../inbox/inbox-repo';
 import { logger } from '../logger';
 import { draftButtons } from './draft-review';
-import { renderCitations } from './response-drafter';
+import { renderCitations, verifierAnnotation } from './response-drafter';
 
 // Draft revise orchestrator (Draft correction loop Phase 1, CORE — injected ports + core
 // repo fns only, imports NO adapter, D1). When the founder taps 🔁 Revise and sends a
@@ -47,6 +47,11 @@ export interface DraftReviserDeps {
    *  is itself best-effort (a miss yields []), and we further isolate its call below — a style-lane
    *  fault must NEVER break revise. */
   styleLane?: StyleLane;
+  /** Draft self-critique (gated DRAFT_VERIFIER_ENABLED). When set, the REGENERATED draft is graded
+   *  and the verdict is recorded on the new decision row + annotated on the notification. NO
+   *  auto-revise loop here — the founder is already iterating. BEST-EFFORT — a throw never breaks the
+   *  committed revise. Undefined → no verification. */
+  verifier?: DraftVerifierPort;
 }
 
 export interface DraftReviserService {
@@ -61,10 +66,10 @@ const REVISE_TITLE = '🔁 Revised draft — needs approval';
 export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
   /** Present (or re-present) the revised draft with the SAME Approve/Edit/Reject/Revise
    *  buttons so the founder can approve, edit, reject, or revise AGAIN. Body never logged. */
-  async function present(customerId: string, queueId: string, body: string, citations: string[], language: string, original?: string): Promise<void> {
+  async function present(customerId: string, queueId: string, body: string, citations: string[], language: string, original?: string, verifierNote?: string): Promise<void> {
     await deps.notifier.notifyCustomerEvent(
       customerId,
-      { ...buildPresentation(body, citations, language, original), contextRef: { kind: 'outbound', ref: queueId } },
+      { ...buildPresentation(body, citations, language, original, verifierNote), contextRef: { kind: 'outbound', ref: queueId } },
       draftButtons(queueId, { revise: true }),
     );
   }
@@ -81,6 +86,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
       let citations: string[];
       let question = '';
       let revised: Awaited<ReturnType<typeof deps.reviseDraft>>;
+      let verdict: DraftVerdict | undefined;
       try {
         // (1) Still an open draft? (guards a draft approved/rejected between 🔁 and the message.)
         const found = await deps.getDraftForRevise(queueId);
@@ -119,8 +125,22 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
         result = await deps.reviser.reviseReply(req);
         citations = renderCitations(knowledge, result.usedSourceIndexes);
 
-        // (5) Persist: resolve old decision → 'revised', open new pending decision, re-point
-        // the queue, update body — ONE transaction. Guarded null = approved/rejected first.
+        // (4b) Verify the REGENERATED draft (gated; best-effort — a throw NEVER breaks the committed
+        // revise). No auto-revise loop: the founder is already iterating, so we only record the
+        // verdict on the new decision row and annotate the re-presentation. `revised: false` — this
+        // is a manual revision, not the drafter's one-shot auto-revise gate.
+        verdict = await verifyRegenerated(deps, queueId, {
+          question,
+          draftBody: result.body,
+          language: meta.language,
+          knowledge,
+          voiceGuidance,
+        });
+        const verifierVerdict = verdict ? { pass: verdict.pass, failures: verdict.failures, revised: false } : undefined;
+
+        // (5) Persist: resolve old decision → 'revised', open new pending decision (carrying the
+        // verdict on verifier_verdict, mig 038), re-point the queue, update body — ONE transaction.
+        // Guarded null = approved/rejected first.
         const newAgentOutput = {
           intent: meta.intent,
           draft_body: result.body,
@@ -129,7 +149,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
           customer_name: meta.customerName,
           revised_from: draft.decisionId,
         };
-        revised = await deps.reviseDraft(queueId, result.body, newAgentOutput, { instruction, by });
+        revised = await deps.reviseDraft(queueId, result.body, newAgentOutput, { instruction, by }, verifierVerdict);
       } catch (err) {
         logger.error({ queueId, reason: errMessage(err) }, 'revise: regeneration failed — asking founder to retry');
         // draft may be unset if getDraftForRevise threw — notify only if we know the customer.
@@ -156,7 +176,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
       // DA S1). Present + learn are best-effort side effects on an already-committed draft.
       if (revised.customerId) {
         try {
-          await present(revised.customerId, queueId, result.body, citations, meta.language, question);
+          await present(revised.customerId, queueId, result.body, citations, meta.language, question, verdict ? verifierAnnotation(verdict, false) : undefined);
         } catch (err) {
           // The revise committed but the founder didn't see it. Do NOT ask them to re-revise;
           // surface a soft note so they know to refresh (a later approve still targets the draft).
@@ -259,15 +279,33 @@ function readDraftMeta(agentOutput: unknown): DraftMeta {
 }
 
 /** Founder-facing presentation of the revised draft: the customer's ORIGINAL message, then the
- *  regenerated body + "Based on:" citations + language. */
-function buildPresentation(body: string, citations: string[], language: string, original?: string): Notification {
+ *  regenerated body + "Based on:" citations + language + (when the verifier ran) a one-line verdict. */
+function buildPresentation(body: string, citations: string[], language: string, original?: string, verifierNote?: string): Notification {
   const lines: string[] = [];
   const orig = original?.trim();
   if (orig) lines.push('📨 They wrote:', orig, '', '✍️ Suggested reply:');
   lines.push(body);
   if (citations.length > 0) lines.push('', 'Based on:', ...citations.map((c) => `- ${c}`));
   if (language) lines.push('', `Language: ${language}`);
+  if (verifierNote) lines.push(verifierNote);
   return { title: REVISE_TITLE, body: lines.join('\n'), severity: 'action' };
+}
+
+/** Grade the regenerated draft, swallowing any verifier fault → undefined (a throw must never break
+ *  the committed revise). Runs inside the pre-commit try, before reviseDraft, so the verdict lands
+ *  atomically on the new decision row. */
+async function verifyRegenerated(
+  deps: Pick<DraftReviserDeps, 'verifier'>,
+  queueId: string,
+  input: VerifyDraftRequest,
+): Promise<DraftVerdict | undefined> {
+  if (!deps.verifier) return undefined;
+  try {
+    return await deps.verifier.verifyDraft(input);
+  } catch (err) {
+    logger.warn({ queueId, reason: errMessage(err) }, 'revise: verifier failed — presenting unannotated');
+    return undefined;
+  }
 }
 
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));

@@ -1,4 +1,4 @@
-import type { AgentLlmPort, DraftRequest, DraftResult, Intent, KnowledgeChunk } from '../ports/llm.port';
+import type { AgentLlmPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, KnowledgeChunk, ReviseRequest, VerifyDraftRequest } from '../ports/llm.port';
 import type { RecipientGender, RecipientProfilePort } from '../ports/recipient-profile.port';
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { ClaimedInbox } from '../inbox/inbox-repo';
@@ -45,6 +45,15 @@ export interface ResponseDrafterDeps {
    *  ("Bienvenido/a"). Best-effort by contract → null just means neutral phrasing.
    *  Undefined → never looked up. */
   recipientProfile?: RecipientProfilePort;
+  /** Draft self-critique (gated DRAFT_VERIFIER_ENABLED). When set, EVERY draft is graded before it
+   *  is presented; the verdict is persisted on the decision row and annotated on the founder
+   *  notification. BEST-EFFORT — a throw never blocks/delays the draft. Undefined → no verification
+   *  (byte-identical prior behavior). */
+  verifier?: DraftVerifierPort;
+  /** One-shot auto-revise (used only WITH `verifier`): on a FAILING verdict, regenerate the draft
+   *  once from the failure details before presenting (the founder still approves). Undefined → a
+   *  failing verdict is annotated but the original draft is presented as-is. */
+  reviser?: DraftReviserPort;
 }
 
 export interface DraftAndPresentInput {
@@ -83,8 +92,9 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
     language: string,
     original?: string,
     inboxMessageId?: string,
+    verifierNote?: string,
   ): Promise<void> {
-    const presentation = buildPresentation(body, citations, language, original);
+    const presentation = buildPresentation(body, citations, language, original, verifierNote);
     if (inboxMessageId) presentation.contextRef = { kind: 'inbox', ref: inboxMessageId };
     await deps.notifier.notifyCustomerEvent(
       customerId,
@@ -157,23 +167,72 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
       };
       const result = await deps.llm.draftReply(req);
 
-      // (3) Citations rendered from OUR chunks at the model's used indexes (no hallucinated cite).
-      //     Voice guidance is deliberately EXCLUDED — it is directive, never a cited source.
-      const citations = renderCitations(knowledge, result.usedSourceIndexes);
+      // (2.5) Draft self-critique (gated; best-effort). When a verifier is injected, grade the draft
+      //       BEFORE presenting. On a FAILING verdict with a reviser available, do ONE auto-revise
+      //       from the failure details and RE-verify — the final draft is presented REGARDLESS (the
+      //       founder still approves), with the verdict annotated on the notification. A verifier /
+      //       reviser throw NEVER blocks or delays the draft (swallowed + warned, no bodies logged).
+      let body = result.body;
+      let usedSourceIndexes = result.usedSourceIndexes;
+      let verdict: DraftVerdict | undefined;
+      let revised = false;
+      if (deps.verifier) {
+        verdict = await gradeSafely(deps, {
+          question: req.question,
+          draftBody: body,
+          language: config.preferredLanguage,
+          knowledge,
+          voiceGuidance,
+        });
+        if (verdict && !verdict.pass && deps.reviser) {
+          const regen = await reviseSafely(deps, {
+            question: req.question,
+            language: config.preferredLanguage,
+            customerName: config.displayName,
+            knowledge,
+            priorDraft: body,
+            instruction: reviseInstruction(verdict),
+            voiceGuidance,
+          });
+          if (regen) {
+            body = regen.body;
+            usedSourceIndexes = regen.usedSourceIndexes;
+            revised = true;
+            // Re-verify the regenerated draft; keep the new verdict when we got one (else the first).
+            const reverdict = await gradeSafely(deps, {
+              question: req.question,
+              draftBody: body,
+              language: config.preferredLanguage,
+              knowledge,
+              voiceGuidance,
+            });
+            if (reverdict) verdict = reverdict;
+          }
+        }
+      }
 
-      // (4) Open the audit decision (outcome='pending') — the queue row FKs to it.
+      // (3) Citations rendered from OUR chunks at the (possibly regenerated) model's used indexes
+      //     (no hallucinated cite). Voice guidance is deliberately EXCLUDED — directive, never cited.
+      const citations = renderCitations(knowledge, usedSourceIndexes);
+
+      const verifierVerdict = verdict ? { pass: verdict.pass, failures: verdict.failures, revised } : undefined;
+      const verifierNote = verdict ? verifierAnnotation(verdict, revised) : undefined;
+
+      // (4) Open the audit decision (outcome='pending') — the queue row FKs to it. The verdict rides
+      //     on verifier_verdict (mig 038) so acceptance analytics can correlate it with the outcome.
       const { decisionId } = await deps.recordDraftDecision({
         customerId,
         inboxMessageId: row.id,
         agentOutput: {
           intent,
-          draft_body: result.body,
+          draft_body: body,
           citations,
           language: config.preferredLanguage,
           // Carried so the 🔁 Revise loop can regenerate with the same salutation/tone
           // without a customer lookup (never the raw customer body — just the display name).
           customer_name: config.displayName,
         },
+        verifierVerdict,
       });
 
       // (5) Enqueue as a DRAFT (status='pending', is_draft=true) — NEVER auto-drained.
@@ -189,7 +248,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
         channelInstanceId: row.channel_instance_id,
         channelType: row.channel_type,
         recipientAddress: row.sender_address,
-        body: result.body,
+        body,
         threadKey,
         inReplyTo: isEmail ? row.message_id_header ?? row.channel_message_id : row.channel_message_id,
         subject: isEmail ? emailReplySubject(row.subject) : undefined,
@@ -202,9 +261,9 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
         'drafter: cited draft enqueued (pending) — presenting for approval',
       );
 
-      // (6) Present with Approve/Edit/Reject. A failure here throws → the row is reclaimed
-      //     and step (1) re-presents this same draft (no double).
-      await present(customerId, queueId, result.body, citations, config.preferredLanguage, assembleQuestion(row), row.id);
+      // (6) Present with Approve/Edit/Reject (+ the verifier annotation when one ran). A failure
+      //     here throws → the row is reclaimed and step (1) re-presents this same draft (no double).
+      await present(customerId, queueId, body, citations, config.preferredLanguage, assembleQuestion(row), row.id, verifierNote);
     },
 
     async reconfirmOpenDraft(inboxMessageId: string): Promise<boolean> {
@@ -248,8 +307,8 @@ function assembleQuestion(row: ClaimedInbox): string {
 
 /** Build the founder-facing presentation: the customer's ORIGINAL message (so the founder can judge
  *  the reply without digging), then the draft body + a "Based on:" citation list + the reply
- *  language. Never logged. */
-function buildPresentation(body: string, citations: string[], language: string, original?: string): Notification {
+ *  language + (when the verifier ran) a one-line verdict annotation. Never logged. */
+function buildPresentation(body: string, citations: string[], language: string, original?: string, verifierNote?: string): Notification {
   const lines: string[] = [];
   const orig = original?.trim();
   if (orig) lines.push('📨 They wrote:', orig, '', '✍️ Suggested reply:');
@@ -258,7 +317,47 @@ function buildPresentation(body: string, citations: string[], language: string, 
     lines.push('', 'Based on:', ...citations.map((c) => `- ${c}`));
   }
   lines.push('', `Language: ${language}`);
+  if (verifierNote) lines.push(verifierNote);
   return { title: PRESENT_TITLE, body: lines.join('\n'), severity: 'action' };
+}
+
+/**
+ * The one-line founder-facing verdict annotation on a presented draft. A pass shows a small check;
+ * a fail lists the flagged failure codes. `revised` notes that the one-shot auto-revise fired (the
+ * verdict is then the RE-verify of the regenerated draft). Exported + reused by the revise path.
+ */
+export function verifierAnnotation(verdict: DraftVerdict, revised: boolean): string {
+  if (verdict.pass) return revised ? '✅ Verifier: passed after auto-revise' : '✅ Verifier: passed';
+  const codes = verdict.failures.map((f) => f.code).join(', ') || 'failed';
+  return revised ? `⚠️ Verifier: ${codes} (auto-revised, still flagged)` : `⚠️ Verifier: ${codes}`;
+}
+
+/** The auto-revise instruction built from a failing verdict's one-sentence failure details. */
+function reviseInstruction(verdict: DraftVerdict): string {
+  const details = verdict.failures.map((f) => f.detail.trim()).filter((d) => d.length > 0);
+  return `Fix: ${details.join('; ')}`;
+}
+
+/** Grade a draft, swallowing any verifier fault → undefined (a throw must never block the draft). */
+async function gradeSafely(deps: Pick<ResponseDrafterDeps, 'verifier'>, input: VerifyDraftRequest): Promise<DraftVerdict | undefined> {
+  if (!deps.verifier) return undefined;
+  try {
+    return await deps.verifier.verifyDraft(input);
+  } catch (err) {
+    logger.warn({ reason: (err as Error)?.message }, 'drafter: verifier failed — presenting unannotated');
+    return undefined;
+  }
+}
+
+/** Regenerate a draft once, swallowing any reviser fault → undefined (the original draft stands). */
+async function reviseSafely(deps: Pick<ResponseDrafterDeps, 'reviser'>, input: ReviseRequest): Promise<{ body: string; usedSourceIndexes: number[] } | undefined> {
+  if (!deps.reviser) return undefined;
+  try {
+    return await deps.reviser.reviseReply(input);
+  } catch (err) {
+    logger.warn({ reason: (err as Error)?.message }, 'drafter: auto-revise failed — presenting original draft');
+    return undefined;
+  }
 }
 
 /** Safely read the citations + language a prior attempt stored on the decision's

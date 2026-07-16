@@ -135,6 +135,9 @@ export function buildDraftReviserService(
     // SAME buildStyleLaneGated the inbox drafter uses (STYLE_LANE_ENABLED) — one gated builder, no
     // second flag.
     styleLane: buildStyleLaneGated(),
+    // WP3 draft self-critique: grade the REGENERATED draft too (recorded + annotated; no auto-revise
+    // loop here — the founder is already iterating). Gated; the SAME LLM router implements the port.
+    verifier: env.DRAFT_VERIFIER_ENABLED ? llm : undefined,
   });
 }
 

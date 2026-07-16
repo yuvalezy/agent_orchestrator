@@ -62,18 +62,27 @@ test('recordDraftDecision: opens a pending draft_reply row; agent_output seriali
   assert.equal(poolCalls.length, 1);
   const sql = collapse(poolCalls[0].text);
   assert.match(sql, /INSERT INTO agent_decisions/);
-  assert.match(sql, /'draft_reply', \$3::jsonb, 'pending'/);
+  assert.match(sql, /'draft_reply', \$3::jsonb, \$4::jsonb, 'pending'/);
   assert.match(sql, /RETURNING id/);
   const p = poolCalls[0].params;
   assert.equal(p[0], 'cust-1');
   assert.equal(p[1], 'inbox-77');
   assert.deepEqual(JSON.parse(p[2] as string), output);
+  // No verifier verdict passed → the column is NULL (indistinguishable from a pre-WP3 row).
+  assert.equal(p[3], null);
 });
 
 test('recordDraftDecision: null agent_output serializes to JSON null (not undefined)', async () => {
   poolResult = { rows: [{ id: 'dec-1' }] };
   await recordDraftDecision({ customerId: 'c', inboxMessageId: 'i', agentOutput: undefined });
   assert.equal(poolCalls[0].params[2], 'null');
+});
+
+test('recordDraftDecision: WP3 verifier verdict serialized onto verifier_verdict ($4)', async () => {
+  poolResult = { rows: [{ id: 'dec-2' }] };
+  const verdict = { pass: false, failures: [{ code: 'wrong_language', detail: 'Reply is in English.' }], revised: true };
+  await recordDraftDecision({ customerId: 'c', inboxMessageId: 'i', agentOutput: { a: 1 }, verifierVerdict: verdict });
+  assert.deepEqual(JSON.parse(poolCalls[0].params[3] as string), verdict);
 });
 
 test('resolveDraftDecisionTx: accepted → guarded UPDATE on the caller client, no override', async () => {
