@@ -150,6 +150,28 @@ test('run: a synthesis failure posts the deterministic facts digest, never nothi
   assert.doesNotMatch(rec.posted[0].body, /Highlights/, 'no fabricated narrative when synthesis failed');
 });
 
+test('run: a zero-activity week skips the synthesizer entirely and posts the deterministic quiet digest', async () => {
+  let called = 0;
+  const { deps: d, rec } = deps({
+    // No activity from ANY source → buildCustomerFacts is empty.
+    fetchInboxVolume: async () => [],
+    fetchDraftOutcomes: async () => [],
+    fetchAwaitingReply: async () => [],
+    fetchOpenTasks: async () => [],
+    synthesizer: {
+      synthesizeWeeklyReview: async () => {
+        called += 1;
+        return { highlights: [], perCustomer: [], focusNextWeek: [] };
+      },
+    },
+  });
+  assert.deepEqual(await runWeeklyReview(d), { posted: true });
+  assert.equal(called, 0, 'no facts → the LLM is never called');
+  assert.equal(rec.posted.length, 1, 'the quiet-week digest still posts');
+  assert.match(rec.posted[0].body, /No customer activity this week/);
+  assert.doesNotMatch(rec.posted[0].body, /Highlights/, 'no narrative section on a zero-activity week');
+});
+
 test('run: with a synthesizer, the narrative leads and the facts still follow', async () => {
   const result: WeeklyReviewResult = {
     highlights: ['Acme ramped up'],

@@ -12,7 +12,7 @@ import { resolveTaskOrigin } from '../../proactive/resolution-origin-repo';
 import { loadCustomerConfig } from '../../triage/context-loader';
 import { recordReleaseNoteDraftDecision } from '../../decisions/decisions';
 import { enqueueDraft } from '../../outbound/outbound-repo';
-import { fetchAwaitingReply } from '../query/briefing-repo';
+import { fetchAwaitingReply, fetchAwaitingReplyAll } from '../query/briefing-repo';
 import { getAppState, setAppState } from '../../db/app-state';
 import { buildLlmRouter } from '../llm/factory';
 
@@ -53,6 +53,10 @@ export interface AwaitingReplyWorkerDeps {
   /** The briefing's awaiting-reply read, filtered to last-sent-before `olderThan` (we pass
    *  now − nudgeDays). REUSED verbatim — the "awaiting" definition lives in ONE place. */
   fetchAwaitingReply: (olderThan: Date) => Promise<AwaitingReplyItem[]>;
+  /** The UNCAPPED seed read — same "awaiting" definition, every thread. Used ONLY by the first-run
+   *  seed, which must pre-claim the ENTIRE go-live backlog: seeding only the capped window would
+   *  leak a cold nudge for every over-cap thread once older ones clear and it rises into view. */
+  fetchAllAwaiting: (olderThan: Date) => Promise<AwaitingReplyItem[]>;
   /** Exactly-once (kind, episode) claim — TRUE iff THIS call is the first to observe it. */
   claimChase: (ref: string) => Promise<boolean>;
   /** Roll back a claim after a TRANSIENT notify failure so the next tick re-observes it. */
@@ -82,18 +86,21 @@ export function buildAwaitingReplyWorker(deps: AwaitingReplyWorkerDeps): WorkerD
     intervalMs: deps.intervalMs,
     run: async () => {
       const olderThan = new Date(now().getTime() - deps.nudgeDays * DAY_MS);
-      const items = await deps.fetchAwaitingReply(olderThan);
 
       // FIRST-RUN SEED: no marker yet → pre-claim every CURRENTLY-awaiting episode WITHOUT
       // notifying, so the go-live backlog is suppressed; then set the marker. Only threads that
-      // cross the silence threshold AFTER go-live (a new episode key, un-seeded) will nudge.
+      // cross the silence threshold AFTER go-live (a new episode key, un-seeded) will nudge. The
+      // seed reads the UNCAPPED variant: a backlog past ROW_CAP left unseeded would leak a cold
+      // nudge later as older threads clear and it rises into the capped sweep's window.
       if ((await deps.getState(SEED_KEY)) === null) {
-        for (const it of items) await deps.claimChase(episodeKey(it.taskRef, it.lastOutboundAt));
+        const backlog = await deps.fetchAllAwaiting(olderThan);
+        for (const it of backlog) await deps.claimChase(episodeKey(it.taskRef, it.lastOutboundAt));
         await deps.setState(SEED_KEY, now().toISOString());
-        deps.log.info({ awaitingThreads: items.length }, `proactive: seeded awaiting-reply ledger, ${items.length} awaiting threads`);
+        deps.log.info({ awaitingThreads: backlog.length }, `proactive: seeded awaiting-reply ledger, ${backlog.length} awaiting threads`);
         return;
       }
 
+      const items = await deps.fetchAwaitingReply(olderThan);
       for (const it of items) {
         const ref = episodeKey(it.taskRef, it.lastOutboundAt);
         // Claim BEFORE drafting so a crash mid-draft is at-most-once. A repeat pass conflicts → suppressed.
@@ -133,6 +140,7 @@ export function buildAwaitingReplyWorkerFactory(notifier: FounderNotifierPort): 
   });
   return buildAwaitingReplyWorker({
     fetchAwaitingReply,
+    fetchAllAwaiting: fetchAwaitingReplyAll,
     claimChase: (ref) => claimChase(CHASER_KIND, ref),
     releaseChase: (ref) => releaseChase(CHASER_KIND, ref),
     chaserNotifier,

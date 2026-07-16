@@ -7,6 +7,7 @@ import type {
 } from '../ports/llm.port';
 import type { ResolvedDecision } from './acceptance-report';
 import type { AwaitingReplyItem } from '../query/daily-briefing';
+import { hourInTz } from '../query/daily-briefing';
 import type { SyncLogger } from '../knowledge/sync';
 import { isoWeekInTz } from '../knowledge/pattern-detect';
 
@@ -86,13 +87,6 @@ function weekdayInTz(d: Date, tz: string): number {
   const wd = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(d);
   const order: Record<string, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
   return order[wd] ?? 1;
-}
-
-/** The founder-local hour (0–23) of a Date in an IANA timezone. */
-function hourInTz(d: Date, tz: string): number {
-  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', hourCycle: 'h23' }).formatToParts(d);
-  const raw = Number(parts.find((p) => p.type === 'hour')?.value);
-  return Number.isFinite(raw) ? raw % 24 : 0;
 }
 
 /**
@@ -300,9 +294,11 @@ export async function runWeeklyReview(deps: WeeklyReviewDeps): Promise<{ posted:
   const facts = buildCustomerFacts({ volume, outcomes, awaiting, openTasks, now });
 
   // Best-effort synthesis over the gathered facts. A throw yields null → the facts digest posts
-  // without narrative rather than nothing.
+  // without narrative rather than nothing. A ZERO-activity week (no per-customer facts at all) skips
+  // the LLM entirely — there is nothing to synthesize, so the deterministic "no activity" digest
+  // posts without spending a call.
   let synthesis: WeeklyReviewResult | null | undefined;
-  if (deps.synthesizer) {
+  if (deps.synthesizer && facts.length > 0) {
     const req: WeeklyReviewRequest = { weekLabel: week, perCustomer: facts, upcomingMeetings };
     try {
       synthesis = await deps.synthesizer.synthesizeWeeklyReview(req);

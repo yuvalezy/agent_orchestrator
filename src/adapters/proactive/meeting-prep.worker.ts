@@ -18,6 +18,7 @@ import {
 import { fetchAwaitingReply } from '../query/briefing-repo';
 import { buildCalendarAdapter } from '../calendar';
 import { buildLlmRouter } from '../llm/factory';
+import { OUTBOUND_CONTACT_ATTRIBUTION_JOIN } from './outbound-attribution';
 
 // WP7(a) MEETING PREP WORKER (ADAPTER — concrete worker builder, may import adapters). Every few
 // minutes it reads the founder's upcoming calendar events, keeps only those starting within the next
@@ -171,8 +172,7 @@ async function fetchRecentSnippets(customerId: string, limit: number): Promise<P
     `SELECT i.direction, i.body
        FROM agent_inbox i
        JOIN channel_instances ci ON ci.id = i.channel_instance_id
-       LEFT JOIN agent_customer_contacts ct
-         ON ct.channel_type = ci.channel_type AND ct.address = i.channel_thread_id
+       ${OUTBOUND_CONTACT_ATTRIBUTION_JOIN}
       WHERE i.body IS NOT NULL
         AND (i.customer_id = $1::uuid OR ct.customer_id = $1::uuid)
       ORDER BY i.received_at DESC

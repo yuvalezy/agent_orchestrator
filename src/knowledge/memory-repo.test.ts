@@ -229,6 +229,25 @@ test('buildKeywordSearchSql (customer): strict isolation, websearch_to_tsquery p
   assert.equal(values[3], KEYWORD_CANDIDATE_CAP);
 });
 
+test('buildKeywordSearchSql (customer): the fused legs are ordered by LEXICAL rank, NOT cosine distance', () => {
+  // REGRESSION: fuseByRrf ranks by array POSITION, so the keyword leg it consumes must arrive in
+  // ts_rank (relevance) order. An outer `ORDER BY distance ASC` would silently re-sort the UNION'd
+  // keyword candidates by cosine distance and corrupt the RRF ranking.
+  const { text } = buildKeywordSearchSql({
+    embedding: [0.1, 0.2],
+    queryText: 'export report csv',
+    customerId: 'cust-uuid-1',
+    maxCandidates: KEYWORD_CANDIDATE_CAP,
+  });
+  const sql = collapse(text);
+  // Each leg projects the lexical rank so the UNION can be ordered by it.
+  assert.match(sql, /ts_rank\(content_tsv, websearch_to_tsquery\('simple', \$2\)\) AS kw_rank/, 'legs project kw_rank');
+  // The FINAL (outer) ORDER BY — the last one in the string — must rank by kw_rank, never distance.
+  const outer = sql.slice(sql.lastIndexOf('ORDER BY'));
+  assert.match(outer, /^ORDER BY kw_rank DESC/, 'outer ORDER BY is by lexical rank');
+  assert.ok(!/ORDER BY distance/.test(sql), 'the fused result is never re-ordered by cosine distance');
+});
+
 test('buildKeywordSearchSql (no customer): shared-only, no customer leg, no union', () => {
   const { text, values } = buildKeywordSearchSql({
     embedding: [1, 2],

@@ -1,21 +1,24 @@
-import { logger } from '../logger';
-import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
+import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import type { CustomerConfig } from '../triage/context-loader';
-import { draftButtons } from '../triage/draft-review';
 import type { enqueueDraft } from '../outbound/outbound-repo';
 import type { recordReleaseNoteDraftDecision } from '../decisions/decisions';
 import type { TaskOrigin } from './resolution-origin-repo';
 import type { ComposeResolutionDraft } from './resolution-draft';
+import { buildChaserNotifier } from './chaser-notifier';
 
-// M4 resolution notifier (CORE — injected ports + core repo fns only, imports NO
-// adapter, D1). The heart of M4: for a portal task that moved to 'done', if it
-// ORIGINATED from a customer conversation (the agent_tasks bridge resolves the origin),
-// draft ONE warm "your request is resolved" reply on the ORIGIN channel — threaded and
-// quoting the inbound message — enqueue it is_draft=true (NEVER auto-sent), and present
-// it via the SAME Telegram/console approve/edit/reject flow (draftButtons + the existing
-// draft-review handlers, keyed by queueId). NOTHING auto-sends; the founder approves each
-// one. Not customer-originated → SKIP. Per-task isolation: any failure after the origin
-// resolves is caught and returned as a skip (this method NEVER throws). Never logs the body.
+// M4 resolution notifier (CORE — injected ports + core repo fns only, imports NO adapter, D1).
+// A resolution notice IS a chase grounded on a DONE task, so this is now a THIN CONFIGURATION of
+// the shared chaser pipeline (chaser-notifier.ts): for a portal task that moved to 'done', if it
+// ORIGINATED from a customer conversation (the agent_tasks bridge resolves the origin), draft ONE
+// warm "your request is resolved" reply on the ORIGIN channel — threaded and quoting the inbound
+// message — enqueue it is_draft=true (NEVER auto-sent), and present it via the SAME approve/edit/
+// reject flow. NOTHING auto-sends. Not customer-originated → SKIP. Per-task isolation: any failure
+// after the origin resolves is a transient FAILURE, never thrown. Never logs the body.
+//
+// The three config points over the generic chaser: the resolution compose adapter (composeResolution
+// Draft, grounded on the done task's title), decisionKind='task_resolved' + its presentation title,
+// and the extra `task_code` audit field. Everything else — the 5-step pipeline, the skip/fail
+// semantics, the origin bridge, the Re: subject threading — is the chaser's, verbatim.
 
 /** The done task the notifier acts on ({ref, code, title} from the portal poll). */
 export interface DoneTask {
@@ -58,96 +61,30 @@ export interface ResolutionNotifier {
   notifyForDoneTask(task: DoneTask): Promise<ResolutionNotifyResult>;
 }
 
-const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-
 /** Title on every resolution-draft presentation. */
 const PRESENT_TITLE = '✅ Resolution notification — needs approval';
 
 export function buildResolutionNotifier(deps: ResolutionNotifierDeps): ResolutionNotifier {
   return {
     async notifyForDoneTask(task: DoneTask): Promise<ResolutionNotifyResult> {
-      // customerId is only known once the origin resolves — undefined until then so the
-      // catch can log it when the origin lookup itself is what failed.
-      let customerId: string | undefined;
-      try {
-        // (1) Origin bridge FIRST — a task with no customer-conversation origin is not
-        // ours to notify about (by-design SKIP, before any LLM/decision/queue work). A
-        // THROW here (transient DB blip) falls through to the catch as a FAILURE (retry),
-        // never a skip — otherwise the claim would suppress the notice forever.
-        const origin = await deps.resolveTaskOrigin(task.ref);
-        if (!origin) {
-          logger.info({ taskRef: task.ref }, 'resolution: not customer-originated — skipped');
-          return { drafted: false, skipped: true, failed: false, reason: 'not customer-originated' };
-        }
-        customerId = origin.customerId;
-
-        const config = await deps.loadCustomerConfig(origin.customerId);
-        if (!config) {
-          logger.warn({ taskRef: task.ref, customerId: origin.customerId }, 'resolution: customer config unresolved — skipped');
-          return { drafted: false, skipped: true, failed: false, reason: 'customer config unresolved' };
-        }
-
-        // (2) Compose the warm, cite-or-abstain resolution body in the customer's language.
-        const body = await deps.composeResolutionDraft({
-          task,
-          customer: { displayName: config.displayName, preferredLanguage: config.preferredLanguage },
-        });
-
-        // (3) Open the audit decision (draft_reply, inbox NULL — founder-initiated), varying
-        //     kind='task_resolved' so it's distinguishable from a release-note draft.
-        const { decisionId } = await deps.recordDraftDecision({
-          customerId: origin.customerId,
-          agentOutput: {
-            kind: 'task_resolved',
-            task_ref: task.ref,
-            task_code: task.code,
-            task_title: task.title,
-            draft_body: body,
-            language: config.preferredLanguage,
-          },
-        });
-
-        // (4) Enqueue the DRAFT (is_draft=true → NEVER drained) on the ORIGIN channel,
-        //     threaded + quoting the inbound message. Email carries a Re: subject so an
-        //     approved send lands in the same thread.
-        const queueId = await deps.enqueueDraft({
-          channelInstanceId: origin.channelInstanceId,
-          channelType: origin.channelType,
-          recipientAddress: origin.recipientAddress,
-          body,
-          threadKey: origin.threadKey,
-          inReplyTo: origin.inReplyTo,
-          subject: origin.channelType === 'email' ? `Re: ${task.title}` : undefined,
-          customerId: origin.customerId,
-          decisionId,
-        });
-
-        // (5) Present with Approve/Edit/Reject — the existing draft-review handlers act on it
-        //     by queueId (nothing task-specific downstream). Nothing sends without a tap.
-        await deps.notifier.notifyCustomerEvent(
-          origin.customerId,
-          { ...buildPresentation(body, config.preferredLanguage), contextRef: { kind: 'outbound', ref: queueId } },
-          draftButtons(queueId),
-        );
-
-        logger.info(
-          { taskRef: task.ref, customerId: origin.customerId, queueId, decisionId },
-          'resolution: draft enqueued (pending) — presenting for approval',
-        );
-        return { drafted: true, skipped: false, failed: false };
-      } catch (err) {
-        // Per-task isolation: NEVER throw out. A compose/decision/enqueue/present error (or an
-        // origin-lookup blip) is a TRANSIENT FAILURE — the caller releases the ledger claim and
-        // holds the cursor so the next tick retries (distinct from a by-design skip above).
-        const reason = errMessage(err);
-        logger.warn({ taskRef: task.ref, customerId, reason }, 'resolution: draft failed — will retry');
-        return { drafted: false, skipped: false, failed: true, reason };
-      }
+      // Configure the shared chaser pipeline for THIS done task: the compose closure + task_code
+      // audit field carry the task's identity (the chaser item only carries taskRef + title), and
+      // the composer receives the full DoneTask so its grounding is unchanged. Built per call so the
+      // closure captures this task — the construction is just closures, no I/O.
+      const chaser = buildChaserNotifier({
+        resolveTaskOrigin: deps.resolveTaskOrigin,
+        loadCustomerConfig: deps.loadCustomerConfig,
+        composeChase: ({ customer }) => deps.composeResolutionDraft({ task, customer }),
+        recordDraftDecision: deps.recordDraftDecision,
+        enqueueDraft: deps.enqueueDraft,
+        notifier: deps.notifier,
+        decisionKind: 'task_resolved',
+        presentTitle: PRESENT_TITLE,
+        auditMeta: { task_code: task.code },
+      });
+      // notifyForItem keys the origin bridge on taskRef and the Re: subject / task_title on title —
+      // task.ref / task.title map exactly onto those, so the enqueued draft is byte-identical.
+      return chaser.notifyForItem({ taskRef: task.ref, title: task.title });
     },
   };
-}
-
-/** Founder-facing presentation: the draft body + the reply language. Never logged. */
-function buildPresentation(body: string, language: string): Notification {
-  return { title: PRESENT_TITLE, body: `${body}\n\nLanguage: ${language}`, severity: 'action' };
 }

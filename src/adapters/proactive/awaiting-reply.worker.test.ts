@@ -37,6 +37,7 @@ function harness(over: Partial<AwaitingReplyWorkerDeps> = {}): Harness {
   };
   const deps: AwaitingReplyWorkerDeps = {
     fetchAwaitingReply: async () => [],
+    fetchAllAwaiting: async () => [],
     claimChase: async (ref) => {
       if (claims.has(ref)) return false;
       claims.add(ref);
@@ -74,11 +75,38 @@ test('the "> N days" cutoff is now − nudgeDays, handed to the reused fetch', a
 test('first-run: seeds the ledger from every currently-awaiting thread (no nudge) and sets the marker', async () => {
   const t1 = new Date('2026-07-10T00:00:00.000Z');
   const t2 = new Date('2026-07-11T00:00:00.000Z');
-  const h = harness({ fetchAwaitingReply: async () => [item('OLD-1', t1), item('OLD-2', t2)] });
+  // The seed reads the UNCAPPED variant, NOT the capped sweep read.
+  const h = harness({
+    fetchAllAwaiting: async () => [item('OLD-1', t1), item('OLD-2', t2)],
+    fetchAwaitingReply: async () => {
+      throw new Error('seed must not use the capped sweep read');
+    },
+  });
   await buildAwaitingReplyWorker(h.deps).run();
   assert.equal(h.notified.length, 0, 'seeding never drafts a nudge');
   assert.equal(h.claims.has(episodeKey('OLD-1', t1)), true, 'awaiting backlog pre-claimed');
   assert.equal(h.claims.has(episodeKey('OLD-2', t2)), true);
+  assert.equal(h.state.get(SEED_KEY), NOW.toISOString(), 'seed marker set');
+});
+
+test('first-run: seeds the ENTIRE over-cap backlog (uncapped), so no thread leaks a cold nudge later', async () => {
+  // A backlog larger than the capped sweep window (ROW_CAP): the seed must claim EVERY episode, or
+  // an unseeded over-cap thread would nudge cold once older threads clear and it rises into view.
+  const backlog = Array.from({ length: 1200 }, (_, i) =>
+    item(`BULK-${i}`, new Date(Date.UTC(2026, 6, 1, 0, 0, i))),
+  );
+  const h = harness({
+    fetchAllAwaiting: async () => backlog,
+    fetchAwaitingReply: async () => {
+      throw new Error('seed must not use the capped sweep read');
+    },
+  });
+  await buildAwaitingReplyWorker(h.deps).run();
+  assert.equal(h.notified.length, 0, 'seeding never drafts a nudge');
+  assert.equal(h.claims.size, backlog.length, 'every awaiting episode is pre-claimed, not just the capped window');
+  for (const it of backlog) {
+    assert.equal(h.claims.has(episodeKey(it.taskRef, it.lastOutboundAt)), true, `episode ${it.taskRef} claimed`);
+  }
   assert.equal(h.state.get(SEED_KEY), NOW.toISOString(), 'seed marker set');
 });
 

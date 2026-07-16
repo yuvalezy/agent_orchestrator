@@ -8,6 +8,7 @@ import { extractCommitmentsForBatch, type CustomerBatch } from '../../commitment
 import { insertCommitmentIfNew } from '../../commitments/commitment-repo';
 import { resolveDueHint } from '../../commitments/due-hint';
 import { buildLlmRouter } from '../llm/factory';
+import { OUTBOUND_CONTACT_ATTRIBUTION_JOIN } from './outbound-attribution';
 
 // WP7(b) COMMITMENT EXTRACTION WORKER (ADAPTER — concrete worker builder, may import adapters). Scans
 // NEW outbound rows in agent_inbox (direction='outbound' — our OWN sends, surfaced by the channel
@@ -135,8 +136,7 @@ async function fetchNewOutbound(afterId: string, limit: number): Promise<Outboun
             i.body AS body
        FROM agent_inbox i
        JOIN channel_instances ci ON ci.id = i.channel_instance_id
-       LEFT JOIN agent_customer_contacts ct
-         ON ct.channel_type = ci.channel_type AND ct.address = i.channel_thread_id
+       ${OUTBOUND_CONTACT_ATTRIBUTION_JOIN}
        LEFT JOIN agent_customers cu ON cu.id = COALESCE(i.customer_id, ct.customer_id)
       WHERE i.direction = 'outbound'
         AND i.id > $1::bigint
@@ -156,8 +156,7 @@ async function currentMaxOutboundId(): Promise<string | null> {
     `SELECT max(i.id)::text AS max_id
        FROM agent_inbox i
        JOIN channel_instances ci ON ci.id = i.channel_instance_id
-       LEFT JOIN agent_customer_contacts ct
-         ON ct.channel_type = ci.channel_type AND ct.address = i.channel_thread_id
+       ${OUTBOUND_CONTACT_ATTRIBUTION_JOIN}
       WHERE i.direction = 'outbound'
         AND i.body IS NOT NULL
         AND COALESCE(i.customer_id, ct.customer_id) IS NOT NULL`,

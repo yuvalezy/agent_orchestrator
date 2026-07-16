@@ -172,11 +172,15 @@ export async function markScheduled(
   id: string,
   event: { eventId: string; calendarId: string; meetLink: string | null; calendarAccountId: string | null },
 ): Promise<void> {
+  // Guarded on status = 'creating' (defense-in-depth): the normal path always arrives here with the
+  // row in 'creating' (claimForCreating precedes createEvent). Dispatch is serialized today so there
+  // is no live race, but an unguarded terminal flip WOULD become the double-outcome race the moment
+  // dispatch ever runs concurrently — matching claimForCreating / claimMeetingGiveUp's own guards.
   await query(
     `UPDATE agent_meeting_requests
         SET status = 'scheduled', event_id = $2, event_calendar_id = $3, meet_link = $4,
             calendar_account_id = $5
-      WHERE id = $1`,
+      WHERE id = $1 AND status = 'creating'`,
     [id, event.eventId, event.calendarId, event.meetLink, event.calendarAccountId],
   );
 }

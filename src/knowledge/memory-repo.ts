@@ -393,8 +393,12 @@ export function buildKeywordSearchSql(input: {
     return { text, values: [vec, queryText, maxCandidates] };
   }
 
+  // Each leg projects its LEXICAL rank (kw_rank) so the UNION can be re-ordered by relevance, NOT
+  // by cosine distance: fuseByRrf ranks candidates by ARRAY POSITION, so the keyword leg it consumes
+  // must arrive in ts_rank order (mirrors the shared-only branch above). The `distance` column stays
+  // (consumers read the real cosine distance); it just no longer drives the ordering.
   const text = `(
-      SELECT ${projection}
+      SELECT ${projection}, ts_rank(content_tsv, ${tsquery}) AS kw_rank
        FROM agent_memory
        WHERE customer_id = $3
          AND lifecycle_status = 'active'
@@ -404,7 +408,7 @@ export function buildKeywordSearchSql(input: {
     )
     UNION ALL
     (
-      SELECT ${projection}
+      SELECT ${projection}, ts_rank(content_tsv, ${tsquery}) AS kw_rank
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
@@ -412,7 +416,7 @@ export function buildKeywordSearchSql(input: {
        ORDER BY ts_rank(content_tsv, ${tsquery}) DESC
        LIMIT $4
     )
-    ORDER BY distance ASC`;
+    ORDER BY kw_rank DESC`;
   return { text, values: [vec, queryText, customerId, maxCandidates] };
 }
 

@@ -129,9 +129,9 @@ interface AwaitingReplyRow {
  *    that a task closed. It is only populated while the resolution poller runs, so a task closed
  *    while that worker was off can still appear.
  */
-export async function fetchAwaitingReply(olderThan: Date): Promise<AwaitingReplyItem[]> {
-  const { rows } = await query<AwaitingReplyRow>(
-    `WITH last_out AS (
+/** The awaiting-reply derivation (everything but the final LIMIT). Shared by the capped briefing
+ *  read and the uncapped seed variant so the two can never drift in what "awaiting" means. */
+const AWAITING_REPLY_SQL = `WITH last_out AS (
        SELECT t.task_ref, q.customer_id, max(q.updated_at) AS last_outbound_at
          FROM agent_outbound_queue q
          JOIN agent_decisions d ON d.id = q.decision_id
@@ -169,10 +169,9 @@ export async function fetchAwaitingReply(olderThan: Date): Promise<AwaitingReply
               SELECT 1 FROM agent_task_transition_ledger tl
                WHERE tl.task_ref = l.task_ref
             )
-      ORDER BY l.last_outbound_at ASC
-      LIMIT ${ROW_CAP}`,
-    [olderThan.toISOString()],
-  );
+      ORDER BY l.last_outbound_at ASC`;
+
+function mapAwaitingRows(rows: AwaitingReplyRow[]): AwaitingReplyItem[] {
   return rows.map((r) => ({
     customerId: r.customer_id,
     customerName: r.customer_name,
@@ -187,6 +186,23 @@ export async function fetchAwaitingReply(olderThan: Date): Promise<AwaitingReply
     taskCode: null,
     lastOutboundAt: new Date(r.last_outbound_at),
   }));
+}
+
+export async function fetchAwaitingReply(olderThan: Date): Promise<AwaitingReplyItem[]> {
+  const { rows } = await query<AwaitingReplyRow>(`${AWAITING_REPLY_SQL}\n      LIMIT ${ROW_CAP}`, [olderThan.toISOString()]);
+  return mapAwaitingRows(rows);
+}
+
+/**
+ * The SEED variant of {@link fetchAwaitingReply}: enumerate EVERY awaiting thread, UNCAPPED. Used
+ * ONLY by the awaiting-reply worker's first-run seed, which must pre-claim the entire go-live
+ * backlog. The capped {@link fetchAwaitingReply} would pre-claim only its LIMIT-{@link ROW_CAP}
+ * window, so any thread past the cap would later leak a COLD nudge as older threads clear and it
+ * rises into the window. The seed is a one-shot at go-live, so a single uncapped read is fine.
+ */
+export async function fetchAwaitingReplyAll(olderThan: Date): Promise<AwaitingReplyItem[]> {
+  const { rows } = await query<AwaitingReplyRow>(AWAITING_REPLY_SQL, [olderThan.toISOString()]);
+  return mapAwaitingRows(rows);
 }
 
 /** Today's holidays (agent_holidays, mig 008) for a founder-local `YYYY-MM-DD`. The seeder

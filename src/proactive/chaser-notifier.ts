@@ -47,6 +47,10 @@ export interface ChaserNotifierDeps {
   decisionKind: string;
   /** The founder-facing presentation title (e.g. '⏳ Status-update draft — needs approval'). */
   presentTitle: string;
+  /** Extra audit fields merged into the decision's agent_output (e.g. { task_code } for the
+   *  resolution config). Lets a caller carry an item-specific fact into the trail without a new
+   *  port; omitted → nothing extra is stamped (the two chaser configs pass nothing). */
+  auditMeta?: Record<string, unknown>;
 }
 
 /**
@@ -109,6 +113,7 @@ export function buildChaserNotifier(deps: ChaserNotifierDeps): ChaserNotifier {
             task_title: item.title,
             draft_body: body,
             language: config.preferredLanguage,
+            ...(deps.auditMeta ?? {}),
           },
         });
 
