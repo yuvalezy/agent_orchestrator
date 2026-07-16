@@ -57,9 +57,12 @@ function fakes(
     /** undefined = scheduler NOT wired (the pre-feature behavior); 'ok' = it takes the message;
      *  'declines' = it cannot start, so triage must fall through to the task path. */
     meeting?: 'ok' | 'declines';
+    /** WP2(c): wire a needs-info clarification drafter (records each draftClarification call). */
+    needsInfo?: boolean;
   } = {},
 ) {
   const initiated: unknown[] = [];
+  const clarified: string[] = [];
   const created: unknown[] = [];
   const notified: Array<{ title: string; buttons: boolean }> = [];
   const adminNotes: Array<{ title: string }> = [];
@@ -124,8 +127,11 @@ function fakes(
           onDecline: async () => {},
         }
       : undefined,
+    needsInfoDrafter: opts.needsInfo
+      ? { draftClarification: async ({ row }) => { clarified.push(row.id); } }
+      : undefined,
   });
-  return { svc, created, notified, adminNotes, attached, initiated, get skipped() { return skipped; } };
+  return { svc, created, notified, adminNotes, attached, initiated, clarified, get skipped() { return skipped; } };
 }
 
 /** A GroupSummaryPort fake with call counters, for the muted-group routing tests. */
@@ -274,6 +280,43 @@ test('actionable category without an explicit current-message request is held fo
 
   assert.equal(f.created.length, 0, 'no task without an explicit ask in the current message');
   assert.match(f.notified[0]?.title ?? '', /Confirm before creating/);
+});
+
+const UNCLEAR: Intent = {
+  category: 'unclear', summary: 'Something about the last invoice, unclear what they need',
+  suggested_title: 'Unclear', priority: 'low', confidence: 0.3, explicit_action_request: false, related_open_task_ref: null,
+};
+
+test('WP2(c) flag-OFF (no drafter): unclear message asks the founder ONLY, drafts nothing', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-unclear-off', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const f = fakes([UNCLEAR], 'known'); // needsInfo not wired → pre-feature behavior
+  const row = await seedInbox(`${TAG}-unclear-off`, '???');
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 0, 'an unclear message never creates a task');
+  assert.match(f.notified[0]?.title ?? '', /Needs your input/, 'the founder is still asked');
+  assert.equal(f.clarified.length, 0, 'no clarification draft when the drafter is not wired');
+});
+
+test('WP2(c) flag-ON: unclear message ADDITIONALLY drafts a clarification (askFounder STILL fires)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-unclear-on', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const f = fakes([UNCLEAR], 'known', { needsInfo: true });
+  const row = await seedInbox(`${TAG}-unclear-on`, '???');
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 0, 'still no task');
+  assert.match(f.notified[0]?.title ?? '', /Needs your input/, 'askFounder still fires — the draft is additive');
+  assert.deepEqual(f.clarified, [row.id], 'a clarification draft was composed for this inbox row');
 });
 
 test('multi-intent message → two distinct tasks (no sibling collapse)', async (t) => {

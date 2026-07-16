@@ -15,6 +15,7 @@ import { claimDueEvent, completeDueEvent, releaseDueEvent } from '../../triage/d
 import { buildCalendarAdapter, resolveDueEventTarget } from '../calendar';
 import type { TaskTargetPort } from '../../ports/task-target.port';
 import { buildResponseDrafter, type ResponseDrafter } from '../../triage/response-drafter';
+import { buildNeedsInfoDrafter, type NeedsInfoDrafter } from '../../triage/needs-info-draft';
 import { buildCrossChannelDedup, type CrossChannelDedup } from '../../triage/cross-channel-dedup';
 import { searchConversationLinks, insertConversationLink } from '../../triage/conversation-link-repo';
 import { memoryRepo } from '../../knowledge/memory-repo';
@@ -147,6 +148,25 @@ function buildMeetingContextGated(): MeetingContext | undefined {
 }
 
 /**
+ * WP2(c): build the needs-info clarification drafter wired into triage — the composition root where
+ * the core drafter meets the LLM router + notifier + the draft queue/decision repo fns (D1: core
+ * never imports adapters). Gated by NEEDS_INFO_DRAFT_ENABLED so it stays dormant → an unclear intent
+ * only asks the founder (the pre-feature behavior). Returns undefined when off. It is ADDITIVE: the
+ * askFounder notice still fires; this just hands the founder a ready-made clarification to send.
+ */
+function buildNeedsInfoDrafterGated(
+  llm: Pick<AgentLlmPort, 'draftReply'>,
+  notifier: FounderNotifierPort,
+): NeedsInfoDrafter | undefined {
+  if (!env.NEEDS_INFO_DRAFT_ENABLED) {
+    logger.info('needs-info clarification drafter NOT wired (NEEDS_INFO_DRAFT_ENABLED=false)');
+    return undefined;
+  }
+  logger.info('needs-info clarification drafter wired (NEEDS_INFO_DRAFT_ENABLED=true)');
+  return buildNeedsInfoDrafter({ llm, notifier, enqueueDraft, recordDraftDecision, findOpenDraftByInbox });
+}
+
+/**
  * M2(f): build the cross-channel dedup matcher wired into triage — the composition root
  * where the embedding ADAPTER meets the core conversation-link repo (D1: core never
  * imports adapters). Gated by CROSS_CHANNEL_DEDUP_ENABLED so it stays dormant → dedup
@@ -235,6 +255,8 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     responseDrafter: buildResponseDrafterGated(llm, notifier),
     // M2(f): cross-channel semantic dedup (gated; dormant by default).
     crossChannelDedup: buildCrossChannelDedupGated(),
+    // WP2(c): needs-info clarification drafter for unclear intents (gated; additive to askFounder).
+    needsInfoDrafter: buildNeedsInfoDrafterGated(llm, notifier),
   });
 
   // Early-warning tracker (§9.5): raises ONE admin alert as soon as triage failures

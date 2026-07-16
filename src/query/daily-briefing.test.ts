@@ -197,8 +197,8 @@ function urgentItem(score: number, ageH: number, id = 'A'): UrgentItem {
 
 function awaiting(): AwaitingReplyItem[] {
   return [
-    { customerId: 'A', customerName: 'Acme', taskCode: 'TSK-1', lastOutboundAt: hoursAgo(120) }, // 5d
-    { customerId: 'B', customerName: 'Beta', taskCode: null, lastOutboundAt: hoursAgo(96) }, // 4d
+    { customerId: 'A', customerName: 'Acme', taskRef: 'task-A', taskTitle: 'CSV export', taskCode: 'TSK-1', lastOutboundAt: hoursAgo(120) }, // 5d
+    { customerId: 'B', customerName: 'Beta', taskRef: 'task-B', taskTitle: null, taskCode: null, lastOutboundAt: hoursAgo(96) }, // 4d
   ];
 }
 

@@ -5,6 +5,7 @@ import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/group-summary.port';
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
 import type { ResponseDrafter } from './response-drafter';
+import type { NeedsInfoDrafter } from './needs-info-draft';
 import type { CrossChannelDedup } from './cross-channel-dedup';
 import type { MeetingScheduler } from './meeting-scheduler';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
@@ -157,6 +158,11 @@ export interface TriageDeps {
    *  every other actionable category does (the pre-feature behavior). `tryInitiate` returning
    *  false has the same effect, so no calendar problem can cost the customer their ask. */
   meetingScheduler?: MeetingScheduler;
+  /** WP2(c): needs-info clarification drafter. Optional + gated (NEEDS_INFO_DRAFT_ENABLED) — when
+   *  present, an unclear/low-confidence intent ADDITIONALLY drafts a clarifying question to the
+   *  customer (is_draft=true, approve/edit/reject) so the founder can one-tap ask. Absent = the
+   *  pre-feature behavior (askFounder only). Best-effort: a draft failure never fails the row. */
+  needsInfoDrafter?: NeedsInfoDrafter;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -492,6 +498,16 @@ export class TriageService {
         severity: 'action',
         contextRef: { kind: 'inbox', ref: inboxId },
       });
+      // WP2(c): ADDITIVELY hand the founder a ready-made clarification draft to send (gated —
+      // absent by default → askFounder-only, unchanged). Best-effort: a compose/enqueue failure
+      // must NOT fail the row (the founder already got the notice above), so it is swallowed here.
+      if (this.deps.needsInfoDrafter && !ctx.ccOnly) {
+        try {
+          await this.deps.needsInfoDrafter.draftClarification({ row, customerId, config, threadKey, intent });
+        } catch (err) {
+          logger.warn({ inboxId, reason: (err as Error)?.message }, 'triage: needs-info clarification draft failed (non-fatal)');
+        }
+      }
       return;
     }
 

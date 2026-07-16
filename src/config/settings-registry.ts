@@ -323,6 +323,36 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     applyMode: 'restart',
     default: false,
   },
+  {
+    key: 'STALE_TASK_CHASER_ENABLED',
+    type: 'boolean',
+    category: PROACTIVE,
+    label: 'Stale-task status updates',
+    description:
+      'Registers the worker that scans in-progress portal tasks not updated for STALE_TASK_DAYS and drafts one "still working on it" status update per customer-originated task on its origin channel (draft only, never auto-sent). First tick per customer only pre-claims the current backlog — no flood.',
+    applyMode: 'restart',
+    default: false,
+  },
+  {
+    key: 'AWAITING_REPLY_NUDGE_ENABLED',
+    type: 'boolean',
+    category: PROACTIVE,
+    label: 'Awaiting-reply nudges',
+    description:
+      'Registers the worker that reuses the daily briefing’s "awaiting customer reply > N days" definition and drafts one polite nudge per silent thread on its origin channel (draft only, never auto-sent). First tick pre-claims the current backlog; a thread is not re-nudged until the customer replies.',
+    applyMode: 'restart',
+    default: false,
+  },
+  {
+    key: 'NEEDS_INFO_DRAFT_ENABLED',
+    type: 'boolean',
+    category: PROACTIVE,
+    label: 'Needs-info clarification drafts',
+    description:
+      'When an unclear/low-confidence message can’t be actioned, additionally drafts a short clarifying question to the customer (draft only, approve/edit/reject) so the founder can one-tap ask. The existing "needs your input" notice still fires — purely additive. Only affects triage.',
+    applyMode: 'restart',
+    default: false,
+  },
 
   // ── Pass-2 tuning knobs (the values the founder actually tuned) ───────────────
   // ── LLM Routing ──────────────────────────────────────────────────────────────

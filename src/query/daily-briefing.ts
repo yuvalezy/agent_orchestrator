@@ -95,6 +95,14 @@ export interface UrgentFeed {
 export interface AwaitingReplyItem {
   customerId: string;
   customerName: string | null;
+  /** The OPAQUE portal task ref (agent_tasks). The briefing does not render it, but the WP2
+   *  awaiting-reply NUDGE worker reuses this exact fetch and needs the ref to resolve the
+   *  conversation origin to reply on (resolution-origin-repo). */
+  taskRef: string;
+  /** The task's human-readable title (the triage `suggested_title` we stored at create), the ONE
+   *  fact the WP2 nudge grounds on ("waiting on your reply about <title>"). Null when the bridge
+   *  has no triage decision; the briefing does not render it. */
+  taskTitle: string | null;
   /** Human task code (e.g. 'TSK-00214'); null when the bridge has no code. */
   taskCode: string | null;
   /** When we last sent the customer something on this task. */

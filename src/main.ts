@@ -65,6 +65,8 @@ import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.w
 import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker';
 import { buildCalendarAdapter } from './adapters/calendar';
 import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
+import { buildStaleTaskWorkerFactory } from './adapters/proactive/stale-task.worker';
+import { buildAwaitingReplyWorkerFactory } from './adapters/proactive/awaiting-reply.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
 import { FanoutFounderNotifier, WebPushNotifier } from './adapters/push/web-push-notifier';
@@ -691,6 +693,44 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('proactive task-event worker NOT registered (PROACTIVE_NOTIFICATIONS_ENABLED=false) — nothing drafts task-done resolution notices');
+  }
+
+  // WP2(a): proactive stale-task status updates — registered ONLY when STALE_TASK_CHASER_ENABLED
+  // (kill-switch, mirrors PROACTIVE_NOTIFICATIONS_ENABLED). DORMANT by default. Requires Telegram
+  // (drafts present in customer topics); the produced drafts are is_draft=true (approved via the
+  // existing draft-review flow, drained by the outbound drainer). Per-customer FIRST-RUN seed means
+  // a boot never floods the stale backlog; only tasks that cross the staleness threshold draft.
+  if (env.STALE_TASK_CHASER_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  STALE_TASK_CHASER_ENABLED=true but Telegram is unconfigured — status-update drafts have nowhere to present; NOT registering.');
+    } else {
+      if (!tryResolveCredential('OPENAI_API_KEY')) {
+        logger.warn('⚠️  STALE_TASK_CHASER_ENABLED=true but OPENAI_API_KEY is UNSET — status-update composition will fail until an LLM provider key is set.');
+      }
+      proactiveWorkers.push(buildStaleTaskWorkerFactory(notifier));
+      logger.info({ staleDays: env.STALE_TASK_DAYS }, 'proactive stale-task worker registered (STALE_TASK_CHASER_ENABLED=true)');
+    }
+  } else {
+    logger.info('proactive stale-task worker NOT registered (STALE_TASK_CHASER_ENABLED=false) — nothing drafts stale-task status updates');
+  }
+
+  // WP2(b): proactive awaiting-reply nudges — registered ONLY when AWAITING_REPLY_NUDGE_ENABLED
+  // (kill-switch, mirrors PROACTIVE_NOTIFICATIONS_ENABLED). DORMANT by default. Reuses the daily-
+  // briefing awaiting-reply definition; the produced drafts are is_draft=true (approved via the
+  // existing draft-review flow, drained by the outbound drainer). FIRST-RUN seed pre-claims the
+  // current backlog so enabling the flag never floods; a nudged thread is not re-nudged until reply.
+  if (env.AWAITING_REPLY_NUDGE_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  AWAITING_REPLY_NUDGE_ENABLED=true but Telegram is unconfigured — nudge drafts have nowhere to present; NOT registering.');
+    } else {
+      if (!tryResolveCredential('OPENAI_API_KEY')) {
+        logger.warn('⚠️  AWAITING_REPLY_NUDGE_ENABLED=true but OPENAI_API_KEY is UNSET — nudge composition will fail until an LLM provider key is set.');
+      }
+      proactiveWorkers.push(buildAwaitingReplyWorkerFactory(notifier));
+      logger.info({ nudgeDays: env.AWAITING_REPLY_NUDGE_DAYS }, 'proactive awaiting-reply worker registered (AWAITING_REPLY_NUDGE_ENABLED=true)');
+    }
+  } else {
+    logger.info('proactive awaiting-reply worker NOT registered (AWAITING_REPLY_NUDGE_ENABLED=false) — nothing drafts reply nudges');
   }
 
   const app = buildApp(appDeps);

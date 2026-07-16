@@ -100,6 +100,7 @@ export async function fetchUrgentItems(): Promise<UrgentFeed> {
 
 interface AwaitingReplyRow {
   task_ref: string;
+  task_title: string | null;
   customer_id: string;
   customer_name: string | null;
   last_outbound_at: Date | string;
@@ -140,9 +141,21 @@ export async function fetchAwaitingReply(olderThan: Date): Promise<AwaitingReply
      SELECT l.task_ref,
             l.customer_id::text AS customer_id,
             c.display_name      AS customer_name,
-            l.last_outbound_at
+            l.last_outbound_at,
+            -- The title we generated for the task at triage (agent_output.suggested_title). Best-
+            -- effort (LEFT JOIN LATERAL, earliest triage decision): null when no triage row exists.
+            -- The briefing ignores it; the WP2 nudge grounds its draft on it.
+            td.suggested_title  AS task_title
        FROM last_out l
        LEFT JOIN agent_customers c ON c.id = l.customer_id
+       LEFT JOIN LATERAL (
+              SELECT d2.agent_output->>'suggested_title' AS suggested_title
+                FROM agent_decisions d2
+               WHERE d2.task_ref = l.task_ref
+                 AND d2.decision_type = 'triage'
+               ORDER BY d2.id ASC
+               LIMIT 1
+            ) td ON true
       WHERE l.last_outbound_at < $1
         AND NOT EXISTS (
               SELECT 1 FROM agent_inbox i
@@ -161,6 +174,10 @@ export async function fetchAwaitingReply(olderThan: Date): Promise<AwaitingReply
   return rows.map((r) => ({
     customerId: r.customer_id,
     customerName: r.customer_name,
+    // The opaque portal ref — carried through for the WP2 nudge worker (which resolves the
+    // conversation origin from it); the digest itself does not render it.
+    taskRef: r.task_ref,
+    taskTitle: r.task_title,
     // agent_tasks stores the OPAQUE portal ref (mig 005) — the human 'TSK-…' code lives only in
     // the portal (TaskRef.code, on list reads) and is never persisted here. Rather than fan a
     // per-task portal read out of a best-effort digest section, the line names the customer and

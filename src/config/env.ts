@@ -599,6 +599,65 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   // Portal poll interval for the task-event worker (env tuning knob, like the other *_INTERVAL_MS).
   TASK_EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(900_000), // 15m
+
+  // ── WP2(a): proactive STALE-TASK status updates. A worker scans each onboarded customer's portal
+  // project for tasks that are IN PROGRESS but whose last update is older than STALE_TASK_DAYS, and
+  // for every CUSTOMER-ORIGINATED one drafts ONE is_draft=true "still working on it" status update
+  // on the ORIGIN channel (founder approves/edits/rejects via the existing draft-review flow —
+  // NEVER auto-sent). Kill-switch (mirrors PROACTIVE_NOTIFICATIONS_ENABLED strict-bool): the worker
+  // is registered ONLY when the literal "true"; unset/"false"/anything else → false. DORMANT by
+  // default so a boot never drafts status updates by surprise.
+  //
+  // FIRST-RUN SEED: a customer's first tick pre-claims every CURRENTLY-stale episode WITHOUT
+  // drafting (exactly-once ledger, mig 037) so the go-live backlog never floods Telegram; only tasks
+  // that cross the staleness threshold after go-live draft. Requires Telegram (drafts present in
+  // customer topics); the approved draft is drained by the outbound drainer (OUTBOUND_ENABLED, +
+  // email needs OUTBOUND_EMAIL_ENABLED). Composing needs an LLM provider key (resolveCredential).
+  STALE_TASK_CHASER_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // A task not updated for at least this many days is "stale" (the status-update trigger).
+  STALE_TASK_DAYS: z.coerce.number().int().positive().default(5),
+  // Scan interval for the stale-task worker (each tick re-scans open tasks and filters by age).
+  STALE_TASK_CHASER_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
+
+  // ── WP2(b): proactive AWAITING-REPLY nudges. A worker reuses the daily-briefing "awaiting customer
+  // reply > N days" definition (the founder/agent sent the last message and the customer has gone
+  // silent) and drafts ONE is_draft=true polite nudge per customer-originated thread on the ORIGIN
+  // channel (founder approves/edits/rejects — NEVER auto-sent). Kill-switch (mirrors
+  // PROACTIVE_NOTIFICATIONS_ENABLED strict-bool): registered ONLY when the literal "true"; DORMANT
+  // by default.
+  //
+  // FIRST-RUN SEED: the first tick pre-claims the CURRENTLY-awaiting backlog WITHOUT drafting
+  // (exactly-once ledger, mig 037) so enabling the flag never floods Telegram; only threads that
+  // cross the silence threshold after go-live nudge, and a nudged thread is not re-nudged until the
+  // customer replies (the episode key includes the last-outbound marker). Requires Telegram; the
+  // approved draft is drained by the outbound drainer. Composing needs an LLM provider key.
+  AWAITING_REPLY_NUDGE_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // A thread silent for at least this many days is nudgeable. Default 3 = the same "> 3 days"
+  // cutoff the daily briefing's awaiting-reply section already surfaces.
+  AWAITING_REPLY_NUDGE_DAYS: z.coerce.number().int().positive().default(3),
+  // Scan interval for the awaiting-reply worker.
+  AWAITING_REPLY_NUDGE_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
+
+  // ── WP2(c): needs-info clarification drafts. When ON, an UNCLEAR / low-confidence triage intent
+  // ADDITIONALLY drafts a short clarifying QUESTION to the customer (is_draft=true, approve/edit/
+  // reject) so the founder can one-tap ask instead of writing it — the existing askFounder notice
+  // STILL fires (this is purely additive). Kill-switch (mirrors OUTBOUND_ENABLED strict-bool): the
+  // drafter is wired into triage ONLY when the literal "true"; unset/"false"/else → false. DORMANT
+  // by default so a boot never drafts clarifications by surprise.
+  //
+  // Best-effort: a compose/enqueue failure is swallowed (the founder already got the askFounder
+  // notice), so it never fails a triage row. Requires Telegram (the draft presents in the customer
+  // topic); the approved draft is drained by the outbound drainer. Composing needs an LLM key.
+  NEEDS_INFO_DRAFT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);
