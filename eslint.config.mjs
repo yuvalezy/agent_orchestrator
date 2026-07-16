@@ -17,7 +17,9 @@ export default tseslint.config(
   {
     ignores: [
       'dist/**',
-      'web/**', // independently built Vite application
+      '.claude/**', // agent tooling + transient git worktrees, not project source
+      'web/**', // independently built Vite application (console)
+      'app/**', // independently built Vite application (AO Founder PWA)
       'node_modules/**',
       'src/inbox/__illegal_import_fixture__.ts',
       'src/knowledge/__illegal_import_fixture__.ts',

@@ -8,10 +8,18 @@ RUN npm ci
 COPY web/package*.json ./web/
 RUN npm --prefix web ci
 
+COPY app/package*.json ./app/
+RUN npm --prefix app ci
+
 COPY tsconfig.json ./
 COPY src ./src
 COPY web ./web
-RUN npm run build && npm run build:console && cp -R web/dist dist/web
+COPY app ./app
+# Package both founder frontends next to the server build: dist/web (console) and
+# dist/app (AO Founder PWA), served by the console/app routers respectively.
+RUN npm run build \
+ && npm run build:console && cp -R web/dist dist/web \
+ && npm run build:app && cp -R app/dist dist/app
 
 # ─── Runtime stage ───────────────────────────────────────────
 FROM node:22-bookworm-slim
