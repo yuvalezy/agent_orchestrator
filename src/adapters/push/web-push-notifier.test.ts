@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import webpush from 'web-push';
-import { buildPushMessage, FanoutFounderNotifier, WebPushNotifier } from './web-push-notifier';
+import { buildPushMessage, FanoutFounderNotifier, WebPushMirror, WebPushNotifier, type NotifierMirror } from './web-push-notifier';
+import type { DecisionEvent } from '../../ports/founder-notifier.port';
 
 const vapid = webpush.generateVAPIDKeys();
 const config = { publicKey: vapid.publicKey, privateKey: vapid.privateKey, subject: 'mailto:founder@example.com' };
@@ -41,8 +42,50 @@ test('fan-out always completes Telegram first and keeps routine events Telegram-
     notifyCustomerEvent: async () => { calls.push('telegram-customer'); },
     notifyAdmin: async () => { calls.push('telegram-admin'); },
     askFounder: async () => {}, onDecision: () => {},
-  }, push);
+  }, [new WebPushMirror(push)]);
   await notifier.notifyAdmin({ title: 'routine', body: 'safe', severity: 'warning' });
   await notifier.notifyAdmin({ title: 'urgent', body: 'safe', severity: 'warning', urgency: 'urgent' });
   assert.deepEqual(calls, ['telegram-admin', 'telegram-admin', 'push']);
+});
+
+test('fanout mirrors every verb + the decision handler to N mirrors, isolating a throwing one', async () => {
+  const seen: string[] = [];
+  let handler: ((d: DecisionEvent) => Promise<void>) | null = null;
+  const record = (name: string): NotifierMirror => ({
+    notifyCustomerEvent: async () => { seen.push(`${name}:customer`); },
+    notifyAdmin: async () => { seen.push(`${name}:admin`); },
+    askFounder: async () => { seen.push(`${name}:ask`); },
+    onDecision: (h) => { seen.push(`${name}:onDecision`); if (name === 'b') handler = h; },
+  });
+  const throwing: NotifierMirror = {
+    notifyCustomerEvent: async () => { throw new Error('mirror down'); },
+    notifyAdmin: async () => { throw new Error('mirror down'); },
+    askFounder: async () => { throw new Error('mirror down'); },
+    onDecision: () => {},
+  };
+  const primaryDecisions: DecisionEvent[] = [];
+  const notifier = new FanoutFounderNotifier({
+    ensureCustomerTopic: async () => ({ ref: '' }),
+    notifyCustomerEvent: async () => { seen.push('primary:customer'); },
+    notifyAdmin: async () => { seen.push('primary:admin'); },
+    askFounder: async () => { seen.push('primary:ask'); },
+    onDecision: (h) => { void h; },
+  }, [throwing, record('a'), record('b')]);
+
+  notifier.onDecision(async (d) => { primaryDecisions.push(d); });
+  await notifier.notifyAdmin({ title: 't', body: 'b' });
+  await notifier.notifyCustomerEvent('c1', { title: 't', body: 'b' });
+  await notifier.askFounder('c1', { title: 'q', body: 'b' }, [{ id: 'x:ref', label: 'X' }]);
+
+  // Primary always runs first; a throwing mirror never blocks later mirrors.
+  assert.deepEqual(seen, [
+    'a:onDecision', 'b:onDecision',
+    'primary:admin', 'a:admin', 'b:admin',
+    'primary:customer', 'a:customer', 'b:customer',
+    'primary:ask', 'a:ask', 'b:ask',
+  ]);
+  // The SAME handler reaches every mirror — mirror b's captured handler is the fanout's.
+  assert.ok(handler);
+  await (handler as unknown as (d: DecisionEvent) => Promise<void>)({ notificationRef: 'ref', optionId: 'x', by: 'test' });
+  assert.deepEqual(primaryDecisions, [{ notificationRef: 'ref', optionId: 'x', by: 'test' }]);
 });

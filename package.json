@@ -47,6 +47,7 @@
     "date-holidays": "^3.32.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "firebase-admin": "^13.0.2",
     "helmet": "^8.0.0",
     "luxon": "^3.7.2",
     "pg": "^8.13.1",

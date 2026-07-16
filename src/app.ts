@@ -13,6 +13,8 @@ export interface AppDeps {
   adminRouter?: Router;
   /** Founder console API + static app. Present only when both console secrets are valid. */
   consoleRouter?: Router;
+  /** AO Founder PWA API + static shell (M6). Present only when console secrets are valid. */
+  founderAppRouter?: Router;
 }
 
 /**
@@ -71,6 +73,10 @@ export function buildApp(deps: AppDeps = {}) {
   // Founder operations console — also after JSON parsing and before the 404. The
   // router is created only when its independent application-auth secrets validate.
   if (deps.consoleRouter) app.use('/console', deps.consoleRouter);
+
+  // AO Founder PWA (M6) — same JSON/pre-404 placement as the console; mounted only when
+  // its console-shared auth secrets validate.
+  if (deps.founderAppRouter) app.use('/app', deps.founderAppRouter);
 
   // 404
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));

@@ -154,7 +154,23 @@ function buildDraftReviserGated(
   return { service, flip };
 }
 
-export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDefinition {
+/** A secondary surface that routes its own decision taps (the AO Founder app). It
+ *  receives the SAME routeDecision closure the Telegram poll drives, so a tap there
+ *  resolves byte-identically to a Telegram button tap. */
+export interface DecisionSink {
+  onDecision(handler: (d: DecisionEvent) => Promise<void>): void;
+}
+
+export function buildCallbackPollerWorker(
+  notifier: TelegramNotifier,
+  options: {
+    decisionSinks?: DecisionSink[];
+    /** Runs AFTER the real decision handler, on EVERY surface's decision. The AO Founder
+     *  app wires this to mark + re-emit its mirrored rows, so a Telegram-made decision
+     *  clears the app's Attention card too (not just app-made ones). */
+    onDecided?: (d: DecisionEvent) => Promise<void>;
+  } = {},
+): WorkerDefinition {
   const taskTarget = buildEzyPortalGateway();
   const cancel = buildCancelHandler({ taskTarget, notifier });
 
@@ -231,7 +247,23 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
     if (meeting && meeting.isMeetingOption(d.optionId)) return meeting.handle(d);
   };
 
-  notifier.onDecision(routeDecision);
+  // The composite decision handler shared by ALL surfaces: run the real router, THEN the
+  // mirror hook (mark + re-emit the app's rows). onDecided runs after routeDecision so a
+  // handler that throws (Telegram cancel setStatus failure) neither marks the mirror nor
+  // advances the poller offset — the whole thing retries, idempotently. markDecidedByRef
+  // and the real handlers are both first-writer-wins, so a retry converges.
+  const handleDecision = options.onDecided
+    ? async (d: DecisionEvent): Promise<void> => {
+        await routeDecision(d);
+        await options.onDecided!(d);
+      }
+    : routeDecision;
+
+  notifier.onDecision(handleDecision);
+  // Register the SAME composite handler on every extra surface (the AO Founder app), so a
+  // decision tapped there routes to the identical handler — and mirror-marking — a Telegram
+  // tap reaches (M6).
+  for (const sink of options.decisionSinks ?? []) sink.onDecision(handleDecision);
 
   // ── The composite free-text chain on onMessage ────────────────────────────────────────
   // WHICH links are wired is decided here (one per feature flag); the ORDER they run in —
