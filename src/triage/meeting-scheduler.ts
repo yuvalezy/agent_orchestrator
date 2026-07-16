@@ -98,7 +98,8 @@ export interface MeetingSchedulerDeps {
       id: string,
       e: { eventId: string; calendarId: string; meetLink: string | null; calendarAccountId: string | null },
     ) => Promise<void>;
-    markFailed: (id: string) => Promise<void>;
+    /** Guarded: TRUE only for the caller that wins the right to abandon + mint the task. */
+    claimGiveUp: (id: string) => Promise<boolean>;
     releaseToAwaitingSlot: (id: string) => Promise<void>;
     enqueueConfirmation: (id: string, body: string, by: string) => Promise<boolean>;
   };
@@ -110,15 +111,26 @@ export interface MeetingSchedulerDeps {
   slotOptions?: { count?: number; leadMinutes?: number; horizonDays?: number };
 }
 
-/** Abandon the meeting and mint the task instead — the recovery every dead-end funnels into, so
- *  the customer's ask survives a founder who cannot (or would rather not) book right now. */
+/**
+ * Abandon the meeting and mint the task instead — the recovery every dead-end funnels into, so
+ * the customer's ask survives a founder who cannot (or would rather not) book right now.
+ *
+ * The claim is ATOMIC and comes first: minting a task is as un-undoable as booking an event, and
+ * a tap can arrive twice (double-tap, or the Telegram poller redelivering a batch after any
+ * dispatch error — including an error thrown by the notify BELOW, after the task already
+ * landed). Gating here rather than in each caller means every dead-end is exactly-once by
+ * construction, instead of relying on five separate entry guards staying correct.
+ */
 async function giveUpToTask(
   deps: MeetingSchedulerDeps,
   m: MeetingRequest,
   title: string,
   body: string,
 ): Promise<void> {
-  await deps.repo.markFailed(m.id);
+  if (!(await deps.repo.claimGiveUp(m.id))) {
+    logger.info({ meetingId: m.id }, 'meeting: give-up already claimed — not creating a second task');
+    return;
+  }
   const task = await deps.fallbackToTask(m).catch((err) => {
     logger.error({ meetingId: m.id, reason: (err as Error)?.message }, 'meeting: task fallback FAILED — the ask may be dropped');
     return null;
@@ -479,11 +491,13 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
     },
 
     /** The founder tapped "Just make a task" — they've decided a meeting isn't what they want.
-     *  Honour it and mint the task. Refused once the meeting is booked: the event and its
-     *  invitation already exist, so quietly abandoning the record would leave them orphaned. */
+     *  No hand-rolled status check: giveUpToTask's atomic claim is the gate, so a re-tap and an
+     *  already-booked meeting are both refused there (a booked one is not in the claim's
+     *  allow-list — its event and invitation exist, and abandoning the record would orphan
+     *  them). One gate, not two that can drift apart. */
     async onDecline(meetingId): Promise<void> {
       const m = await deps.repo.get(meetingId);
-      if (!m || m.status === 'scheduled' || m.status === 'creating') return;
+      if (!m) return;
       await giveUpToTask(deps, m, '📋 Task instead', 'Skipped scheduling, as you asked.');
     },
   };

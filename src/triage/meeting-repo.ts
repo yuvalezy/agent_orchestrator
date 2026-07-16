@@ -181,10 +181,26 @@ export async function markScheduled(
   );
 }
 
-/** PERMANENT failure (403 scope, 404 calendar). Terminal — never re-claimed, because retrying a
- *  decision just replays it. The caller tells the founder and mints the task instead. */
-export async function markMeetingFailed(id: string): Promise<void> {
-  await query(`UPDATE agent_meeting_requests SET status = 'failed' WHERE id = $1`, [id]);
+/**
+ * THE give-up gate — claim the right to abandon this request and mint the task instead.
+ * Returns false when someone already did (or it is already booked), so the caller must NOT
+ * create a task.
+ *
+ * Guarded for the same reason claimForCreating is: a tap can arrive twice (a genuine double-tap,
+ * or the Telegram poller redelivering a whole batch after any dispatch error), and minting the
+ * task is just as un-undoable as booking the event. An unguarded `SET status='failed'` would
+ * happily run twice and leave the founder with two identical tasks.
+ *
+ * The allow-list is the three OPEN states — notably including 'creating', because the permanent
+ * -failure path gives up AFTER claimForCreating has already moved the row there.
+ */
+export async function claimMeetingGiveUp(id: string): Promise<boolean> {
+  const { rowCount } = await query(
+    `UPDATE agent_meeting_requests SET status = 'failed'
+      WHERE id = $1 AND status IN ('awaiting_duration','awaiting_slot','creating')`,
+    [id],
+  );
+  return rowCount === 1;
 }
 
 export async function abandonMeeting(id: string): Promise<void> {

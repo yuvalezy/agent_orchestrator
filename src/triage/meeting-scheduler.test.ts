@@ -165,8 +165,12 @@ function harness(
         row.event_id = e.eventId;
         row.meet_link = e.meetLink;
       },
-      markFailed: async () => {
+      // Models the REAL guarded UPDATE (WHERE status IN <open states>), not a stub that always
+      // succeeds — a permissive fake here would hide exactly the double-task bug this guards.
+      claimGiveUp: async () => {
+        if (!['awaiting_duration', 'awaiting_slot', 'creating'].includes(row.status)) return false;
         row.status = 'failed';
+        return true;
       },
       releaseToAwaitingSlot: async () => {
         row.status = 'awaiting_slot';
@@ -414,6 +418,47 @@ test('"Just make a task" is refused once the meeting is booked (the invite alrea
   const h = harness({ row: { status: 'scheduled' } });
   await buildMeetingScheduler(h.deps).onDecline('m1');
   assert.deepEqual(h.tasks, [], 'abandoning a booked meeting would orphan the event and its invitation');
+});
+
+test('a DOUBLE-TAP on "Just make a task" mints exactly ONE task', async () => {
+  // Telegram redelivers a whole update batch after any dispatch error, and a founder can simply
+  // tap twice before the keyboard settles — so the give-up claim must be as exactly-once as the
+  // booking claim. Without it the second tap sails past a 'failed' row and creates a duplicate.
+  const h = harness();
+  const s = buildMeetingScheduler(h.deps);
+  await s.onDecline('m1');
+  await s.onDecline('m1');
+  assert.deepEqual(h.tasks, ['m1'], 'the second tap must not create a second task');
+});
+
+test('a give-up REDELIVERED after its notify threw still mints only one task', async () => {
+  // The nastier shape: the task landed, then notifyCustomerEvent threw, so the poller holds its
+  // offset and replays the whole callback. The claim — taken BEFORE the task — is what saves it.
+  const h = harness();
+  let first = true;
+  const realNotify = h.deps.notifier.notifyCustomerEvent;
+  h.deps.notifier.notifyCustomerEvent = async (c, n) => {
+    if (first) {
+      first = false;
+      throw new Error('telegram 500');
+    }
+    return realNotify(c, n);
+  };
+  const s = buildMeetingScheduler(h.deps);
+  await assert.rejects(() => s.onDecline('m1'));
+  await s.onDecline('m1'); // the redelivery
+  assert.deepEqual(h.tasks, ['m1'], 'the replay must not create a second task');
+});
+
+test('every dead-end is exactly-once, not just the decline path', async () => {
+  // giveUpToTask is the single funnel for no-slots / unreadable-calendar / 403 / decline, so the
+  // claim protects all of them at once. Replaying an unreadable-calendar duration tap must not
+  // double-task either.
+  const h = harness({ freeBusyThrows: true });
+  const s = buildMeetingScheduler(h.deps);
+  await s.onDuration('m1', 30);
+  await s.onDuration('m1', 30);
+  assert.deepEqual(h.tasks, ['m1']);
 });
 
 // ── the confirmation template ───────────────────────────────────────────────────────────────

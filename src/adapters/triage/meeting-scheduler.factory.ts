@@ -12,11 +12,11 @@ import { buildMeetingDecisionHandler, type MeetingDecisionHandler } from '../../
 import { buildMeetingScheduler, type MeetingScheduler } from '../../triage/meeting-scheduler';
 import type { MeetingRequest } from '../../triage/meeting-repo';
 import {
+  claimMeetingGiveUp,
   claimMeetingRequest,
   claimForCreating,
   enqueueMeetingConfirmation,
   getMeetingRequest,
-  markMeetingFailed,
   markScheduled,
   releaseToAwaitingSlot,
   replaceSlots,
@@ -156,7 +156,7 @@ export function buildMeetingSchedulerGated(
       replaceSlots,
       claimForCreating,
       markScheduled,
-      markFailed: markMeetingFailed,
+      claimGiveUp: claimMeetingGiveUp,
       releaseToAwaitingSlot,
       enqueueConfirmation: enqueueMeetingConfirmation,
     },
