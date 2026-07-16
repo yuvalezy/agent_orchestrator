@@ -5,7 +5,9 @@ import { z } from 'zod';
 // src/config/credentials.ts (`resolveCredential`), the M1.4 sealed-store seam.
 // Later milestones extend this schema (LLM provider base URLs, more channel
 // instances — M1.3+).
-const envSchema = z.object({
+// Exported ONLY so settings-registry.test.ts can enumerate the flags and prove every one of
+// them is console-managed. Read values through `env` below, never through this schema.
+export const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().positive().default(3100),
   LOG_LEVEL: z

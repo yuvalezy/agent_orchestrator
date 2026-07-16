@@ -300,6 +300,26 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
     dependsOn: 'KNOWLEDGE_DRAFT_ENABLED',
   },
+  {
+    key: 'CALENDAR_WRITE_ENABLED',
+    type: 'boolean',
+    category: TRIAGE,
+    label: 'Calendar deadline events',
+    description:
+      'A task created with a due date also gets a deadline block on the founder’s calendar. Deliberately NOT under Calendar read — this one MUTATES the calendar, so turning meeting context on must never silently start writing. Needs a calendar account re-consented with write scope; a 403 degrades to no event and never fails the task.',
+    applyMode: 'restart',
+    default: false,
+  },
+  {
+    key: 'MEETING_SCHEDULING_ENABLED',
+    type: 'boolean',
+    category: TRIAGE,
+    label: 'Meeting scheduling',
+    description:
+      'A customer asking to talk books a call instead of creating a task: the founder is asked for a duration and a slot (computed from real free/busy across every enabled calendar), it books on the meeting-host account with a Meet link, invites the customer, and auto-sends a templated confirmation. Also enables "set up a meeting with X at 3pm" from a Telegram topic. Independent of both calendar flags above. Off: a meeting request creates a task like any other actionable category.',
+    applyMode: 'restart',
+    default: false,
+  },
 
   // ── Proactive ────────────────────────────────────────────────────────────────
   {
