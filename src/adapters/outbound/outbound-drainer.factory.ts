@@ -155,8 +155,11 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       return;
     }
 
-    // (c) business-hours / holiday window (D-D/E). An explicitly scheduled founder
-    // command carries a narrow override; every other guard remains active.
+    // (c) business-hours / holiday window (D-D/E). Two senders carry a narrow override, for
+    // DIFFERENT reasons: a scheduled founder command (the founder named the send time itself),
+    // and a meeting confirmation (the founder named a SLOT — holding the confirmation until
+    // 09:00 could deliver it after the meeting it confirms). Every other guard — rate limit,
+    // circuit breaker — remains active for both.
     if (!row.bypass_send_window) {
       const tz = row.timezone ?? cfg.defaultTz;
       const faith = row.customer_id ? row.faith : 'none';

@@ -76,6 +76,22 @@ export async function findCustomerCalendarAccount(bpRef: string, q: Query = dbQu
   return rows[0] ? toAccount(rows[0]) : null;
 }
 
+/**
+ * The account that HOSTS customer meetings (mig 036's `is_meeting_host`). A DIFFERENT question
+ * from findCustomerCalendarAccount: that one asks "where do THIS customer's deadlines land",
+ * this one asks "which of the founder's identities does a customer meeting get organized by" —
+ * the answer is one account for the whole tenant, and the customer sees its address on the
+ * invitation.
+ *
+ * A partial UNIQUE index guarantees at most one host row, so this cannot silently pick among
+ * candidates. Returns null when no host is set or the host was disabled in the console — the
+ * caller then declines to schedule rather than guessing (calendar-write-target.ts's rule).
+ */
+export async function findMeetingHostAccount(q: Query = dbQuery): Promise<CalendarAccount | null> {
+  const { rows } = await q<Row>(`${SELECT} WHERE is_meeting_host = true AND enabled = true`);
+  return rows[0] ? toAccount(rows[0]) : null;
+}
+
 /** Mint a unique GOOGLE_CALENDAR_<SLUG>_OAUTH credential ref for a new account (avoids the
  *  reserved work/personal creds + any existing row's credentials_ref). Pure (collision testable). */
 export function mintCalendarCredentialName(label: string, existingRefs: string[]): string {

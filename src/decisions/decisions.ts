@@ -43,18 +43,50 @@ export async function findTaskByInbox(inboxMessageId: string): Promise<string | 
   return rows[0]?.task_ref ?? null;
 }
 
-/** Record a triage decision (create/comment/askFounder). */
+/**
+ * Record a triage decision (create/comment/askFounder). Returns the new row's id, matching
+ * recordDraftDecision's established shape — every existing caller ignores it.
+ *
+ * The id matters for the meeting path: the request row FKs to this decision, and the task
+ * fallback reads `agent_output` back out of it to rebuild the intent it would have become. That
+ * also starts closing a real gap — triage's outcome='pending' rows have historically been
+ * written and never read by anything.
+ */
 export async function recordTriageDecision(input: {
   customerId: string;
   inboxMessageId: string;
   agentOutput: unknown;
   outcome: 'accepted' | 'pending';
   taskRef?: string;
-}): Promise<void> {
-  await query(
+}): Promise<{ decisionId: string }> {
+  const { rows } = await query<{ id: string }>(
     `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, task_ref, agent_output, outcome)
-     VALUES ($1, $2, 'triage', $3, $4::jsonb, $5)`,
+     VALUES ($1, $2, 'triage', $3, $4::jsonb, $5)
+     RETURNING id`,
     [input.customerId, input.inboxMessageId, input.taskRef ?? null, JSON.stringify(input.agentOutput ?? null), input.outcome],
+  );
+  return { decisionId: rows[0].id };
+}
+
+/** Read a triage decision's recorded intent back — the meeting path's task fallback rebuilds the
+ *  task from it rather than duplicating the intent onto a second table. */
+export async function findTriageIntent(decisionId: string): Promise<unknown | null> {
+  const { rows } = await query<{ agent_output: unknown }>(
+    `SELECT agent_output FROM agent_decisions WHERE id = $1 AND decision_type = 'triage'`,
+    [decisionId],
+  );
+  return rows[0]?.agent_output ?? null;
+}
+
+/** Resolve a triage decision that was left pending (the meeting flow settling one way or the
+ *  other). Narrow by decision_type so a stray id cannot rewrite a draft's outcome. */
+export async function resolveTriageDecision(
+  decisionId: string,
+  outcome: 'accepted' | 'rejected' | 'modified',
+): Promise<void> {
+  await query(
+    `UPDATE agent_decisions SET outcome = $2, resolved_at = now() WHERE id = $1 AND decision_type = 'triage'`,
+    [decisionId, outcome],
   );
 }
 

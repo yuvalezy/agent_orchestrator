@@ -6,6 +6,7 @@ import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/gro
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
 import type { ResponseDrafter } from './response-drafter';
 import type { CrossChannelDedup } from './cross-channel-dedup';
+import type { MeetingScheduler } from './meeting-scheduler';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
@@ -21,8 +22,21 @@ import { loadPriorThreadConversation, markProcessed, markSkipped, setInboxCustom
 export const CANCEL_PREFIX = 'x:';
 const cancelButton = (taskRef: string) => [{ id: `${CANCEL_PREFIX}${taskRef}`, label: '❌ Cancel task' }];
 
-/** Categories that represent an explicit ask (→ a task). The rest are context. */
-export const ACTIONABLE = new Set(['bug_report', 'new_feature_request', 'custom_development', 'question_existing', 'follow_up']);
+/** Categories that represent an explicit ask (→ a task). The rest are context.
+ *
+ * 'meeting_request' is a member even though it aims to produce a MEETING, not a task. That is
+ * deliberate and load-bearing: a non-member terminates at the `'context'` gate below, so if
+ * scheduling could not start (no calendar, no free slots, a write-scope 403) the ask would
+ * evaporate — neither meeting nor task. Membership is exactly what keeps the task FALLBACK
+ * reachable. */
+export const ACTIONABLE = new Set([
+  'bug_report',
+  'new_feature_request',
+  'custom_development',
+  'question_existing',
+  'follow_up',
+  'meeting_request',
+]);
 export function taskMutationGate(
   intent: Pick<Intent, 'category' | 'explicit_action_request'>,
 ): 'context' | 'confirm' | 'act' {
@@ -138,6 +152,11 @@ export interface TriageDeps {
    *  customers are never merged. Best-effort: an embed/search miss degrades to the
    *  normal path (never blocks triage). */
   crossChannelDedup?: CrossChannelDedup;
+  /** A customer asking to TALK → a booked meeting instead of a task. Optional + gated
+   *  (MEETING_SCHEDULING_ENABLED) — when absent, `meeting_request` creates a task exactly as
+   *  every other actionable category does (the pre-feature behavior). `tryInitiate` returning
+   *  false has the same effect, so no calendar problem can cost the customer their ask. */
+  meetingScheduler?: MeetingScheduler;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -501,6 +520,43 @@ export class TriageService {
         contextRef: { kind: 'inbox', ref: inboxId },
       });
       return;
+    }
+
+    // A customer asking to TALK wants a meeting, not a task. Before this branch existed,
+    // "avisame cuando puedes hablar" was triaged follow_up and became TSK-00249 — a task whose
+    // whole content was "a customer wants to talk to you", leaving the founder to open a
+    // calendar, pick a time, and reply by hand. Now: real availability → duration → slot → a
+    // booked Meet event with the customer invited → a confirmation on the origin channel.
+    //
+    // Placed AFTER the confidence/'confirm' gates so it inherits them (a vague "we should talk
+    // sometime" has explicit_action_request=false → 'confirm' → no meeting, no task), and
+    // guarded on !ccOnly for the same reason the drafter below is: a message the founder was
+    // merely copied on must not book their calendar.
+    //
+    // tryInitiate returns FALSE for every "cannot start" case (no host calendar, unreadable
+    // free/busy, no free slots) → fall through to the task path below, exactly as before this
+    // feature existed. Absent dep = pre-feature behavior, per the TriageDeps convention.
+    // The scheduler records its OWN decision row once it claims the conversation, so nothing is
+    // recorded here — a fall-through must leave the task path free to record exactly one.
+    if (intent.category === 'meeting_request' && this.deps.meetingScheduler && !ctx.ccOnly) {
+      const started = await this.deps.meetingScheduler.tryInitiate({
+        customerId,
+        inboxMessageId: inboxId,
+        intent,
+        threadId: config.telegramTopicId ?? threadKey,
+        displayName: config.displayName,
+        customerTz: config.timezone,
+        channelType: row.channel_type,
+        channelInstanceId: row.channel_instance_id,
+        senderAddress: row.sender_address ?? '',
+        recipientAddress: row.sender_address ?? '',
+        threadKey,
+        inReplyTo: row.channel_message_id,
+        summary: intent.summary,
+        preferredLanguage: config.preferredLanguage,
+      });
+      if (started) return; // the meeting conversation owns this message — NOT a task
+      // else: fall through to dedup + createTask, exactly as before this feature existed
     }
 
     // M2a(c): ANSWERABLE 'question_existing' → a cited DRAFT reply (no task). Gated:

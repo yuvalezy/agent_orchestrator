@@ -32,6 +32,8 @@ export interface ContactResolutionQueries {
     address: string,
   ): Promise<{ customerId: string; contactId: string } | null>;
   findCustomersByEmailDomain(domain: string): Promise<Array<{ id: string; displayName: string }>>;
+  /** The email address of the HUMAN behind a non-email contact — see findContactEmail. */
+  findContactEmailByAddress(channelType: string, address: string): Promise<string | null>;
 }
 
 export const dbContactResolutionQueries: ContactResolutionQueries = {
@@ -56,7 +58,60 @@ export const dbContactResolutionQueries: ContactResolutionQueries = {
     );
     return rows.map((r) => ({ id: r.id, displayName: r.display_name }));
   },
+  async findContactEmailByAddress(channelType, address) {
+    // Self-join on directory_contact_ref: the portal directory ref is what ties one PERSON's
+    // channels together (onboarding.ts writes it), so a WhatsApp number resolves to the email of
+    // the same human — e.g. 50766736013 → iyelinek@holadocmed.com.
+    //
+    // Two hard guards:
+    //  • `w.is_group IS NOT TRUE` — in a shared group the sender is NOT the contact row (the
+    //    address is the group jid), so a join from it would invite the group's contact rather
+    //    than whoever actually asked to talk.
+    //  • the ref must be NON-NULL on both sides — SQL would happily match NULL=NULL in a naive
+    //    join formulation, and "two contacts with no directory ref" is not "the same person".
+    const { rows } = await query<{ address: string }>(
+      `SELECT e.address
+         FROM agent_customer_contacts w
+         JOIN agent_customer_contacts e
+           ON e.directory_contact_ref = w.directory_contact_ref
+          AND e.channel_type = 'email'
+        WHERE w.channel_type = $1
+          AND w.address = $2
+          AND w.is_group IS NOT TRUE
+          AND w.directory_contact_ref IS NOT NULL
+        ORDER BY e.is_primary DESC, e.created_at ASC
+        LIMIT 1`,
+      [channelType, address],
+    );
+    return rows[0]?.address ?? null;
+  },
 };
+
+/**
+ * The email address to invite when a customer asks to meet, or null when we cannot know it.
+ *
+ * An email-origin ask needs no lookup — the sender IS the attendee. Anything else routes through
+ * the directory ref (see findContactEmailByAddress).
+ *
+ * Null is a normal answer, not an error: group chats have no single asker, and a contact may
+ * simply have no email on file. The caller books WITHOUT an attendee in that case (the Meet link
+ * in the reply is the invitation) rather than guessing at an address — an invitation sent to the
+ * wrong person is worse than one not sent at all.
+ *
+ * ⚠︎ The ref is never re-verified: onboarding.ts COALESCEs it and never clears it, so a contact
+ * who has left the company still resolves to their old mailbox. The founder is shown the address
+ * before anything is sent, which is the only real check available here.
+ */
+export async function findContactEmail(
+  channelType: string,
+  address: string,
+  q: ContactResolutionQueries = dbContactResolutionQueries,
+): Promise<string | null> {
+  const addr = address.trim().toLowerCase();
+  if (!addr) return null;
+  if (channelType === 'email') return addr;
+  return q.findContactEmailByAddress(channelType, addr);
+}
 
 /** Email-domain propose fallback (email-only affordance — no reliable domain for a
  *  bare phone/whatsapp/telegram address, and a bp-ref UUID has no `@`). */

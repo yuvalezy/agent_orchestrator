@@ -1,11 +1,17 @@
-// Calendar ports (M5(d)). TWO interfaces, deliberately split (see CalendarWriterPort):
-//   • CalendarPort       — READ. The founder's Google Calendar is polled at draft time so the
-//                          drafter can surface the drafted customer's UPCOMING meetings.
-//   • CalendarWriterPort — WRITE. A task created with a `dueAt` gets a deadline event.
-// Both are implemented by the Google Calendar adapter (src/adapters/calendar). Best-effort
-// everywhere — a calendar miss NEVER fails drafting, and a calendar WRITE failure never fails
-// task creation (D1: core never imports the adapter; the Google client is wired only in the
-// composition root).
+// Calendar ports (M5(d)). THREE interfaces, deliberately split (see CalendarWriterPort):
+//   • CalendarPort        — READ. The founder's Google Calendar is polled at draft time so the
+//                           drafter can surface the drafted customer's UPCOMING meetings.
+//   • CalendarWriterPort  — WRITE. A task created with a `dueAt` gets a deadline event; a
+//                           meeting request gets a booked event with a Meet link.
+//   • CalendarFreeBusyPort — AVAILABILITY. Busy intervals for meeting-slot generation.
+// All implemented by the Google Calendar adapter (src/adapters/calendar). D1: core never imports
+// the adapter; the Google client is wired only in the composition root.
+//
+// ⚠︎ The best-effort posture is NOT uniform, and the difference is load-bearing:
+//   • read (meeting context) and the dueAt write are best-effort — a miss costs a convenience,
+//     so they degrade silently rather than fail the money path.
+//   • free/busy is FAIL-CLOSED — a miss there would mean proposing a slot over a real meeting.
+//     See CalendarFreeBusyPort.
 
 /**
  * One NORMALIZED calendar event (provider-shape stripped). `startsAt`/`endsAt` are the
@@ -80,6 +86,23 @@ export interface CreateEventInput {
    * Must be base32hex (lowercase a–v + 0–9, 5–1024 chars) or Google rejects it with 400.
    */
   eventId?: string;
+  /**
+   * Request a Google Meet conference on the event (`conferenceData.createRequest`). The adapter
+   * must also send `conferenceDataVersion=1` — without that query param Google SILENTLY IGNORES
+   * conferenceData: no error, no link.
+   *
+   * Conference creation is ASYNC: the insert response may carry `status: 'pending'` and no link
+   * at all, so `meetLink` is `string | null` even on success. A meeting without a Meet link is
+   * still a meeting — never fail a booking over it.
+   */
+  conference?: boolean;
+  /**
+   * Whether Google emails the attendees. DEFAULT 'none', deliberately: `events.insert`'s own
+   * default sends nothing, and the dueAt deadline path (due-event-sync.ts) must keep it that way
+   * — it has no attendees and adding one "would silently email them". A MEETING invitation is the
+   * opposite case and must pass 'all', or the customer is added to the event and never told.
+   */
+  sendUpdates?: 'all' | 'none';
 }
 
 /** The created (or already-existing) event. */
@@ -88,10 +111,51 @@ export interface CreatedEvent {
   /** Google `htmlLink` (UI deep link), or null when absent / not returned. */
   htmlLink: string | null;
   /**
+   * The Google Meet join URL (`hangoutLink`), or null when none was requested, the conference
+   * is still being minted, or workspace policy declined it. Callers MUST treat null as "book it
+   * anyway, just say so" — never as a failure.
+   */
+  meetLink: string | null;
+  /**
    * TRUE when the deterministic `eventId` already existed (Google 409) — this call created
-   * NOTHING. Not an error: it is the API-level idempotency guard reporting a duplicate.
+   * NOTHING. Not an error: it is the API-level idempotency guard reporting a duplicate. The
+   * adapter re-reads the existing event, so `htmlLink`/`meetLink` describe what is ACTUALLY on
+   * the calendar (which may differ from what this call would have written).
    */
   alreadyExisted: boolean;
+}
+
+/** A block of time the founder is already committed. Half-open: [start, end). */
+export interface BusyInterval {
+  start: Date;
+  end: Date;
+}
+
+export interface FreeBusyInput {
+  timeMin: Date;
+  timeMax: Date;
+  /** Target calendar id; defaults to 'primary' when omitted. */
+  calendarId?: string;
+}
+
+/**
+ * Availability lookup, backed by Google's `freebusy.query` — which returns busy intervals
+ * NATIVELY and already excludes cancelled, transparent ("free") and declined events. Do NOT
+ * reimplement this on top of `CalendarPort.listUpcomingEvents`: that is a context reader (it
+ * normalizes none of those fields and caps its read via `maxEvents`), so everything past the cap
+ * or marked free would read as available.
+ *
+ * ⚠︎ FAIL-CLOSED CONTRACT. Unlike every other calendar call in this codebase, an implementation
+ * MUST THROW rather than degrade. The multi-account read composite swallows a per-account error
+ * and returns [] for it; the same policy here would mean an expired credential contributes ZERO
+ * busy intervals — i.e. the founder reads as free all week and gets double-booked, with only a
+ * log line. No slots beats wrong slots: a throw costs the founder a task-fallback, a silent []
+ * costs them a meeting they can't attend.
+ *
+ * Needs only `calendar.readonly` — availability works on credentials that cannot yet write.
+ */
+export interface CalendarFreeBusyPort {
+  queryFreeBusy(input: FreeBusyInput): Promise<BusyInterval[]>;
 }
 
 /**

@@ -11,6 +11,7 @@ function deps(over: Partial<ContactResolutionQueries> = {}): ContactResolutionQu
     findCustomerByBpRef: async () => null,
     findContactByAddress: async () => null,
     findCustomersByEmailDomain: async () => [],
+    findContactEmailByAddress: async () => null,
     ...over,
   };
 }

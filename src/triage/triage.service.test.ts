@@ -50,8 +50,16 @@ const BUG: Intent = { category: 'bug_report', summary: 'Export fails', suggested
 function fakes(
   intents: Intent[],
   contactKind: 'known' | 'unknown',
-  opts: { groupSummary?: GroupSummaryPort; bpCustomerId?: string; attachThrows?: boolean } = {},
+  opts: {
+    groupSummary?: GroupSummaryPort;
+    bpCustomerId?: string;
+    attachThrows?: boolean;
+    /** undefined = scheduler NOT wired (the pre-feature behavior); 'ok' = it takes the message;
+     *  'declines' = it cannot start, so triage must fall through to the task path. */
+    meeting?: 'ok' | 'declines';
+  } = {},
 ) {
+  const initiated: unknown[] = [];
   const created: unknown[] = [];
   const notified: Array<{ title: string; buttons: boolean }> = [];
   const adminNotes: Array<{ title: string }> = [];
@@ -62,6 +70,7 @@ function fakes(
     findCustomerByBpRef: async () => (opts.bpCustomerId ? { customerId: opts.bpCustomerId } : null),
     findContactByAddress: async () => (contactKind === 'known' ? { customerId, contactId: 'c1' } : null),
     findCustomersByEmailDomain: async () => [],
+    findContactEmailByAddress: async () => null,
   };
   // Realistic fake: createTask registers a task keyed by its sourceEntityId, and
   // findOpenTasks(sourceEntity) returns matching tasks — so the multi-intent
@@ -104,8 +113,19 @@ function fakes(
     deepLink: (r) => `http://portal/t/${r}`,
     bumpSkipped: async () => { skipped += 1; },
     groupSummary: opts.groupSummary,
+    meetingScheduler: opts.meeting
+      ? {
+          tryInitiate: async (i) => {
+            initiated.push(i);
+            return opts.meeting === 'ok';
+          },
+          onDuration: async () => {},
+          onSlot: async () => {},
+          onDecline: async () => {},
+        }
+      : undefined,
   });
-  return { svc, created, notified, adminNotes, attached, get skipped() { return skipped; } };
+  return { svc, created, notified, adminNotes, attached, initiated, get skipped() { return skipped; } };
 }
 
 /** A GroupSummaryPort fake with call counters, for the muted-group routing tests. */
@@ -527,4 +547,98 @@ test('attach is best-effort: upload throws → the row is still processed', asyn
   assert.ok(f.adminNotes.some((n) => /attach failed/i.test(n.title)), 'an admin note flags the failed attach');
   const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
   assert.equal(inbox.rows[0].status, 'processed', 'row processed despite the attach failure');
+});
+
+// ── meeting_request: the TSK-00249 regression ────────────────────────────────────
+// "avisame cuando puedes hablar" (let me know when you can talk) was triaged follow_up and
+// became a task whose whole content was "a customer wants to talk to you". These pin the three
+// outcomes that matter: it schedules, it NEVER silently drops, and it is byte-for-byte the old
+// behavior when the feature is off.
+
+const WANTS_TO_TALK: Intent = {
+  category: 'meeting_request', summary: 'Customer asks to be notified when the founder is available to talk',
+  suggested_title: 'Notify customer when available for call', priority: 'medium',
+  confidence: 0.7, explicit_action_request: true, related_open_task_ref: null,
+};
+
+test('meeting_request goes to the scheduler and creates NO task (the TSK-00249 fix)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-meeting', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const f = fakes([WANTS_TO_TALK], 'known', { meeting: 'ok' });
+  const row = await seedInbox(`${TAG}-meeting`, 'avisame cuando puedes hablar');
+  await f.svc.process(row);
+
+  assert.equal(f.initiated.length, 1, 'the ask must reach the scheduler');
+  assert.equal(f.created.length, 0, 'a request to TALK must not become a project task');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'processed');
+});
+
+test('meeting_request passes the founder tz-independent customer zone + language through', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id, timezone, preferred_language)
+     VALUES ('bp-triage-meeting-tz', 'Triage Test Co', 'proj-1', 'wit-1', '99', 'America/Panama', 'es') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const f = fakes([WANTS_TO_TALK], 'known', { meeting: 'ok' });
+  await f.svc.process(await seedInbox(`${TAG}-meeting-tz`, 'avisame cuando puedes hablar'));
+
+  const i = f.initiated[0] as { customerTz: string; preferredLanguage: string; intent: Intent };
+  assert.equal(i.customerTz, 'America/Panama', 'the confirmation is rendered in the CUSTOMER zone');
+  assert.equal(i.preferredLanguage, 'es');
+  assert.equal(i.intent.category, 'meeting_request', 'the intent travels so the task fallback can rebuild it');
+});
+
+test('a scheduler that CANNOT start falls through to the task — the ask is never dropped', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-meeting-decline', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const f = fakes([WANTS_TO_TALK], 'known', { meeting: 'declines' }); // no calendar / no slots
+  await f.svc.process(await seedInbox(`${TAG}-meeting-decline`, 'avisame cuando puedes hablar'));
+
+  assert.equal(f.initiated.length, 1);
+  assert.equal(f.created.length, 1, 'no meeting AND no task would silently drop a customer request');
+  const decisions = await query<{ n: string }>(
+    `SELECT count(*) AS n FROM agent_decisions WHERE customer_id = $1 AND decision_type = 'triage'`,
+    [customerId],
+  );
+  assert.equal(decisions.rows[0].n, '1', 'exactly one audit row per intent — the fall-through must not double-record');
+});
+
+test('meeting_request with the scheduler UNWIRED creates a task exactly as before', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-meeting-off', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const f = fakes([WANTS_TO_TALK], 'known'); // flag off → dep absent
+  await f.svc.process(await seedInbox(`${TAG}-meeting-off`, 'avisame cuando puedes hablar'));
+
+  assert.equal(f.created.length, 1, 'absent dep = pre-feature behavior');
+  assert.equal((f.created[0] as { tags: string[] }).tags[0], 'meeting_request');
+});
+
+test('a vague "we should talk sometime" books nothing and creates nothing (inherits the confirm gate)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-meeting-vague', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+  const vague: Intent = { ...WANTS_TO_TALK, explicit_action_request: false };
+  const f = fakes([vague], 'known', { meeting: 'ok' });
+  await f.svc.process(await seedInbox(`${TAG}-meeting-vague`, 'algún día tenemos que hablar'));
+
+  assert.equal(f.initiated.length, 0, 'the confirm gate must precede the scheduler');
+  assert.equal(f.created.length, 0);
+  assert.equal(f.notified.length, 1, 'the founder is asked instead');
 });

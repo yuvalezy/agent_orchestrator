@@ -15,6 +15,11 @@ export interface CustomerConfig {
   workItemTypeRef: string | null;
   telegramTopicId: string | null;
   preferredLanguage: string;
+  /** The CUSTOMER's zone (agent_customers.timezone) — what a time is rendered in when we speak
+   *  TO them. Distinct from the founder's zone (env.CALENDAR_TZ), which is what their own
+   *  availability is computed in. Both are America/Panama today, which is exactly why the two
+   *  must stay separately named. */
+  timezone: string;
   /** The go-live watermark: messages that PREDATE this were already history when the
    *  customer was onboarded, so they are context, never work (triage.service.ts skips
    *  them). NULL = "triage everything" — the pre-watermark behavior every customer
@@ -34,10 +39,11 @@ export async function loadCustomerConfig(customerId: string): Promise<CustomerCo
     work_item_type_ref: string | null;
     telegram_topic_id: string | null;
     preferred_language: string;
+    timezone: string | null;
     backfill_cutoff: Date | null;
   }>(
     `SELECT id, bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id, preferred_language,
-            backfill_cutoff
+            timezone, backfill_cutoff
        FROM agent_customers WHERE id = $1`,
     [customerId],
   );
@@ -51,6 +57,9 @@ export async function loadCustomerConfig(customerId: string): Promise<CustomerCo
     workItemTypeRef: r.work_item_type_ref,
     telegramTopicId: r.telegram_topic_id,
     preferredLanguage: r.preferred_language,
+    // The column is NOT NULL with a default in practice; the ?? keeps a hand-edited NULL from
+    // producing an invalid zone downstream (luxon would silently fall back to UTC).
+    timezone: r.timezone ?? 'America/Panama',
     // pg returns TIMESTAMPTZ as a Date (no type parser is registered); normalize
     // anyway so a driver/parser change can't turn the guard into a string compare.
     backfillCutoff: r.backfill_cutoff ? new Date(r.backfill_cutoff) : null,

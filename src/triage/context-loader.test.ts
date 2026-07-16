@@ -59,6 +59,7 @@ const config: CustomerConfig = {
   customerId: 'customer-1',
   bpRef: 'bp-1',
   displayName: 'Customer',
+  timezone: 'America/Panama',
   projectRef: 'project-1',
   workItemTypeRef: 'type-1',
   telegramTopicId: null,
