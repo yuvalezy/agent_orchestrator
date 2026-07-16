@@ -3,12 +3,14 @@ import type { CalendarPort } from '../../ports/calendar.port';
 import {
   dayInTz,
   type AwaitingReplyItem,
+  type CommitmentDueItem,
   type PendingItem,
   type TodayHoliday,
   type TodayMeeting,
   type UrgentFeed,
 } from '../../query/daily-briefing';
 import { listUrgencyInbox } from '../console/console-urgency-repo';
+import { listOpenCommitmentsDueBy } from '../../commitments/commitment-repo';
 
 // Read queries backing task 3.1's four briefing sections (ADAPTER — the core briefing takes
 // these as injected fns and never imports this file, D1). Kept in its OWN file (not the worker)
@@ -206,24 +208,53 @@ export async function fetchTodayHolidays(day: string): Promise<TodayHoliday[]> {
  *
  * `listUpcomingEvents` reads FORWARD from now, so this is the founder's day AHEAD of the
  * briefing — a meeting that already finished before the digest fires is intentionally not
- * relisted. `matchEmails: []` is what makes this a whole-day agenda rather than the drafter's
+ * relisted. Normally `matchEmails: []` makes this a whole-day agenda rather than the drafter's
  * per-customer view (meeting-context.ts keeps only `matchedCustomer` events; the briefing wants
  * every meeting, so it reads the port directly). A 2-day lookahead over-reads and is then
  * filtered to today's local day, so an event never leaks in from tomorrow.
+ *
+ * WP7(a): when `loadMatchEmails` is supplied (MEETING_PREP on), the founder's known customer emails
+ * are passed as `matchEmails` so a customer-matched event carries `hasPrep=true` and the digest can
+ * flag "📋 Prep". Without it, matchEmails stays [] and no meeting is flagged — byte-identical to before.
  */
 export function buildFetchTodayMeetings(
   calendar: Pick<CalendarPort, 'listUpcomingEvents'>,
   tz: string,
+  loadMatchEmails?: () => Promise<string[]>,
 ): (day: string) => Promise<TodayMeeting[]> {
   return async (day) => {
+    const matchEmails = loadMatchEmails ? await loadMatchEmails() : [];
     const events = await calendar.listUpcomingEvents({
       lookaheadDays: 2,
-      matchEmails: [],
+      matchEmails,
       maxEvents: MAX_TODAY_MEETINGS,
     });
     return events
       .filter((e) => dayInTz(e.startsAt, tz) === day)
-      .map((e) => ({ title: e.title, startsAt: e.startsAt, allDay: e.allDay }))
+      .map((e) => ({ title: e.title, startsAt: e.startsAt, allDay: e.allDay, hasPrep: e.matchedCustomer }))
       .slice(0, MAX_TODAY_MEETINGS);
   };
+}
+
+/** Every known customer email contact (lower-cased), for the WP7(a) "📋 Prep" meeting match. A whole-
+ *  agenda read, so it loads all email contacts once per briefing tick. */
+export async function listCustomerEmails(): Promise<string[]> {
+  const { rows } = await query<{ address: string }>(
+    `SELECT DISTINCT lower(address) AS address FROM agent_customer_contacts WHERE channel_type = 'email'`,
+  );
+  return rows.map((r) => r.address).filter(Boolean);
+}
+
+/** Open commitments due today or overdue (WP7(b)) — due_at at or before `cutoff` (the founder-local
+ *  end of today). Maps the ledger read down to the briefing's PII-light-ish CommitmentDueItem (the
+ *  founder's own promise text + who + the deadline; never a customer message body). */
+export async function fetchCommitmentsDue(cutoff: Date): Promise<CommitmentDueItem[]> {
+  const rows = await listOpenCommitmentsDueBy(cutoff);
+  return rows.map((c) => ({
+    customerId: c.customerId,
+    customerName: c.customerName,
+    text: c.text,
+    // The "due" read filters due_at IS NOT NULL, so this is always set.
+    dueAt: c.dueAt as Date,
+  }));
 }

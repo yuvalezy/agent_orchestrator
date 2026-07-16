@@ -22,6 +22,7 @@ export default tseslint.config(
       'src/inbox/__illegal_import_fixture__.ts',
       'src/knowledge/__illegal_import_fixture__.ts',
       'src/query/__illegal_import_fixture__.ts',
+      'src/commitments/__illegal_import_fixture__.ts',
     ],
   },
   ...tseslint.configs.recommended,
@@ -53,6 +54,7 @@ export default tseslint.config(
                 './src/ports',
                 './src/knowledge',
                 './src/query',
+                './src/commitments',
               ],
               from: './src/adapters',
               message:

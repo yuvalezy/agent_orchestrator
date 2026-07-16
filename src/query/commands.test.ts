@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSlashCommandRouter, parseCommand } from './commands';
+import { buildSlashCommandRouter, parseCommand, type CommitmentLine } from './commands';
 import type { PendingItem } from './daily-briefing';
 import type { MessageEvent } from '../ports/founder-notifier.port';
 
@@ -491,4 +491,81 @@ test('/backfill: a start failure is reported to the founder, still consumed', as
 
   assert.equal(await router(msg('/backfill')), true);
   assert.match(c.posts[0].text, /Couldn't run \/backfill right now: OPENAI_API_KEY not resolvable/);
+});
+
+// ── /commitments (WP7(b)) ─────────────────────────────────────────────────────────────────────
+
+/** Collects the per-item commitment cards (text + buttons) alongside the plain postAnswer stream. */
+function cardCollector() {
+  const cards: Array<{ threadId: string; text: string; buttons: Array<{ id: string; label: string }> }> = [];
+  return {
+    cards,
+    postCommitmentCard: async (threadId: string, text: string, buttons: Array<{ id: string; label: string }>) =>
+      void cards.push({ threadId, text, buttons }),
+  };
+}
+
+const commitment = (id: string, over: Partial<CommitmentLine> = {}): CommitmentLine => ({
+  id,
+  customerName: null,
+  text: `promise ${id}`,
+  dueAt: null,
+  duePrecision: null,
+  createdAt: daysAgo(2),
+  ...over,
+});
+
+test('/commitments: degrades honestly when tracking is off', async () => {
+  const { c, router } = deps({ listOpenCommitments: undefined, postCommitmentCard: undefined });
+  assert.equal(await router(msg('/commitments')), true);
+  assert.match(c.posts[0].text, /\/commitments is unavailable — commitment tracking is off/);
+});
+
+test('/commitments: scoped by topic → header + one ✔/✖ card per open commitment', async () => {
+  const card = cardCollector();
+  const { c, router } = deps({
+    resolveThreadCustomer: async () => ACME,
+    listOpenCommitments: async (customerId) => {
+      assert.equal(customerId, 'cus_1', 'scoped to the topic customer');
+      return [commitment('5', { dueAt: new Date(NOW.getTime() + 3_600_000), duePrecision: 'day' })];
+    },
+    postCommitmentCard: card.postCommitmentCard,
+  });
+  assert.equal(await router(msg('/commitments')), true);
+  assert.match(c.posts[0].text, /⏰ Open commitments — Acme \(1\)/);
+  assert.equal(card.cards.length, 1);
+  assert.match(card.cards[0].text, /promise 5/);
+  assert.match(card.cards[0].text, /2d old · due/);
+  assert.deepEqual(card.cards[0].buttons, [
+    { id: 'cmd:5', label: '✔ done' },
+    { id: 'cmx:5', label: '✖ dismiss' },
+  ]);
+});
+
+test('/commitments: an unbound Admin topic lists ALL customers, prefixing each card with the name', async () => {
+  const card = cardCollector();
+  const { c, router } = deps({
+    resolveThreadCustomer: async () => null, // Admin topic
+    listOpenCommitments: async (customerId) => {
+      assert.equal(customerId, null, 'unscoped → all customers');
+      return [commitment('9', { customerName: 'Beta', dueAt: new Date(NOW.getTime() - 3_600_000), duePrecision: 'day' })];
+    },
+    postCommitmentCard: card.postCommitmentCard,
+  });
+  assert.equal(await router(msg('/commitments')), true);
+  assert.match(c.posts[0].text, /⏰ Open commitments — all customers \(1\)/);
+  assert.match(card.cards[0].text, /Beta: promise 9/);
+  assert.match(card.cards[0].text, /⚠️ overdue/, 'a past deadline is flagged');
+});
+
+test('/commitments: nothing open → a single all-clear line, no cards', async () => {
+  const card = cardCollector();
+  const { c, router } = deps({
+    resolveThreadCustomer: async () => ACME,
+    listOpenCommitments: async () => [],
+    postCommitmentCard: card.postCommitmentCard,
+  });
+  assert.equal(await router(msg('/commitments')), true);
+  assert.match(c.posts[0].text, /⏰ Open commitments — Acme \(0\)\nNothing open. 🎉/);
+  assert.equal(card.cards.length, 0);
 });

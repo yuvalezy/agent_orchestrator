@@ -1,3 +1,4 @@
+import { DateTime } from 'luxon';
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort } from '../ports/llm.port';
 import type { SyncLogger } from '../knowledge/sync';
@@ -109,11 +110,25 @@ export interface AwaitingReplyItem {
   lastOutboundAt: Date;
 }
 
-/** One of today's calendar events. Title + time only — never the event description. */
+/** One of today's calendar events. Title + time only — never the event description. `hasPrep` marks
+ *  an event matched to a known customer (WP7(a)) so the briefing can flag "📋 Prep"; it defaults to
+ *  false/undefined, so a caller that does not compute matching (MEETING_PREP off) renders unchanged. */
 export interface TodayMeeting {
   title: string;
   startsAt: Date;
   allDay: boolean;
+  hasPrep?: boolean;
+}
+
+/** One open commitment due today or overdue, for the briefing's "⏰ Commitments due" section (WP7(b)).
+ *  `text` is the founder's OWN promise phrasing (like a meeting title — the founder's content, not a
+ *  customer message body), rendered short and never logged. */
+export interface CommitmentDueItem {
+  customerId: string;
+  customerName: string | null;
+  text: string;
+  /** The resolved deadline instant (always set — the "due" read filters out null-due rows). */
+  dueAt: Date;
 }
 
 /** One of today's holidays (agent_holidays). `faith` is the 'global' sentinel or a faith key. */
@@ -169,6 +184,22 @@ export interface TodaySummary {
   holidays: TodayHoliday[];
 }
 
+/** One rendered commitment-due line: who + a short promise + whether it is already overdue. */
+export interface CommitmentDueLine {
+  customerId: string;
+  customerName: string | null;
+  text: string;
+  overdue: boolean;
+}
+
+export interface CommitmentsDueSummary {
+  count: number;
+  /** How many of those are already past their deadline (a subset of `count`). */
+  overdue: number;
+  /** The soonest-due (then most-overdue) lines, capped by topN. */
+  top: CommitmentDueLine[];
+}
+
 export interface BriefingData {
   drafts: QueueSummary;
   proposals: QueueSummary;
@@ -184,6 +215,8 @@ export interface BriefingData {
   awaitingReply?: AwaitingReplySummary | null;
   /** Today's meetings + holidays (founder-local day). */
   today?: TodaySummary | null;
+  /** Open commitments due today or overdue (WP7(b)). undefined = source not wired; null = failed. */
+  commitmentsDue?: CommitmentsDueSummary | null;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -245,6 +278,8 @@ export interface BriefingSectionInput {
   /** Already filtered to > AWAITING_REPLY_DAYS by the fetch (core hands it the cutoff). */
   awaitingReply?: readonly AwaitingReplyItem[] | null;
   today?: { meetings: readonly TodayMeeting[]; holidays: readonly TodayHoliday[] } | null;
+  /** Open commitments already filtered to due-today-or-overdue by the fetch (core hands it the day-end cutoff). */
+  commitmentsDue?: readonly CommitmentDueItem[] | null;
   /** Cut on change 06's urgency scale; defaults to URGENT_MIN_SCORE. */
   urgentMinScore?: number;
 }
@@ -286,6 +321,29 @@ function summarizeAwaitingReply(
     count: lines.length,
     oldestAgeHours: lines.length === 0 ? null : lines[0].ageHours,
     top: lines.slice(0, topN),
+  };
+}
+
+/** Roll due commitments up to a count + overdue count + the soonest-due lines (PURE). Overdue rows
+ *  (due_at < now) sort first, then by soonest deadline; `text` is truncated for a scannable line. */
+function summarizeCommitmentsDue(items: readonly CommitmentDueItem[], now: Date, topN: number): CommitmentsDueSummary {
+  const clip = (s: string): string => {
+    const flat = s.replace(/\s+/g, ' ').trim();
+    return flat.length > 80 ? `${flat.slice(0, 79).trimEnd()}…` : flat;
+  };
+  const lines = [...items]
+    .map((c) => ({
+      customerId: c.customerId,
+      customerName: c.customerName,
+      text: clip(c.text),
+      overdue: c.dueAt.getTime() < now.getTime(),
+      dueMs: c.dueAt.getTime(),
+    }))
+    .sort((a, b) => a.dueMs - b.dueMs);
+  return {
+    count: lines.length,
+    overdue: lines.filter((l) => l.overdue).length,
+    top: lines.slice(0, topN).map(({ customerId, customerName, text, overdue }) => ({ customerId, customerName, text, overdue })),
   };
 }
 
@@ -371,6 +429,10 @@ export function composeBriefing(
       opts.today === null
         ? null
         : { meetings: [...opts.today.meetings], holidays: [...opts.today.holidays] };
+  }
+  if (opts.commitmentsDue !== undefined) {
+    data.commitmentsDue =
+      opts.commitmentsDue === null ? null : summarizeCommitmentsDue(opts.commitmentsDue, now, topN);
   }
   return data;
 }
@@ -525,7 +587,23 @@ function sectionLines(data: BriefingData, tz: string): string[] {
         for (const h of holidays) {
           parts.push(`  🎉 ${h.name ?? 'Holiday'}${h.faith === 'global' ? '' : ` (${h.faith})`}`);
         }
-        for (const m of meetings) parts.push(`  ${meetingTime(m, tz)} — ${m.title}`);
+        // A meeting matched to a known customer (WP7(a)) is flagged "📋 Prep" — a founder-facing hint
+        // that a prep pack is (or will be) posted in that customer's topic. `hasPrep` is absent when
+        // meeting-prep is off, so the line renders exactly as before.
+        for (const m of meetings) parts.push(`  ${meetingTime(m, tz)} — ${m.title}${m.hasPrep ? ' · 📋 Prep' : ''}`);
+      }
+    }
+  }
+
+  if (data.commitmentsDue !== undefined) {
+    const label = '⏰ Commitments due';
+    if (data.commitmentsDue === null) parts.push(`${label} — unavailable`);
+    else if (data.commitmentsDue.count === 0) parts.push(`${label}: none`);
+    else {
+      const od = data.commitmentsDue.overdue;
+      parts.push(`${label}: ${data.commitmentsDue.count}${od > 0 ? ` (${od} overdue)` : ''}`);
+      for (const c of data.commitmentsDue.top) {
+        parts.push(`  ${who(c.customerName, c.customerId)} · ${c.overdue ? '⚠️ overdue' : 'today'} — ${c.text}`);
       }
     }
   }
@@ -537,7 +615,8 @@ function hasActionableSections(data: BriefingData): boolean {
   return (
     (data.overnight?.count ?? 0) > 0 ||
     (data.urgent?.count ?? 0) > 0 ||
-    (data.awaitingReply?.count ?? 0) > 0
+    (data.awaitingReply?.count ?? 0) > 0 ||
+    (data.commitmentsDue?.count ?? 0) > 0
   );
 }
 
@@ -633,6 +712,9 @@ export interface DailyBriefingDeps {
   fetchTodayMeetings?: (day: string) => Promise<TodayMeeting[]>;
   /** Today's holidays (agent_holidays) for the founder-local `day`. */
   fetchTodayHolidays?: (day: string) => Promise<TodayHoliday[]>;
+  /** Open commitments due at or before `cutoff` (core passes the founder-local end of today, so the
+   *  section means "due today or overdue"). Omitted when COMMITMENT_TRACKING is off → section absent. */
+  fetchCommitmentsDue?: (cutoff: Date) => Promise<CommitmentDueItem[]>;
   /** Cut on change 06's urgency scale (DAILY_BRIEFING_URGENT_MIN_SCORE). */
   urgentMinScore?: number;
 
@@ -655,6 +737,14 @@ export function dayInTz(d: Date, tz: string): string {
     month: '2-digit',
     day: '2-digit',
   }).format(d);
+}
+
+/** The END of `now`'s founder-local calendar day, as a UTC instant — the "due today or overdue"
+ *  cutoff for the commitments section (a commitment due any time today counts). Luxon keeps the tz
+ *  math in one call; an invalid zone degrades to the machine-local end of day rather than throwing. */
+export function endOfDayInTz(now: Date, tz: string): Date {
+  const d = DateTime.fromJSDate(now, { zone: tz });
+  return (d.isValid ? d : DateTime.fromJSDate(now)).endOf('day').toJSDate();
 }
 
 /** The hour (0–23) of a Date in an IANA timezone. `hourCycle:'h23'` pins midnight to 0; the
@@ -774,8 +864,10 @@ export async function runDailyBriefing(deps: DailyBriefingDeps): Promise<{ poste
 
   const overnightSince = new Date(now.getTime() - OVERNIGHT_WINDOW_HOURS * HOUR_MS);
   const awaitingCutoff = new Date(now.getTime() - AWAITING_REPLY_DAYS * 24 * HOUR_MS);
+  // "Due today or overdue" = due_at at or before the END of the founder-local day.
+  const dueCutoff = endOfDayInTz(now, deps.tz);
 
-  const [drafts, proposals, overnight, urgent, awaitingReply, meetings, holidays] = await Promise.all([
+  const [drafts, proposals, overnight, urgent, awaitingReply, meetings, holidays, commitmentsDue] = await Promise.all([
     deps.fetchPendingDrafts(),
     deps.fetchPendingProposals(),
     safeSection(deps.fetchOvernightUnprocessed && (() => deps.fetchOvernightUnprocessed!(overnightSince)), 'overnight', deps.log),
@@ -783,6 +875,7 @@ export async function runDailyBriefing(deps: DailyBriefingDeps): Promise<{ poste
     safeSection(deps.fetchAwaitingReply && (() => deps.fetchAwaitingReply!(awaitingCutoff)), 'awaiting_reply', deps.log),
     safeSection(deps.fetchTodayMeetings && (() => deps.fetchTodayMeetings!(today)), 'meetings', deps.log),
     safeSection(deps.fetchTodayHolidays && (() => deps.fetchTodayHolidays!(today)), 'holidays', deps.log),
+    safeSection(deps.fetchCommitmentsDue && (() => deps.fetchCommitmentsDue!(dueCutoff)), 'commitments_due', deps.log),
   ]);
 
   // Meetings + holidays render as ONE "Today" section but come from two independent sources
@@ -802,6 +895,7 @@ export async function runDailyBriefing(deps: DailyBriefingDeps): Promise<{ poste
     ...(urgent !== undefined && { urgent }),
     ...(awaitingReply !== undefined && { awaitingReply }),
     ...(today_ !== undefined && { today: today_ }),
+    ...(commitmentsDue !== undefined && { commitmentsDue }),
   });
 
   // WP1: judgment ATOP the composed digest. Best-effort — its failure yields an "unavailable"
@@ -824,6 +918,7 @@ export async function runDailyBriefing(deps: DailyBriefingDeps): Promise<{ poste
       awaitingReply: data.awaitingReply === null ? 'unavailable' : (data.awaitingReply?.count ?? null),
       meetings: data.today === null ? 'unavailable' : (data.today?.meetings.length ?? null),
       holidays: data.today === null ? 'unavailable' : (data.today?.holidays.length ?? null),
+      commitmentsDue: data.commitmentsDue === null ? 'unavailable' : (data.commitmentsDue?.count ?? null),
       // Count only — never a focus title or its justification.
       focus: synthesis === undefined ? null : synthesis === null ? 'unavailable' : synthesis.focus.length,
     },

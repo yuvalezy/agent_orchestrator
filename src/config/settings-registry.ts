@@ -395,6 +395,27 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     applyMode: 'restart',
     default: false,
   },
+  {
+    key: 'MEETING_PREP_ENABLED',
+    type: 'boolean',
+    category: PROACTIVE,
+    label: 'Meeting prep packs',
+    description:
+      'Registers the worker that reads upcoming calendar events, matches each to a known customer by attendee email, and posts a prep pack (open tasks, awaiting/pending counts, recent snippets, open commitments, plus a best-effort ≤3 talking points) to that customer’s founder topic before the meeting. Needs Calendar read on and an LLM provider key.',
+    applyMode: 'restart',
+    default: false,
+    dependsOn: 'CALENDAR_ENABLED',
+  },
+  {
+    key: 'COMMITMENT_TRACKING_ENABLED',
+    type: 'boolean',
+    category: PROACTIVE,
+    label: 'Commitment tracking',
+    description:
+      'Registers the worker that scans your own outbound messages for explicit promises you made ("I’ll send it Friday"), resolves the deadline in your timezone, and records them — surfaced via /commitments (✔ done / ✖ dismiss) and the daily briefing’s due section. First tick only watermarks — no historical backfill. Needs an LLM provider key.',
+    applyMode: 'restart',
+    default: false,
+  },
 
   // ── Pass-2 tuning knobs (the values the founder actually tuned) ───────────────
   // ── LLM Routing ──────────────────────────────────────────────────────────────

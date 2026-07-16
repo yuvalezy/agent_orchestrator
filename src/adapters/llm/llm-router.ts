@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, CommitmentExtractionResult, CommitmentExtractorPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, MeetingPrepRequest, MeetingPrepResult, MeetingPrepSynthesizerPort, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
@@ -13,6 +13,8 @@ import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
 import { VERIFY_SCHEMA, VERIFY_SYSTEM, parseVerdict, verifyUserMessage } from './verify-prompt';
 import { BRIEF_SCHEMA, BRIEF_SYSTEM, briefUserMessage, parseBrief } from './brief-prompt';
+import { MEETING_PREP_SCHEMA, MEETING_PREP_SYSTEM, meetingPrepUserMessage, parseMeetingPrep } from './meeting-prep-prompt';
+import { COMMITMENT_SCHEMA, COMMITMENT_SYSTEM, commitmentUserMessage, parseCommitmentExtraction } from './commitment-extract-prompt';
 import { COMPOSE_SCHEMA, COMPOSE_SYSTEM, SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, composeUserMessage, parseComposedBody, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
@@ -42,7 +44,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, MeetingPrepSynthesizerPort, CommitmentExtractorPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -264,6 +266,45 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       messages: [{ role: 'user', content: briefUserMessage(input) }],
       maxTokens: 1000,
       validate: parseBrief,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Synthesize meeting talking points (WP7(a), role 'answer'). Reuses the golden structured-call path
+   * — cost accounting, ordered failover, daily cap — with the strict MEETING_PREP_SCHEMA. The model
+   * grounds ONLY in the assembled facts and returns ≤3 short bullets; the clamp lives in parseMeetingPrep.
+   * customerId null: a prep pack is a founder-facing internal note, not billed to any one customer's
+   * reply flow. Best-effort at the call site (a throw posts the deterministic pack without bullets).
+   * NEVER logs the facts or the talking points.
+   */
+  async synthesizeMeetingPrep(input: MeetingPrepRequest): Promise<MeetingPrepResult> {
+    return this.callStructured<MeetingPrepResult>({
+      role: 'answer',
+      schema: MEETING_PREP_SCHEMA,
+      system: MEETING_PREP_SYSTEM,
+      messages: [{ role: 'user', content: meetingPrepUserMessage(input) }],
+      maxTokens: 1000,
+      validate: parseMeetingPrep,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Extract the founder's own promises from an outbound message batch (WP7(b), role 'classify').
+   * Reuses the golden structured-call path with COMMITMENT_SCHEMA. Returns ONLY explicit promises BY
+   * THE SENDER (empty for most messages); customer asks / pleasantries / hypotheticals are dropped in
+   * the prompt. customerId null: extraction is a founder-facing bookkeeping pass. Best-effort at the
+   * call site (a throw skips the batch, re-read next tick). Never logs the message body.
+   */
+  async extractCommitments(input: { customerName: string; messages: string[] }): Promise<CommitmentExtractionResult> {
+    return this.callStructured<CommitmentExtractionResult>({
+      role: 'classify',
+      schema: COMMITMENT_SCHEMA,
+      system: COMMITMENT_SYSTEM,
+      messages: [{ role: 'user', content: commitmentUserMessage(input) }],
+      maxTokens: 512,
+      validate: parseCommitmentExtraction,
       customerId: null,
     });
   }

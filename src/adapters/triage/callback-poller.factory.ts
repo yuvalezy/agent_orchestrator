@@ -28,6 +28,8 @@ import {
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
 import { buildBackfillApproveHandler } from './backfill-approve.factory';
 import { buildMeetingSchedulerGated } from './meeting-scheduler.factory';
+import { buildCommitmentDecisionHandler } from '../../commitments/commitment-decision-handler';
+import { setCommitmentStatus } from '../../commitments/commitment-repo';
 import { threadMarkers } from './thread-markers.instance';
 import { buildFounderMessageRouter } from '../../triage/founder-message-router';
 import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
@@ -202,6 +204,17 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
   // couple them for nothing.
   const meeting = buildMeetingSchedulerGated(taskTarget, notifier)?.decisions ?? null;
 
+  // WP7(b): ✔ done / ✖ dismiss taps on /commitments cards — only registered when commitment tracking
+  // is on, so a stray tap on an old card no-ops until the feature is enabled. Idempotent against a
+  // re-delivered tap (the repo transition is guarded on status='open').
+  const commitments = env.COMMITMENT_TRACKING_ENABLED
+    ? buildCommitmentDecisionHandler({
+        setStatus: setCommitmentStatus,
+        postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+        log: logger,
+      })
+    : null;
+
   // THE decision router. Named (not inlined into onDecision) because a second caller
   // needs it: the askFounder free-text resolver turns a TYPED answer into a DecisionEvent
   // and routes it here, so typing an option and tapping it land in the same handler.
@@ -224,6 +237,7 @@ export function buildCallbackPollerWorker(notifier: TelegramNotifier): WorkerDef
     if (revise && isCorrectionFlipOption(d.optionId)) return revise.flip(d);
     if (backfill && backfill.isBackfillOption(d.optionId)) return backfill.handle(d);
     if (meeting && meeting.isMeetingOption(d.optionId)) return meeting.handle(d);
+    if (commitments && commitments.isCommitmentOption(d.optionId)) return commitments.handle(d);
   };
 
   notifier.onDecision(routeDecision);

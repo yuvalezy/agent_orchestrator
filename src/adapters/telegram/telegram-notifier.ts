@@ -144,6 +144,19 @@ export class TelegramNotifier implements FounderNotifierPort {
     });
   }
 
+  /** Post a reply WITH inline buttons back to a specific forum topic (WP7(b) `/commitments` cards:
+   *  one ✔ done / ✖ dismiss card per open commitment, posted to the requesting thread). Like
+   *  replyInThread, a Telegram-adapter convenience the slash-command composition wires — taps arrive
+   *  via onDecision, keyed by callback_data (≤ 64 bytes). */
+  async replyInThreadWithButtons(threadId: string, text: string, buttons: Array<{ id: string; label: string }>): Promise<void> {
+    await this.client.sendMessage({
+      chatId: this.opts.supergroupChatId,
+      messageThreadId: threadId,
+      text,
+      inlineKeyboard: [buttons.map((b) => ({ text: b.label, callback_data: b.id }))],
+    });
+  }
+
   async askFounder(
     customerId: string,
     question: Notification,

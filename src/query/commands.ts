@@ -8,6 +8,8 @@ import {
   type BriefingData,
   type PendingItem,
 } from './daily-briefing';
+import { COMMITMENT_DONE_OPTION, COMMITMENT_DISMISS_OPTION } from '../commitments/commitment-decision-handler';
+import type { DuePrecision } from '../commitments/due-hint';
 
 // Telegram founder slash-command surface (M5(c) — CORE, injected ports only; the concrete
 // queue reads + notifier are wired at the composition root, so this never imports src/adapters
@@ -66,6 +68,19 @@ export interface HistoryHit {
 export interface HistoryLegResult {
   hits: HistoryHit[];
   capped?: boolean;
+}
+
+/** One open commitment for the `/commitments` surface — enough to render a card + wire its buttons.
+ *  This is the founder's OWN promise-tracker (their words back to them), not customer message content
+ *  the way a draft body is, but it is still founder-topic-only and never logged. */
+export interface CommitmentLine {
+  id: string;
+  /** Present on the unscoped (all-customers) listing; null when the list is already one customer. */
+  customerName: string | null;
+  text: string;
+  dueAt: Date | null;
+  duePrecision: DuePrecision | null;
+  createdAt: Date;
 }
 
 /** `/draft email` request — what to say, to which resolved customer. */
@@ -142,6 +157,12 @@ export interface SlashCommandDeps {
    *  own report): a sweep takes minutes, and the Telegram poll loop awaits this handler, so
    *  blocking on it would stall the whole founder surface. */
   startBackfill?: (customerId: string, threadId: string) => Promise<BackfillStart>;
+  /** `/commitments` — open commitments for a customer (customerId given) or ALL customers (null).
+   *  undefined = commitment tracking is off → the command reports it is unavailable. */
+  listOpenCommitments?: (customerId: string | null) => Promise<CommitmentLine[]>;
+  /** Post ONE commitment card (text + ✔ done / ✖ dismiss buttons) to the requesting thread. Wired
+   *  alongside listOpenCommitments; a card needs buttons, which postAnswer cannot carry. */
+  postCommitmentCard?: (threadId: string, text: string, buttons: Array<{ id: string; label: string }>) => Promise<void>;
 }
 
 /** A parsed leading slash command: the lowercased name (no `/`, no `@botname`) + the rest. */
@@ -509,6 +530,82 @@ async function runBackfillCommand(ctx: CommandContext): Promise<void> {
   await deps.postAnswer(ctx.threadId, text);
 }
 
+// ── /commitments ──────────────────────────────────────────────────────────────────────────────────
+
+/** Max commitment cards posted per `/commitments` — one Telegram message each, so bound the fan-out;
+ *  the header names the true total and the tail says how many were not shown. */
+const MAX_COMMITMENT_CARDS = 20;
+
+/** Compact due suffix for a commitment card: overdue is flagged, an upcoming deadline names the day
+ *  (week-precision hints render "~" to signal the softer target); no deadline renders nothing. */
+function dueSuffix(c: CommitmentLine, now: Date, tz: string): string {
+  if (!c.dueAt) return '';
+  const fmt = new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: tz });
+  const when = fmt.format(c.dueAt);
+  if (c.dueAt.getTime() < now.getTime()) return ` · ⚠️ overdue (was ${when})`;
+  const approx = c.duePrecision === 'week' ? '~' : '';
+  return ` · due ${approx}${when}`;
+}
+
+/** One commitment card body: the promise text, its age, and the due suffix; the customer name is
+ *  prefixed only on the all-customers listing (a scoped list already names them in the header). */
+function formatCommitmentCard(c: CommitmentLine, showCustomer: boolean, now: Date, tz: string): string {
+  const ageHours = Math.max(0, Math.floor((now.getTime() - c.createdAt.getTime()) / (60 * 60 * 1000)));
+  const who = showCustomer && c.customerName ? `${c.customerName}: ` : '';
+  return `⏰ ${who}${c.text}\n${humanizeAgeHours(ageHours)} old${dueSuffix(c, now, tz)}`;
+}
+
+async function runCommitments(ctx: CommandContext): Promise<void> {
+  const { deps } = ctx;
+  if (!deps.listOpenCommitments || !deps.postCommitmentCard) {
+    deps.log.info({ command: 'commitments', available: false }, 'slash: commitments unavailable');
+    await deps.postAnswer(ctx.threadId, '⚠️ /commitments is unavailable — commitment tracking is off (COMMITMENT_TRACKING_ENABLED=false).');
+    return;
+  }
+  // Scope: an explicit name wins; else the topic binding; else (Admin, no arg) → ALL customers.
+  const arg = ctx.args.trim();
+  let scopeId: string | null;
+  let scopeName: string | null;
+  if (arg) {
+    if (!deps.findCustomerByName) {
+      await deps.postAnswer(ctx.threadId, '⚠️ Customer lookup is unavailable.');
+      return;
+    }
+    const byName = await deps.findCustomerByName(arg);
+    if (!byName) {
+      await deps.postAnswer(ctx.threadId, "⚠️ I don't know a customer by that name.");
+      return;
+    }
+    scopeId = byName.customerId;
+    scopeName = byName.customerName;
+  } else {
+    const byTopic = deps.resolveThreadCustomer ? await deps.resolveThreadCustomer(ctx.threadId) : null;
+    scopeId = byTopic?.customerId ?? null;
+    scopeName = byTopic?.customerName ?? null;
+  }
+
+  const items = await deps.listOpenCommitments(scopeId);
+  deps.log.info({ command: 'commitments', scoped: scopeId !== null, count: items.length }, 'slash: commitments');
+
+  const header = scopeName ? `⏰ Open commitments — ${scopeName} (${items.length})` : `⏰ Open commitments — all customers (${items.length})`;
+  if (items.length === 0) {
+    await deps.postAnswer(ctx.threadId, `${header}\nNothing open. 🎉`);
+    return;
+  }
+  await deps.postAnswer(ctx.threadId, header);
+  const now = deps.now();
+  const shown = items.slice(0, MAX_COMMITMENT_CARDS);
+  for (const c of shown) {
+    await deps.postCommitmentCard(ctx.threadId, formatCommitmentCard(c, scopeId === null, now, deps.tz), [
+      { id: `${COMMITMENT_DONE_OPTION}:${c.id}`, label: '✔ done' },
+      { id: `${COMMITMENT_DISMISS_OPTION}:${c.id}`, label: '✖ dismiss' },
+    ]);
+  }
+  if (items.length > shown.length) {
+    await deps.postAnswer(ctx.threadId, `…and ${items.length - shown.length} more not shown.`);
+  }
+}
+
 // ── Registry ────────────────────────────────────────────────────────────────────────────────────
 
 /** `/help` renders the command registry (this router's commands). `/ask` is a separate handler
@@ -552,6 +649,12 @@ const COMMANDS: readonly CommandSpec[] = [
     usage: '[customer]',
     summary: 'Re-run the history sweep that seeds memory + task proposals.',
     run: runBackfillCommand,
+  },
+  {
+    name: 'commitments',
+    usage: '[customer]',
+    summary: 'Open promises you made — ✔ done / ✖ dismiss per item.',
+    run: runCommitments,
   },
   { name: 'help', summary: 'List the available commands.', run: runHelp },
 ];

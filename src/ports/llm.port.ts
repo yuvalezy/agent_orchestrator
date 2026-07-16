@@ -604,6 +604,89 @@ export interface CustomerBriefSynthesizerPort {
   synthesizeCustomerBrief(input: CustomerBriefRequest): Promise<CustomerBriefResult>;
 }
 
+/** One open task on the prep pack: a short title + how many whole days old (mirrors CustomerBriefTask). */
+export interface MeetingPrepTask {
+  title: string;
+  ageDays: number;
+}
+
+/** One recent conversation snippet on the prep pack: who spoke + a SHORT truncated line. This is the
+ *  founder's private topic (same PII surface as an existing draft card), so a truncated body is
+ *  allowed here — but it is NEVER logged. */
+export interface MeetingPrepSnippet {
+  direction: 'inbound' | 'outbound';
+  /** Already truncated at the call site (≤120 chars). */
+  text: string;
+}
+
+/**
+ * The structured FACTS for ONE upcoming meeting, handed to the talking-points synthesis (WP7(a), LLM
+ * role 'answer'). Assembled from EXISTING local reads — the matched customer, the event title/time,
+ * open task titles + ages, awaiting-reply / pending-draft counts, a handful of recent conversation
+ * snippets, and any open commitments. The synthesis grounds ONLY in these facts and never invents.
+ * NEVER logged.
+ */
+export interface MeetingPrepRequest {
+  /** Display name (or id fallback) — the customer the founder is about to meet. */
+  customerName: string;
+  /** The meeting title (the founder's own calendar entry — not customer message content). */
+  meetingTitle: string;
+  /** Founder-local clock time of the meeting ('09:30' / 'all day'). */
+  meetingTime: string;
+  openTasks: MeetingPrepTask[];
+  awaitingReplyCount: number;
+  pendingDraftCount: number;
+  recentSnippets: MeetingPrepSnippet[];
+  /** Open commitments the founder has made to this customer (short text + a due label). */
+  openCommitments: string[];
+}
+
+/** The talking-points synthesis result: at most 3 short bullets the founder can glance at before the
+ *  meeting. Grounded ONLY in the facts — never a fabricated agenda item. */
+export interface MeetingPrepResult {
+  /** At most 3 (enforced in the zod validator; the caller clamps defensively too). */
+  talkingPoints: string[];
+}
+
+/**
+ * Meeting-prep talking-points synthesis (WP7(a), LLM role 'answer'). SEPARATE from AgentLlmPort
+ * (interface segregation, like the other synthesizer ports): the prep worker depends only on this,
+ * and existing fakes are untouched. Implemented by the LlmRouter. Grounds ONLY in the given facts;
+ * a failure is best-effort at the call site — the deterministic prep pack still posts without the
+ * bullets. NEVER logs the facts or the talking points.
+ */
+export interface MeetingPrepSynthesizerPort {
+  synthesizeMeetingPrep(input: MeetingPrepRequest): Promise<MeetingPrepResult>;
+}
+
+/** One promise the founder made, extracted from an outbound message (WP7(b), LLM role 'classify').
+ *  `dueHint` is the founder's OWN phrasing of the deadline ("by Friday", "next week") or null — the
+ *  hint is resolved to a concrete due_at IN CODE (never by the model). */
+export interface ExtractedCommitment {
+  /** The promise, in the founder's own phrasing (what was promised). */
+  text: string;
+  /** The founder's deadline phrasing verbatim, or null when none was stated. */
+  dueHint: string | null;
+}
+
+/** Structured commitment-extraction result. `commitments` is EMPTY for most messages (the strict
+ *  default) — a message becomes a commitment only when it carries an explicit promise BY THE SENDER. */
+export interface CommitmentExtractionResult {
+  commitments: ExtractedCommitment[];
+}
+
+/**
+ * Commitment extraction (WP7(b), LLM role 'classify'). SEPARATE from AgentLlmPort (interface
+ * segregation): the extraction worker depends only on this, and existing fakes are untouched.
+ * Implemented by the LlmRouter. Reads ONE outbound message batch and returns ONLY the explicit
+ * promises the founder made to deliver/do/send something — customer asks, pleasantries, and
+ * hypotheticals yield an empty array. Best-effort at the call site (a throw skips the batch, to be
+ * re-read next tick). NEVER logs the message body.
+ */
+export interface CommitmentExtractorPort {
+  extractCommitments(input: { customerName: string; messages: string[] }): Promise<CommitmentExtractionResult>;
+}
+
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */
 export interface LlmProviderClient {
   readonly provider: string; // 'anthropic' | 'openai' | 'deepseek' | future

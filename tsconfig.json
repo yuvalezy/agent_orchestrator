@@ -24,6 +24,7 @@
     "dist",
     "src/inbox/__illegal_import_fixture__.ts",
     "src/knowledge/__illegal_import_fixture__.ts",
-    "src/query/__illegal_import_fixture__.ts"
+    "src/query/__illegal_import_fixture__.ts",
+    "src/commitments/__illegal_import_fixture__.ts"
   ]
 }

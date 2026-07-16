@@ -3,14 +3,16 @@ import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import type { CalendarPort } from '../../ports/calendar.port';
 import type { BriefingSynthesizerPort } from '../../ports/llm.port';
 import type { SyncLogger } from '../../knowledge/sync';
-import { runDailyBriefing, type PendingItem } from '../../query/daily-briefing';
+import { runDailyBriefing, type CommitmentDueItem, type PendingItem } from '../../query/daily-briefing';
 import { listPendingDrafts, listPendingBackfillProposals } from '../console/console-approvals-repo';
 import {
   buildFetchTodayMeetings,
   fetchAwaitingReply,
+  fetchCommitmentsDue,
   fetchOvernightUnprocessed,
   fetchTodayHolidays,
   fetchUrgentItems,
+  listCustomerEmails,
 } from './briefing-repo';
 
 // Daily-briefing WORKER builder (ADAPTER). Wraps runDailyBriefing in a WorkerDefinition with
@@ -43,6 +45,12 @@ export interface DailyBriefingWorkerDeps {
   /** WP1 chief-of-staff synthesizer. OMITTED when BRIEFING_SYNTHESIS_ENABLED=false — the digest
    *  then renders without the "🧭 Focus" section (exactly like an unwired task-3.1 section). */
   synthesizer?: BriefingSynthesizerPort;
+  /** WP7(b): due-commitments read. OMITTED when COMMITMENT_TRACKING_ENABLED=false — the "⏰
+   *  Commitments due" section is then left out entirely. */
+  commitmentTrackingEnabled?: boolean;
+  /** WP7(a): when true (MEETING_PREP_ENABLED + a calendar), today's meetings are matched to known
+   *  customer emails so a matched one flags "📋 Prep". OMITTED → no meeting is flagged (unchanged). */
+  meetingPrepEnabled?: boolean;
   /** Clock seam — defaults to the wall clock. */
   now?: () => Date;
 }
@@ -70,7 +78,11 @@ export async function fetchPendingProposals(): Promise<PendingItem[]> {
 export function buildDailyBriefingWorker(deps: DailyBriefingWorkerDeps): WorkerDefinition {
   const now = deps.now ?? (() => new Date());
   const fetchTodayMeetings = deps.calendar
-    ? buildFetchTodayMeetings(deps.calendar, deps.tz)
+    ? buildFetchTodayMeetings(deps.calendar, deps.tz, deps.meetingPrepEnabled ? listCustomerEmails : undefined)
+    : undefined;
+  // WP7(b): only wire the due-commitments read when tracking is on, so the section is otherwise absent.
+  const commitmentsDue: ((cutoff: Date) => Promise<CommitmentDueItem[]>) | undefined = deps.commitmentTrackingEnabled
+    ? fetchCommitmentsDue
     : undefined;
   return {
     name: 'briefing:daily',
@@ -87,6 +99,7 @@ export function buildDailyBriefingWorker(deps: DailyBriefingWorkerDeps): WorkerD
         fetchAwaitingReply,
         fetchTodayHolidays,
         fetchTodayMeetings,
+        fetchCommitmentsDue: commitmentsDue,
         notifier: deps.notifier,
         readLastRun: deps.readLastRun,
         writeLastRun: deps.writeLastRun,

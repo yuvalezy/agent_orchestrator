@@ -12,6 +12,7 @@ import {
   MAX_FOCUS,
   OVERNIGHT_WINDOW_HOURS,
   type AwaitingReplyItem,
+  type CommitmentDueItem,
   type DailyBriefingDeps,
   type PendingItem,
   type TodayHoliday,
@@ -678,4 +679,47 @@ test('runDailyBriefing: no synthesizer wired → the Focus section is absent and
   assert.equal(deps.synthesizer, undefined);
   assert.equal((await runDailyBriefing(deps)).posted, true);
   assert.doesNotMatch(notifier.posts[0].body, /🧭 Focus/);
+});
+
+// ── WP7: "⏰ Commitments due" section + the "📋 Prep" meeting flag ─────────────────────────────
+
+const dueCommit = (id: string, name: string, offsetMs: number): CommitmentDueItem => ({
+  customerId: id,
+  customerName: name,
+  text: `promise ${id}`,
+  dueAt: new Date(NOW.getTime() + offsetMs),
+});
+
+test('composeBriefing: commitmentsDue omitted when unsupplied; null stays null (tri-state)', () => {
+  assert.equal(composeBriefing([], [], NOW).commitmentsDue, undefined);
+  assert.equal(composeBriefing([], [], NOW, { commitmentsDue: null }).commitmentsDue, null);
+});
+
+test('composeBriefing/renderBriefing: due commitments count + overdue subset, soonest first', () => {
+  const d = composeBriefing([], [], NOW, {
+    commitmentsDue: [dueCommit('c1', 'Acme', -3_600_000), dueCommit('c2', 'Beta', +3_600_000)],
+  });
+  assert.equal(d.commitmentsDue?.count, 2);
+  assert.equal(d.commitmentsDue?.overdue, 1);
+  assert.equal(d.commitmentsDue?.top[0].overdue, true, 'overdue (soonest due) sorts first');
+  const n = renderBriefing(d, '2026-07-13');
+  assert.match(n.body, /⏰ Commitments due: 2 \(1 overdue\)/);
+  assert.match(n.body, /Acme · ⚠️ overdue — promise c1/);
+  assert.match(n.body, /Beta · today — promise c2/);
+  assert.equal(n.severity, 'action', 'a due commitment is actionable');
+});
+
+test('renderBriefing: commitmentsDue empty → explicit none; null → unavailable', () => {
+  assert.match(renderBriefing(composeBriefing([], [], NOW, { commitmentsDue: [] }), '2026-07-13').body, /⏰ Commitments due: none/);
+  assert.match(renderBriefing(composeBriefing([], [], NOW, { commitmentsDue: null }), '2026-07-13').body, /⏰ Commitments due — unavailable/);
+});
+
+test('renderBriefing: a customer-matched meeting flags "📋 Prep"; an unmatched one renders unchanged', () => {
+  const m: TodayMeeting[] = [
+    { title: 'Kickoff', startsAt: new Date('2026-07-13T13:30:00Z'), allDay: false, hasPrep: true },
+    { title: 'Dentist', startsAt: new Date('2026-07-13T15:00:00Z'), allDay: false },
+  ];
+  const n = renderBriefing(composeBriefing([], [], NOW, { today: { meetings: m, holidays: [] } }), '2026-07-13', { tz: 'UTC' });
+  assert.match(n.body, /13:30 — Kickoff · 📋 Prep/);
+  assert.match(n.body, /15:00 — Dentist$/m, 'an unmatched meeting has no Prep flag');
 });

@@ -69,6 +69,8 @@ import { buildCalendarAdapter } from './adapters/calendar';
 import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
 import { buildStaleTaskWorkerFactory } from './adapters/proactive/stale-task.worker';
 import { buildAwaitingReplyWorkerFactory } from './adapters/proactive/awaiting-reply.worker';
+import { buildMeetingPrepWorkerFactory } from './adapters/proactive/meeting-prep.worker';
+import { buildCommitmentWorkerFactory } from './adapters/proactive/commitment.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
 import { FanoutFounderNotifier, WebPushNotifier } from './adapters/push/web-push-notifier';
@@ -615,6 +617,10 @@ async function main(): Promise<void> {
           synthesizer: env.BRIEFING_SYNTHESIS_ENABLED
             ? buildLlmRouter({ notifyAdmin: (msg) => briefingNotifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }) })
             : undefined,
+          // WP7: the "⏰ Commitments due" section (only when tracking is on) and the "📋 Prep" meeting
+          // flag (only when prep + a calendar are on) — both additive, tri-state, off by default.
+          commitmentTrackingEnabled: env.COMMITMENT_TRACKING_ENABLED,
+          meetingPrepEnabled: env.MEETING_PREP_ENABLED && env.CALENDAR_ENABLED,
           log: logger,
           intervalMs: env.DAILY_BRIEFING_INTERVAL_MS,
         }),
@@ -801,6 +807,44 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('proactive awaiting-reply worker NOT registered (AWAITING_REPLY_NUDGE_ENABLED=false) — nothing drafts reply nudges');
+  }
+
+  // WP7(a): meeting prep packs — registered ONLY when MEETING_PREP_ENABLED, Telegram is configured
+  // (the pack presents in the customer topic), AND CALENDAR_ENABLED (the calendar read). DORMANT by
+  // default. Exactly-once per event via the WP2 chaser ledger (kind 'meeting_prep'); a best-effort
+  // talking-points synthesis needs an LLM provider key (a failure posts the deterministic pack).
+  if (env.MEETING_PREP_ENABLED) {
+    if (!notifier) {
+      logger.warn('⚠️  MEETING_PREP_ENABLED=true but Telegram is unconfigured — prep packs have nowhere to present; NOT registering.');
+    } else if (!env.CALENDAR_ENABLED) {
+      logger.warn('⚠️  MEETING_PREP_ENABLED=true but CALENDAR_ENABLED=false — there is no calendar to read upcoming meetings from; NOT registering.');
+    } else {
+      if (!tryResolveCredential('OPENAI_API_KEY')) {
+        logger.warn('⚠️  MEETING_PREP_ENABLED=true but OPENAI_API_KEY is UNSET — talking-points synthesis will degrade to the deterministic pack until a provider key is set.');
+      }
+      proactiveWorkers.push(buildMeetingPrepWorkerFactory(notifier));
+      logger.info({ leadMinutes: env.PREP_LEAD_MINUTES }, 'meeting-prep worker registered (MEETING_PREP_ENABLED=true)');
+    }
+  } else {
+    logger.info('meeting-prep worker NOT registered (MEETING_PREP_ENABLED=false) — no prep packs');
+  }
+
+  // WP7(b): commitment tracking — registered ONLY when COMMITMENT_TRACKING_ENABLED. DORMANT by
+  // default. Scans NEW outbound rows for the founder's promises (extraction needs an LLM provider
+  // key); the first tick only watermarks (no historical backfill). Telegram is used only for the LLM
+  // router's failover/cost notices, so it is not strictly required — but a boot without it still
+  // works (notices fall to the log). Commitments surface via /commitments + the daily briefing.
+  if (env.COMMITMENT_TRACKING_ENABLED) {
+    const commitmentNotifyAdmin = notifier
+      ? (msg: string) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' })
+      : async (msg: string) => void logger.warn({ msg }, 'commitment LLM gateway notice (Telegram unconfigured)');
+    if (!tryResolveCredential('OPENAI_API_KEY')) {
+      logger.warn('⚠️  COMMITMENT_TRACKING_ENABLED=true but OPENAI_API_KEY is UNSET — commitment extraction will fail until a provider key is set.');
+    }
+    proactiveWorkers.push(buildCommitmentWorkerFactory(commitmentNotifyAdmin));
+    logger.info('commitment-tracking worker registered (COMMITMENT_TRACKING_ENABLED=true)');
+  } else {
+    logger.info('commitment-tracking worker NOT registered (COMMITMENT_TRACKING_ENABLED=false) — nothing extracts commitments');
   }
 
   const app = buildApp(appDeps);

@@ -7,8 +7,10 @@ import { query as pooledQuery } from '../db';
 // task-transition-ledger.ts (mig 033), generalized to (kind, ref) over one table (mig 037).
 // Never logs bodies.
 
-/** The two chaser kinds — the ledger's partitioning column (also the value the worker seeds/claims). */
-export type ChaserKind = 'stale_task' | 'awaiting_reply';
+/** The chaser kinds — the ledger's partitioning column (also the value the worker seeds/claims). The
+ *  ledger table (mig 037) puts no CHECK on `kind`, so a new kind adds no migration: 'meeting_prep'
+ *  (WP7(a)) reuses the exactly-once claim to post ONE prep pack per calendar event_id. */
+export type ChaserKind = 'stale_task' | 'awaiting_reply' | 'meeting_prep';
 
 /** Minimal query seam so the ledger is unit-testable against a fake db. Structurally
  *  compatible with the real `query` from ../db (its QueryResult carries `rowCount`). */

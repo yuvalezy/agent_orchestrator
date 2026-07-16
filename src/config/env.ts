@@ -750,6 +750,44 @@ const envSchema = z.object({
   CONTRADICTION_REPORT_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.15),
   // Cap on flagged pairs per report.
   CONTRADICTION_REPORT_MAX_PAIRS: z.coerce.number().int().positive().default(5),
+
+  // ── WP7(a): meeting prep packs. A short-interval worker reads the founder's upcoming calendar
+  // events, keeps those starting within PREP_LEAD_MINUTES that MATCH a known customer (attendee email
+  // → customer, the reverse of meeting-context), and posts ONE informational prep pack per event to
+  // that customer's founder-facing Telegram topic (open tasks, awaiting/pending counts, recent
+  // snippets, open commitments, plus a best-effort ≤3 talking-points synthesis). Exactly-once per
+  // event_id via the WP2 chaser ledger (kind 'meeting_prep'). Kill-switch (mirrors OUTBOUND_ENABLED
+  // strict-bool): the worker is registered ONLY when the literal "true"; unset/"false"/else → false.
+  // DORMANT by default. Requires Telegram (the pack presents in the customer topic) AND CALENDAR_ENABLED
+  // (the calendar read) — skipped otherwise. The talking-points synthesis needs an LLM provider key;
+  // a synthesis failure posts the deterministic pack without bullets.
+  MEETING_PREP_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // A matched event starting within this many minutes from now is prepped. 60 = an hour's warning.
+  PREP_LEAD_MINUTES: z.coerce.number().int().positive().default(60),
+  // Poll interval for the prep worker (each tick reads the near-term agenda). 5m keeps a pack timely
+  // relative to the lead window without a tight calendar-poll cadence.
+  MEETING_PREP_INTERVAL_MS: z.coerce.number().int().positive().default(300_000), // 5m
+
+  // ── WP7(b): commitment tracking. A ~10m worker scans NEW outbound rows in agent_inbox (the
+  // founder's own sends, surfaced by the reconcilers) past an app_state watermark, runs one classify
+  // call per customer batch to extract the founder's explicit PROMISES, resolves each due-hint to a
+  // due_at IN CODE (founder tz), and records them (deduped among open). The founder resolves each from
+  // /commitments (✔ done / ✖ dismiss) and the daily briefing surfaces the ones due today/overdue.
+  // Kill-switch (mirrors OUTBOUND_ENABLED strict-bool): registered ONLY when the literal "true";
+  // unset/"false"/else → false. DORMANT by default. FIRST-RUN SEED: the first tick pins the watermark
+  // to now (the current max outbound id) and extracts NOTHING historical. Extraction needs an LLM
+  // provider key; the Admin topic (Telegram) receives only the router's failover/cost notices.
+  COMMITMENT_TRACKING_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Scan interval for the extraction worker.
+  COMMITMENT_TRACKING_INTERVAL_MS: z.coerce.number().int().positive().default(600_000), // 10m
+  // Max outbound rows scanned per tick (blast-radius / prompt-size guard).
+  COMMITMENT_TRACKING_BATCH: z.coerce.number().int().positive().default(50),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -7,10 +7,12 @@ import type { TelegramNotifier } from '../telegram/telegram-notifier';
 import {
   buildSlashCommandRouter,
   type BackfillStart,
+  type CommitmentLine,
   type HistoryLegResult,
   type OpenTaskLine,
   type ResolvedCustomerRef,
 } from '../../query/commands';
+import { listAllOpenCommitments, listOpenCommitmentsForCustomer } from '../../commitments/commitment-repo';
 import { fetchPendingDrafts, fetchPendingProposals } from './daily-briefing.worker';
 import { loadCustomerConfig } from '../../triage/context-loader';
 import { buildEzyPortalGateway } from '../ezy-portal';
@@ -118,7 +120,7 @@ async function searchInboxHistory(keyword: string, customerId: string | null): P
 }
 
 export function buildSlashCommandsHandler(
-  notifier: Pick<TelegramNotifier, 'replyInThread' | 'notifyCustomerEvent' | 'notifyAdmin'>,
+  notifier: Pick<TelegramNotifier, 'replyInThread' | 'replyInThreadWithButtons' | 'notifyCustomerEvent' | 'notifyAdmin'>,
 ): ((m: MessageEvent) => Promise<boolean>) | null {
   if (!env.SLASH_COMMANDS_ENABLED) {
     logger.info('slash commands NOT wired (SLASH_COMMANDS_ENABLED=false)');
@@ -302,6 +304,31 @@ export function buildSlashCommandsHandler(
     : undefined;
   if (!backfillEnabled) logger.info('slash /backfill NOT wired (BACKFILL_ENABLED=false)');
 
+  // `/commitments` — open promises the founder made, with ✔ done / ✖ dismiss per item. Gated by
+  // COMMITMENT_TRACKING_ENABLED (the extraction worker fills the ledger); off → the command reports
+  // it is unavailable. A scoped customerId lists that customer; null (Admin, no arg) lists all.
+  const commitmentsEnabled = env.COMMITMENT_TRACKING_ENABLED;
+  const listOpenCommitments = commitmentsEnabled
+    ? async (customerId: string | null): Promise<CommitmentLine[]> => {
+        const rows = customerId
+          ? (await listOpenCommitmentsForCustomer(customerId)).map((c) => ({ ...c, customerName: null }))
+          : await listAllOpenCommitments();
+        return rows.map((c) => ({
+          id: c.id,
+          customerName: 'customerName' in c ? c.customerName : null,
+          text: c.text,
+          dueAt: c.dueAt,
+          duePrecision: c.duePrecision,
+          createdAt: c.createdAt,
+        }));
+      }
+    : undefined;
+  const postCommitmentCard = commitmentsEnabled
+    ? (threadId: string, text: string, buttons: Array<{ id: string; label: string }>) =>
+        notifier.replyInThreadWithButtons(threadId, text, buttons)
+    : undefined;
+  if (!commitmentsEnabled) logger.info('slash /commitments NOT wired (COMMITMENT_TRACKING_ENABLED=false)');
+
   logger.info('slash commands wired (SLASH_COMMANDS_ENABLED=true)');
   return buildSlashCommandRouter({
     fetchPendingDrafts,
@@ -319,5 +346,7 @@ export function buildSlashCommandsHandler(
     searchWhatsAppHistory,
     draftEmail,
     startBackfill,
+    listOpenCommitments,
+    postCommitmentCard,
   });
 }
