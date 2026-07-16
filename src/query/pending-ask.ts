@@ -104,9 +104,31 @@ export function matchOption(
   return best;
 }
 
+/**
+ * What an `onUnmatched` hook did with an answer that matched no option.
+ *  • 'resolved' — it acted, and the question is finished → disarm.
+ *  • 'consumed' — it recognized the question and already replied, but the question still stands
+ *    (an unbookable time, an unreadable one) → stay armed so the buttons keep working.
+ *  • 'declined' — not its question → the standard "I can only take …" re-ask.
+ */
+export type UnmatchedOutcome = 'resolved' | 'consumed' | 'declined';
+
 export interface PendingAskHandlerDeps {
   /** Read this thread's armed askFounder marker (raw serialized record). */
   readPending: (threadId: string) => Promise<string | null>;
+  /**
+   * Last chance to interpret an answer that matched no LABEL, before the re-ask.
+   *
+   * matchOption is deliberately literal — it only recognizes the words we ourselves offered. That
+   * is right for a closed choice ("Add contact"/"Ignore"), but some questions have an open answer:
+   * "Pick a time" offers four slots and the founder may reasonably mean a fifth. Without this,
+   * every such answer is met with "I can only take …", which is the tool telling its owner their
+   * plain instruction is unreadable.
+   *
+   * A hook decides for ITSELF whether a question is its own (via the option ids, which it minted),
+   * so this stays a generic extension point and this module keeps knowing nothing about meetings.
+   */
+  onUnmatched?: (input: { threadId: string; text: string; by: string; pending: PendingAsk }) => Promise<UnmatchedOutcome>;
   /** Disarm the marker — called ONLY once an answer actually resolved the question. */
   clearPending: (threadId: string) => Promise<void>;
   /** Route the resolved choice to the SAME composite onDecision router a button tap
@@ -140,6 +162,16 @@ export function buildPendingAskHandler(
 
     const choice = matchOption(pending.options, text);
     if (!choice) {
+      // An open-answer question (e.g. "pick a time") gets to read this before we insist on a
+      // label. It runs ONLY on the no-match path, so it can never pre-empt an exact answer.
+      const outcome = (await deps.onUnmatched?.({ threadId, text, by, pending })) ?? 'declined';
+      if (outcome !== 'declined') {
+        // 'resolved' disarms; 'consumed' leaves the question standing (the hook has already
+        // said why), and the marker's TTL is still what eventually frees the thread.
+        if (outcome === 'resolved') await deps.clearPending(threadId);
+        deps.log.info({ resolved: outcome === 'resolved', hook: true }, 'pending-ask: answer handled by the unmatched hook');
+        return true;
+      }
       deps.log.info({ resolved: false, options: pending.options.length }, 'pending-ask: unmatched answer, re-asking');
       const labels = pending.options.map((o) => `“${o.label}”`).join(' or ');
       await deps.postAnswer(

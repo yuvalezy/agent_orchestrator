@@ -127,6 +127,7 @@ function fakes(
             return opts.meeting === 'ok';
           },
           onDuration: async () => {},
+          onTypedTime: async () => true,
           onSlot: async () => {},
           onDecline: async () => {},
         }

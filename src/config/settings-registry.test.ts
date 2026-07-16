@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SETTINGS_REGISTRY, SETTINGS_KEYS, settingDef, coerceSettingValue } from './settings-registry';
+import { envSchema } from './env';
 
 // Pass 1 = the `*_ENABLED` booleans; pass 2 appends the tuned knobs (LLM routing/effort +
 // backfill determinism + style-lane size). If a setting is added/removed, update this list.
@@ -35,6 +36,8 @@ const EXPECTED_KEYS = [
   'CROSS_CHANNEL_DEDUP_ENABLED',
   'TASK_INVENTORY_ENABLED',
   'CALENDAR_ENABLED',
+  'CALENDAR_WRITE_ENABLED',
+  'MEETING_SCHEDULING_ENABLED',
   'PROACTIVE_NOTIFICATIONS_ENABLED',
   'STALE_TASK_CHASER_ENABLED',
   'AWAITING_REPLY_NUDGE_ENABLED',
@@ -78,6 +81,19 @@ test('every def is well-formed (type-matched default, valid applyMode, enum opti
       assert.ok(def.options!.includes(def.default as string), `${def.key} default must be an option`);
     }
   }
+});
+
+// EXPECTED_KEYS above pins what IS registered, so it can never notice a flag that was never
+// added — which is exactly how CALENDAR_WRITE_ENABLED and MEETING_SCHEDULING_ENABLED both
+// shipped invisible to the console, settable only by hand-editing .env. This guard asserts the
+// real invariant from the other direction: a feature gate the founder cannot see is a feature
+// gate they cannot use. If a future *_ENABLED is genuinely internal, this failing test is the
+// right place to argue that — not a silent omission.
+test('every *_ENABLED flag in env.ts is console-managed', () => {
+  const envFlags = Object.keys(envSchema.shape).filter((k) => k.endsWith('_ENABLED'));
+  assert.ok(envFlags.length > 0, 'sanity: the schema exposes its keys');
+  const missing = envFlags.filter((k) => !settingDef(k));
+  assert.deepEqual(missing, [], `these env flags are missing from SETTINGS_REGISTRY: ${missing.join(', ')}`);
 });
 
 test('every *_ENABLED flag is a restart-apply boolean', () => {

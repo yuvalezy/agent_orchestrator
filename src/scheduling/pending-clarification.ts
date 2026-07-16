@@ -23,7 +23,12 @@ export type PendingAsk =
   /** Anything free-text (missing time, ambiguous wording) — answered by a message. */
   | 'free'
   /** ✏️ Edit of a composed draft — the next message IS the replacement body. */
-  | 'edit';
+  | 'edit'
+  /** Confirm a resolved meeting before it is booked — answered by a button. Its own ask (not
+   *  'draft') because a meeting carries no channel and no body to edit, and because what the
+   *  founder is really approving is the ATTENDEE LIST: booking emails those people instantly
+   *  and nothing here can un-send it. */
+  | 'meeting';
 
 export interface PendingDraft {
   kind: 'customer_message' | 'reminder';
@@ -37,6 +42,20 @@ export interface PendingDraft {
   /** WP5(b): the derived recurrence pattern for a RECURRING reminder; null/absent = one-shot.
    *  Only reminders carry it (a recurring customer_message is refused before a draft is built). */
   recurrence?: Recurrence | null;
+}
+
+/** A meeting resolved and waiting for the founder's ✅ — everything needed to book it without
+ *  re-asking the model. Attendee ADDRESSES are ours (resolved from contacts), never customer
+ *  speech, so they may live in the marker; the founder's own command text already does. */
+export interface PendingMeeting {
+  /** RFC3339. Re-validated at the tap — a time can lapse while a question sits unanswered. */
+  executeAt: string;
+  durationMinutes: number;
+  title: string;
+  attendees: Array<{ name: string; email: string }>;
+  /** Titles of the founder's own events that overlap this slot, if any. Rendered in the
+   *  confirmation so double-booking is a decision rather than an accident. */
+  conflicts: string[];
 }
 
 export interface PendingClarification {
@@ -58,6 +77,7 @@ export interface PendingClarification {
    *  customer-authored text never round-trips through app_state. */
   origin: ReplyOrigin | null;
   draft?: PendingDraft;
+  meeting?: PendingMeeting;
 }
 
 /** Past this, tell the founder to send the whole instruction in one message. */
@@ -76,7 +96,7 @@ export function parsePending(raw: string | null): PendingClarification | null {
     if (p?.v !== 1) return null;
     if (typeof p.nonce !== 'string' || typeof p.commandText !== 'string') return null;
     if (typeof p.chatId !== 'string' || typeof p.messageId !== 'string' || typeof p.customerId !== 'string') return null;
-    if (p.ask !== 'channel' && p.ask !== 'draft' && p.ask !== 'free' && p.ask !== 'edit') return null;
+    if (p.ask !== 'channel' && p.ask !== 'draft' && p.ask !== 'free' && p.ask !== 'edit' && p.ask !== 'meeting') return null;
     if (typeof p.turns !== 'number') return null;
     return p as PendingClarification;
   } catch {

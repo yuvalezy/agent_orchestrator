@@ -5,6 +5,7 @@ import { TranscriptionError } from '../llm/openai-transcription.client';
 import { TelegramError } from './telegram-client';
 import { TelegramClient } from './telegram-client';
 import { parseOptionData } from '../../triage/decision-handler';
+import { layoutInlineKeyboard } from './keyboard-layout';
 
 // TelegramNotifier — the FounderNotifierPort adapter (design.md D7). One forum
 // supergroup, one topic per customer, one pinned admin topic.
@@ -170,7 +171,7 @@ export class TelegramNotifier implements FounderNotifierPort {
       chatId: this.opts.supergroupChatId,
       messageThreadId: threadId,
       text: render(question),
-      inlineKeyboard: [options.map((o) => ({ text: o.label, callback_data: o.id }))],
+      inlineKeyboard: layoutInlineKeyboard(options),
     });
     // Arm AFTER the send, never before: a marker for a question that failed to post would
     // capture the founder's next message as the answer to something they never saw.

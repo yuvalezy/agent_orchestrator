@@ -14,10 +14,16 @@ import {
 
 test('schedule schema is strict-output compatible and parses the closed action set', () => {
   assert.equal(SCHEDULE_SCHEMA.additionalProperties, false);
-  assert.deepEqual(SCHEDULE_SCHEMA.required, ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification', 'recurrence']);
+  // Strict structured output wants EVERY property in `required` — a new field that is absent for
+  // most kinds is typed nullable rather than omitted from this list.
+  assert.deepEqual(SCHEDULE_SCHEMA.required, [
+    'kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification',
+    'recurrence', 'attendees', 'duration_minutes',
+  ]);
+  assert.deepEqual(Object.keys(SCHEDULE_SCHEMA.properties).sort(), [...SCHEDULE_SCHEMA.required].sort());
   const parsed = parseScheduleInterpretation({
     kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'follow up',
-    delivery_channel: 'none', clarification: null, recurrence: null,
+    delivery_channel: 'none', clarification: null, recurrence: null, attendees: null, duration_minutes: null,
   });
   assert.equal(parsed.kind, 'reminder');
   assert.throws(() => parseScheduleInterpretation({ kind: 'send_everything' }));
@@ -29,6 +35,7 @@ test('recurrence parses (daily/weekly/monthly) and one-shot regression keeps rec
   const base = {
     kind: 'reminder' as const, execute_at: '2026-07-20T09:00:00-05:00', explicit_date: true,
     body: 'call the plumber', delivery_channel: 'none' as const, clarification: null,
+    attendees: null, duration_minutes: null,
   };
   assert.deepEqual(
     parseScheduleInterpretation({ ...base, recurrence: { kind: 'weekly', dow: 1, dom: null, hour: 9, minute: 0 } }).recurrence,
@@ -46,13 +53,35 @@ test('the system prompt teaches recurrence recognition and reminders-only scope'
   assert.match(SCHEDULE_SYSTEM, /system will decline it/i);
 });
 
+test('a meeting parses with its attendees and duration; the kind set stays closed', () => {
+  const parsed = parseScheduleInterpretation({
+    kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: 'Pricing review',
+    delivery_channel: 'none', clarification: null, recurrence: null, attendees: ['Idan', 'Karen'], duration_minutes: 45,
+  });
+  assert.equal(parsed.kind, 'meeting');
+  assert.deepEqual(parsed.attendees, ['Idan', 'Karen']);
+  assert.equal(parsed.duration_minutes, 45);
+});
+
+test('the model cannot smuggle an ADDRESS in as an attendee decision', () => {
+  // attendees are NAMES the founder said; resolving one to a mailbox is the code's job
+  // (meeting-invitees.ts). The schema cannot enforce "not an address", but the handler never
+  // treats these as addresses — this pins the shape the handler relies on.
+  const parsed = parseScheduleInterpretation({
+    kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: null,
+    delivery_channel: 'none', clarification: null, recurrence: null, attendees: ['someone@evil.com'], duration_minutes: null,
+  });
+  assert.deepEqual(parsed.attendees, ['someone@evil.com'], 'it parses as a NAME — and will simply fail to match a contact');
+});
+
 // body_source used to be a model output that selected its own enforcement level.
 test('the model cannot declare its own body_source', () => {
   assert.ok(!('body_source' in SCHEDULE_SCHEMA.properties));
   assert.ok(!SCHEDULE_SCHEMA.required.includes('body_source' as never));
   const parsed = parseScheduleInterpretation({
     kind: 'customer_message', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'hi',
-    delivery_channel: 'whatsapp', clarification: null, recurrence: null, body_source: 'command',
+    delivery_channel: 'whatsapp', clarification: null, recurrence: null, attendees: null, duration_minutes: null,
+    body_source: 'command',
   });
   assert.ok(!('body_source' in parsed), 'a smuggled body_source is stripped, not honoured');
 });
@@ -77,8 +106,31 @@ test('the prior turn is carried as authoritative founder speech to merge', () =>
   assert.match(user, /say hi to Shlomo at 8 am/);
   assert.match(user, /Which channel\?/);
   assert.match(SCHEDULE_SYSTEM, /merge them into ONE action/i);
+  // Measured, not assumed: without this rule the model re-resolved the day on the merge turn
+  // and moved "thursday 3pm" to the following Monday — 0/5 runs kept the founder's day, and the
+  // plain customer_message path drifted identically. With it, 6/6 held. An answer about the
+  // channel/wording/attendees must not move the appointment.
+  assert.match(SCHEDULE_SYSTEM, /answer only overrides what it actually addresses/i);
+  assert.match(SCHEDULE_SYSTEM, /does not move the meeting/i);
   // The channel question is resolved by the system, not by badgering the founder.
   assert.match(SCHEDULE_SYSTEM, /Do NOT clarify merely because the channel is absent/);
+});
+
+// Measured, not assumed: a SPANISH weekday drifted a day forward — "el lunes 11am" resolved to
+// Tue 07-21 (3/3) and "el viernes" to Sat 07-18, while the English "monday"/"friday" were right.
+// This was NOT introduced by the slot-answer framing: the shipped customer_message path
+// ("el lunes a las 11am mandale un mensaje") drifted identically 3/3 with no prior turn, i.e. a
+// founder writing Spanish had their customer messaged a day late. With this rule: 10/10 cases
+// (including every previously-passing one) held across 3 runs each.
+test('the prompt pins weekday names to the NEXT occurrence, and names them in Spanish', () => {
+  assert.match(SCHEDULE_SYSTEM, /NEXT occurrence at or after nowIso/);
+  assert.match(SCHEDULE_SYSTEM, /never the day after it/i);
+  // The mapping itself must be present — the drift was the model's own es→weekday step.
+  for (const day of ['lunes=Monday', 'martes=Tuesday', 'viernes=Friday', 'domingo=Sunday']) {
+    assert.ok(SCHEDULE_SYSTEM.includes(day), `${day} must be spelled out for the model`);
+  }
+  // The worked example is load-bearing: the rule alone did not fix it in earlier drafts.
+  assert.match(SCHEDULE_SYSTEM, /2026-07-20 \(NOT the 21st\)/);
 });
 
 // The composer's payload is the security boundary: while the model only copied founder

@@ -167,15 +167,14 @@ export async function claimForCreating(id: string): Promise<boolean> {
 }
 
 /** Record where the event landed. `meetLink` may legitimately be null (conference creation is
- *  async, and a Workspace policy can omit it) — a meeting without a link is still a meeting. */
+ *  async, and a Workspace policy can omit it) — a meeting without a link is still a meeting.
+ *  Guarded on status='creating' as defense-in-depth: dispatch is serialized today, but an
+ *  unguarded terminal flip would become a scheduled-overwrites-failed race (double outcome:
+ *  invite AND fallback task) if callback dispatch ever went concurrent. */
 export async function markScheduled(
   id: string,
   event: { eventId: string; calendarId: string; meetLink: string | null; calendarAccountId: string | null },
 ): Promise<void> {
-  // Guarded on status = 'creating' (defense-in-depth): the normal path always arrives here with the
-  // row in 'creating' (claimForCreating precedes createEvent). Dispatch is serialized today so there
-  // is no live race, but an unguarded terminal flip WOULD become the double-outcome race the moment
-  // dispatch ever runs concurrently — matching claimForCreating / claimMeetingGiveUp's own guards.
   await query(
     `UPDATE agent_meeting_requests
         SET status = 'scheduled', event_id = $2, event_calendar_id = $3, meet_link = $4,

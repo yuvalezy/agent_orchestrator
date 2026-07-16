@@ -3,7 +3,7 @@ import { logger } from '../logger';
 import type { BusinessHour, Holiday } from '../outbound/send-window';
 import type { BusyInterval, CalendarFreeBusyPort, CreatedEvent, CreateEventInput } from '../ports/calendar.port';
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
-import { generateSlots, isSlotFree, type Slot } from './meeting-slots';
+import { generateSlots, isSlotFree, slotConflicts, type Slot } from './meeting-slots';
 import type { ClaimMeetingInput, MeetingRequest, MeetingSlot } from './meeting-repo';
 
 // Meeting scheduling (CORE — ports + repo only; imports NO adapter, D1).
@@ -30,16 +30,15 @@ export const slotOptionId = (i: number): string => `ms${i}`;
 export const MEETING_MAKE_TASK = 'mtask';
 
 /**
- * "Other time…" — a free-text escape from the offered slots. NOT OFFERED YET, and deliberately
- * so: it needs a founder-message capture (a new thread-marker kind, armed at the tap so the
- * 30-minute TTL starts when the founder is provably at the keyboard) plus an LLM parse of the
- * typed time, re-validated against free/busy like any tapped slot. Until that exists, offering
- * the button would be a dead affordance — worse than not offering it, because the founder would
- * tap it and get silence.
+ * "Other time…" — retained as a PARSEABLE id, still not offered as a button.
  *
- * The id is kept parseable so a tap on a stale keyboard from a future/older build routes to a
- * no-op rather than falling through to the query engine, which would answer it as if it were a
- * question. Today's escape is "Just make a task", which is honest and works.
+ * The escape it was meant to provide now exists and is strictly better: the founder just replies
+ * with the time ("thursday 3pm"), handled by onTypedTime via the pending-ask hook. A button whose
+ * only job is to say "now type a time" is a step that earns nothing — the typing is the answer.
+ *
+ * The id stays parseable so a tap on a STALE keyboard (an older build's message, still sitting in
+ * the topic) routes to a no-op rather than falling through to the query engine, which would answer
+ * it as though it were a question.
  */
 export const MEETING_OTHER_TIME = 'mso';
 
@@ -174,6 +173,9 @@ export interface MeetingScheduler {
   tryInitiate(input: InitiateInput): Promise<boolean>;
   onDuration(meetingId: string, minutes: number): Promise<void>;
   onSlot(meetingId: string, index: number, by: string): Promise<void>;
+  /** The founder typed a time rather than tapping. TRUE = done with (booked, or funnelled to a
+   *  task); FALSE = they must answer again, so the question stays armed and the buttons live. */
+  onTypedTime(meetingId: string, startsAt: Date, by: string): Promise<boolean>;
   onDecline(meetingId: string): Promise<void>;
 }
 
@@ -273,7 +275,12 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
       m.customer_id,
       {
         title: '📅 Pick a time',
-        body: `${prefix ? `${prefix}\n\n` : ''}${m.duration_minutes} min — free slots (${tz}):`,
+        // The typed escape is ADVERTISED, not just accepted. An affordance nobody is told about
+        // is one nobody uses — and the offered slots are only the founder's *free* time, which
+        // is not always the time they want.
+        body:
+          `${prefix ? `${prefix}\n\n` : ''}${m.duration_minutes} min — free slots (${tz}):` +
+          `\n\nOr reply with a time — “thursday 3pm”, “mañana a las 10”.`,
         severity: 'action',
         contextRef: { kind: 'inbox', ref: m.inbox_message_id },
       },
@@ -283,6 +290,97 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
         { id: `${MEETING_MAKE_TASK}:${m.id}`, label: 'Just make a task' },
       ],
     );
+  }
+
+  /**
+   * Book a slot that has ALREADY been judged acceptable, and tell everyone.
+   *
+   * Shared verbatim by the tapped-slot and typed-time paths. What differs between them is only
+   * how the slot was CHOSEN and what may veto it (an offered slot must respect the founder's
+   * working day; one they typed must not) — everything from the double-book gate onwards is
+   * identical, and forking it would give the typed path its own subtly-different idempotency,
+   * its own 403 handling, and its own confirmation. Those are exactly the parts that must never
+   * drift: they create a real event and email a real customer.
+   */
+  async function bookSlot(m: MeetingRequest, slot: Slot, by: string): Promise<void> {
+    const meetingId = m.id;
+
+    // ── Double-book gate: flip the status BEFORE any network call ────────────────────────
+    if (!(await deps.repo.claimForCreating(meetingId))) {
+      logger.info({ meetingId }, 'meeting: already claimed — ignoring the duplicate');
+      return;
+    }
+
+    const host = await deps.resolveHost();
+    if (!host) {
+      await giveUpToTask(deps, m, '⚠️ No calendar to book on', 'The meeting-host calendar is not usable.');
+      return;
+    }
+
+    let created: CreatedEvent;
+    try {
+      created = await host.writer.createEvent({
+        calendarId: host.calendarId,
+        title: `Call — ${m.thread_key ?? 'customer'}`,
+        startsAt: slot.startsAt,
+        endsAt: slot.endsAt,
+        timeZone: m.founder_tz ?? deps.founderTz,
+        description: 'Scheduled by agent-orchestrator from the customer’s request to talk.',
+        attendeeEmails: m.attendee_email ? [m.attendee_email] : undefined,
+        // Deterministic, derived from the REQUEST id alone — never the slot index or the typed
+        // instant. Keying on the time would let two attempts mint two events; the API-level 409
+        // is the second line of defence behind claimForCreating.
+        eventId: deps.eventId(meetingId),
+        conference: true,
+        sendUpdates: m.attendee_email ? 'all' : 'none',
+      });
+    } catch (err) {
+      const status = (err as { status?: number })?.status;
+      if (status === 403 || status === 404) {
+        // PERMANENT. The founder cannot fix a scope from their phone mid-conversation, so the
+        // ask must survive as a task while they go re-consent.
+        await giveUpToTask(
+          deps,
+          m,
+          '⚠️ Calendar write refused',
+          `Booking was refused (${status}). Re-connect the meeting-host calendar in the console — it likely has read-only access.`,
+        );
+        return;
+      }
+      // TRANSIENT → hand the slot back so the next attempt retries (mirrors releaseDueEvent).
+      await deps.repo.releaseToAwaitingSlot(meetingId);
+      logger.warn({ meetingId, reason: (err as Error)?.message }, 'meeting: create failed transiently — released for retry');
+      await deps.notifier.notifyCustomerEvent(m.customer_id, {
+        title: '⚠️ Booking failed',
+        body: 'Something went wrong booking that time. Tap a slot or reply with a time again to retry.',
+        severity: 'warning',
+      });
+      return;
+    }
+
+    await deps.repo.markScheduled(meetingId, {
+      eventId: created.id,
+      calendarId: host.calendarId,
+      meetLink: created.meetLink,
+      calendarAccountId: host.accountId,
+    });
+
+    const body = confirmationBody({
+      slot,
+      customerTz: m.customer_tz ?? deps.founderTz,
+      meetLink: created.meetLink,
+      language: m.preferred_language ?? 'en',
+    });
+    await deps.repo.enqueueConfirmation(meetingId, body, by);
+
+    const linkNote = created.meetLink ? `\n${created.meetLink}` : '\n(no Meet link — add one in the calendar if you need it)';
+    const inviteNote = m.attendee_email ? `Invited ${m.attendee_email}.` : 'No email on file — they get the link on the chat.';
+    await deps.notifier.notifyCustomerEvent(m.customer_id, {
+      title: created.alreadyExisted ? '📅 Already booked' : '✅ Meeting booked',
+      body: `${renderSlot(slot, m.founder_tz ?? deps.founderTz)} · ${m.duration_minutes} min\n${inviteNote} Confirmation sent.${linkNote}`,
+      severity: 'info',
+      contextRef: { kind: 'inbox', ref: m.inbox_message_id },
+    });
   }
 
   return {
@@ -407,87 +505,68 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
         return;
       }
 
-      // ── Double-tap gate: flip the status BEFORE any network call ────────────────────────
-      if (!(await deps.repo.claimForCreating(meetingId))) {
-        logger.info({ meetingId }, 'meeting: slot already claimed — ignoring the duplicate tap');
-        return;
-      }
+      await bookSlot(m, slot, by);
+    },
 
-      const host = await deps.resolveHost();
-      if (!host) {
-        await giveUpToTask(deps, m, '⚠️ No calendar to book on', 'The meeting-host calendar is not usable.');
-        return;
-      }
+    /**
+     * The founder TYPED a time instead of tapping a slot ("thursday 3pm", "mañana a las 10").
+     *
+     * Returns whether the meeting is finished with: TRUE once it is booked (or funnelled to a
+     * task), FALSE when the founder needs to answer again — the caller uses that to decide
+     * whether the question stays armed, so a rejected time leaves the buttons live rather than
+     * dropping the conversation on the floor.
+     *
+     * The offered slots are NOT the allowed set. This is the founder naming a time on their own
+     * calendar, so the working-day window that shapes our proposals does not apply — only a real
+     * conflict and the past do.
+     */
+    async onTypedTime(meetingId, startsAt, by): Promise<boolean> {
+      const m = await deps.repo.get(meetingId);
+      if (!m || m.status !== 'awaiting_slot' || !m.duration_minutes) return true; // stale → let it go
+      const slot = { startsAt, endsAt: new Date(startsAt.getTime() + m.duration_minutes * 60_000) };
 
-      let created: CreatedEvent;
-      try {
-        created = await host.writer.createEvent({
-          calendarId: host.calendarId,
-          title: `Call — ${m.thread_key ?? 'customer'}`,
-          startsAt: slot.startsAt,
-          endsAt: slot.endsAt,
-          timeZone: m.founder_tz ?? deps.founderTz,
-          description: 'Scheduled by agent-orchestrator from the customer’s request to talk.',
-          attendeeEmails: m.attendee_email ? [m.attendee_email] : undefined,
-          // Deterministic, derived from the REQUEST id alone — never the slot index. Keying on
-          // the slot would let two different taps mint two events; the API-level 409 is the
-          // second line of defence behind claimForCreating.
-          eventId: deps.eventId(meetingId),
-          conference: true,
-          sendUpdates: m.attendee_email ? 'all' : 'none',
-        });
-      } catch (err) {
-        const status = (err as { status?: number })?.status;
-        if (status === 403 || status === 404) {
-          // PERMANENT, and the one that will actually fire first in this deployment: every
-          // calendar credential was consented BEFORE the calendar.events scope existed, so it
-          // reads fine and 403s on every write. Availability still worked (freebusy needs only
-          // readonly), which is exactly why this surfaces here and not earlier.
-          //
-          // The founder cannot fix a scope from their phone mid-conversation, so the ask must
-          // survive as a task while they go re-consent.
-          await giveUpToTask(
-            deps,
-            m,
-            '⚠️ Calendar write refused',
-            `Booking was refused (${status}). Re-connect the meeting-host calendar in the console — it likely has read-only access.`,
-          );
-          return;
-        }
-        // TRANSIENT → hand the slot back so the next tap retries (mirrors releaseDueEvent).
-        await deps.repo.releaseToAwaitingSlot(meetingId);
-        logger.warn({ meetingId, reason: (err as Error)?.message }, 'meeting: create failed transiently — released for retry');
+      if (slot.startsAt.getTime() <= now().getTime()) {
         await deps.notifier.notifyCustomerEvent(m.customer_id, {
-          title: '⚠️ Booking failed',
-          body: 'Something went wrong booking that time. Tap a slot again to retry.',
+          title: '🕐 That time has passed',
+          body: 'Give me a time in the future, or tap one of the slots above.',
           severity: 'warning',
         });
-        return;
+        return false;
       }
 
-      await deps.repo.markScheduled(meetingId, {
-        eventId: created.id,
-        calendarId: host.calendarId,
-        meetLink: created.meetLink,
-        calendarAccountId: host.accountId,
-      });
+      // FAIL-CLOSED, exactly as at tap time: an unreadable calendar is not an empty one.
+      let busy: BusyInterval[];
+      try {
+        busy = await deps.freeBusy.queryFreeBusy({ timeMin: slot.startsAt, timeMax: slot.endsAt });
+      } catch (err) {
+        logger.warn({ reason: (err as Error)?.message }, 'meeting: free/busy unavailable for a typed time — not booking');
+        await deps.notifier.notifyCustomerEvent(m.customer_id, {
+          title: '⚠️ Could not check that time',
+          body: 'I could not re-check your calendars, so I did not book it (I will not risk double-booking you). Please try again.',
+          severity: 'warning',
+        });
+        return false;
+      }
 
-      const body = confirmationBody({
-        slot,
-        customerTz: m.customer_tz ?? deps.founderTz,
-        meetLink: created.meetLink,
-        language: m.preferred_language ?? 'en',
-      });
-      await deps.repo.enqueueConfirmation(meetingId, body, by);
+      const clash = slotConflicts(slot, busy);
+      if (clash) {
+        // Refused rather than confirmed-through. Unlike a founder-initiated "book X at 3pm" —
+        // where a warning is all we can offer because no alternative exists — here four free
+        // times are already on screen one tap away, so the cheap, reversible move is to say
+        // what it collides with and let them choose again.
+        const tz = m.founder_tz ?? deps.founderTz;
+        await deps.notifier.notifyCustomerEvent(m.customer_id, {
+          title: '⚠️ You are busy then',
+          body:
+            `${renderSlot(slot, tz)} overlaps ${renderSlot({ startsAt: clash.start, endsAt: clash.end }, tz)}.\n` +
+            'Reply with another time, or tap one of the free slots above.',
+          severity: 'warning',
+        });
+        return false;
+      }
 
-      const linkNote = created.meetLink ? `\n${created.meetLink}` : '\n(no Meet link — add one in the calendar if you need it)';
-      const inviteNote = m.attendee_email ? `Invited ${m.attendee_email}.` : 'No email on file — they get the link on the chat.';
-      await deps.notifier.notifyCustomerEvent(m.customer_id, {
-        title: created.alreadyExisted ? '📅 Already booked' : '✅ Meeting booked',
-        body: `${renderSlot(slot, m.founder_tz ?? deps.founderTz)} · ${m.duration_minutes} min\n${inviteNote} Confirmation sent.${linkNote}`,
-        severity: 'info',
-        contextRef: { kind: 'inbox', ref: m.inbox_message_id },
-      });
+      await bookSlot(m, slot, by);
+      return true;
     },
 
     /** The founder tapped "Just make a task" — they've decided a meeting isn't what they want.

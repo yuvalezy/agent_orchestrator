@@ -214,7 +214,7 @@ export interface ScheduleInterpretRequest {
  * for verbatimness, and the result decides whether an approval gate is required.
  */
 export interface ScheduleInterpretation {
-  kind: 'none' | 'clarify' | 'customer_message' | 'reminder';
+  kind: 'none' | 'clarify' | 'customer_message' | 'reminder' | 'meeting';
   execute_at: string | null;
   /** Did the founder name a DAY, or only a clock time? A bare "at 8 am" means the next
    *  occurrence, and the handler — not the model — does that roll. */
@@ -239,6 +239,13 @@ export interface ScheduleInterpretation {
     hour: number;
     minute: number;
   } | null;
+  /** kind='meeting' only: the names the founder NAMED, verbatim (or ['everyone']). Never
+   *  addresses — resolving a name to a person is the handler's job, because a model that picks
+   *  attendees picks who gets an un-recallable invitation. Null for every other kind. */
+  attendees: string[] | null;
+  /** kind='meeting' only: the length if the founder stated one, else null (the handler
+   *  defaults it). */
+  duration_minutes: number | null;
 }
 
 export interface ComposeMessageRequest {

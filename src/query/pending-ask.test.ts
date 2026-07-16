@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import type { PendingAskHandlerDeps } from './pending-ask';
 import {
   buildPendingAskHandler,
   matchOption,
@@ -31,7 +32,7 @@ const msg = (text: string): MessageEvent => ({
   by: 'founder',
 });
 
-function harness(armed: string | null) {
+function harness(armed: string | null, onUnmatched?: PendingAskHandlerDeps['onUnmatched']) {
   const store = { value: armed };
   const dispatched: DecisionEvent[] = [];
   const posts: string[] = [];
@@ -40,6 +41,7 @@ function harness(armed: string | null) {
     clearPending: async () => void (store.value = null),
     dispatch: async (d) => void dispatched.push(d),
     postAnswer: async (_t, text) => void posts.push(text),
+    onUnmatched,
     log: silentLog,
   });
   return { handler, store, dispatched, posts };
@@ -168,4 +170,55 @@ test('disarms BEFORE dispatch, so a throwing handler cannot act twice on a retry
 
   await assert.rejects(() => handler(msg('Add contact')), /portal down/);
   assert.equal(store.value, null, 'a re-delivered answer cannot re-fire a non-idempotent action');
+});
+
+// ── The onUnmatched hook: an OPEN-answer question ("pick a time") ─────────────────────
+// matchOption only knows the labels we minted, which is right for a closed choice and wrong
+// for a question whose real answer space is larger than the buttons. These pin the contract
+// the meeting free-text hook relies on.
+
+test('a hook that RESOLVES the answer disarms the question and suppresses the re-ask', async () => {
+  const seen: string[] = [];
+  const { handler, store, posts } = harness(pending(), async ({ text }) => {
+    seen.push(text);
+    return 'resolved';
+  });
+  assert.equal(await handler(msg('thursday 3pm')), true);
+  assert.deepEqual(seen, ['thursday 3pm'], 'the hook got the founder text verbatim');
+  assert.equal(store.value, null, 'resolved → disarmed');
+  assert.deepEqual(posts, [], 'the hook already replied — never also nag with "I can only take …"');
+});
+
+test('a hook that CONSUMES keeps the question armed so the buttons still work', async () => {
+  const { handler, store, posts } = harness(pending(), async () => 'consumed');
+  assert.equal(await handler(msg('yesterday')), true);
+  assert.notEqual(store.value, null, 'still armed — the founder must answer again');
+  assert.deepEqual(posts, [], 'the hook owns the explanation');
+});
+
+test('a hook that DECLINES leaves the closed-choice re-ask exactly as it was', async () => {
+  const { handler, store, posts } = harness(pending(), async () => 'declined');
+  assert.equal(await handler(msg('maybe later')), true);
+  assert.notEqual(store.value, null);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /I can only take/);
+});
+
+// The hook must never get first refusal on an answer the founder actually gave us.
+test('an EXACT label match never reaches the hook', async () => {
+  let called = false;
+  const { handler, dispatched } = harness(pending(), async () => {
+    called = true;
+    return 'resolved';
+  });
+  await handler(msg('Add contact'));
+  assert.equal(called, false, 'matchOption wins — the hook is the no-match path only');
+  assert.equal(dispatched.length, 1, 'and the real decision still dispatched');
+});
+
+test('with no hook wired, behaviour is byte-for-byte the pre-hook re-ask', async () => {
+  const { handler, store, posts } = harness(pending());
+  assert.equal(await handler(msg('something else')), true);
+  assert.notEqual(store.value, null);
+  assert.match(posts[0], /I can only take/);
 });
