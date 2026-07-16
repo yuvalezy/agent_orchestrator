@@ -228,6 +228,17 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
   },
   {
+    key: 'BRIEFING_SYNTHESIS_ENABLED',
+    type: 'boolean',
+    category: INTELLIGENCE,
+    label: 'Briefing focus synthesis',
+    description:
+      'Adds a chief-of-staff "🧭 Focus" read at the top of the daily briefing: an LLM judges the digest’s facts into the top ≤3 things to do (each justified), what can wait, and emerging risks. Best-effort and additive — a failure renders "unavailable" and never blocks the digest. Needs an LLM provider key.',
+    applyMode: 'restart',
+    default: false,
+    dependsOn: 'DAILY_BRIEFING_ENABLED',
+  },
+  {
     key: 'WEEKLY_PATTERNS_ENABLED',
     type: 'boolean',
     category: INTELLIGENCE,

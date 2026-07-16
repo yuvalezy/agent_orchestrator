@@ -427,6 +427,19 @@ const envSchema = z.object({
   // (console-urgency-repo.ts: failed=1000, pending=500, processing=200, +age, +retries).
   // 500 = "at least queued or broken", so a row merely mid-flight (200) does not cry wolf.
   DAILY_BRIEFING_URGENT_MIN_SCORE: z.coerce.number().int().min(0).default(500),
+  // ── WP1: chief-of-staff synthesis over the daily briefing. When ON, an LLM pass (role 'answer')
+  // judges PRIORITY over the facts the deterministic digest already computed and renders a
+  // "🧭 Focus" section at the TOP — the top ≤3 things to do (each justified), what can wait, and
+  // emerging risks. Strictly ADDITIVE and best-effort: the deterministic sections are untouched and
+  // remain the source of truth, and a synthesis failure renders "unavailable" rather than blocking
+  // or delaying the digest. Kill-switch (mirrors DAILY_BRIEFING_ENABLED strict-bool): the
+  // synthesizer is injected ONLY when the literal "true"; unset/"false"/anything else → false.
+  // DORMANT by default. Has effect only when DAILY_BRIEFING_ENABLED is also on (it augments that
+  // digest) and an LLM provider key is configured; a synthesis failure degrades to "unavailable".
+  BRIEFING_SYNTHESIS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 
   // ── Draft correction loop (🔁 Revise) + scoped correction memory. When the founder
   // taps 🔁 Revise on a draft and sends a correction INSTRUCTION, the agent regenerates

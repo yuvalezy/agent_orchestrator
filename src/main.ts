@@ -526,9 +526,10 @@ async function main(): Promise<void> {
     if (!notifier) {
       logger.warn('⚠️  DAILY_BRIEFING_ENABLED=true but Telegram is unconfigured — the daily briefing has nowhere to post; NOT registering.');
     } else {
+      const briefingNotifier = notifier; // const capture: narrowed non-null inside the synthesizer closure
       feedbackWorkers.push(
         buildDailyBriefingWorker({
-          notifier,
+          notifier: briefingNotifier,
           readLastRun: () => getAppState('daily_briefing:last_run_day'),
           writeLastRun: (day) => setAppState('daily_briefing:last_run_day', day),
           tz: env.DAILY_BRIEFING_TZ,
@@ -536,12 +537,18 @@ async function main(): Promise<void> {
           topN: env.DAILY_BRIEFING_TOP_N,
           urgentMinScore: env.DAILY_BRIEFING_URGENT_MIN_SCORE,
           calendar: env.CALENDAR_ENABLED ? buildCalendarAdapter() : undefined,
+          // WP1: inject the chief-of-staff synthesizer ONLY when its flag is on — otherwise the
+          // digest renders without the "🧭 Focus" section. The router's failover/cap notices go to
+          // the Admin topic (same notifier), and a synthesis failure degrades to "unavailable".
+          synthesizer: env.BRIEFING_SYNTHESIS_ENABLED
+            ? buildLlmRouter({ notifyAdmin: (msg) => briefingNotifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }) })
+            : undefined,
           log: logger,
           intervalMs: env.DAILY_BRIEFING_INTERVAL_MS,
         }),
       );
       logger.info(
-        { hour: env.DAILY_BRIEFING_HOUR, tz: env.DAILY_BRIEFING_TZ, calendar: env.CALENDAR_ENABLED },
+        { hour: env.DAILY_BRIEFING_HOUR, tz: env.DAILY_BRIEFING_TZ, calendar: env.CALENDAR_ENABLED, synthesis: env.BRIEFING_SYNTHESIS_ENABLED },
         'daily-briefing worker registered (DAILY_BRIEFING_ENABLED=true)',
       );
     }

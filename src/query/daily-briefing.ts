@@ -1,4 +1,5 @@
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
+import type { BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort } from '../ports/llm.port';
 import type { SyncLogger } from '../knowledge/sync';
 
 // Daily founder briefing (M5(b), CORE — ports + injected data-fetch fns only; the
@@ -389,6 +390,84 @@ function meetingTime(m: TodayMeeting, tz: string): string {
   }).format(m.startsAt);
 }
 
+// ── WP1: optional chief-of-staff synthesis ("🧭 Focus") ─────────────────────────────────────
+// An OPTIONAL LLM pass that judges PRIORITY over the deterministic digest and renders a Focus
+// section at the TOP. It is strictly additive and best-effort: the same tri-state as task 3.1's
+// sections applies — a synthesizer that is not injected omits the section, a synthesis that FAILS
+// renders an "unavailable" line, and the deterministic sections below are never touched or delayed.
+// The synthesis reasons ONLY over the FACTS the digest already computed (buildSynthesisFacts) — it
+// never fetches and never becomes the source of truth. See src/adapters/llm/briefing-prompt.ts.
+
+/** The chief of staff hands the founder at most this many focus items (mirrors the zod cap). */
+export const MAX_FOCUS = 3;
+
+/**
+ * Reduce a composed briefing to the PII-light FACTS the synthesis reasons over (PURE). These are
+ * the SAME numbers the deterministic sections already render — counts, ages, names — never a
+ * message body. `tz` renders today's meeting times in the founder's zone. A section that is
+ * unavailable (null) or unwired (undefined) contributes nothing (empty list / null count), so the
+ * model is never handed a phantom item. Exported for direct unit testing.
+ */
+export function buildSynthesisFacts(data: BriefingData, tz: string): BriefingSynthesisRequest {
+  const approvalAges = [data.drafts.oldestAgeHours, data.proposals.oldestAgeHours].filter(
+    (h): h is number => h !== null,
+  );
+  return {
+    overnightUntriaged: data.overnight?.count ?? null,
+    urgent: data.urgent
+      ? data.urgent.top.map((u) => ({
+          label: `score ${u.urgencyScore}`,
+          ageHours: u.ageHours,
+          customer: u.customerName ?? u.customerId,
+        }))
+      : [],
+    awaitingReply: data.awaitingReply
+      ? data.awaitingReply.top.map((a) => ({
+          customer: a.customerName ?? a.customerId,
+          daysWaiting: Math.floor(a.ageHours / 24),
+        }))
+      : [],
+    approvals: {
+      drafts: data.drafts.count,
+      proposals: data.proposals.count,
+      oldestAgeHours: approvalAges.length > 0 ? Math.max(...approvalAges) : null,
+    },
+    meetings: data.today ? data.today.meetings.map((m) => ({ time: meetingTime(m, tz), title: m.title })) : [],
+    needsAttention: data.topCustomers.map((c) => ({
+      customer: c.customerName ?? c.customerId,
+      waitingItems: c.totalCount,
+      oldestAgeHours: c.oldestAgeHours,
+    })),
+  };
+}
+
+/**
+ * Render the "🧭 Focus" section (PURE). Tri-state, matching task 3.1's sections:
+ *   • undefined → the synthesizer is not wired → OMIT the section entirely (empty list).
+ *   • null      → the synthesis FAILED this tick → a single "unavailable" line (never a fabricated
+ *                 all-clear: absence of a read is not "nothing to focus on").
+ *   • result    → the focus items (clamped to MAX_FOCUS defensively), what can wait, and risks.
+ * A result with nothing in any of the three lists collapses to no section — an empty header helps
+ * no one. The focus clamp is belt-and-suspenders: the zod validator already caps focus at 3.
+ */
+function focusLines(synthesis: BriefingSynthesisResult | null | undefined): string[] {
+  if (synthesis === undefined) return [];
+  if (synthesis === null) return ['🧭 Focus — unavailable'];
+  const focus = synthesis.focus.slice(0, MAX_FOCUS);
+  if (focus.length === 0 && synthesis.canWait.length === 0 && synthesis.risks.length === 0) return [];
+  const parts: string[] = ['🧭 Focus'];
+  for (const f of focus) parts.push(`  • ${f.title} — ${f.why}`);
+  if (synthesis.canWait.length > 0) {
+    parts.push('Can wait');
+    for (const c of synthesis.canWait) parts.push(`  • ${c}`);
+  }
+  if (synthesis.risks.length > 0) {
+    parts.push('⚠️ Risks');
+    for (const r of synthesis.risks) parts.push(`  • ${r}`);
+  }
+  return parts;
+}
+
 /** Render task 3.1's four sections. Each returns [] when its source is not wired, and an
  *  explicit "unavailable" line when the source failed (null) — never a silent zero. */
 function sectionLines(data: BriefingData, tz: string): string[] {
@@ -464,10 +543,21 @@ function hasActionableSections(data: BriefingData): boolean {
  * `opts.tz` renders today's meeting times in the founder's zone; it is optional so the M5(b)
  * two-arg callers in src/query/commands.ts keep compiling and rendering identically (they pass
  * no sections, so nothing tz-dependent is ever printed for them).
+ *
+ * `opts.synthesis` is the optional WP1 chief-of-staff read, rendered as a "🧭 Focus" section at
+ * the TOP (tri-state — see focusLines). It is judgment ATOP the deterministic sections, never a
+ * replacement: everything below it is unchanged whether the synthesis is present, absent, or failed.
  */
-export function renderBriefing(data: BriefingData, day: string, opts: { tz?: string } = {}): Notification {
+export function renderBriefing(
+  data: BriefingData,
+  day: string,
+  opts: { tz?: string; synthesis?: BriefingSynthesisResult | null } = {},
+): Notification {
   const totalPending = data.drafts.count + data.proposals.count;
   const parts: string[] = [];
+
+  const focus = focusLines(opts.synthesis);
+  if (focus.length > 0) parts.push(...focus, '');
 
   const sections = sectionLines(data, opts.tz ?? 'UTC');
   if (sections.length > 0) parts.push(...sections, '');
@@ -537,6 +627,15 @@ export interface DailyBriefingDeps {
   fetchTodayHolidays?: (day: string) => Promise<TodayHoliday[]>;
   /** Cut on change 06's urgency scale (DAILY_BRIEFING_URGENT_MIN_SCORE). */
   urgentMinScore?: number;
+
+  /**
+   * WP1 chief-of-staff synthesis. OPTIONAL — omitted (BRIEFING_SYNTHESIS_ENABLED off) means the
+   * "🧭 Focus" section is left out entirely, exactly like an unwired task-3.1 section. When wired,
+   * it is called best-effort AFTER the deterministic digest is composed and over its FACTS only; a
+   * throw yields an "unavailable" line and NEVER blocks or delays the digest. Never the source of
+   * truth — the deterministic sections below always stand on their own.
+   */
+  synthesizer?: BriefingSynthesizerPort;
 }
 
 /** Format a Date as YYYY-MM-DD in the given IANA timezone (en-CA yields ISO order).
@@ -616,6 +715,31 @@ async function safeSection<T>(
 }
 
 /**
+ * Run the optional WP1 synthesis best-effort. Builds the PII-light facts from the ALREADY-composed
+ * digest and asks the synthesizer to judge priority. A throw (all providers failed / schema-invalid
+ * / cost cap) yields `null` — rendered as a "🧭 Focus — unavailable" line — so a synthesis outage
+ * never costs the founder their deterministic briefing. Returns undefined when no synthesizer is
+ * wired, so the section is omitted entirely. Never logs the facts or the judgment (counts elsewhere).
+ */
+async function safeSynthesis(
+  synthesizer: BriefingSynthesizerPort | undefined,
+  data: BriefingData,
+  tz: string,
+  log: SyncLogger,
+): Promise<BriefingSynthesisResult | null | undefined> {
+  if (!synthesizer) return undefined;
+  try {
+    const result = await synthesizer.synthesizeBriefing(buildSynthesisFacts(data, tz));
+    // Defensive clamp: the zod validator already caps focus at MAX_FOCUS, but the caller is the
+    // last line before the founder sees it — never render a fourth "top" item.
+    return { ...result, focus: result.focus.slice(0, MAX_FOCUS) };
+  } catch (err) {
+    log.warn({ reason: (err as Error)?.message }, 'daily briefing: synthesis unavailable');
+    return null;
+  }
+}
+
+/**
  * One briefing tick. Fires at the configured founder-local hour and is idempotent per calendar
  * day: if a briefing already posted today (the app_state last-run day == today) it is a no-op,
  * so an interval that ticks many times a day (and restarts) posts EXACTLY ONCE per day. See
@@ -672,7 +796,12 @@ export async function runDailyBriefing(deps: DailyBriefingDeps): Promise<{ poste
     ...(today_ !== undefined && { today: today_ }),
   });
 
-  await deps.notifier.notifyAdmin(renderBriefing(data, today, { tz: deps.tz }));
+  // WP1: judgment ATOP the composed digest. Best-effort — its failure yields an "unavailable"
+  // line, never a blocked digest — and it reads only the facts the deterministic sections already
+  // hold, so it can never contradict them.
+  const synthesis = await safeSynthesis(deps.synthesizer, data, deps.tz, deps.log);
+
+  await deps.notifier.notifyAdmin(renderBriefing(data, today, { tz: deps.tz, synthesis }));
   await deps.writeLastRun(today);
 
   // Counts + flags ONLY — never a name, a title, or a body.
@@ -687,6 +816,8 @@ export async function runDailyBriefing(deps: DailyBriefingDeps): Promise<{ poste
       awaitingReply: data.awaitingReply === null ? 'unavailable' : (data.awaitingReply?.count ?? null),
       meetings: data.today === null ? 'unavailable' : (data.today?.meetings.length ?? null),
       holidays: data.today === null ? 'unavailable' : (data.today?.holidays.length ?? null),
+      // Count only — never a focus title or its justification.
+      focus: synthesis === undefined ? null : synthesis === null ? 'unavailable' : synthesis.focus.length,
     },
     'daily briefing posted',
   );

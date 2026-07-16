@@ -246,6 +246,88 @@ export interface AnswerSynthesizerPort {
 }
 
 /**
+ * One urgent inbox row reduced to the FACTS the chief-of-staff synthesis reasons over
+ * (WP1). No subject/body — the briefing is PII-light — so `label` is a short, non-PII
+ * descriptor (change 06's urgency score) plus who + how long it has waited.
+ */
+export interface BriefingFactUrgent {
+  /** A short, non-PII descriptor of the item (e.g. 'score 1000'). NOT a message body. */
+  label: string;
+  ageHours: number;
+  /** Customer name (or id fallback); null when the row has no customer. */
+  customer: string | null;
+}
+
+/** One task still awaiting a customer reply, reduced to who + how many whole days silent. */
+export interface BriefingFactAwaiting {
+  customer: string | null;
+  daysWaiting: number;
+}
+
+/** One of today's meetings, reduced to its founder-tz time + title (never the description). */
+export interface BriefingFactMeeting {
+  /** Founder-local clock time ('09:30') or 'all day'. */
+  time: string;
+  title: string;
+}
+
+/** One customer on the needs-attention ranking: who + how many items + oldest age. */
+export interface BriefingFactAttention {
+  customer: string | null;
+  waitingItems: number;
+  oldestAgeHours: number;
+}
+
+/**
+ * The structured FACTS from a composed daily briefing, handed to the chief-of-staff
+ * synthesis (WP1, LLM role 'answer'). These are the SAME numbers the deterministic
+ * digest already computed — never prose, never a message body — so the model judges
+ * priority over facts it cannot invent. The deterministic sections remain the source
+ * of truth; this pass only adds judgment on top. NEVER logged (counts only elsewhere).
+ */
+export interface BriefingSynthesisRequest {
+  /** Untriaged inbox rows in the overnight window; null when that section is unavailable. */
+  overnightUntriaged: number | null;
+  urgent: BriefingFactUrgent[];
+  awaitingReply: BriefingFactAwaiting[];
+  /** The two founder-decision queues + the oldest waiting item across them (whole hours). */
+  approvals: { drafts: number; proposals: number; oldestAgeHours: number | null };
+  meetings: BriefingFactMeeting[];
+  /** Customers ranked by waiting items desc (the digest's "needs attention" list). */
+  needsAttention: BriefingFactAttention[];
+}
+
+/** One prioritized focus item: what to do + a one-sentence justification. */
+export interface BriefingFocusItem {
+  title: string;
+  why: string;
+}
+
+/**
+ * The chief-of-staff judgment over a briefing's facts. `focus` is the top ≤3 things to do
+ * today (each justified in one sentence), `canWait` is what can safely slip, `risks` flags
+ * emerging trouble (long-waiting customers, aging approvals). Grounded ONLY in the facts —
+ * the model never invents an item that is not in BriefingSynthesisRequest.
+ */
+export interface BriefingSynthesisResult {
+  /** At most 3 (enforced in the zod validator; the caller clamps defensively too). */
+  focus: BriefingFocusItem[];
+  canWait: string[];
+  risks: string[];
+}
+
+/**
+ * Daily-briefing synthesis (WP1). SEPARATE from AgentLlmPort (interface segregation, like
+ * AnswerSynthesizerPort): the briefing depends only on this, and existing fakes are
+ * untouched. Implemented by the LlmRouter (role 'answer'). Judges priority over the
+ * structured facts of an ALREADY-composed briefing — it never fetches, and a failure here
+ * must never block or delay the deterministic digest. NEVER logs the facts or the judgment.
+ */
+export interface BriefingSynthesizerPort {
+  synthesizeBriefing(input: BriefingSynthesisRequest): Promise<BriefingSynthesisResult>;
+}
+
+/**
  * Request to REGENERATE a draft per the founder's correction (🔁 Revise, role 'draft').
  * Mirrors DraftRequest but adds the PRIOR draft + the founder's authoritative correction
  * `instruction`. The reviser applies the instruction faithfully (the founder is the

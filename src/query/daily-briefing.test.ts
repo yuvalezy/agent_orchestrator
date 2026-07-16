@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildSynthesisFacts,
   composeBriefing,
   renderBriefing,
   runDailyBriefing,
@@ -8,6 +9,7 @@ import {
   hourInTz,
   humanizeAgeHours,
   AWAITING_REPLY_DAYS,
+  MAX_FOCUS,
   OVERNIGHT_WINDOW_HOURS,
   type AwaitingReplyItem,
   type DailyBriefingDeps,
@@ -18,6 +20,7 @@ import {
   type UrgentItem,
 } from './daily-briefing';
 import type { Notification } from '../ports/founder-notifier.port';
+import type { BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort } from '../ports/llm.port';
 import type { SyncLogger } from '../knowledge/sync';
 
 // Unit tests for the CORE daily briefing (pure compose + render, and the idempotent run
@@ -534,4 +537,145 @@ test('runDailyBriefing: a queue read failure defers the whole day (it is not a s
   await assert.rejects(() => runDailyBriefing(deps), /db down/);
   assert.equal(notifier.posts.length, 0);
   assert.equal(cell.value(), null, 'the day stays owed, so the next tick retries it');
+});
+
+// ── WP1: the chief-of-staff synthesis ("🧭 Focus") ──────────────────────────────────────────
+
+/** A synthesizer spy: records the facts it was handed + call count, returns a canned read. */
+function synthSpy(
+  result: BriefingSynthesisResult | (() => never),
+): BriefingSynthesizerPort & { calls: number; lastInput: BriefingSynthesisRequest | null } {
+  const spy = {
+    calls: 0,
+    lastInput: null as BriefingSynthesisRequest | null,
+    async synthesizeBriefing(input: BriefingSynthesisRequest): Promise<BriefingSynthesisResult> {
+      spy.calls += 1;
+      spy.lastInput = input;
+      if (typeof result === 'function') return result();
+      return result;
+    },
+  };
+  return spy;
+}
+
+const sampleRead: BriefingSynthesisResult = {
+  focus: [
+    { title: 'Unblock Acme', why: 'Two drafts have waited over two days.' },
+    { title: 'Reply to Ceta', why: 'Silent five days on an open task.' },
+  ],
+  canWait: ['The overnight backlog is small.'],
+  risks: ['Ceta approaching a week of silence.'],
+};
+
+test('buildSynthesisFacts: derives the PII-light facts from a composed briefing', () => {
+  const data = composeBriefing(drafts(), proposals(), NOW, {
+    overnight: overnight(),
+    urgent: { items: [urgentItem(1000, 50, 'A')], capped: false },
+    awaitingReply: awaiting(),
+    today: { meetings, holidays },
+  });
+  const facts = buildSynthesisFacts(data, 'America/Panama'); // UTC−5
+
+  assert.equal(facts.overnightUntriaged, 3);
+  assert.equal(facts.approvals.drafts, 4);
+  assert.equal(facts.approvals.proposals, 2);
+  assert.equal(facts.approvals.oldestAgeHours, 80, 'oldest across BOTH queues');
+  assert.deepEqual(facts.urgent, [{ label: 'score 1000', ageHours: 50, customer: 'cust-A' }]);
+  assert.deepEqual(facts.awaitingReply, [
+    { customer: 'Acme', daysWaiting: 5 },
+    { customer: 'Beta', daysWaiting: 4 },
+  ]);
+  assert.equal(facts.meetings[0].time, '08:30', '13:30Z renders in the founder tz');
+  assert.equal(facts.meetings[0].title, 'Standup');
+  assert.equal(facts.needsAttention[0].customer, 'Acme');
+  assert.equal(facts.needsAttention[0].waitingItems, 3);
+});
+
+test('buildSynthesisFacts: an unavailable/unwired section contributes nothing (no phantom items)', () => {
+  const data = composeBriefing([], [], NOW, { overnight: null, urgent: null, awaitingReply: null, today: null });
+  const facts = buildSynthesisFacts(data, 'UTC');
+  assert.equal(facts.overnightUntriaged, null, 'a failed overnight read is null, never a phantom 0');
+  assert.deepEqual(facts.urgent, []);
+  assert.deepEqual(facts.awaitingReply, []);
+  assert.deepEqual(facts.meetings, []);
+  assert.equal(facts.approvals.oldestAgeHours, null);
+});
+
+test('renderBriefing: the synthesis renders as a 🧭 Focus section at the TOP, above the sections', () => {
+  const data = composeBriefing(drafts(), proposals(), NOW, { overnight: overnight() });
+  const n = renderBriefing(data, '2026-07-13', { synthesis: sampleRead });
+  assert.match(n.body, /^🧭 Focus/, 'Focus leads the digest');
+  assert.match(n.body, /• Unblock Acme — Two drafts have waited over two days\./);
+  assert.match(n.body, /Can wait\n {2}• The overnight backlog is small\./);
+  assert.match(n.body, /⚠️ Risks\n {2}• Ceta approaching a week of silence\./);
+  // Focus sits ABOVE the deterministic overnight section, which is untouched.
+  assert.ok(n.body.indexOf('🧭 Focus') < n.body.indexOf('🌙 Overnight'), 'Focus precedes the sections');
+  assert.match(n.body, /🌙 Overnight \(last 24h\): 3 unprocessed/);
+});
+
+test('renderBriefing: no synthesis passed → the Focus section is absent entirely', () => {
+  const n = renderBriefing(composeBriefing(drafts(), proposals(), NOW), '2026-07-13');
+  assert.doesNotMatch(n.body, /🧭 Focus/, 'undefined synthesis omits the section, like an unwired section');
+});
+
+test('renderBriefing: a FAILED synthesis (null) says "unavailable", never a fabricated all-clear', () => {
+  const n = renderBriefing(composeBriefing(drafts(), proposals(), NOW), '2026-07-13', { synthesis: null });
+  assert.match(n.body, /🧭 Focus — unavailable/);
+});
+
+test('renderBriefing: a focus list over MAX is clamped defensively at render', () => {
+  const tooMany: BriefingSynthesisResult = {
+    focus: Array.from({ length: MAX_FOCUS + 2 }, (_, i) => ({ title: `t${i}`, why: `w${i}` })),
+    canWait: [],
+    risks: [],
+  };
+  const n = renderBriefing(composeBriefing([], [], NOW), '2026-07-13', { synthesis: tooMany });
+  const focusBullets = n.body.split('\n').filter((l) => /^ {2}• t\d/.test(l));
+  assert.equal(focusBullets.length, MAX_FOCUS, 'never more than MAX_FOCUS items reach the founder');
+});
+
+test('renderBriefing: an all-empty synthesis collapses to no section (no lonely header)', () => {
+  const n = renderBriefing(composeBriefing(drafts(), proposals(), NOW), '2026-07-13', {
+    synthesis: { focus: [], canWait: [], risks: [] },
+  });
+  assert.doesNotMatch(n.body, /🧭 Focus/);
+});
+
+test('runDailyBriefing: a wired synthesizer adds the Focus section and is fed the digest facts', async () => {
+  const notifier = spyNotifier();
+  const spy = synthSpy(sampleRead);
+  const deps: DailyBriefingDeps = {
+    ...hourDeps(() => new Date('2026-07-13T08:00:00Z'), dayCell(), notifier),
+    synthesizer: spy,
+  };
+  assert.equal((await runDailyBriefing(deps)).posted, true);
+  assert.equal(spy.calls, 1, 'the synthesizer is called once per post');
+  assert.equal(spy.lastInput?.overnightUntriaged, 3, 'it received the composed facts');
+  assert.match(notifier.posts[0].body, /🧭 Focus/);
+  assert.match(notifier.posts[0].body, /🔥 Urgent: 1/, 'the deterministic sections still render below');
+});
+
+test('runDailyBriefing: a THROWING synthesizer degrades to "unavailable" and never blocks the digest', async () => {
+  const notifier = spyNotifier();
+  const spy = synthSpy(() => {
+    throw new Error('all providers failed');
+  });
+  const deps: DailyBriefingDeps = {
+    ...hourDeps(() => new Date('2026-07-13T08:00:00Z'), dayCell(), notifier),
+    synthesizer: spy,
+  };
+  assert.equal((await runDailyBriefing(deps)).posted, true, 'the digest still posts');
+  assert.equal(spy.calls, 1);
+  assert.match(notifier.posts[0].body, /🧭 Focus — unavailable/);
+  assert.match(notifier.posts[0].body, /🔥 Urgent: 1/, 'every deterministic section is intact');
+  assert.match(notifier.posts[0].body, /🌙 Overnight \(last 24h\): 3 unprocessed/);
+});
+
+test('runDailyBriefing: no synthesizer wired → the Focus section is absent and none is called', async () => {
+  const notifier = spyNotifier();
+  const deps = hourDeps(() => new Date('2026-07-13T08:00:00Z'), dayCell(), notifier);
+  // deps.synthesizer is undefined (flag off) — nothing to spy on; assert the rendered absence.
+  assert.equal(deps.synthesizer, undefined);
+  assert.equal((await runDailyBriefing(deps)).posted, true);
+  assert.doesNotMatch(notifier.posts[0].body, /🧭 Focus/);
 });

@@ -1,6 +1,7 @@
 import type { WorkerDefinition } from '../../workers/worker-runner';
 import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import type { CalendarPort } from '../../ports/calendar.port';
+import type { BriefingSynthesizerPort } from '../../ports/llm.port';
 import type { SyncLogger } from '../../knowledge/sync';
 import { runDailyBriefing, type PendingItem } from '../../query/daily-briefing';
 import { listPendingDrafts, listPendingBackfillProposals } from '../console/console-approvals-repo';
@@ -39,6 +40,9 @@ export interface DailyBriefingWorkerDeps {
    *  then left out of the digest rather than reported as an empty day (holidays still render:
    *  they are a DB read and do not depend on Google). */
   calendar?: Pick<CalendarPort, 'listUpcomingEvents'>;
+  /** WP1 chief-of-staff synthesizer. OMITTED when BRIEFING_SYNTHESIS_ENABLED=false — the digest
+   *  then renders without the "🧭 Focus" section (exactly like an unwired task-3.1 section). */
+  synthesizer?: BriefingSynthesizerPort;
   /** Clock seam — defaults to the wall clock. */
   now?: () => Date;
 }
@@ -91,6 +95,7 @@ export function buildDailyBriefingWorker(deps: DailyBriefingWorkerDeps): WorkerD
         hour: deps.hour,
         topN: deps.topN,
         urgentMinScore: deps.urgentMinScore,
+        synthesizer: deps.synthesizer,
         log: deps.log,
       });
     },

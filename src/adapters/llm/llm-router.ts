@@ -1,12 +1,13 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
 import { DRAFT_SCHEMA, DRAFT_SYSTEM, draftUserMessage, parseDraft } from './draft-prompt';
 import { ANSWER_SCHEMA, ANSWER_SYSTEM, answerUserMessage, parseAnswer } from './answer-prompt';
+import { BRIEFING_SCHEMA, BRIEFING_SYSTEM, briefingUserMessage, parseBriefingSynthesis } from './briefing-prompt';
 import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
 import { COMPOSE_SCHEMA, COMPOSE_SYSTEM, SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, composeUserMessage, parseComposedBody, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
@@ -38,7 +39,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftReviserPort, CorrectionClassifierPort, ScheduleInterpreterPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, DraftReviserPort, CorrectionClassifierPort, ScheduleInterpreterPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -198,6 +199,28 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, DraftRevi
       // thinking + output combined (R44) — a tight budget could truncate the JSON.
       maxTokens: 1500,
       validate: parseAnswer,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Synthesize a chief-of-staff read over the daily briefing (role 'answer', WP1). Reuses the
+   * golden structured-call path — cost accounting, ordered failover, daily cap — with the strict
+   * BRIEFING_SCHEMA. The model judges priority over the FACTS the deterministic digest already
+   * computed and never invents an item. customerId null: the briefing spans all customers, so it
+   * is not billed to any one. Best-effort at the call site (a throw must never block the digest).
+   * NEVER logs the facts or the judgment.
+   */
+  async synthesizeBriefing(input: BriefingSynthesisRequest): Promise<BriefingSynthesisResult> {
+    return this.callStructured<BriefingSynthesisResult>({
+      role: 'answer',
+      schema: BRIEFING_SCHEMA,
+      system: BRIEFING_SYSTEM,
+      messages: [{ role: 'user', content: briefingUserMessage(input) }],
+      // Ample headroom: sonnet-5 runs adaptive thinking ON and max_tokens caps
+      // thinking + output combined (R44) — a tight budget could truncate the JSON.
+      maxTokens: 1500,
+      validate: parseBriefingSynthesis,
       customerId: null,
     });
   }
