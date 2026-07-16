@@ -10,24 +10,32 @@ import type { ComposeMessageRequest, ScheduleInterpretRequest, ScheduleInterpret
 export const SCHEDULE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification'],
+  required: ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification', 'attendees', 'duration_minutes'],
   properties: {
-    kind: { type: 'string', enum: ['none', 'clarify', 'customer_message', 'reminder'] },
+    kind: { type: 'string', enum: ['none', 'clarify', 'customer_message', 'reminder', 'meeting'] },
     execute_at: { type: ['string', 'null'] },
     explicit_date: { type: 'boolean' },
     body: { type: ['string', 'null'] },
     delivery_channel: { type: 'string', enum: ['whatsapp', 'email', 'none'] },
     clarification: { type: ['string', 'null'] },
+    // The names the founder NAMED, verbatim — never addresses, and never the model's idea of
+    // who is relevant. Resolving a name to a person is the code's job (meeting-invitees.ts),
+    // for the same reason `body_source` was taken away: a model that picks its own attendees
+    // picks who receives an un-recallable invitation.
+    attendees: { type: ['array', 'null'], items: { type: 'string' } },
+    duration_minutes: { type: ['number', 'null'] },
   },
 } as const;
 
 const ResultSchema = z.object({
-  kind: z.enum(['none', 'clarify', 'customer_message', 'reminder']),
+  kind: z.enum(['none', 'clarify', 'customer_message', 'reminder', 'meeting']),
   execute_at: z.string().nullable(),
   explicit_date: z.boolean(),
   body: z.string().nullable(),
   delivery_channel: z.enum(['whatsapp', 'email', 'none']),
   clarification: z.string().nullable(),
+  attendees: z.array(z.string()).nullable(),
+  duration_minutes: z.number().nullable(),
 });
 
 export function parseScheduleInterpretation(value: unknown): ScheduleInterpretation {
@@ -43,12 +51,31 @@ export const SCHEDULE_SYSTEM = [
   'priorCommandText, when present, is an EARLIER founder command in this topic that commandText answers,',
   'and priorClarification is the question that was asked. Both are authoritative founder speech:',
   'merge them into ONE action. "WhatsApp" answering "which channel?" means the earlier command, sent on WhatsApp.',
+  'The answer only overrides what it actually addresses. Re-read the DAY AND TIME from',
+  'priorCommandText and resolve it against nowIso exactly as if it had arrived alone — an answer',
+  'about the channel, the wording, or who to invite does not move the meeting. If the earlier',
+  'command said "thursday 3pm" and nowIso is a Thursday, it still means TODAY at 15:00.',
   '',
   'Kinds:',
   '- none: no scheduling intent; all other fields null/none.',
   '- clarify: scheduling intent exists but the time or the action is ambiguous.',
   '- reminder: remind the founder in this Telegram topic.',
   '- customer_message: send a customer-facing message.',
+  '- meeting: book a calendar meeting and invite people ("set up a meeting with X thursday 3pm",',
+  '  "agenda una reunion con ellos manana a las 10", "book 45 min with Idan and Karen tomorrow").',
+  '  A meeting is booked on the calendar; it does NOT send a message, so set delivery_channel=none.',
+  '  Prefer customer_message when the founder wants words delivered, and meeting when they want a',
+  '  slot held. "tell them we should meet" is a customer_message; "set up the meeting" is a meeting.',
+  '',
+  'For kind=meeting ONLY:',
+  '- attendees: the names the founder NAMED, copied verbatim as separate strings ["Idan","Karen"].',
+  '  If they said everyone/all/todos/the group, return exactly ["everyone"]. If they named nobody,',
+  '  return []. NEVER invent a name, never resolve one to an address, and never add someone just',
+  '  because they appear in the context — the system matches names to contacts and asks when unsure.',
+  '- duration_minutes: the length if stated ("45 min", "media hora" -> 30), else null.',
+  '- body: a SHORT meeting title ("Call", "Pricing review"). It is a calendar title the customer',
+  '  will see, not a message. If the founder gave no topic, use null and the system titles it.',
+  'For every other kind set attendees=null and duration_minutes=null.',
   '',
   'Set delivery_channel to the founder EXPLICIT choice of WhatsApp or email if stated in the command.',
   'Otherwise set delivery_channel=none. NEVER infer it from the customer, reply, draft, or available contacts.',

@@ -29,6 +29,46 @@ export interface ReplyOrigin {
   ref: string;
 }
 
+/**
+ * A customer's individual EMAIL contacts — the candidate invitees for a founder-initiated
+ * meeting, and the entire meaning of "invite everyone" (there is no group roster to read: a
+ * group is one row with a jid, and whatsapp_manager exposes no participants endpoint).
+ *
+ * `is_group = false` mirrors listScheduleRouteCandidates' own exclusion: a group's address is a
+ * jid, not a person, and it has no email. Ordered primary-first so the founder reads a stable,
+ * sensible list.
+ */
+export async function listCustomerEmailContacts(
+  customerId: string,
+): Promise<Array<{ name: string; email: string; isPrimary: boolean }>> {
+  const { rows } = await query<{ display_name: string | null; address: string; is_primary: boolean }>(
+    `SELECT display_name, address, COALESCE(is_primary, false) AS is_primary
+       FROM agent_customer_contacts
+      WHERE customer_id = $1 AND channel_type = 'email' AND is_group = false
+      ORDER BY is_primary DESC, created_at ASC`,
+    [customerId],
+  );
+  return rows.map((r) => ({ name: r.display_name ?? r.address, email: r.address, isPrimary: r.is_primary }));
+}
+
+/**
+ * The founder's OWN addresses — the connected Gmail instances' account emails. Used to keep
+ * "invite everyone" from emailing the founder an invitation to a meeting they are already the
+ * organizer of.
+ *
+ * Best-effort by nature: a founder alias sitting on a CUSTOMER's contact list (Holadoc really
+ * carries a "Yuval Lerner" one) is NOT here and cannot be recognised — which is exactly why the
+ * resolved list is shown before booking rather than trusted.
+ */
+export async function listFounderEmails(): Promise<string[]> {
+  const { rows } = await query<{ email: string }>(
+    `SELECT DISTINCT config->>'accountEmail' AS email
+       FROM channel_instances
+      WHERE channel_type = 'email' AND config->>'accountEmail' IS NOT NULL`,
+  );
+  return rows.map((r) => r.email).filter(Boolean);
+}
+
 export interface ScheduledAction {
   id: string;
   source_chat_id: string;

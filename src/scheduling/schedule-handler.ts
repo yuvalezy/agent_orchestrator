@@ -3,6 +3,7 @@ import type { DecisionEvent, MessageEvent, Notification } from '../ports/founder
 import type { ScheduleInterpretation, ScheduleInterpreterPort } from '../ports/llm.port';
 import type { RecipientGender, RecipientProfilePort } from '../ports/recipient-profile.port';
 import { checkComposedBody, COMPOSE_MAX_CHARS } from './composed-body';
+import { meansEveryone, resolveInvitees, type ContactCandidate } from './meeting-invitees';
 import {
   MAX_CLARIFY_TURNS,
   mergeCommandText,
@@ -12,6 +13,7 @@ import {
   type PendingAsk,
   type PendingClarification,
   type PendingDraft,
+  type PendingMeeting,
 } from './pending-clarification';
 import type { ReplyOrigin, ScheduleRoute, ScheduledAction } from './scheduling-repo';
 
@@ -36,6 +38,11 @@ export const SCHEDULE_OPTIONS = {
   approve: 'sca',
   edit: 'scx',
   cancel: 'scc',
+  /** ✅ Book the resolved meeting. MUST stay distinct from the customer-initiated meeting
+   *  lane's ids (the md/ms/mso/mtask family in triage/meeting-scheduler.ts): routeDecision
+   *  tries isScheduleOption BEFORE isMeetingOption, so a collision silently mis-routes a tap
+   *  to the wrong lane. The 'sc' prefix keeps the two namespaces apart by construction. */
+  bookMeeting: 'scb',
 } as const;
 
 const CHANNEL_BY_OPTION: Record<string, string> = {
@@ -94,6 +101,38 @@ export interface ScheduleHandlerDeps {
   postAnswer: (threadId: string, text: string) => Promise<void>;
   notifyCustomer: (customerId: string, n: Notification, buttons?: Array<{ id: string; label: string }>) => Promise<void>;
   log: { info: (o: object, m: string) => void; error: (o: object, m: string) => void };
+  /**
+   * Founder-initiated meetings ("set up a meeting with X thursday 3pm"). Optional — absent
+   * means kind='meeting' is answered with "that isn't wired", never silently ignored.
+   *
+   * Deliberately NOT routed through createAction: `scheduled_actions` DEFERS a send (deliver
+   * this at 8am), but a meeting is booked NOW for a future time — there is nothing to defer.
+   * Forcing it through that table would also hit a CHECK that rejects channel-less rows, and
+   * the due-worker's `else` branch (a reminder catch-all) would post the meeting into the topic
+   * as reminder text and mark it done, never booking it.
+   */
+  meetings?: MeetingCommandDeps;
+}
+
+export interface MeetingCommandDeps {
+  /** The customer's individual email contacts — the candidate invitees, and the entire meaning
+   *  of "everyone" (no group roster exists to read). */
+  listContacts: (customerId: string) => Promise<ContactCandidate[]>;
+  /** The founder's own addresses, so "everyone" doesn't invite them to their own meeting. */
+  founderEmails: () => Promise<string[]>;
+  /** Titles of the founder's own overlapping events, for the conflict warning. Best-effort:
+   *  a failure yields [] and the founder simply books unwarned — unlike the customer-initiated
+   *  lane, they NAMED this time, so we are not choosing a slot on their behalf. */
+  conflictsAt: (startsAt: Date, endsAt: Date) => Promise<string[]>;
+  /** Book it. Returns the Meet link (null is fine — never fail a booking over a link). */
+  book: (input: {
+    startsAt: Date;
+    endsAt: Date;
+    title: string;
+    attendeeEmails: string[];
+    idempotencyKey: string;
+  }) => Promise<{ meetLink: string | null; htmlLink: string | null; alreadyExisted: boolean }>;
+  defaultDurationMinutes: number;
 }
 
 /**
@@ -374,6 +413,171 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
     return true;
   };
 
+  /** Render a slot for the founder, in their own zone. */
+  const slotLabel = (at: Date, minutes: number): string => {
+    const s = DateTime.fromJSDate(at, { zone: deps.timezone });
+    return `${s.toFormat('ccc d LLL, HH:mm')}–${s.plus({ minutes }).toFormat('HH:mm')}`;
+  };
+
+  /**
+   * Resolve "meeting with X at Y" into a concrete, confirmable booking — then STOP and ask.
+   *
+   * The confirmation is not ceremony. Two things here are guesses that a human should see
+   * before Google emails anybody: the model read the names out of free text, and the code
+   * matched those names to contacts. Booking is not recallable, so the founder confirms the
+   * ATTENDEE LIST, not the wording.
+   */
+  const proposeMeeting = async (
+    ctx: Ctx,
+    interpreted: ScheduleInterpretation,
+    executeAt: Date,
+    merged: string,
+    origin: ReplyOrigin | null,
+    anchor: { chatId: string; messageId: string },
+  ): Promise<boolean> => {
+    const meetings = deps.meetings;
+    if (!meetings) {
+      await deps.clearPending(ctx.threadId);
+      await deps.postAnswer(ctx.threadId, 'Meeting scheduling is not enabled, so I did not book anything.');
+      return true;
+    }
+
+    const requested = (interpreted.attendees ?? []).map((a) => a.trim()).filter(Boolean);
+    const all = requested.some(meansEveryone);
+    const contacts = await meetings.listContacts(ctx.customer.id);
+    const resolved = resolveInvitees({
+      requested: all ? [] : requested,
+      all,
+      contacts,
+      founderEmails: await meetings.founderEmails(),
+    });
+
+    if (resolved.kind === 'ambiguous') {
+      // A name we cannot place is a QUESTION. Guessing would email the wrong customer an
+      // invitation — the one failure here that cannot be taken back.
+      const known = resolved.candidates.length
+        ? resolved.candidates.map((c) => `• ${c.name}`).join('\n')
+        : '(no email contacts on file for this customer)';
+      return askAndArm(
+        ctx,
+        merged,
+        `I don't know who "${resolved.unresolved.join('", "')}" is for ${ctx.customer.displayName}. Who should I invite?\n\n${known}\n\nReply with the names, or "everyone", or "nobody".`,
+        origin,
+        anchor,
+      );
+    }
+
+    const durationMinutes =
+      interpreted.duration_minutes && interpreted.duration_minutes > 0
+        ? Math.min(Math.round(interpreted.duration_minutes), 480)
+        : meetings.defaultDurationMinutes;
+    const endsAt = new Date(executeAt.getTime() + durationMinutes * 60_000);
+    // Best-effort, unlike the customer-initiated lane's fail-closed slot search: the founder
+    // NAMED this time, so we are warning them about their own calendar, not choosing for them.
+    // A calendar we cannot read costs them a warning; it must not cost them the booking.
+    const conflicts = await meetings.conflictsAt(executeAt, endsAt).catch(() => [] as string[]);
+
+    const meeting: PendingMeeting = {
+      executeAt: executeAt.toISOString(),
+      durationMinutes,
+      title: interpreted.body?.trim() || `Call — ${ctx.customer.displayName}`,
+      attendees: resolved.invitees,
+      conflicts,
+    };
+    // armPending mints the nonce and hands it back — the confirmation's buttons must carry the
+    // SAME one the record holds, and deriving it twice is how those drift apart.
+    const nonce = await armPending(ctx.threadId, {
+      ask: 'meeting',
+      // Not a clarify round, so the turn count is carried, not spent: an earlier "who?" already
+      // charged its turn, and confirming should not push the founder toward the cap.
+      turns: ctx.pending?.turns ?? 0,
+      // The ORIGINAL command's ids (see originCommand) — the whole multi-turn conversation
+      // books under one anchor, which is what makes a replayed tap idempotent below.
+      chatId: anchor.chatId,
+      messageId: anchor.messageId,
+      customerId: ctx.customer.id,
+      commandText: merged,
+      clarification: null,
+      origin,
+      meeting,
+    });
+
+    const who = meeting.attendees.length
+      ? meeting.attendees.map((a) => a.name).join(', ')
+      : 'nobody (a hold on your calendar)';
+    const warn = conflicts.length ? `\n⚠️ Clashes with: ${conflicts.join(', ')}` : '';
+    await deps.notifyCustomer(
+      ctx.customer.id,
+      {
+        title: '📅 Book this?',
+        body: `${ctx.customer.displayName} · ${slotLabel(executeAt, durationMinutes)}\n“${meeting.title}”\nInvite: ${who}${warn}`,
+        severity: 'action',
+      },
+      [
+        { id: `${SCHEDULE_OPTIONS.bookMeeting}:${nonce}`, label: '✅ Book it' },
+        { id: `${SCHEDULE_OPTIONS.cancel}:${nonce}`, label: REJECT_LABEL },
+      ],
+    );
+    return true;
+  };
+
+  /** The founder tapped ✅. Re-validate the time, book, tell them. */
+  const bookPendingMeeting = async (ctx: Ctx, meeting: PendingMeeting): Promise<void> => {
+    const meetings = deps.meetings;
+    if (!meetings) return;
+    // The same re-check finalize does, via the same helper: a time can lapse while a
+    // confirmation sits unanswered.
+    const startsAt = stillFuture(meeting.executeAt, deps.now());
+    if (!startsAt) {
+      await deps.clearPending(ctx.threadId);
+      await deps.postAnswer(ctx.threadId, 'That time has already passed — send the command again with a new time.');
+      return;
+    }
+    const endsAt = new Date(startsAt.getTime() + meeting.durationMinutes * 60_000);
+
+    let booked: { meetLink: string | null; htmlLink: string | null; alreadyExisted: boolean };
+    try {
+      booked = await meetings.book({
+        startsAt,
+        endsAt,
+        title: meeting.title,
+        attendeeEmails: meeting.attendees.map((a) => a.email),
+        // Derived from the ORIGINAL command's ids — the same anchor scheduled_actions uses for
+        // its UNIQUE constraint. A redelivered tap (the Telegram poller replays a batch after
+        // any dispatch error) therefore collides at Google's API instead of double-booking.
+        idempotencyKey: `${ctx.pending?.chatId ?? ctx.threadId}:${ctx.pending?.messageId ?? meeting.executeAt}`,
+      });
+    } catch (err) {
+      const status = (err as { status?: number })?.status;
+      await deps.clearPending(ctx.threadId);
+      deps.log.error({ customerId: ctx.customer.id, status }, 'meeting command: booking failed');
+      await deps.postAnswer(
+        ctx.threadId,
+        status === 403 || status === 404
+          ? `I could not book it (${status}) — re-connect the meeting-host calendar in the console; it likely has read-only access.`
+          : // Deliberately NOT "just try again": this is an at-least-once boundary. A failure
+            // AFTER Google created the event is indistinguishable from one before, and a retry
+            // types a new command — a new idempotency key — so a blind retry could double-book.
+            // (Keying on customer+slot instead would make this retry collide, but Google reserves
+            // deleted event ids, so delete-then-rebook-the-same-slot would then silently no-op —
+            // a worse failure, because it looks like success.)
+            'Something went wrong booking that — check your calendar before retrying, in case it went through.',
+      );
+      return;
+    }
+
+    // Clear only AFTER a successful book: a thrown notify below would otherwise replay the tap
+    // against a cleared marker and tell the founder "that question has expired" for a meeting
+    // that is, in fact, on their calendar.
+    await deps.clearPending(ctx.threadId);
+    const who = meeting.attendees.length ? `Invited ${meeting.attendees.map((a) => a.name).join(', ')}.` : 'No invitations sent.';
+    const link = booked.meetLink ? `\n${booked.meetLink}` : '\n(no Meet link — add one in the calendar if you need it)';
+    await deps.postAnswer(
+      ctx.threadId,
+      `${booked.alreadyExisted ? '📅 Already booked' : '✅ Booked'} — ${slotLabel(startsAt, meeting.durationMinutes)}\n${who}${link}`,
+    );
+  };
+
   const onMessage = async (m: MessageEvent): Promise<boolean> => {
     const customer = await deps.findCustomer(m.threadId);
     if (!customer) return false; // scheduling is customer-topic only
@@ -470,6 +674,15 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
     }
 
     const ctxWithAnchor: Ctx = { ...ctx, pending: { ...(usable ?? emptyPending(anchor, customer.id)), commandText: merged, origin } };
+
+    // A meeting leaves here: it has no channel and no customer-facing body, so none of the
+    // machinery below applies to it. The verbatim/compose fork in particular is about text a
+    // CUSTOMER reads — a meeting's blast radius is a different thing entirely (an invitation
+    // Google emails the instant the event exists, which nothing here can recall), so it gets
+    // its own gate rather than inheriting one built for wording.
+    if (interpreted.kind === 'meeting') {
+      return proposeMeeting(ctxWithAnchor, interpreted, executeAt, merged, origin, anchor);
+    }
 
     // The founder's own words → no gate, exactly as before.
     const quoted = verbatimBody(interpreted.kind, interpreted.body, merged, mappedOutboundBody);
@@ -574,13 +787,32 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
       await deps.postAnswer(threadId, 'That question has expired — please send the command again.');
       return;
     }
+    const ctx: Ctx = { threadId, by: d.by, customer, pending };
+
+    // A meeting confirmation comes BEFORE the draft guard below: it carries a `meeting`, not a
+    // `draft`, so that guard would tell the founder we "lost track of that draft" for a
+    // perfectly good booking.
+    if (pending.ask === 'meeting') {
+      if (d.optionId === SCHEDULE_OPTIONS.cancel) {
+        await deps.clearPending(threadId);
+        await deps.postAnswer(threadId, 'Cancelled — nothing booked.');
+        return;
+      }
+      if (d.optionId !== SCHEDULE_OPTIONS.bookMeeting) return;
+      if (!pending.meeting) {
+        await deps.clearPending(threadId);
+        await deps.postAnswer(threadId, 'I lost track of that meeting — please send the command again.');
+        return;
+      }
+      await bookPendingMeeting(ctx, pending.meeting);
+      return;
+    }
+
     if (!pending.draft) {
       await deps.clearPending(threadId);
       await deps.postAnswer(threadId, 'I lost track of that draft — please send the command again.');
       return;
     }
-
-    const ctx: Ctx = { threadId, by: d.by, customer, pending };
 
     if (d.optionId === SCHEDULE_OPTIONS.cancel) {
       await deps.clearPending(threadId);

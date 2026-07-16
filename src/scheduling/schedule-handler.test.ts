@@ -38,8 +38,39 @@ function action(input: Parameters<ScheduleHandlerDeps['createAction']>[0]): Sche
 }
 
 /** `result` may be a single interpretation or one per successive turn. */
-function harness(result: ScheduleInterpretation | ScheduleInterpretation[], composed = 'Hi Ana, hope you are well!') {
-  const results = Array.isArray(result) ? [...result] : [result];
+/** An interpretation as a TEST writes one: the meeting-only fields default to their
+ *  not-a-meeting values, so the 30-odd existing literals stay about what they are testing. */
+type PartialInterpretation = Omit<ScheduleInterpretation, 'attendees' | 'duration_minutes'> &
+  Partial<Pick<ScheduleInterpretation, 'attendees' | 'duration_minutes'>>;
+
+const fill = (r: PartialInterpretation): ScheduleInterpretation => ({
+  attendees: null,
+  duration_minutes: null,
+  ...r,
+});
+
+/** Acme's contact list for the founder-initiated meeting tests. */
+const CONTACTS = [
+  { name: 'Idan Yelinkek', email: 'iyelinek@holadocmed.com', isPrimary: true },
+  { name: 'Karen Zyman', email: 'kzyman@holadocmed.com', isPrimary: false },
+];
+
+interface MeetingOpts {
+  /** undefined = meetings NOT wired (the flag is off). */
+  meetings?: 'on';
+  contacts?: Array<{ name: string; email: string; isPrimary: boolean }>;
+  conflicts?: string[];
+  bookThrows?: unknown;
+  alreadyExisted?: boolean;
+}
+
+function harness(
+  result: PartialInterpretation | PartialInterpretation[],
+  composed = 'Hi Ana, hope you are well!',
+  mo: MeetingOpts = {},
+) {
+  const results = (Array.isArray(result) ? [...result] : [result]).map(fill);
+  const booked: Array<Parameters<NonNullable<ScheduleHandlerDeps['meetings']>['book']>[0]> = [];
   const posts: string[] = [];
   const notices: Array<{ n: Notification; buttons?: Array<{ id: string; label: string }> }> = [];
   const creates: Array<Parameters<ScheduleHandlerDeps['createAction']>[0]> = [];
@@ -71,10 +102,23 @@ function harness(result: ScheduleInterpretation | ScheduleInterpretation[], comp
     postAnswer: async (_thread, text) => { posts.push(text); },
     notifyCustomer: async (_customer, n, buttons) => { notices.push({ n, buttons }); },
     log: { info: () => undefined, error: () => undefined },
+    meetings: mo.meetings
+      ? {
+          listContacts: async () => mo.contacts ?? CONTACTS,
+          founderEmails: async () => ['yuval@venditi.ai'],
+          conflictsAt: async () => mo.conflicts ?? [],
+          book: async (input) => {
+            booked.push(input);
+            if (mo.bookThrows) throw mo.bookThrows;
+            return { meetLink: 'https://meet.google.com/abc', htmlLink: null, alreadyExisted: mo.alreadyExisted ?? false };
+          },
+          defaultDurationMinutes: 30,
+        }
+      : undefined,
   };
   const handlers = buildScheduleHandlers(deps);
   return {
-    ...handlers, deps, posts, notices, creates, interpreted, composeCalls,
+    ...handlers, deps, posts, notices, creates, interpreted, composeCalls, booked,
     peekPending: () => pending,
   };
 }
@@ -498,4 +542,159 @@ test('only scheduling button ids are claimed', () => {
   for (const id of ['scw', 'sce', 'sca', 'scx', 'scc']) assert.equal(isScheduleOption(id), true);
   // 'sc' (cancel a scheduled action) stays with its own handler.
   for (const id of ['sc', 'da', 'de', 'x', 'bfok']) assert.equal(isScheduleOption(id), false);
+});
+
+// ── Founder-initiated meetings: "set up a meeting with X at Y, invite Z" ─────────
+// The governing asymmetry: a customer_message is recallable right up to the send, but a
+// booking emails its attendees the instant the event exists and nothing here can un-send that.
+// So the gate is on WHO gets invited, not on wording.
+
+const MEETING = {
+  kind: 'meeting' as const,
+  execute_at: '2026-07-16T15:00:00-05:00', // Thu 15:00 Panama
+  explicit_date: true,
+  body: null,
+  delivery_channel: 'none' as const,
+  clarification: null,
+  attendees: ['Idan'],
+  duration_minutes: null,
+};
+
+const tap = (optionId: string, nonce = 'n0nce'): Parameters<ReturnType<typeof buildScheduleHandlers>['onDecision']>[0] => ({
+  notificationRef: nonce,
+  optionId,
+  by: '9001',
+  threadId: '42',
+});
+
+test('a meeting command proposes a booking for confirmation — and books NOTHING yet', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on' });
+  assert.equal(await h.onMessage(message('set up a meeting with idan thursday 3pm')), true);
+
+  assert.deepEqual(h.booked, [], 'nothing may be booked before the founder confirms');
+  assert.deepEqual(h.creates, [], 'a meeting is NOT a scheduled_action — there is nothing to defer');
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0].n.title, /Book this/);
+  assert.match(h.notices[0].n.body, /Idan/);
+  assert.match(h.notices[0].n.body, /Thu 16 Jul, 15:00–15:30/, 'rendered in the founder tz, with the default duration');
+  assert.deepEqual(h.notices[0].buttons?.map((b) => b.id), ['scb:n0nce', 'scc:n0nce']);
+});
+
+test('tapping ✅ books it with the invitee, a Meet link, and sendUpdates', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on' });
+  await h.onMessage(message('set up a meeting with idan thursday 3pm'));
+  await h.onDecision(tap('scb'));
+
+  assert.equal(h.booked.length, 1);
+  assert.deepEqual(h.booked[0].attendeeEmails, ['iyelinek@holadocmed.com'], 'the NAME was resolved to a contact');
+  assert.equal(h.booked[0].startsAt.toISOString(), '2026-07-16T20:00:00.000Z');
+  assert.equal(h.booked[0].endsAt.toISOString(), '2026-07-16T20:30:00.000Z');
+  assert.match(h.posts.at(-1)!, /Booked/);
+  assert.match(h.posts.at(-1)!, /meet\.google\.com/);
+  assert.equal(h.peekPending(), null, 'the marker is cleared once it is on the calendar');
+});
+
+test('the founder\'s stated duration and title win over the defaults', async () => {
+  const h = harness({ ...MEETING, duration_minutes: 45, body: 'Pricing review' }, undefined, { meetings: 'on' });
+  await h.onMessage(message('45 min with idan thursday 3pm about pricing'));
+  await h.onDecision(tap('scb'));
+  assert.equal(h.booked[0].title, 'Pricing review');
+  assert.equal(h.booked[0].endsAt.getTime() - h.booked[0].startsAt.getTime(), 45 * 60_000);
+});
+
+test('"everyone" invites every email contact of the customer, minus the founder', async () => {
+  const withSelf = [...CONTACTS, { name: 'Yuval', email: 'yuval@venditi.ai', isPrimary: false }];
+  const h = harness({ ...MEETING, attendees: ['everyone'] }, undefined, { meetings: 'on', contacts: withSelf });
+  await h.onMessage(message('meeting with everyone thursday 3pm'));
+  await h.onDecision(tap('scb'));
+  assert.deepEqual(h.booked[0].attendeeEmails, ['iyelinek@holadocmed.com', 'kzyman@holadocmed.com']);
+});
+
+test('an UNKNOWN name asks who to invite instead of booking or guessing', async () => {
+  const h = harness({ ...MEETING, attendees: ['Idan', 'Roberto'] }, undefined, { meetings: 'on' });
+  const consumed = await h.onMessage(message('meeting with idan and roberto thursday 3pm'));
+
+  assert.equal(consumed, true);
+  assert.deepEqual(h.booked, []);
+  assert.deepEqual(h.notices, [], 'no confirmation may be offered for a list we cannot resolve');
+  assert.match(h.posts.at(-1)!, /don't know who "Roberto" is/);
+  assert.match(h.posts.at(-1)!, /Idan Yelinkek/, 'the real contacts are offered');
+  assert.ok(h.peekPending(), 'and the loop stays armed for the answer');
+});
+
+test('naming nobody books a solo hold and emails no one', async () => {
+  const h = harness({ ...MEETING, attendees: [] }, undefined, { meetings: 'on' });
+  await h.onMessage(message('block 30 min thursday 3pm'));
+  assert.match(h.notices[0].n.body, /nobody \(a hold on your calendar\)/);
+  await h.onDecision(tap('scb'));
+  assert.deepEqual(h.booked[0].attendeeEmails, []);
+  assert.match(h.posts.at(-1)!, /No invitations sent/);
+});
+
+test('a calendar clash is WARNED but still bookable — the founder named the time', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on', conflicts: ['an existing event'] });
+  await h.onMessage(message('meeting with idan thursday 3pm'));
+  assert.match(h.notices[0].n.body, /Clashes with/);
+  await h.onDecision(tap('scb'));
+  assert.equal(h.booked.length, 1, 'a warning is not a veto');
+});
+
+test('❌ cancels without booking', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on' });
+  await h.onMessage(message('meeting with idan thursday 3pm'));
+  await h.onDecision(tap('scc'));
+  assert.deepEqual(h.booked, []);
+  assert.match(h.posts.at(-1)!, /Cancelled/);
+  assert.equal(h.peekPending(), null);
+});
+
+test('a stale tap is told so rather than booking against a lapsed question', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on' });
+  await h.onMessage(message('meeting with idan thursday 3pm'));
+  await h.onDecision(tap('scb', 'wrong-nonce'));
+  assert.deepEqual(h.booked, []);
+  assert.match(h.posts.at(-1)!, /expired/);
+});
+
+test('a time that lapsed while the confirmation sat unanswered is refused', async () => {
+  const h = harness({ ...MEETING, execute_at: '2026-07-14T09:35:00-05:00' }, undefined, { meetings: 'on' });
+  await h.onMessage(message('meeting with idan at 9:35'));
+  // The founder wanders off; the slot passes before they tap.
+  h.deps.now = () => new Date('2026-07-14T15:30:00.000Z');
+  await h.onDecision(tap('scb'));
+  assert.deepEqual(h.booked, []);
+  assert.match(h.posts.at(-1)!, /already passed/);
+});
+
+test('a write-scope 403 is reported as a re-consent, not a mystery', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on', bookThrows: Object.assign(new Error('nope'), { status: 403 }) });
+  await h.onMessage(message('meeting with idan thursday 3pm'));
+  await h.onDecision(tap('scb'));
+  assert.match(h.posts.at(-1)!, /re-connect the meeting-host calendar/i);
+});
+
+test('a replayed ✅ reuses the SAME idempotency key (one command, one event)', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on', alreadyExisted: true });
+  await h.onMessage(message('set up a meeting with idan thursday 3pm'));
+  await h.onDecision(tap('scb'));
+  // Derived from the ORIGINAL command's ids, so Google's 409 catches the duplicate.
+  assert.equal(h.booked[0].idempotencyKey, '-1001:77');
+  assert.match(h.posts.at(-1)!, /Already booked/);
+});
+
+test('a meeting command with meetings UNWIRED says so rather than falling silent', async () => {
+  const h = harness(MEETING); // flag off
+  const consumed = await h.onMessage(message('set up a meeting with idan thursday 3pm'));
+  assert.equal(consumed, true);
+  assert.deepEqual(h.creates, [], 'and it must NOT leak into the scheduled_actions lane');
+  assert.match(h.posts.at(-1)!, /not enabled/);
+});
+
+test('the meeting button id does not collide with the customer-initiated lane', async () => {
+  // routeDecision tries isScheduleOption BEFORE isMeetingOption, so an overlap would silently
+  // hijack a tap meant for the triage-side scheduler.
+  for (const id of ['md30', 'ms1', 'mso', 'mtask']) {
+    assert.equal(isScheduleOption(id), false, `${id} belongs to the other lane`);
+  }
+  assert.equal(isScheduleOption('scb'), true);
 });

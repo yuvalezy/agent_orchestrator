@@ -14,13 +14,40 @@ import {
 
 test('schedule schema is strict-output compatible and parses the closed action set', () => {
   assert.equal(SCHEDULE_SCHEMA.additionalProperties, false);
-  assert.deepEqual(SCHEDULE_SCHEMA.required, ['kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification']);
+  // Strict structured output wants EVERY property in `required` — a new field that is absent for
+  // most kinds is typed nullable rather than omitted from this list.
+  assert.deepEqual(SCHEDULE_SCHEMA.required, [
+    'kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification',
+    'attendees', 'duration_minutes',
+  ]);
+  assert.deepEqual(Object.keys(SCHEDULE_SCHEMA.properties).sort(), [...SCHEDULE_SCHEMA.required].sort());
   const parsed = parseScheduleInterpretation({
     kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'follow up',
-    delivery_channel: 'none', clarification: null,
+    delivery_channel: 'none', clarification: null, attendees: null, duration_minutes: null,
   });
   assert.equal(parsed.kind, 'reminder');
   assert.throws(() => parseScheduleInterpretation({ kind: 'send_everything' }));
+});
+
+test('a meeting parses with its attendees and duration; the kind set stays closed', () => {
+  const parsed = parseScheduleInterpretation({
+    kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: 'Pricing review',
+    delivery_channel: 'none', clarification: null, attendees: ['Idan', 'Karen'], duration_minutes: 45,
+  });
+  assert.equal(parsed.kind, 'meeting');
+  assert.deepEqual(parsed.attendees, ['Idan', 'Karen']);
+  assert.equal(parsed.duration_minutes, 45);
+});
+
+test('the model cannot smuggle an ADDRESS in as an attendee decision', () => {
+  // attendees are NAMES the founder said; resolving one to a mailbox is the code's job
+  // (meeting-invitees.ts). The schema cannot enforce "not an address", but the handler never
+  // treats these as addresses — this pins the shape the handler relies on.
+  const parsed = parseScheduleInterpretation({
+    kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: null,
+    delivery_channel: 'none', clarification: null, attendees: ['someone@evil.com'], duration_minutes: null,
+  });
+  assert.deepEqual(parsed.attendees, ['someone@evil.com'], 'it parses as a NAME — and will simply fail to match a contact');
 });
 
 // body_source used to be a model output that selected its own enforcement level.
@@ -29,7 +56,8 @@ test('the model cannot declare its own body_source', () => {
   assert.ok(!SCHEDULE_SCHEMA.required.includes('body_source' as never));
   const parsed = parseScheduleInterpretation({
     kind: 'customer_message', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'hi',
-    delivery_channel: 'whatsapp', clarification: null, body_source: 'command',
+    delivery_channel: 'whatsapp', clarification: null, attendees: null, duration_minutes: null,
+    body_source: 'command',
   });
   assert.ok(!('body_source' in parsed), 'a smuggled body_source is stripped, not honoured');
 });
@@ -54,6 +82,12 @@ test('the prior turn is carried as authoritative founder speech to merge', () =>
   assert.match(user, /say hi to Shlomo at 8 am/);
   assert.match(user, /Which channel\?/);
   assert.match(SCHEDULE_SYSTEM, /merge them into ONE action/i);
+  // Measured, not assumed: without this rule the model re-resolved the day on the merge turn
+  // and moved "thursday 3pm" to the following Monday — 0/5 runs kept the founder's day, and the
+  // plain customer_message path drifted identically. With it, 6/6 held. An answer about the
+  // channel/wording/attendees must not move the appointment.
+  assert.match(SCHEDULE_SYSTEM, /answer only overrides what it actually addresses/i);
+  assert.match(SCHEDULE_SYSTEM, /does not move the meeting/i);
   // The channel question is resolved by the system, not by badgering the founder.
   assert.match(SCHEDULE_SYSTEM, /Do NOT clarify merely because the channel is absent/);
 });
