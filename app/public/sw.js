@@ -27,8 +27,8 @@ function readConfig() {
 const fcmConfig = readConfig();
 if (fcmConfig && fcmConfig.apiKey) {
   try {
-    importScripts('https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js');
-    importScripts('https://www.gstatic.com/firebasejs/10.14.1/firebase-messaging-compat.js');
+    importScripts('https://www.gstatic.com/firebasejs/12.16.0/firebase-app-compat.js');
+    importScripts('https://www.gstatic.com/firebasejs/12.16.0/firebase-messaging-compat.js');
     firebase.initializeApp(fcmConfig);
     // Payloads are data-only, so this handler owns display (no double notification).
     firebase.messaging().onBackgroundMessage((payload) => {
