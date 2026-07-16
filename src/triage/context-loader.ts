@@ -74,6 +74,7 @@ export function buildTriageContext(
   openTasks: TargetTask[],
   knowledge: KnowledgeChunk[] = [],
   priorTurns: ThreadConversationTurn[] = [],
+  customerBrief: string | null = null,
 ): TriageContext {
   const recentConversation = activeExchange(priorTurns).map((turn) => ({
     direction: turn.direction,
@@ -93,6 +94,8 @@ export function buildTriageContext(
       ? 'customer'
       : recentConversation[0].direction === 'outbound' ? 'founder' : 'customer',
     knowledge,
+    // WP6: CONTEXT-ONLY relationship brief (additive; null → the field is simply absent).
+    ...(customerBrief && customerBrief.trim().length > 0 ? { customerBrief: customerBrief.trim() } : {}),
   };
 }
 

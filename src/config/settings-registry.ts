@@ -281,6 +281,16 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     default: false,
   },
   {
+    key: 'CUSTOMER_BRIEF_ENABLED',
+    type: 'boolean',
+    category: INTELLIGENCE,
+    label: 'Customer relationship briefs',
+    description:
+      'Registers the worker that keeps a one-paragraph relationship brief per customer (who they are, what is live, how it feels), refreshed only when their facts change — no LLM spend when unchanged. The brief is injected as context-only side information into triage and drafting (never a citation source); a miss never blocks either. Needs an LLM provider key.',
+    applyMode: 'restart',
+    default: false,
+  },
+  {
     key: 'ACCEPTANCE_REPORT_ENABLED',
     type: 'boolean',
     category: INTELLIGENCE,

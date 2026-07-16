@@ -51,6 +51,7 @@ interface Captured {
   findInboxIds: string[];
   styleCustomerIds: Array<string | null>;
   meetingCalls: Array<{ customerId: string | null; matchEmails: string[] }>;
+  briefCustomerIds: string[];
   verifyReqs: VerifyDraftRequest[];
   reviseReqs: ReviseRequest[];
 }
@@ -63,6 +64,9 @@ function makeDeps(over?: {
   styleGuidance?: string[];
   styleGuidanceFor?: (customerId: string | null) => Promise<string[]>;
   meetings?: string[];
+  /** WP6 relationship brief: the loader's return, or a custom impl (e.g. to throw). */
+  brief?: string | null;
+  briefLoad?: (customerId: string) => Promise<string | null>;
   resolveGender?: (channelType: string, address: string) => Promise<'male' | 'female' | null>;
   /** WP3 verifier: return a verdict per verifyDraft call (consumed in order; last repeats), or throw. */
   verdicts?: DraftVerdict[];
@@ -71,7 +75,7 @@ function makeDeps(over?: {
   reviseResult?: ReviseResult;
   reviseThrows?: boolean;
 }): { deps: ResponseDrafterDeps; cap: Captured } {
-  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [], meetingCalls: [], verifyReqs: [], reviseReqs: [] };
+  const cap: Captured = { draftReqs: [], records: [], enqueues: [], notifies: [], findInboxIds: [], styleCustomerIds: [], meetingCalls: [], briefCustomerIds: [], verifyReqs: [], reviseReqs: [] };
   const deps: ResponseDrafterDeps = {
     ...(over?.verdicts || over?.verifyThrows
       ? {
@@ -113,6 +117,17 @@ function makeDeps(over?: {
             upcomingFor: async (input): Promise<string[]> => {
               cap.meetingCalls.push(input);
               return over.meetings ?? [];
+            },
+          },
+        }
+      : {}),
+    ...(over?.brief !== undefined || over?.briefLoad
+      ? {
+          brief: {
+            load: async (customerId: string): Promise<string | null> => {
+              cap.briefCustomerIds.push(customerId);
+              if (over?.briefLoad) return over.briefLoad(customerId);
+              return over?.brief ?? null;
             },
           },
         }
@@ -447,6 +462,45 @@ test('meetings: no meetings dep → upcomingMeetings absent/empty, drafting unaf
   });
   assert.equal(cap.meetingCalls.length, 0, 'no fetch when the lane is not wired');
   assert.deepEqual(cap.draftReqs[0].upcomingMeetings, [], 'upcomingMeetings defaults to empty');
+});
+
+// ── WP6: relationship-brief draft context (mirrors the meetings never-citable contract) ──────────
+
+test('brief: the customer brief is loaded + injected as draft context (never a citation)', async () => {
+  const { deps, cap } = makeDeps({ brief: 'Warm long-term customer; one open export bug.' });
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 'tk', knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  // Loaded for THIS customer, passed to the LLM as customerBrief (draft context).
+  assert.deepEqual(cap.briefCustomerIds, ['cust-9']);
+  assert.equal(cap.draftReqs[0].customerBrief, 'Warm long-term customer; one open export bug.');
+  // NOT turned into citations — the decision carries ONLY the knowledge-chunk cite.
+  const ao = cap.records[0].agentOutput as { citations: string[] };
+  assert.deepEqual(ao.citations, ['Exports › Scheduling (/docs/exports)']);
+  assert.equal(cap.notifies[0].n.body.includes('export bug'), false, 'the brief never appears in the founder-facing citation block');
+});
+
+test('brief: no brief dep → customerBrief absent, drafting unaffected', async () => {
+  const { deps, cap } = makeDeps({});
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 'tk', knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  assert.equal(cap.briefCustomerIds.length, 0, 'no load when the lane is not wired');
+  assert.equal(cap.draftReqs[0].customerBrief, undefined, 'customerBrief defaults to absent');
+  assert.equal(cap.enqueues.length, 1, 'the draft still went out');
+});
+
+test('brief: a null brief (none yet) → customerBrief absent, drafting proceeds', async () => {
+  const { deps, cap } = makeDeps({ brief: null });
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row(), customerId: 'cust-9', config: cfg, threadKey: 'tk', knowledge: [chunk()],
+    intent: { category: 'question_existing', summary: 's', suggested_title: 't', priority: 'low', confidence: 0.9, related_open_task_ref: null },
+  });
+  assert.deepEqual(cap.briefCustomerIds, ['cust-9']);
+  assert.equal(cap.draftReqs[0].customerBrief, undefined);
+  assert.equal(cap.enqueues.length, 1);
 });
 
 test('meetingMatchEmails: email sender → [lowercased]; phone/blank → []', () => {

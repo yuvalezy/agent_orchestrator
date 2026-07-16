@@ -7,6 +7,7 @@ import type { enqueueDraft, findOpenDraftByInbox, OpenDraftForInbox } from '../o
 import type { recordDraftDecision } from '../decisions/decisions';
 import type { StyleLane } from '../knowledge/style-lane';
 import type { MeetingContext } from './meeting-context';
+import type { CustomerBriefLoader } from '../knowledge/customer-brief';
 import { logger } from '../logger';
 import { draftButtons } from './draft-review';
 
@@ -40,6 +41,10 @@ export interface ResponseDrafterDeps {
    *  meetings are pulled from the founder's calendar on every draft and injected as draft CONTEXT
    *  (best-effort → [] on miss) — never a citation source. Undefined → no meetings context. */
   meetings?: MeetingContext;
+  /** WP6 relationship-brief loader (gated CUSTOMER_BRIEF_ENABLED). When set, the customer's live
+   *  brief is pulled on every draft and injected as draft CONTEXT (best-effort → null on miss) —
+   *  never a citation source. Undefined → no brief context. */
+  brief?: CustomerBriefLoader;
   /** Recipient grammatical gender lookup. In a gendered language a reply must agree with the
    *  person; with `preferred_language='es'` and no gender the model can only hedge
    *  ("Bienvenido/a"). Best-effort by contract → null just means neutral phrasing.
@@ -141,6 +146,11 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
         ? await deps.meetings.upcomingFor({ customerId, matchEmails: meetingMatchEmails(row) })
         : [];
 
+      // (2b') WP6 relationship brief (gated CUSTOMER_BRIEF_ENABLED): the customer's live brief injected
+      //       as draft CONTEXT (best-effort → null on miss). NOT a citation source — it never feeds
+      //       renderCitations, so no "Based on:" hallucination.
+      const customerBrief = deps.brief ? (await deps.brief.load(customerId)) ?? undefined : undefined;
+
       // (2) Draft in the customer's preferred language, grounded ONLY in `knowledge`; voice
       //     guidance shapes phrasing only; meetings are acknowledgeable context only.
       // (2c) Recipient gender (best-effort → null): the sender we are replying TO is the
@@ -164,6 +174,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
         knowledge,
         voiceGuidance,
         upcomingMeetings,
+        customerBrief,
       };
       const result = await deps.llm.draftReply(req);
 

@@ -718,6 +718,38 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+
+  // ── WP6: rolling per-customer relationship brief. A ~6h worker assembles each onboarded customer's
+  // recent facts (30d conversation volume + last contact, recent memory snippets, open tasks, pending
+  // drafts), hashes them, and re-synthesizes the ONE live brief (agent_customer_briefs) ONLY when the
+  // facts changed (hash != stored) — so an unchanged customer costs no LLM spend. The brief is injected
+  // as CONTEXT-ONLY side information into triage + drafting (never a citation source); the loader is
+  // best-effort (a miss/error → no brief section, never a triage/draft failure). Kill-switch (mirrors
+  // OUTBOUND_ENABLED strict-bool): the worker + the triage/draft loaders are wired ONLY when the literal
+  // "true"; unset/"false"/anything else → false. DORMANT by default so nothing generates briefs or
+  // changes the triage/draft context by surprise. Requires Telegram only for the worker's LLM-failover
+  // notices; synthesis needs an LLM provider key (resolveCredential).
+  CUSTOMER_BRIEF_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  CUSTOMER_BRIEF_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000), // 6h
+  // Look-back window (days) for the conversation-volume + last-contact facts.
+  CUSTOMER_BRIEF_WINDOW_DAYS: z.coerce.number().int().positive().default(30),
+  // Max recent memory snippets (feedback/correction/conversation) folded into the facts.
+  CUSTOMER_BRIEF_MAX_MEMORIES: z.coerce.number().int().positive().default(10),
+  // Max open-task lines folded into the facts.
+  CUSTOMER_BRIEF_MAX_TASKS: z.coerce.number().int().positive().default(10),
+
+  // ── WP6(3): learned-fact CONTRADICTION report (report-only). Piggybacks on the weekly-patterns
+  // sweep (WEEKLY_PATTERNS_ENABLED): the same weekly tick scans this week's 'correction' facts (kind=
+  // 'fact') for same-subject pairs (highly similar STORED embeddings, per scope) and posts a review
+  // note to the Admin topic. No auto-resolution, no deletion. These are TUNING knobs (not a flag) — the
+  // report is gated by WEEKLY_PATTERNS_ENABLED, not its own switch. No embed calls (reuses ingest vectors).
+  // ⚠︎ Cosine-distance ceiling (0..2) for two facts to be "about the same subject" — TIGHT by design.
+  CONTRADICTION_REPORT_MAX_DISTANCE: z.coerce.number().min(0).max(2).default(0.15),
+  // Cap on flagged pairs per report.
+  CONTRADICTION_REPORT_MAX_PAIRS: z.coerce.number().int().positive().default(5),
 });
 
 const parsed = envSchema.safeParse(process.env);

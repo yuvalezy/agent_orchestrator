@@ -66,6 +66,12 @@ export const DRAFT_SYSTEM = [
   'knowledge sources and NOT facts: never cite them, never list their number in used_sources,',
   'and never invent, move, or promise a meeting that is not listed.',
   '',
+  'RELATIONSHIP BRIEF (when a "Customer relationship brief" section is present): that paragraph is',
+  'an internal note about who this customer is and what is live with them. It may shade your TONE and',
+  'awareness, but it is NOT a knowledge source and NOT product fact: never cite it, never list its',
+  'number in used_sources, and never assert a capability, commitment, or fact that appears only there',
+  '— grounding for anything the customer will read still comes ONLY from the numbered sources.',
+  '',
   'In a gendered language, use the supplied recipient gender for adjectives/participles about them.',
   'When no gender is supplied you do NOT know it: use phrasing that works for anyone — never guess from',
   'the name, and never hedge with a slash ("Bienvenido/a"), which no native speaker writes.',
@@ -96,6 +102,12 @@ export function draftUserMessage(req: DraftRequest): string {
   if (meetings.length > 0) {
     parts.push('', 'Upcoming meetings with this customer (context — NOT a source, do NOT cite):');
     meetings.forEach((m) => parts.push(`- ${m}`));
+  }
+  // WP6 relationship brief: a DISTINCT, UN-numbered context paragraph (not a source) so the model can
+  // never cite it or fold it into used_sources. Rendered only when present.
+  const brief = req.customerBrief?.trim();
+  if (brief) {
+    parts.push('', 'Customer relationship brief (context — NOT a source, do NOT cite):', brief);
   }
   parts.push('', 'Knowledge sources (answer ONLY from these):');
   req.knowledge.forEach((k, i) => {

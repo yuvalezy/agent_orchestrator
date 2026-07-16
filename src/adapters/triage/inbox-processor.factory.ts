@@ -10,6 +10,8 @@ import { FailureEpisodeTracker } from '../../triage/failure-episode';
 import { buildKnowledgeRetriever, type KnowledgeRetriever } from '../../knowledge/retrieval';
 import { buildStyleLaneGated } from '../knowledge/style-lane.factory';
 import { buildMeetingContext, type MeetingContext } from '../../triage/meeting-context';
+import { buildCustomerBriefLoader, type CustomerBriefLoader } from '../../knowledge/customer-brief';
+import { getCustomerBrief } from '../../knowledge/customer-brief-repo';
 import { withDueDateCalendarEventsIf } from '../../triage/due-event-sync';
 import { claimDueEvent, completeDueEvent, releaseDueEvent } from '../../triage/due-event-ledger';
 import { buildCalendarAdapter, resolveDueEventTarget } from '../calendar';
@@ -85,9 +87,26 @@ function buildTriageKnowledgeRetriever(): KnowledgeRetriever | undefined {
  * KNOWLEDGE_DRAFT_ENABLED without KNOWLEDGE_RETRIEVAL_ENABLED is dormant-but-enabled
  * (diagnosable via this log).
  */
+/**
+ * WP6: build the per-customer relationship-brief loader wired into triage + drafting — the
+ * composition root where the core best-effort loader meets the concrete brief read (D1: core never
+ * imports adapters). Gated by CUSTOMER_BRIEF_ENABLED so it stays dormant → triage/draft context is
+ * byte-for-byte what it was before this feature. Returns undefined when off. A pure DB read (no
+ * secret, no embedding); the loader swallows its own errors → a brief miss never fails triage/drafting.
+ */
+function buildCustomerBriefLoaderGated(): CustomerBriefLoader | undefined {
+  if (!env.CUSTOMER_BRIEF_ENABLED) {
+    logger.info('customer relationship brief NOT wired (CUSTOMER_BRIEF_ENABLED=false)');
+    return undefined;
+  }
+  logger.info('customer relationship brief wired (CUSTOMER_BRIEF_ENABLED=true) — injected as context-only into triage + drafting');
+  return buildCustomerBriefLoader({ get: getCustomerBrief, log: logger });
+}
+
 function buildResponseDrafterGated(
   llm: Pick<AgentLlmPort, 'draftReply'> & DraftVerifierPort & DraftReviserPort,
   notifier: FounderNotifierPort,
+  brief: CustomerBriefLoader | undefined,
 ): ResponseDrafter | undefined {
   if (!env.KNOWLEDGE_DRAFT_ENABLED) {
     logger.info('response drafter NOT wired (KNOWLEDGE_DRAFT_ENABLED=false)');
@@ -122,6 +141,8 @@ function buildResponseDrafterGated(
     // M5(d): upcoming-meetings context from the founder's Google Calendar (gated; undefined
     // when off → no meetings context).
     meetings: buildMeetingContextGated(),
+    // WP6: relationship-brief context (gated; undefined when off → no brief context).
+    brief,
   });
 }
 
@@ -243,6 +264,9 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
   });
 
+  // WP6: one relationship-brief loader, shared by the triage context + the drafter (gated).
+  const customerBrief = buildCustomerBriefLoaderGated();
+
   const triage = new TriageService({
     // A customer asking to talk books a call instead of minting a task (gated; dormant by
     // default). Given the UNDECORATED task target on purpose: its fallback creates the task a
@@ -261,11 +285,13 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     // M2a(b): scoped RAG retrieval into the triage context (gated; see below).
     knowledgeRetriever: buildTriageKnowledgeRetriever(),
     // M2a(c): cited-draft responder for answerable questions (gated; dormant by default).
-    responseDrafter: buildResponseDrafterGated(llm, notifier),
+    responseDrafter: buildResponseDrafterGated(llm, notifier, customerBrief),
     // M2(f): cross-channel semantic dedup (gated; dormant by default).
     crossChannelDedup: buildCrossChannelDedupGated(),
     // WP2(c): needs-info clarification drafter for unclear intents (gated; additive to askFounder).
     needsInfoDrafter: buildNeedsInfoDrafterGated(llm, notifier),
+    // WP6: relationship-brief context injected into triage (gated; undefined when off).
+    customerBrief,
   });
 
   // Early-warning tracker (§9.5): raises ONE admin alert as soon as triage failures

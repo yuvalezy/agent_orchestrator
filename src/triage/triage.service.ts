@@ -8,6 +8,7 @@ import type { ResponseDrafter } from './response-drafter';
 import type { NeedsInfoDrafter } from './needs-info-draft';
 import type { CrossChannelDedup } from './cross-channel-dedup';
 import type { MeetingScheduler } from './meeting-scheduler';
+import type { CustomerBriefLoader } from '../knowledge/customer-brief';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
@@ -163,6 +164,11 @@ export interface TriageDeps {
    *  customer (is_draft=true, approve/edit/reject) so the founder can one-tap ask. Absent = the
    *  pre-feature behavior (askFounder only). Best-effort: a draft failure never fails the row. */
   needsInfoDrafter?: NeedsInfoDrafter;
+  /** WP6: the per-customer relationship-brief loader. Optional + gated (CUSTOMER_BRIEF_ENABLED) —
+   *  when present, the customer's live brief is injected as CONTEXT-ONLY into the triage context.
+   *  Best-effort by contract (load returns null on a miss/error), so a brief read NEVER blocks triage;
+   *  absent = no brief section (byte-for-byte the pre-feature context). */
+  customerBrief?: CustomerBriefLoader;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -297,7 +303,10 @@ export class TriageService {
           limit: 12,
         })
       : [];
-    const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks, knowledge, priorTurns);
+    // WP6: best-effort relationship brief (CONTEXT-ONLY). A miss/error → no brief section (never
+    // blocks triage); absent loader (feature off) → no brief section.
+    const customerBrief = await this.loadCustomerBrief(customerId);
+    const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks, knowledge, priorTurns, customerBrief);
     const intents = await this.deps.llm.extractIntents(context);
 
     if (intents.length === 0) {
@@ -329,6 +338,21 @@ export class TriageService {
     const queryText = [row.subject, row.body].filter((s): s is string => !!s && s.trim().length > 0).join('\n');
     if (!queryText) return [];
     return retriever.retrieve(queryText, customerId);
+  }
+
+  /**
+   * WP6: best-effort relationship-brief load for the triage context (CONTEXT-ONLY). Returns null when
+   * no loader is wired (feature off) OR on ANY error — the loader is best-effort by contract, and this
+   * belt-and-braces catch guarantees a bad brief read can never block the money loop.
+   */
+  private async loadCustomerBrief(customerId: string): Promise<string | null> {
+    if (!this.deps.customerBrief) return null;
+    try {
+      return await this.deps.customerBrief.load(customerId);
+    } catch (err) {
+      logger.warn({ reason: (err as Error)?.message }, 'triage: brief load failed — proceeding without a brief');
+      return null;
+    }
   }
 
   /**

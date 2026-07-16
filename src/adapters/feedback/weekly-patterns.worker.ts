@@ -3,6 +3,7 @@ import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import type { SyncLogger } from '../../knowledge/sync';
 import {
   runWeeklyPatterns,
+  type ContradictionOptions,
   type DetectOptions,
   type PatternSignalInput,
 } from '../../knowledge/pattern-detect';
@@ -21,6 +22,9 @@ export interface WeeklyPatternsWorkerDeps {
   tz: string;
   windowDays: number;
   detect: DetectOptions;
+  /** WP6(3): learned-fact contradiction report options. Optional — omit to keep the sweep as
+   *  pattern-digest-only (byte-for-byte the prior behavior). */
+  contradiction?: ContradictionOptions;
   log: SyncLogger;
   intervalMs: number;
   /** Clock seam — defaults to the wall clock. */
@@ -43,6 +47,7 @@ export function buildWeeklyPatternsWorker(deps: WeeklyPatternsWorkerDeps): Worke
         tz: deps.tz,
         windowDays: deps.windowDays,
         detect: deps.detect,
+        contradiction: deps.contradiction,
         log: deps.log,
       });
     },

@@ -59,3 +59,29 @@ test('DRAFT_SYSTEM: instructs voice guidance is directive-only — apply, never 
   assert.ok(s.includes('not') && s.includes('used_sources'), 'excludes voice guidance from used_sources');
   assert.ok(s.includes('never cite') || s.includes('not') , 'voice guidance is not cited');
 });
+
+// ── WP6: relationship brief side-context (mirrors the upcoming-meetings never-citable contract) ──
+
+test('draftUserMessage: the relationship brief renders as a distinct un-numbered context section, not a source', () => {
+  const msg = draftUserMessage(req({ customerBrief: 'Long-standing customer; one open export bug; warm.' }));
+  assert.match(msg, /Customer relationship brief \(context — NOT a source, do NOT cite\):/);
+  assert.match(msg, /Long-standing customer; one open export bug; warm\./);
+  // The knowledge source is still numbered [0]; the brief is NEVER numbered like a source.
+  assert.match(msg, /\[0\] Exports › Scheduling/);
+  assert.equal(/\[\d+\][^\n]*Long-standing/.test(msg), false, 'the brief is never emitted as a numbered [i] source');
+  // The brief appears BEFORE the knowledge sources (context frames the answer).
+  assert.ok(msg.indexOf('relationship brief') < msg.indexOf('Knowledge sources'));
+});
+
+test('draftUserMessage: no/blank relationship brief → no brief section at all', () => {
+  assert.equal(/relationship brief/i.test(draftUserMessage(req())), false, 'absent → omitted');
+  assert.equal(/relationship brief/i.test(draftUserMessage(req({ customerBrief: '' }))), false, 'empty → omitted');
+  assert.equal(/relationship brief/i.test(draftUserMessage(req({ customerBrief: '   ' }))), false, 'blank-only → omitted');
+});
+
+test('DRAFT_SYSTEM: the relationship brief is context-only — apply for tone, never cite, never in used_sources', () => {
+  const s = DRAFT_SYSTEM.toLowerCase();
+  assert.ok(s.includes('relationship brief'), 'names the relationship brief');
+  assert.ok(s.includes('never cite it'), 'the brief is never cited');
+  assert.ok(s.includes('used_sources'), 'excludes the brief from used_sources');
+});

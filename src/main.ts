@@ -63,6 +63,7 @@ import { buildFeedbackLearningWorker } from './adapters/feedback/feedback-learni
 import { buildAcceptanceReportWorker } from './adapters/feedback/acceptance-report.worker';
 import { buildWeeklyPatternsWorker } from './adapters/feedback/weekly-patterns.worker';
 import { buildWeeklyReviewWorker } from './adapters/feedback/weekly-review.worker';
+import { buildCustomerBriefWorker } from './adapters/knowledge/customer-brief.worker';
 import { buildDailyBriefingWorker } from './adapters/query/daily-briefing.worker';
 import { buildCalendarAdapter } from './adapters/calendar';
 import { buildTaskEventWorkerFactory } from './adapters/proactive/task-event.worker';
@@ -509,6 +510,12 @@ async function main(): Promise<void> {
             minCount: env.WEEKLY_PATTERNS_MIN_COUNT,
             topK: env.WEEKLY_PATTERNS_TOP_K,
           },
+          // WP6(3): the same weekly tick also posts a learned-fact contradiction report (report-only).
+          // Piggybacks on this sweep's signals + stored embeddings — no new flag, no embed calls.
+          contradiction: {
+            maxDistance: env.CONTRADICTION_REPORT_MAX_DISTANCE,
+            maxPairs: env.CONTRADICTION_REPORT_MAX_PAIRS,
+          },
           log: logger,
           intervalMs: env.WEEKLY_PATTERNS_INTERVAL_MS,
         }),
@@ -554,6 +561,31 @@ async function main(): Promise<void> {
     }
   } else {
     logger.info('weekly-review worker NOT registered (WEEKLY_REVIEW_ENABLED=false)');
+  }
+
+  // WP6: rolling per-customer relationship brief — registered ONLY when CUSTOMER_BRIEF_ENABLED. A ~6h
+  // sweep that refreshes each onboarded customer's one-paragraph brief, but only when their facts
+  // changed (per-customer facts-hash skip → no LLM spend when unchanged). The brief is injected as
+  // CONTEXT-ONLY side information into triage + drafting (wired in the inbox-processor factory under
+  // the SAME flag). The router's failover/cap notices go to the Admin topic when Telegram is
+  // configured, else to the log. DORMANT by default.
+  if (env.CUSTOMER_BRIEF_ENABLED) {
+    const briefNotifyAdmin = notifier
+      ? (msg: string) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' })
+      : async (msg: string) => void logger.warn({ msg }, 'customer-brief LLM gateway notice (Telegram unconfigured)');
+    knowledgeWorkers.push(
+      buildCustomerBriefWorker({
+        synthesizer: buildLlmRouter({ notifyAdmin: briefNotifyAdmin }),
+        intervalMs: env.CUSTOMER_BRIEF_INTERVAL_MS,
+        windowDays: env.CUSTOMER_BRIEF_WINDOW_DAYS,
+        maxMemories: env.CUSTOMER_BRIEF_MAX_MEMORIES,
+        maxTasks: env.CUSTOMER_BRIEF_MAX_TASKS,
+        log: logger,
+      }),
+    );
+    logger.info({ intervalMs: env.CUSTOMER_BRIEF_INTERVAL_MS, windowDays: env.CUSTOMER_BRIEF_WINDOW_DAYS }, 'customer-brief worker registered (CUSTOMER_BRIEF_ENABLED=true)');
+  } else {
+    logger.info('customer-brief worker NOT registered (CUSTOMER_BRIEF_ENABLED=false)');
   }
 
   // M5(b) + task 3.1: daily founder briefing — registered ONLY when DAILY_BRIEFING_ENABLED AND

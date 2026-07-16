@@ -1,6 +1,6 @@
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { SyncLogger } from './sync';
-import { clusterByEmbedding, type EmbeddedItem } from './proposal-collapse';
+import { clusterByEmbedding, cosineDistance, type EmbeddedItem } from './proposal-collapse';
 
 // M3(e) Weekly Pattern Detection (CORE, pure aggregation + injected fetch/notifier —
 // mirrors the M3(d) acceptance-report shape). Clusters the week's Layer-A signal
@@ -194,6 +194,102 @@ export function isoWeekInTz(d: Date, tz: string): string {
   return `${isoYear}-W${String(week).padStart(2, '0')}`;
 }
 
+// ── WP6(3): learned-fact CONTRADICTION report (report-only v1) ──────────────────────────────────
+// Among 'correction' memories with kind='fact' for the SAME scope (shared together; customer facts
+// per customer), find pairs that are highly similar by their STORED embeddings — they are about the
+// same subject, so a divergence between them is a candidate contradiction the founder should review.
+// This is REPORT-ONLY: no auto-resolution, no deletion — just a flagged pair list. Reuses the ingest
+// embeddings (no new embed calls); the pure detection is unit-testable without a DB.
+
+/** One flagged pair of learned facts that are about the same subject (highly similar embeddings). */
+export interface ContradictionPair {
+  a: string;
+  b: string;
+  /** Cosine distance between the two (smaller = more similar). */
+  distance: number;
+}
+
+export interface ContradictionOptions {
+  /** Cosine-distance ceiling for two facts to be "about the same subject" (TIGHT by design). */
+  maxDistance: number;
+  /** Cap on pairs surfaced per report. */
+  maxPairs: number;
+}
+
+/** The fact text of a signal (prefers the normalized `metadata.fact`, else the content), collapsed. */
+function factText(s: PatternSignalInput): string {
+  const fact = s.metadata && typeof s.metadata['fact'] === 'string' ? (s.metadata['fact'] as string) : '';
+  return (fact || s.content || '').replace(/\s+/g, ' ').trim();
+}
+
+/** The scope-isolation key: shared facts group together; customer facts group PER customer (a
+ *  contradiction is only meaningful within one scope). */
+function scopeKey(s: PatternSignalInput): string {
+  const scope = s.metadata && typeof s.metadata['scope'] === 'string' ? (s.metadata['scope'] as string) : null;
+  if (scope === 'shared' || (scope === null && s.customerId === null)) return 'shared';
+  return `customer:${s.customerId ?? 'unknown'}`;
+}
+
+/**
+ * Find pairs of learned FACTS (memory_type='correction', metadata.kind='fact') within the SAME scope
+ * whose stored embeddings are within `maxDistance` of each other (PURE). Distinct texts only (an
+ * exact duplicate is already deduped at write time and is not a contradiction). Candidates across all
+ * scope groups are ranked by similarity (nearest first) and capped at `maxPairs`. No new embed calls.
+ */
+export function detectContradictions(signals: readonly PatternSignalInput[], opts: ContradictionOptions): ContradictionPair[] {
+  const facts = signals.filter(
+    (s) => s.memoryType === 'correction' && s.metadata && s.metadata['kind'] === 'fact' && s.embedding.length > 0,
+  );
+
+  // Group by scope so a shared fact is never paired against a customer-only one.
+  const groups = new Map<string, PatternSignalInput[]>();
+  for (const s of facts) {
+    const key = scopeKey(s);
+    const g = groups.get(key);
+    if (g) g.push(s);
+    else groups.set(key, [s]);
+  }
+
+  const pairs: ContradictionPair[] = [];
+  for (const group of groups.values()) {
+    for (let i = 0; i < group.length; i += 1) {
+      for (let j = i + 1; j < group.length; j += 1) {
+        const a = factText(group[i]);
+        const b = factText(group[j]);
+        if (!a || !b || a === b) continue; // identical/empty facts are not a contradiction
+        const distance = cosineDistance(group[i].embedding, group[j].embedding);
+        if (distance <= opts.maxDistance) pairs.push({ a, b, distance });
+      }
+    }
+  }
+
+  return pairs.sort((x, y) => x.distance - y.distance).slice(0, opts.maxPairs);
+}
+
+/** Truncate a fact to `max` chars for the report line (adds an ellipsis). PURE. */
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+/**
+ * Render flagged contradiction pairs into a founder-facing admin Notification (PURE), each fact
+ * truncated to 80 chars. Returns null when there are no pairs (the caller posts nothing). Report-only
+ * — the founder reviews; nothing is auto-resolved or deleted.
+ */
+export function renderContradictionReport(pairs: readonly ContradictionPair[]): Notification | null {
+  if (pairs.length === 0) return null;
+  const parts: string[] = ['Learned facts that look like they may contradict each other:'];
+  for (const p of pairs) {
+    parts.push(`  • “${truncate(p.a, 80)}”`);
+    parts.push(`    ↔ “${truncate(p.b, 80)}”`);
+  }
+  return {
+    title: '🧭 Possible contradicting learned facts — review',
+    body: parts.join('\n'),
+    severity: 'info',
+  };
+}
+
 export interface WeeklyPatternsDeps {
   /** Recent Layer-A signal memories since an ISO instant (memoryRepo.fetchRecentSignals). */
   fetchSignals: (sinceIso: string) => Promise<PatternSignalInput[]>;
@@ -209,6 +305,10 @@ export interface WeeklyPatternsDeps {
   /** Look-back window in days (the signal horizon). */
   windowDays: number;
   detect: DetectOptions;
+  /** WP6(3): learned-fact contradiction report. Optional — when present, the SAME weekly tick also
+   *  scans this week's correction facts for same-subject pairs and posts a review note (best-effort).
+   *  Absent → no contradiction report (byte-for-byte the prior weekly-patterns behavior). */
+  contradiction?: ContradictionOptions;
   log: SyncLogger;
 }
 
@@ -233,6 +333,21 @@ export async function runWeeklyPatterns(deps: WeeklyPatternsDeps): Promise<{ pos
   const digest = detectPatterns(signals, deps.detect);
 
   await deps.notifier.notifyAdmin(renderPatternDigest(digest, week, deps.windowDays));
+
+  // WP6(3): contradiction report — a SECOND admin note in the same weekly tick, best-effort so a
+  // failure here never prevents marking the week (the digest already posted; we must not re-post it).
+  if (deps.contradiction) {
+    try {
+      const report = renderContradictionReport(detectContradictions(signals, deps.contradiction));
+      if (report) {
+        await deps.notifier.notifyAdmin(report);
+        deps.log.info({ week }, 'contradiction report posted');
+      }
+    } catch (err) {
+      deps.log.warn({ week, reason: (err as Error)?.message }, 'contradiction report failed — skipping (digest already posted)');
+    }
+  }
+
   await deps.writeLastRun(week);
 
   deps.log.info(

@@ -6,8 +6,11 @@ import {
   labelForSignal,
   isoWeekInTz,
   runWeeklyPatterns,
+  detectContradictions,
+  renderContradictionReport,
   type PatternSignalInput,
   type DetectOptions,
+  type ContradictionOptions,
 } from './pattern-detect';
 
 const OPTS: DetectOptions = { maxDistance: 0.1, minCount: 3, topK: 5 };
@@ -122,6 +125,112 @@ test('isoWeekInTz: known dates map to the correct ISO week', () => {
   assert.equal(isoWeekInTz(new Date('2026-07-13T12:00:00Z'), 'UTC'), '2026-W29');
   // Timezone shifts the local day: just after UTC midnight, Panama (UTC-5) is still the prior day.
   assert.equal(isoWeekInTz(new Date('2026-01-05T02:00:00Z'), 'America/Panama'), '2026-W01');
+});
+
+// ── WP6(3): learned-fact contradiction report ────────────────────────────────────────────────
+
+const CONTRA: ContradictionOptions = { maxDistance: 0.1, maxPairs: 5 };
+
+/** A learned FACT correction (memory_type='correction', metadata.kind='fact') for pairing tests. */
+function factSig(over: Partial<PatternSignalInput> & { fact: string; scope?: string }): PatternSignalInput {
+  const { fact, scope, ...rest } = over;
+  return sig({
+    memoryType: 'correction',
+    metadata: { kind: 'fact', fact, ...(scope ? { scope } : {}) },
+    ...rest,
+  });
+}
+
+test('detectContradictions: two same-subject facts in the same scope are flagged as a pair', () => {
+  const pairs = detectContradictions(
+    [
+      factSig({ id: 'a', customerId: 'c1', scope: 'customer', fact: 'pricing is per-seat', embedding: [1, 0, 0] }),
+      factSig({ id: 'b', customerId: 'c1', scope: 'customer', fact: 'pricing is per-organization', embedding: [0.999, 0.001, 0] }),
+    ],
+    CONTRA,
+  );
+  assert.equal(pairs.length, 1);
+  assert.deepEqual([pairs[0].a, pairs[0].b].sort(), ['pricing is per-organization', 'pricing is per-seat']);
+});
+
+test('detectContradictions: distant facts (different subjects) are NOT paired', () => {
+  const pairs = detectContradictions(
+    [
+      factSig({ id: 'a', scope: 'shared', fact: 'export runs nightly', embedding: [1, 0, 0] }),
+      factSig({ id: 'b', scope: 'shared', fact: 'invoices are net-30', embedding: [0, 1, 0] }), // orthogonal → distance 1
+    ],
+    CONTRA,
+  );
+  assert.equal(pairs.length, 0);
+});
+
+test('detectContradictions: scope isolation — a shared fact is never paired with a customer fact', () => {
+  const pairs = detectContradictions(
+    [
+      factSig({ id: 'a', customerId: null, scope: 'shared', fact: 'pricing is per-seat', embedding: [1, 0, 0] }),
+      factSig({ id: 'b', customerId: 'c1', scope: 'customer', fact: 'pricing is per-org', embedding: [0.999, 0.001, 0] }),
+    ],
+    CONTRA,
+  );
+  assert.equal(pairs.length, 0, 'different scopes are never paired');
+});
+
+test('detectContradictions: only correction+kind=fact rows are considered (style/other ignored)', () => {
+  const pairs = detectContradictions(
+    [
+      factSig({ id: 'a', scope: 'shared', fact: 'pricing is per-seat', embedding: [1, 0, 0] }),
+      // a 'style' correction — never a fact contradiction
+      sig({ id: 'b', memoryType: 'correction', metadata: { kind: 'style', fact: 'be warmer' }, embedding: [0.999, 0.001, 0] }),
+      // a conversation memory — not a correction at all
+      sig({ id: 'c', memoryType: 'conversation', embedding: [0.999, 0.001, 0] }),
+    ],
+    CONTRA,
+  );
+  assert.equal(pairs.length, 0, 'no other fact to pair the lone fact against');
+});
+
+test('detectContradictions: caps the report at maxPairs (nearest-first)', () => {
+  // Five near-identical shared facts → C(5,2)=10 candidate pairs; cap to 3.
+  const signals = [0, 1, 2, 3, 4].map((i) =>
+    factSig({ id: `f${i}`, scope: 'shared', customerId: null, fact: `fact number ${i}`, embedding: [1, i * 0.0001, 0] }),
+  );
+  const pairs = detectContradictions(signals, { maxDistance: 0.1, maxPairs: 3 });
+  assert.equal(pairs.length, 3, 'capped at maxPairs');
+  // Sorted nearest-first: each distance ≤ the next.
+  for (let i = 1; i < pairs.length; i += 1) assert.ok(pairs[i - 1].distance <= pairs[i].distance);
+});
+
+test('renderContradictionReport: null on no pairs; truncates each fact to 80 chars', () => {
+  assert.equal(renderContradictionReport([]), null, 'no pairs → nothing to post');
+  const longA = 'a'.repeat(120);
+  const report = renderContradictionReport([{ a: longA, b: 'short fact', distance: 0.02 }]);
+  assert.ok(report);
+  assert.match(report!.title, /Possible contradicting learned facts/);
+  assert.ok(report!.body.includes('short fact'));
+  assert.equal(report!.body.includes(longA), false, 'the long fact is truncated, not emitted whole');
+  assert.ok(report!.body.includes('…'), 'truncation ellipsis present');
+});
+
+test('runWeeklyPatterns: contradiction option → a SECOND admin post when fact pairs exist', async () => {
+  const posts: Array<{ title: string }> = [];
+  await runWeeklyPatterns({
+    fetchSignals: async () => [
+      factSig({ id: 'a', customerId: 'c1', scope: 'customer', fact: 'pricing is per-seat', embedding: [1, 0, 0] }),
+      factSig({ id: 'b', customerId: 'c1', scope: 'customer', fact: 'pricing is per-org', embedding: [0.999, 0.001, 0] }),
+    ],
+    notifier: { notifyAdmin: async (n) => void posts.push(n as { title: string }) },
+    readLastRun: async () => null,
+    writeLastRun: async () => {},
+    now: () => new Date('2026-07-13T12:00:00Z'),
+    tz: 'UTC',
+    windowDays: 7,
+    detect: OPTS,
+    contradiction: CONTRA,
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+  });
+  // One digest post + one contradiction post.
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].title, /Possible contradicting learned facts/);
 });
 
 test('runWeeklyPatterns: idempotent — skips when this ISO week already posted', async () => {

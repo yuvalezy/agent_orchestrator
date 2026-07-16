@@ -59,6 +59,9 @@ function fakes(
     meeting?: 'ok' | 'declines';
     /** WP2(c): wire a needs-info clarification drafter (records each draftClarification call). */
     needsInfo?: boolean;
+    /** WP6: wire a relationship-brief loader. 'throw' → the loader throws (must not break triage);
+     *  a string → the brief text; undefined → no loader (feature off). */
+    brief?: string | 'throw';
   } = {},
 ) {
   const initiated: unknown[] = [];
@@ -68,6 +71,7 @@ function fakes(
   const adminNotes: Array<{ title: string }> = [];
   const attached: Array<{ taskRef: string; filename: string; contentType: string; bytes: number }> = [];
   let skipped = 0;
+  let briefLoads = 0;
   const contactQueries: ContactResolutionQueries = {
     // WA author rows never take the bp-ref path; the muted-group path DOES (opts).
     findCustomerByBpRef: async () => (opts.bpCustomerId ? { customerId: opts.bpCustomerId } : null),
@@ -130,8 +134,17 @@ function fakes(
     needsInfoDrafter: opts.needsInfo
       ? { draftClarification: async ({ row }) => { clarified.push(row.id); } }
       : undefined,
+    customerBrief: opts.brief !== undefined
+      ? {
+          load: async () => {
+            briefLoads += 1;
+            if (opts.brief === 'throw') throw new Error('brief store down');
+            return opts.brief ?? null;
+          },
+        }
+      : undefined,
   });
-  return { svc, created, notified, adminNotes, attached, initiated, clarified, get skipped() { return skipped; } };
+  return { svc, created, notified, adminNotes, attached, initiated, clarified, get skipped() { return skipped; }, get briefLoads() { return briefLoads; } };
 }
 
 /** A GroupSummaryPort fake with call counters, for the muted-group routing tests. */
@@ -240,6 +253,24 @@ test('create path: known sender → createTask + bridge + decision + notify(butt
   await f.svc.process(row);
   assert.equal(f.created.length, 1, 'R49: createTask NOT called again');
   assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
+});
+
+test('WP6: a THROWING brief loader is best-effort — triage still creates the task', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-brief', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+
+  const f = fakes([BUG], 'known', { brief: 'throw' });
+  const row = await seedInbox(`${TAG}-brief-throw`, 'the export button is broken');
+  await assert.doesNotReject(f.svc.process(row), 'a brief-store error never fails triage');
+
+  assert.equal(f.briefLoads, 1, 'the loader was invoked');
+  assert.equal(f.created.length, 1, 'the intent still created its task despite the brief failure');
+  const inbox = await query<{ status: string }>(`SELECT status FROM agent_inbox WHERE id = $1`, [row.id]);
+  assert.equal(inbox.rows[0].status, 'processed', 'the row was fully processed');
 });
 
 test('compliment is context-only and never falls through to createTask', async (t) => {

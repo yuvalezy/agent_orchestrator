@@ -42,6 +42,15 @@ export interface TriageContext {
   /** Scoped RAG knowledge (customer-scoped + shared), cited. May be empty/absent
    *  (retrieval is additive — it never blocks triage). See src/knowledge/retrieval.ts. */
   knowledge?: KnowledgeChunk[];
+  /**
+   * Rolling per-customer relationship brief (WP6) — a one-paragraph read of who this customer is,
+   * what is live, and how the relationship feels, injected as CONTEXT-ONLY side information (never
+   * an instruction, never a fact source). The extractor may use it to judge tone/priority but must
+   * NOT treat it as an actionable ask or as product truth. Optional (absent when CUSTOMER_BRIEF_ENABLED
+   * is off, no brief exists yet, or the best-effort load failed → triage proceeds without it). See
+   * src/knowledge/customer-brief.ts.
+   */
+  customerBrief?: string;
 }
 
 /**
@@ -121,6 +130,15 @@ export interface DraftRequest {
    * or the customer has no upcoming meetings). See src/triage/meeting-context.ts.
    */
   upcomingMeetings?: string[];
+  /**
+   * Rolling per-customer relationship brief (WP6) — a one-paragraph read of who this customer is,
+   * what is live, and how the relationship feels. Draft CONTEXT the reply may be shaded by (tone,
+   * awareness of what is in flight); like voiceGuidance and upcomingMeetings it is NOT a knowledge/
+   * citation source — the model must never cite it, never treat it as a product fact, and never list
+   * it in `usedSourceIndexes`. Optional (absent/empty when CUSTOMER_BRIEF_ENABLED is off, no brief
+   * exists yet, or the best-effort load failed). See src/knowledge/customer-brief.ts.
+   */
+  customerBrief?: string;
 }
 
 /**
@@ -532,6 +550,58 @@ export interface DraftVerdict {
  */
 export interface DraftVerifierPort {
   verifyDraft(input: VerifyDraftRequest): Promise<DraftVerdict>;
+}
+
+/** One recent open task on a customer's brief (WP6): a short title + how many whole days old. */
+export interface CustomerBriefTask {
+  title: string;
+  ageDays: number;
+}
+
+/**
+ * The structured recent FACTS for ONE customer, handed to the relationship-brief synthesis (WP6,
+ * LLM role 'answer'). Assembled from EXISTING local reads — 30-day conversation volume + last
+ * contact, a handful of recent memory snippets (feedback/correction/conversation kinds), open task
+ * titles + ages, and the pending-drafts count. The synthesis grounds ONLY in these facts and never
+ * invents. This is ALSO the object the worker hashes (canonical JSON → sha256) to decide whether the
+ * brief needs regenerating — so it is deterministic per customer state. NEVER logged.
+ */
+export interface CustomerBriefRequest {
+  /** Display name (or id fallback) — the subject of the brief. */
+  customerName: string;
+  /** Look-back window (days) the volume/last-contact facts were computed over (e.g. 30). */
+  windowDays: number;
+  /** Inbound messages received from the customer in the window. */
+  inbound: number;
+  /** Messages sent to the customer in the window. */
+  outbound: number;
+  /** Whole days since the last message either way; null when there has never been contact. */
+  lastContactDaysAgo: number | null;
+  /** Up to N recent memory snippets (feedback/correction/conversation), newest first, each a short
+   *  kind-labelled line (e.g. "correction: pricing is per-seat, not per-org"). May be empty. */
+  recentMemories: string[];
+  /** Open tasks (title + age in whole days), newest first. May be empty. */
+  openTasks: CustomerBriefTask[];
+  /** Drafts still awaiting the founder's approval for this customer. */
+  pendingDrafts: number;
+}
+
+/** Structured relationship-brief result. `brief` is ONE paragraph (≤120 words, ≤900 chars — clamped
+ *  in the zod validator): who they are, what's live, how the relationship feels, commitments in flight. */
+export interface CustomerBriefResult {
+  brief: string;
+}
+
+/**
+ * Rolling per-customer relationship-brief synthesis (WP6, LLM role 'answer'). SEPARATE from
+ * AgentLlmPort (interface segregation, like AnswerSynthesizerPort / WeeklyReviewSynthesizerPort): the
+ * brief worker depends only on this, and existing fakes are untouched. Implemented by the LlmRouter.
+ * Grounds ONLY in the given facts (neutral, factual tone; negative signals noted honestly); a failure
+ * here isolates to the one customer and never blocks the rest of the sweep. NEVER logs the facts or
+ * the brief.
+ */
+export interface CustomerBriefSynthesizerPort {
+  synthesizeCustomerBrief(input: CustomerBriefRequest): Promise<CustomerBriefResult>;
 }
 
 /** One adapter per provider — Anthropic, OpenAI, DeepSeek out of the box (D10). */

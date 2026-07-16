@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
+import type { AgentLlmPort, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
@@ -12,6 +12,7 @@ import { WEEKLY_REVIEW_SCHEMA, WEEKLY_REVIEW_SYSTEM, parseWeeklyReview, weeklyRe
 import { REVISE_SCHEMA, REVISE_SYSTEM, parseRevise, reviseUserMessage } from './revise-prompt';
 import { CORRECTION_CLASS_SCHEMA, CORRECTION_CLASS_SYSTEM, correctionClassifyUserMessage, parseCorrectionClass } from './correction-classify-prompt';
 import { VERIFY_SCHEMA, VERIFY_SYSTEM, parseVerdict, verifyUserMessage } from './verify-prompt';
+import { BRIEF_SCHEMA, BRIEF_SYSTEM, briefUserMessage, parseBrief } from './brief-prompt';
 import { COMPOSE_SCHEMA, COMPOSE_SYSTEM, SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, composeUserMessage, parseComposedBody, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
@@ -41,7 +42,7 @@ export interface LlmRouterDeps {
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -243,6 +244,26 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       messages: [{ role: 'user', content: weeklyReviewUserMessage(input) }],
       maxTokens: 2500,
       validate: parseWeeklyReview,
+      customerId: null,
+    });
+  }
+
+  /**
+   * Synthesize a rolling per-customer relationship brief (WP6, role 'answer'). Reuses the golden
+   * structured-call path — cost accounting, ordered failover, daily cap — with the strict
+   * BRIEF_SCHEMA. The model grounds ONLY in the given facts and writes one neutral factual paragraph;
+   * the ≤900-char clamp lives in parseBrief. customerId null: the brief is a founder-facing internal
+   * note, not billed to any one customer's reply flow. Best-effort at the call site (a throw isolates
+   * to the one customer). NEVER logs the facts or the brief.
+   */
+  async synthesizeCustomerBrief(input: CustomerBriefRequest): Promise<CustomerBriefResult> {
+    return this.callStructured<CustomerBriefResult>({
+      role: 'answer',
+      schema: BRIEF_SCHEMA,
+      system: BRIEF_SYSTEM,
+      messages: [{ role: 'user', content: briefUserMessage(input) }],
+      maxTokens: 1000,
+      validate: parseBrief,
       customerId: null,
     });
   }
