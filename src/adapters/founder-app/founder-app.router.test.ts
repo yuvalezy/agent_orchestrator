@@ -14,6 +14,7 @@ import type { ConversationalQueryService } from '../../query/conversational-quer
 import type { DecisionEvent } from '../../ports/founder-notifier.port';
 import type { DraftResolution } from '../../outbound/outbound-repo';
 import type { DraftReviserService } from '../../triage/draft-revise';
+import { TranscriptionError } from '../llm/openai-transcription.client';
 
 const PASSWORD = 'correct horse battery staple';
 
@@ -1170,5 +1171,99 @@ test('every /reminders route is 503 when reminders are unwired', async () => {
     assert.equal((await fetch(`${baseUrl}/app/api/reminders`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ text: 'x', localTime: FUTURE_LOCAL }) })).status, 503);
     assert.equal((await fetch(`${baseUrl}/app/api/reminders`, { headers: { cookie } })).status, 503);
     assert.equal((await fetch(`${baseUrl}/app/api/reminders/${crypto.randomUUID()}`, { method: 'DELETE', headers: { cookie } })).status, 503);
+  });
+});
+
+test('POST /transcribe streams the recorded audio bytes to the adapter and returns the text', async () => {
+  const seen: Array<{ data: Uint8Array; filename: string; mimeType: string }> = [];
+  const audio = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x02, 0x03]); // fake webm header + payload
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/transcribe`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'audio/webm;codecs=opus' },
+      body: audio,
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { text: 'hello founder' } });
+    // The exact bytes reached the adapter, with the mime stripped of its codecs parameter.
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].mimeType, 'audio/webm');
+    assert.equal(seen[0].filename, 'voice.webm');
+    assert.deepEqual([...seen[0].data], [...audio]);
+  }, {
+    deps: {
+      transcribe: async (input) => { seen.push(input); return 'hello founder'; },
+    },
+  });
+});
+
+test('POST /transcribe is 503 when the adapter is unwired', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/transcribe`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'audio/webm' },
+      body: Buffer.from([1, 2, 3]),
+    });
+    assert.equal(res.status, 503);
+  });
+});
+
+test('POST /transcribe maps the adapter\'s "not configured" TranscriptionError to 503', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/transcribe`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'audio/webm' },
+      body: Buffer.from([1, 2, 3]),
+    });
+    assert.equal(res.status, 503);
+  }, {
+    deps: {
+      transcribe: async () => { throw new TranscriptionError('OpenAI transcription is not configured', false); },
+    },
+  });
+});
+
+test('POST /transcribe rejects a non-audio content-type and an empty body with 400', async () => {
+  let calls = 0;
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    // Non-audio content-type: the raw parser never runs, and the route refuses it.
+    const wrongType = await fetch(`${baseUrl}/app/api/transcribe`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ hi: true }),
+    });
+    assert.equal(wrongType.status, 400);
+    // audio/* content-type but a zero-byte body.
+    const empty = await fetch(`${baseUrl}/app/api/transcribe`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'audio/webm' },
+      body: Buffer.alloc(0),
+    });
+    assert.equal(empty.status, 400);
+    // Neither invalid request ever reached the adapter.
+    assert.equal(calls, 0);
+  }, {
+    deps: {
+      transcribe: async () => { calls += 1; return 'unused'; },
+    },
+  });
+});
+
+test('POST /transcribe requires a device cookie', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const res = await fetch(`${baseUrl}/app/api/transcribe`, {
+      method: 'POST',
+      headers: { 'content-type': 'audio/webm' },
+      body: Buffer.from([1, 2, 3]),
+    });
+    assert.equal(res.status, 401);
+  }, {
+    deps: {
+      transcribe: async () => 'unused',
+    },
   });
 });

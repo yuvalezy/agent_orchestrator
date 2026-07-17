@@ -20,6 +20,7 @@ import type { Page } from '../console/console-repo';
 import type { AppMeetingTimeOutcome } from '../triage/meeting-scheduler.factory';
 import type { replaceDraftBodyAndApprove } from '../../outbound/outbound-repo';
 import type { DraftReviserService } from '../../triage/draft-revise';
+import { TranscriptionError } from '../llm/openai-transcription.client';
 
 // The AO Founder PWA API + static shell (M6), mounted at /app and gated by the same
 // ConsoleConfig presence as /console. Auth is a DB-backed device token (a phone stays
@@ -45,6 +46,9 @@ const DRAFT_REVISE_OPT = 'dv';
 const MAX_LABEL = 120;
 const MAX_TEXT = 4000;
 const MAX_FCM_TOKEN = 4096;
+/** Cap on a posted voice-note body. OpenAI's own transcription limit is 25 MB, so a larger
+ *  upload can never succeed — reject it at the door rather than stream it to the adapter. */
+const MAX_AUDIO_BYTES = '25mb';
 const MAX_OPTION_ID = 64;
 const DEFAULT_PAGE = 50;
 const MAX_PAGE = 100;
@@ -127,6 +131,14 @@ export interface FounderAppDeps {
     listUpcoming: (limit: number) => Promise<Array<{ id: string; body: string; executeAt: string; customerId: string | null }>>;
     cancel: (id: string) => Promise<{ result: 'cancelled' | 'already' | 'too_late'; customerId: string | null }>;
   };
+  /**
+   * Transcribe a founder voice note recorded in the PWA chat composer — the SAME OpenAI adapter
+   * the Telegram voice path uses (buildOpenAiTranscriptionClient). OPTIONAL so main.ts still
+   * compiles without it — absent → POST /api/transcribe answers 503. Present but OpenAI
+   * unconfigured (no OPENAI_API_KEY) → the adapter throws a non-retryable "not configured"
+   * TranscriptionError, which the route also maps to 503, so it can just always be passed.
+   */
+  transcribe?: (input: { data: Uint8Array; filename: string; mimeType: string }) => Promise<string>;
 }
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -179,6 +191,30 @@ const FIREBASE_CSP = helmet.contentSecurityPolicy({
     'worker-src': ["'self'"],
   },
 });
+
+/**
+ * Route-scoped RAW body parser for POST /api/transcribe — reads the recorded audio as a Buffer.
+ * app.ts's global express.json() only parses application/json, so an `audio/*` body flows past it
+ * untouched and reaches this parser (there is NO global catch-all body parser to eat it first).
+ * The `type`
+ * predicate matches only `audio/*`, so a non-audio content-type leaves req.body unparsed and the
+ * route answers 400. Over-limit uploads make body-parser throw a 413 `entity.too.large`; the
+ * wrapper maps that to a 400 (per the transcribe contract) rather than the generic error handler.
+ */
+const rawAudio = express.raw({
+  type: (req) => (req.headers['content-type'] || '').startsWith('audio/'),
+  limit: MAX_AUDIO_BYTES,
+});
+function rawAudioBody(req: Request, res: Response, next: NextFunction): void {
+  rawAudio(req, res, (err: unknown) => {
+    if (err) {
+      const status = (err as { status?: number; statusCode?: number }).status ?? (err as { statusCode?: number }).statusCode;
+      if (status === 413) return void res.status(400).json({ error: 'audio too large' });
+      return next(err);
+    }
+    next();
+  });
+}
 
 export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string | undefined, deps: FounderAppDeps): Router {
   const router = Router();
@@ -349,6 +385,39 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
       for (const row of exchange) deps.feed.publish(row);
       res.status(201).json({ data: exchange, conversationId: session.id });
     } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Voice-note transcription (chat composer mic button) ──────────────────────────────
+  // The PWA records a voice note via MediaRecorder and POSTs the RAW audio bytes here; we hand
+  // them to the SAME OpenAI adapter the Telegram voice path uses and return the text for the
+  // founder to review in the composer (transcription-to-text-box, NOT auto-send). Device-auth'd
+  // + no-store like every /api route. rawAudioBody parses the audio/* body into a Buffer.
+  router.post('/api/transcribe', rawAudioBody, async (req, res, next) => {
+    const contentType = (req.headers['content-type'] || '').trim();
+    if (!contentType.startsWith('audio/')) {
+      return void res.status(400).json({ error: 'audio content-type required' });
+    }
+    // Absent injection → feature unwired. Present but OpenAI unconfigured self-reports below.
+    if (!deps.transcribe) return void res.status(503).json({ error: 'transcription unavailable' });
+    const body = req.body;
+    if (!Buffer.isBuffer(body) || body.length === 0) {
+      return void res.status(400).json({ error: 'empty audio body' });
+    }
+    try {
+      const text = await deps.transcribe({
+        data: new Uint8Array(body),
+        filename: 'voice.webm',
+        mimeType: contentType.split(';')[0].trim(),
+      });
+      res.json({ data: { text } });
+    } catch (err) {
+      // The adapter's "not configured" (no OPENAI_API_KEY) is a non-retryable TranscriptionError
+      // → 503, matching the deps-absent case. Every other failure is a genuine error → 500.
+      if (err instanceof TranscriptionError && /not configured/i.test(err.message)) {
+        return void res.status(503).json({ error: 'transcription unavailable' });
+      }
       next(err);
     }
   });

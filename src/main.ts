@@ -27,6 +27,7 @@ import { FounderAppFeed } from './adapters/founder-app/founder-app-feed';
 import { buildFounderAppRouter } from './adapters/founder-app/founder-app.router';
 import { buildAppComposeGated } from './adapters/founder-app/compose-draft.factory';
 import { createAppReminder, listUpcomingReminders, cancelScheduledAction } from './scheduling/scheduling-repo';
+import { buildOpenAiTranscriptionClient } from './adapters/llm/openai-transcription.client';
 import { listAttentionDecisions, augmentCustomers } from './adapters/founder-app/founder-app-cockpit-repo';
 import {
   listCustomers,
@@ -238,6 +239,13 @@ async function main(): Promise<void> {
     }
     const feed = new FounderAppFeed();
     founderAppNotifier = new AppFounderNotifier({ insertMessage, feed, listPushDevices, disableDevicePush, sendPush: fcmSender, markDecidedByRef });
+    // Voice input: the PWA composer's mic uploads audio to /api/transcribe, which reuses the SAME
+    // OpenAI transcription client the Telegram voice path used. Self-reports 503 when OPENAI is unset.
+    const appTranscription = buildOpenAiTranscriptionClient({
+      resolveKey: () => tryResolveCredential('OPENAI_API_KEY'),
+      baseUrl: env.OPENAI_BASE_URL,
+      resolveModel: () => env.OPENAI_TRANSCRIBE_MODEL,
+    });
     const packagedAppAssets = path.join(__dirname, 'app');
     const devAppAssets = path.join(process.cwd(), 'app', 'dist');
     appDeps.founderAppRouter = buildFounderAppRouter(
@@ -268,6 +276,7 @@ async function main(): Promise<void> {
         // App-origin reminders (NULL Telegram anchors — see migration 045). The router anchors the
         // datetime-local wall-clock in env.CALENDAR_TZ before calling create, so these are plain repo fns.
         reminders: { create: createAppReminder, listUpcoming: listUpcomingReminders, cancel: cancelScheduledAction },
+        transcribe: (input) => appTranscription.transcribe(input),
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {
           listCustomers,
