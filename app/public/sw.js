@@ -1,58 +1,58 @@
 /* Single service worker for the AO Founder PWA — one registration owns the '/app/'
- * scope, so the app shell and Firebase background push MUST live together here.
+ * scope, so the app shell and background push MUST live together here.
  *
  * App shell:
  *   - navigations: network-first, falling back to the cached shell / offline page
  *   - /app/api:    network-first, never cached (SSE + auth state stay live)
  *   - hashed build assets: cache-first (immutable, content-hashed filenames)
  *
- * Push: the page registers this script as `/app/sw.js?config=<base64 JSON>` once the
- * founder enables notifications (see swClient.ts / push.ts). The Firebase compat SDK
- * is only pulled in when that config is present, so a push-less install (and offline
- * boot) never depends on the gstatic network fetch. Keep the compat version roughly
- * in step with the `firebase` npm version the page bundles. */
-const CACHE = 'ao-founder-shell-v2';
+ * Push: handled natively off the Push API — NO Firebase SDK in this worker. FCM is
+ * only a relay; what arrives here is a plain push event whose data is the envelope
+ * fcm-sender.ts sent. The page still uses the Firebase SDK to MINT the token
+ * (getToken needs it); the worker only has to render what arrives, which is
+ * ~15 lines. See the commit message for the three separate bugs the SDK-in-worker
+ * arrangement cost us. */
+const CACHE = 'ao-founder-shell-v3';
 const SHELL = ['/app/', '/app/index.html', '/app/offline.html', '/app/manifest.webmanifest', '/app/icon.svg'];
 
-// ── Firebase background push (only when a config rides in on the querystring) ──────────
-function readConfig() {
-  try {
-    const raw = new URL(self.location.href).searchParams.get('config');
-    return raw ? JSON.parse(atob(raw)) : null;
-  } catch (err) {
-    return null;
-  }
+// ── Background push ───────────────────────────────────────────────────────────────────
+/** Does the founder currently have the APP itself on screen? */
+async function appIsOnScreen() {
+  const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return windows.some((client) => {
+    if (client.visibilityState !== 'visible') return false;
+    try { return new URL(client.url).pathname.startsWith('/app'); } catch (err) { return false; }
+  });
 }
 
-const fcmConfig = readConfig();
-if (fcmConfig && fcmConfig.apiKey) {
-  try {
-    importScripts('https://www.gstatic.com/firebasejs/12.16.0/firebase-app-compat.js');
-    importScripts('https://www.gstatic.com/firebasejs/12.16.0/firebase-messaging-compat.js');
-    firebase.initializeApp(fcmConfig);
-    // Payloads are data-only, so this handler owns display (no double notification).
-    firebase.messaging().onBackgroundMessage((payload) => {
-      const data = payload.data || {};
-      const notification = payload.notification || {};
-      const title = notification.title || data.title || 'AO Founder';
-      const body = notification.body || data.body || 'New update from your assistant.';
-      const tag = payload.collapseKey || data.tag || 'ao-founder';
-      // Deep link: '/app/customer/<id>' or '/app/attention' (must stay inside /app).
-      const route = typeof data.route === 'string' && data.route.startsWith('/app') ? data.route : '/app/';
-      self.registration.showNotification(title, {
-        body,
-        tag,
-        renotify: false,
-        icon: '/app/icon.svg',
-        badge: '/app/icon.svg',
-        data: { url: route },
-      });
+self.addEventListener('push', (event) => {
+  event.waitUntil((async () => {
+    // Payloads are data-only (fcm-sender.ts), and deliberately generic: a severity-driven
+    // title, "Tap to open", and a route. No customer content ever transits the relay, so
+    // there is nothing here to leak into a notification.
+    let data = {};
+    try { data = (event.data ? event.data.json() : {}).data || {}; } catch (err) { data = {}; }
+
+    // Suppress only when the APP is visible — the SSE feed already updates an open app
+    // live, so a notification would duplicate what the founder is looking at. Scoped to
+    // /app clients on purpose: the Firebase SDK suppressed on ANY visible window of the
+    // ORIGIN, so an open console tab silently swallowed every push, with no signal.
+    if (await appIsOnScreen()) return;
+
+    const route = typeof data.route === 'string' && data.route.startsWith('/app') ? data.route : '/app/';
+    await self.registration.showNotification(data.title || 'AO Founder', {
+      body: data.body || 'New update from your assistant.',
+      tag: data.tag || 'ao-founder',
+      renotify: false,
+      icon: '/app/icon.svg',
+      badge: '/app/icon.svg',
+      // A founder-attention alert that auto-dismisses while they are away is an alert
+      // they never got; Telegram's would still be waiting for them.
+      requireInteraction: data.severity === 'warning',
+      data: { url: route },
     });
-  } catch (err) {
-    // Offline or gstatic blocked at eval time: the app shell below still installs, and
-    // push resumes on the next online activation of this same worker.
-  }
-}
+  })());
+});
 
 // ── App shell ─────────────────────────────────────────────────────────────────────────
 self.addEventListener('install', (event) => {

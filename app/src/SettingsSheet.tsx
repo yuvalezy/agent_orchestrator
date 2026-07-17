@@ -16,7 +16,6 @@ export function SettingsSheet({
   deviceLabel,
   installPrompt,
   onLogout,
-  onForegroundRefresh,
 }: {
   open: boolean;
   onClose: () => void;
@@ -24,7 +23,6 @@ export function SettingsSheet({
   deviceLabel: string;
   installPrompt: InstallPrompt | null;
   onLogout: () => void;
-  onForegroundRefresh: () => void;
 }): ReactElement {
   return (
     <div className={cn('fixed inset-0 z-40 transition-opacity', open ? 'opacity-100' : 'pointer-events-none opacity-0')}>
@@ -46,7 +44,7 @@ export function SettingsSheet({
           </button>
         </div>
 
-        <PushToggle config={config} onForegroundRefresh={onForegroundRefresh} />
+        <PushToggle config={config} />
 
         <Row icon={<Smartphone size={18} className="text-zinc-400" />} title="This device" subtitle={deviceLabel || 'Signed-in device'} />
 
@@ -75,7 +73,7 @@ export function SettingsSheet({
   );
 }
 
-function PushToggle({ config, onForegroundRefresh }: { config: AppConfig | null; onForegroundRefresh: () => void }): ReactElement {
+function PushToggle({ config }: { config: AppConfig | null }): ReactElement {
   const configured = Boolean(config?.firebase && config?.vapidKey);
   const denied = typeof Notification !== 'undefined' && Notification.permission === 'denied';
   const [enabled, setEnabled] = useState(false);
@@ -92,7 +90,7 @@ function PushToggle({ config, onForegroundRefresh }: { config: AppConfig | null;
         await disablePush();
         setEnabled(false);
       } else {
-        await enablePush(config!.firebase!, config!.vapidKey!, onForegroundRefresh);
+        await enablePush(config!.firebase!, config!.vapidKey!);
         setEnabled(true);
         setNote('Push notifications are on for this device.');
       }

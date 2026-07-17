@@ -103,7 +103,6 @@ function AppShell({ onLoggedOut }: { onLoggedOut: () => void }): ReactElement {
         config={config}
         deviceLabel={deviceLabel}
         installPrompt={installPrompt}
-        onForegroundRefresh={feed.refetch}
         onLogout={() => void logout()}
       />
     </UiProvider>

@@ -19,7 +19,6 @@ function renderSheet(config: AppConfig | null) {
       deviceLabel="Yuval's Pixel"
       installPrompt={null}
       onLogout={vi.fn()}
-      onForegroundRefresh={vi.fn()}
     />,
   );
 }
