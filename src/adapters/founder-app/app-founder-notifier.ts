@@ -2,7 +2,7 @@ import type { Notification, DecisionEvent } from '../../ports/founder-notifier.p
 import type { NotifierMirror } from '../push/web-push-notifier';
 import { parseOptionData } from '../../triage/decision-handler';
 import { logger } from '../../logger';
-import type { FeedMessage, InsertMessageInput } from './founder-app-repo';
+import type { FeedMessage, InsertMessageInput, MessageContext } from './founder-app-repo';
 import type { FounderAppFeed } from './founder-app-feed';
 import type { FcmSender } from './fcm-sender';
 
@@ -36,6 +36,18 @@ export interface AppFounderNotifierDeps {
   markDecidedByRef: (notificationRef: string, optionId: string) => Promise<FeedMessage[]>;
 }
 
+/**
+ * The card's durable origin (043), lifted off the Notification the same way Telegram lifts
+ * `url`. Null when the notification carries neither ref — an empty JSON object would just be
+ * noise in the column, and the app reads an absent context as "no thread to open".
+ */
+function buildContext(n: Notification): MessageContext | null {
+  const context: MessageContext = {};
+  if (n.contextRef) context.contextRef = n.contextRef;
+  if (n.entityRef) context.entityRef = n.entityRef;
+  return Object.keys(context).length > 0 ? context : null;
+}
+
 /** Split incoming notifier buttons into stored (bare-id) buttons + the shared ref. */
 function partitionButtons(
   buttons?: Array<{ id: string; label: string }>,
@@ -53,7 +65,15 @@ export class AppFounderNotifier implements NotifierMirror {
   constructor(private readonly deps: AppFounderNotifierDeps) {}
 
   async notifyAdmin(n: Notification): Promise<void> {
-    await this.record({ direction: 'out', kind: 'notification', title: n.title, body: n.body, severity: n.severity ?? null });
+    await this.record({
+      direction: 'out',
+      kind: 'notification',
+      title: n.title,
+      body: n.body,
+      severity: n.severity ?? null,
+      linkUrl: n.url ?? null,
+      context: buildContext(n),
+    });
   }
 
   async notifyCustomerEvent(customerId: string, n: Notification, buttons?: Array<{ id: string; label: string }>): Promise<void> {
@@ -67,6 +87,8 @@ export class AppFounderNotifier implements NotifierMirror {
       customerRef: customerId,
       notificationRef,
       buttons: stored,
+      linkUrl: n.url ?? null,
+      context: buildContext(n),
     });
   }
 
@@ -81,6 +103,8 @@ export class AppFounderNotifier implements NotifierMirror {
       customerRef: customerId,
       notificationRef,
       buttons: stored,
+      linkUrl: question.url ?? null,
+      context: buildContext(question),
     });
   }
 

@@ -181,3 +181,72 @@ SQL is not (DRY):
 Full founder-message-router parity (slash commands, revise/edit captures, scheduling)
 from the app; iOS; media attachments; composing outbound customer messages from the
 app (the approval money-loop must not be bypassable from a new surface).
+
+## v3 — "make the cockpit actionable" (founder feedback on v2)
+
+Five complaints, each of which turned out to have a real defect behind it rather than a
+missing coat of paint.
+
+### 1. Nothing could be dismissed
+
+A card left Attention only by being *decided*, and the only button on a task card is
+"❌ Cancel task" — so **approving what the assistant did meant doing nothing, and the card
+stayed forever**. Dismiss is now an app-surface gesture (`POST /app/api/dismiss`,
+`dismissed_at` in migration 043): "I've seen this", nothing more. It does not touch the
+task, the decision handler, or Telegram.
+
+It is **ref-keyed** (`planDismiss`), mirroring `markDecidedByRef` — several rows
+legitimately mirror ONE entity, because `tryR49Reconfirm` re-notifies with the same ref, so
+the duplicate cards clear on one tap. A `kind:'question'` is **refused** (409), both directly
+and via the ref fan-out: `askFounder` asks a real fork that must be *answered*, and a new
+surface must not make it silently droppable. Notifications are what the founder was actually
+complaining about, and they are all `kind:'notification'`.
+
+### 2/3. Cards had no context and no link
+
+- **"Task (confirmed)" named no task.** The R49 re-notify holds only a `task_ref` — no intent,
+  no message. `findIntentByTaskRef` recovers the intent from the triage decision that created
+  the task, so the card now names it (`confirmedTaskCard`), degrading to the old generic
+  wording when no intent was ever recorded (the meeting path's task fallback).
+- **"Open Task" was already computed and thrown away.** `Notification.url` has always carried
+  the portal deep link and Telegram has always rendered it; `AppFounderNotifier` dropped it
+  because the table had no column. Now `link_url` (043) ← `n.url`, and the shared `CardActions`
+  renders the button — **only** when a url is present, never constructed client-side (the base
+  URL is server config). `context` (043) ← `contextRef`, which is what lets a tap open the
+  thread behind a card: `/customer/:id?focus=<kind>:<ref>`, where that focus value is
+  deliberately a `TimelineRow.id`.
+- Two non-canonical copies of the deep-link formatter (`inbox-processor.factory.ts`,
+  `meeting-scheduler.factory.ts`) were collapsed onto `portalTaskUrl` — they skipped its
+  encoding and null-guard and could emit a malformed URL.
+- `scripts/backfill-app-link-urls.ts` gives pre-043 task cards their link (a task card's
+  `notification_ref` IS its task UUID). Scoped to the cancel option `'x'` ONLY — draft-approval
+  cards also carry a ref, but it points at a decision, not a task.
+
+### 4. The timeline was unreadable — and two real bugs
+
+The read model was built to "bodies and decision output stay detail-only", which reduced every
+row to an enum, so the UI *had* to render "Inbound message"/"triage · accepted". There was no
+text in the payload to show. `customerTimeline` now also selects body snippets (truncated in
+SQL), `sender_name`, `direction`, and the triage intent's
+`suggested_title`/`summary`/`category`/`priority`. This is not a new exposure — those bodies
+already reach this exact screen via the detail sheets — but they stay out of logs.
+
+Noise is filtered by an **opt-in `omitNoiseDecisions`** that only the app passes: triage writes
+an `{"intents":[]}` decision for every no-op message, and those can never be rendered
+meaningfully. The console deliberately does not pass it — there, every decision row is
+evidence. The filter is in SQL so keyset paging stays correct.
+
+Two genuine bugs fixed alongside: older pages were **prepended to a newest-first list**
+(the timeline now renders ascending, scrolled to the bottom, reusing `ChatFeed`'s proven
+prepend-anchor orchestration), and the inbox arm never filtered on `direction`, so the
+founder's own sent messages rendered as incoming.
+
+### 5. "Make it common"
+
+`CardActions` (Open Task / Dismiss / View thread) is rendered by **both** `AttentionCard` and
+`MessageBubble`, so 1/2/3 land on Attention, Customer›Pending, Activity and Assistant at once;
+`useOptimisticDecide` replaces the decide-with-rollback block that was copy-pasted verbatim
+across two screens.
+
+`ci.sh` now runs the app's typecheck/test/build — it covered the server and console but never
+`app/`, which is how a broken-ordering timeline shipped green.

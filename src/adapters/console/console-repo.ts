@@ -252,34 +252,97 @@ export async function customerDetail(id: string): Promise<Record<string, unknown
   return rows[0] ?? null;
 }
 
-/** Local-only chronological metadata stream. Message bodies and decision output stay detail-only. */
-export async function customerTimeline(id: string, input: { limit?: unknown; cursor?: unknown }): Promise<Page<Record<string, unknown>> | null> {
+/** How much of a message body rides along as the timeline's preview line. Truncated in SQL so a
+ *  long thread never ships a full body to a list surface. */
+const TIMELINE_SNIPPET_CHARS = 180;
+
+/** The preview line for one body column ($6 = TIMELINE_SNIPPET_CHARS). Shared by the inbox and
+ *  outbound arms so the two can never drift into trimming differently. Real bodies open with
+ *  newlines and quoted headers, so the trim set is all whitespace — bare btrim() is spaces only,
+ *  which would spend the whole snippet on a blank line. */
+const timelineSnippetSql = (column: string) => `left(btrim(${column}, E' \\t\\r\\n'), $6::int)`;
+
+/**
+ * Local-only chronological event stream for one customer.
+ *
+ * Carries a TRUNCATED body snippet + the triage `agent_output` fields (title/summary/category/
+ * priority), not just enums and foreign keys — the rule this relaxes ("bodies and decision output
+ * stay detail-only") was costing both surfaces their entire meaning: every row rendered as a bare
+ * "Inbound message" or "triage · accepted". This is not a new exposure: these same bodies already
+ * reach this same screen through the `inboxDetail`/`outboundDetail` sheets, and the decision output
+ * through `decisionDetail`. What stays true is the other half of the rule — **none of this may ever
+ * be logged**. Ids and metadata only, as everywhere else.
+ *
+ * `omitNoiseDecisions` is OPT-IN and filters in SQL (never in a view layer — that would break the
+ * keyset paging below and render 5 rows for a page of 50). It drops the triage decisions that can
+ * never say anything to a human: the `{"intents": []}` row triage writes for every no-op message
+ * ("thanks", an emoji), and accepted rows where nothing happened (no task, no title). The founder's
+ * cockpit passes it; the console must NOT — there every decision row is evidence.
+ */
+export async function customerTimeline(id: string, input: { limit?: unknown; cursor?: unknown; omitNoiseDecisions?: boolean }): Promise<Page<Record<string, unknown>> | null> {
   const limit = parseLimit(input.limit);
   const cursor = decodeTimelineCursor(input.cursor);
   if (limit === null || (input.cursor !== undefined && !cursor)) return null;
+  // Strict === true: the console hands this its raw req.query, so a stringy '?omitNoiseDecisions=true'
+  // must not silently switch an ops surface into the founder's filtered view.
+  const omitNoise = input.omitNoiseDecisions === true;
   const { rows } = await query<Record<string, unknown>>(
     `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, entity_id, event_type, status, metadata
        FROM (
        SELECT i.created_at, i.id::text AS entity_id, 'inbox'::text AS event_type, i.status,
-              jsonb_build_object('channel_instance_id', i.channel_instance_id, 'subject', i.subject, 'retry_count', i.retry_count) AS metadata
+              jsonb_build_object('channel_instance_id', i.channel_instance_id, 'subject', i.subject, 'retry_count', i.retry_count,
+                                 -- direction: agent_inbox also holds the founder's OWN sent messages
+                                 -- (direction='outbound', status 'skipped'). Without this they render
+                                 -- as inbound bubbles — someone else's words in the customer's voice.
+                                 'direction', i.direction, 'sender_name', i.sender_name,
+                                 -- media_type: a photo/voice note/sticker arrives with an EMPTY body
+                                 -- (385 such rows at time of writing). Without this the row has
+                                 -- nothing to say and renders as a content-free placeholder — the
+                                 -- founder read "Inbound message" where a photo had been sent.
+                                 -- Channel-shaped (WhatsApp writes it); absent elsewhere, hence the
+                                 -- ->> null-tolerance rather than a join.
+                                 'media_type', i.raw_metadata->>'media_type',
+                                 'body_snippet', ${timelineSnippetSql('i.body')}) AS metadata
          FROM agent_inbox i WHERE i.customer_id = $1
        UNION ALL
        SELECT d.created_at, d.id::text, 'decision', COALESCE(d.outcome, 'pending'),
-              jsonb_build_object('decision_type', d.decision_type, 'task_ref', d.task_ref, 'inbox_message_id', d.inbox_message_id)
-         FROM agent_decisions d WHERE d.customer_id = $1
+              jsonb_build_object('decision_type', d.decision_type, 'task_ref', d.task_ref, 'inbox_message_id', d.inbox_message_id,
+                                 'suggested_title', d.agent_output->>'suggested_title',
+                                 'summary', d.agent_output->>'summary',
+                                 'category', d.agent_output->>'category',
+                                 'priority', d.agent_output->>'priority')
+         FROM agent_decisions d
+        WHERE d.customer_id = $1
+          AND ($7::boolean IS NOT TRUE
+               OR d.decision_type <> 'triage'
+               OR (d.agent_output->'intents' IS DISTINCT FROM '[]'::jsonb
+                   AND (d.task_ref IS NOT NULL OR d.agent_output->>'suggested_title' IS NOT NULL)))
        UNION ALL
        SELECT o.created_at, o.id::text, 'outbound', o.status,
-              jsonb_build_object('channel_instance_id', o.channel_instance_id, 'subject', o.subject, 'is_draft', o.is_draft)
+              jsonb_build_object('channel_instance_id', o.channel_instance_id, 'subject', o.subject, 'is_draft', o.is_draft,
+                                 'body_snippet', ${timelineSnippetSql('o.body')})
          FROM agent_outbound_queue o WHERE o.customer_id = $1
        UNION ALL
        SELECT t.created_at, t.id::text, 'task_link', COALESCE(t.relationship, 'linked'),
-              jsonb_build_object('task_ref', t.task_ref, 'inbox_message_id', t.inbox_message_id)
-         FROM agent_tasks t WHERE t.customer_id = $1
+              jsonb_build_object('task_ref', t.task_ref, 'inbox_message_id', t.inbox_message_id,
+                                 -- The title we gave the task at triage, so the row is not a raw UUID.
+                                 -- Same earliest-triage lookup the briefing uses (briefing-repo.ts).
+                                 'task_title', tt.suggested_title)
+         FROM agent_tasks t
+    LEFT JOIN LATERAL (
+              SELECT d2.agent_output->>'suggested_title' AS suggested_title
+                FROM agent_decisions d2
+               WHERE d2.task_ref = t.task_ref
+                 AND d2.decision_type = 'triage'
+               ORDER BY d2.id ASC
+               LIMIT 1
+            ) tt ON true
+        WHERE t.customer_id = $1
      ) events
       WHERE ($2::timestamptz IS NULL OR (created_at, event_type, entity_id) < ($2::timestamptz, $3::text, $4::text))
      ORDER BY created_at DESC, event_type DESC, entity_id DESC
      LIMIT $5`,
-    [id, cursor?.at ?? null, cursor?.type ?? null, cursor?.id ?? null, limit + 1],
+    [id, cursor?.at ?? null, cursor?.type ?? null, cursor?.id ?? null, limit + 1, TIMELINE_SNIPPET_CHARS, omitNoise],
   );
   const hasMore = rows.length > limit;
   const data = rows.slice(0, limit);

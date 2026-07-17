@@ -162,3 +162,100 @@ test('customer timeline has a deterministic cursor for equal-timestamp local eve
   assert.notEqual(next.data[0].entity_id, page.data[0].entity_id);
   assert.equal(await customerTimeline(customer.rows[0].id, { cursor: 'not-a-cursor' }), null);
 });
+
+test('customer timeline carries the text each row is about, and omits triage noise only when asked', async (t) => {
+  const channel = await query<{ id: string }>('SELECT id::text FROM channel_instances LIMIT 1').catch(() => null);
+  if (!channel?.rows[0]) return t.skip('database or seeded channel instance unavailable');
+
+  const customer = await query<{ id: string }>(
+    'INSERT INTO agent_customers (bp_ref, display_name) VALUES ($1, $2) RETURNING id::text',
+    [`${tag}-enriched-customer`, 'Timeline enrichment customer'],
+  );
+  const customerId = customer.rows[0].id;
+  const longBody = `  \n  ${'x'.repeat(400)}`;
+  const inbound = await query<{ id: string }>(
+    `INSERT INTO agent_inbox (channel_instance_id, channel_message_id, customer_id, sender_name, direction, subject, body, received_at, status)
+     VALUES ($1, $2, $3, 'Jane Roe', 'inbound', 'Login is broken', $4, now(), 'processed') RETURNING id::text`,
+    [channel.rows[0].id, `${tag}-enriched-in`, customerId, longBody],
+  );
+  // The founder's own sent message, as the channel poller stores it: an agent_inbox row, direction 'outbound'.
+  await query(
+    `INSERT INTO agent_inbox (channel_instance_id, channel_message_id, customer_id, direction, subject, body, received_at, status)
+     VALUES ($1, $2, $3, 'outbound', 'Re: Login is broken', 'Looking into it now', now(), 'skipped')`,
+    [channel.rows[0].id, `${tag}-enriched-out`, customerId],
+  );
+  await query(
+    `INSERT INTO agent_outbound_queue (channel_instance_id, customer_id, recipient_address, subject, body, status, is_draft)
+     VALUES ($1, $2, $3, 'Re: Login is broken', 'We have shipped a fix', 'sent', false)`,
+    [channel.rows[0].id, customerId, `${tag}-enriched@example.test`],
+  );
+  const taskRef = `${tag}-enriched-task`;
+  await query(
+    `INSERT INTO agent_decisions (customer_id, inbox_message_id, decision_type, task_ref, agent_output, outcome)
+     VALUES ($1, $2, 'triage', $3, $4::jsonb, 'accepted')`,
+    [customerId, inbound.rows[0].id, taskRef, JSON.stringify({ suggested_title: 'Investigate login issue', summary: 'User cannot log in.', category: 'bug_report', priority: 'urgent' })],
+  );
+  // Noise #1: what triage writes for every no-op message ("thanks", an emoji).
+  await query(
+    `INSERT INTO agent_decisions (customer_id, decision_type, agent_output, outcome)
+     VALUES ($1, 'triage', $2::jsonb, 'accepted')`,
+    [customerId, JSON.stringify({ intents: [] })],
+  );
+  // Noise #2: accepted, but nothing came of it — no task, no title.
+  await query(
+    `INSERT INTO agent_decisions (customer_id, decision_type, agent_output, outcome)
+     VALUES ($1, 'triage', $2::jsonb, 'accepted')`,
+    [customerId, JSON.stringify({ confidence: 0.2 })],
+  );
+  // A draft_reply carries no triage output either — but it is NOT triage noise and must survive.
+  await query(
+    `INSERT INTO agent_decisions (customer_id, decision_type, agent_output, outcome)
+     VALUES ($1, 'draft_reply', $2::jsonb, 'rejected')`,
+    [customerId, JSON.stringify({ draft_body: 'detail-only' })],
+  );
+  await query(
+    `INSERT INTO agent_tasks (task_ref, customer_id, inbox_message_id, relationship)
+     VALUES ($1, $2, $3, 'created_from')`,
+    [taskRef, customerId, inbound.rows[0].id],
+  );
+
+  const page = await customerTimeline(customerId, { limit: '50' });
+  assert.ok(page);
+  const byType = (type: string) => page.data.filter((r) => r.event_type === type).map((r) => r.metadata as Record<string, unknown>);
+
+  const inboxRows = byType('inbox');
+  const inboundRow = inboxRows.find((m) => m.direction === 'inbound');
+  assert.equal(inboundRow?.sender_name, 'Jane Roe');
+  assert.equal(inboundRow?.subject, 'Login is broken');
+  // Truncated in SQL and leading whitespace stripped — never the whole 400-char body.
+  assert.equal(inboundRow?.body_snippet, 'x'.repeat(180));
+  // The direction that decides which side of the thread a row renders on.
+  assert.equal(inboxRows.filter((m) => m.direction === 'outbound').length, 1);
+
+  assert.equal(byType('outbound')[0].body_snippet, 'We have shipped a fix');
+
+  const triage = byType('decision').find((m) => m.suggested_title);
+  assert.equal(triage?.suggested_title, 'Investigate login issue');
+  assert.equal(triage?.summary, 'User cannot log in.');
+  assert.equal(triage?.category, 'bug_report');
+  assert.equal(triage?.priority, 'urgent');
+
+  // The task's real title, resolved through the triage decision that created it.
+  assert.equal(byType('task_link')[0].task_title, 'Investigate login issue');
+  assert.equal(byType('task_link')[0].task_ref, taskRef);
+
+  // Default (the console): every decision row is kept — it is an ops surface where they are evidence.
+  assert.equal(byType('decision').length, 4);
+
+  const filtered = await customerTimeline(customerId, { limit: '50', omitNoiseDecisions: true });
+  assert.ok(filtered);
+  const decisions = filtered.data.filter((r) => r.event_type === 'decision');
+  assert.equal(decisions.length, 2); // the real triage + the draft_reply; both noise rows gone
+  assert.deepEqual(decisions.map((r) => (r.metadata as Record<string, unknown>).decision_type).sort(), ['draft_reply', 'triage']);
+  // Filtering happens in SQL, so it cannot silently shrink a page below its limit.
+  assert.equal(filtered.data.length, page.data.length - 2);
+  // A stringy query param must NOT flip an ops surface into the founder's filtered view.
+  const stringy = await customerTimeline(customerId, { limit: '50', omitNoiseDecisions: 'true' as unknown as boolean });
+  assert.ok(stringy);
+  assert.equal(stringy.data.filter((r) => r.event_type === 'decision').length, 4);
+});

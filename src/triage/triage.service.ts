@@ -12,7 +12,14 @@ import type { CustomerBriefLoader } from '../knowledge/customer-brief';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
 import { decideDedup } from './dedup';
-import { recordTaskBridge, findTaskByInbox, recordTriageDecision, findCustomerByTaskRef } from '../decisions/decisions';
+import {
+  recordTaskBridge,
+  findTaskByInbox,
+  recordTriageDecision,
+  findCustomerByTaskRef,
+  findIntentByTaskRef,
+  type TaskIntentSummary,
+} from '../decisions/decisions';
 import { loadPriorThreadConversation, markProcessed, markSkipped, setInboxCustomer, type ClaimedInbox } from '../inbox/inbox-repo';
 
 // Triage pipeline (tasks 6.2-6.5, CORE — injected ports + db only, imports NO
@@ -121,6 +128,40 @@ export function resolveTaskSource(
     entityType: row.channel_type,
     entityId: threadKey,
     display: `${config.displayName} · ${threadKey}`,
+  };
+}
+
+/** The generic wording the confirmed card carried for every task, whichever one it was. Kept as
+ *  the FALLBACK only — see confirmedTaskCard. */
+const CONFIRMED_CARD_FALLBACK = {
+  title: '🆕 Task (confirmed)',
+  body: 'A task created from an earlier message is confirmed.',
+} as const;
+
+/**
+ * The "task confirmed" card (the R49 re-notify). It used to read, in its entirety, "A task
+ * created from an earlier message is confirmed." — naming no task, so the founder could not tell
+ * WHICH of their tasks it meant. `intent` is that task's own recorded intent (findIntentByTaskRef)
+ * and `displayName` its customer's, so the card mirrors the shape of the real new-task card below
+ * and names the thing it is confirming.
+ *
+ * Degrades to the original generic wording when the intent was never recorded against the ref
+ * (the meeting fallback's task) — a vague card still beats a blank one, and this path exists to
+ * re-notify a founder whose first notification was lost.
+ */
+export function confirmedTaskCard(
+  intent: TaskIntentSummary | null,
+  displayName: string | null,
+): { title: string; body: string } {
+  const suggested = intent?.suggestedTitle?.trim() || null;
+  const summary = intent?.summary?.trim() || null;
+  const headline = suggested ?? summary;
+  if (!headline) return { ...CONFIRMED_CARD_FALLBACK };
+  const body = [displayName ? `${displayName}: ${headline}` : headline];
+  if (summary && summary !== headline) body.push(`“${summary}”`);
+  return {
+    title: `${CONFIRMED_CARD_FALLBACK.title}${intent?.priority ? ` · ${intent.priority}` : ''}`,
+    body: body.join('\n'),
   };
 }
 
@@ -240,7 +281,11 @@ export class TriageService {
       if (customerId) {
         await this.deps.notifier.notifyCustomerEvent(
           customerId,
-          { title: '🆕 Task (confirmed)', body: 'A task created from an earlier message is confirmed.', url: this.deps.deepLink(existing), contextRef: { kind: 'inbox', ref: inboxId } },
+          {
+            ...(await this.confirmedCard(existing, customerId)),
+            url: this.deps.deepLink(existing),
+            contextRef: { kind: 'inbox', ref: inboxId },
+          },
           cancelButton(existing),
         );
       }
@@ -257,6 +302,23 @@ export class TriageService {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Recover the confirmed task's own words (its recorded intent + the customer's name) so the
+   * card can name it. Best-effort in BOTH directions: a lookup that finds nothing, or one that
+   * throws, still yields the generic card — the whole point of this path is that a founder whose
+   * first notification was lost gets a second one, so a failed enrichment must never cost them
+   * the notification itself.
+   */
+  private async confirmedCard(taskRef: string, customerId: string): Promise<{ title: string; body: string }> {
+    try {
+      const [intent, config] = await Promise.all([findIntentByTaskRef(taskRef), loadCustomerConfig(customerId)]);
+      return confirmedTaskCard(intent, config?.displayName ?? null);
+    } catch (err) {
+      logger.warn({ taskRef, reason: (err as Error)?.message }, 'triage: confirmed-card lookup failed — generic wording');
+      return confirmedTaskCard(null, null);
+    }
   }
 
   /**

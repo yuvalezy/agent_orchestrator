@@ -45,6 +45,7 @@ import {
   insertMessage,
   listMessages,
   getMessage,
+  dismissMessage,
   markDecidedByRef,
   listPushDevices,
 } from './adapters/founder-app/founder-app-repo';
@@ -228,7 +229,7 @@ async function main(): Promise<void> {
       consoleConfig,
       existsSync(path.join(packagedAppAssets, 'index.html')) ? packagedAppAssets : devAppAssets,
       {
-        repo: { createDevice, touchDeviceByTokenHash, revokeDeviceByTokenHash, setDeviceFcmToken, unregisterDevicePush, insertMessage, listMessages, getMessage },
+        repo: { createDevice, touchDeviceByTokenHash, revokeDeviceByTokenHash, setDeviceFcmToken, unregisterDevicePush, insertMessage, listMessages, getMessage, dismissMessage },
         feed,
         // Same isolated founder query engine the console + Telegram /ask use (internal + customer scope).
         query: buildQueryEngineService(async () => {}),

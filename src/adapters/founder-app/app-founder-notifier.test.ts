@@ -33,6 +33,9 @@ function harness(overrides: Partial<AppFounderNotifierDeps> = {}): {
       notificationRef: input.notificationRef ?? null,
       buttons: input.buttons ?? null,
       decidedOptionId: null,
+      linkUrl: input.linkUrl ?? null,
+      context: input.context ?? null,
+      dismissedAt: null,
       createdAt: new Date().toISOString(),
     };
     stored.push(row);
@@ -115,6 +118,36 @@ test('askFounder stores a question row; all options share one parsed ref', async
     { id: 'md30', label: '30 min' },
     { id: 'mtask', label: 'Just make a task' },
   ]);
+});
+
+test('every notifier verb persists the notification url and origin context (they used to be dropped)', async () => {
+  const h = harness();
+  const url = 'https://account.ezyts.com/projects/tasks/task-42';
+  await h.notifier.notifyAdmin({ title: 'Worker down', body: 'b', url, entityRef: 'inbox-1' });
+  await h.notifier.notifyCustomerEvent(
+    'c1',
+    { title: 'New task', body: 'b', url, contextRef: { kind: 'inbox', ref: '77' }, entityRef: 'task-42' },
+    [{ id: 'x:task-42', label: '❌ Cancel' }],
+  );
+  await h.notifier.askFounder(
+    'c2',
+    { title: 'How long?', body: 'b', url, contextRef: { kind: 'outbound', ref: '88' } },
+    [{ id: 'md30:mtg-9', label: '30 min' }],
+  );
+  // Without linkUrl a card can describe a task but never open it — this is the whole "Open Task" ask.
+  assert.deepEqual(h.stored.map((r) => r.linkUrl), [url, url, url]);
+  assert.deepEqual(h.stored.map((r) => r.context), [
+    { entityRef: 'inbox-1' },
+    { contextRef: { kind: 'inbox', ref: '77' }, entityRef: 'task-42' },
+    { contextRef: { kind: 'outbound', ref: '88' } },
+  ]);
+});
+
+test('a notification with no url/refs stores nulls, not an empty context object', async () => {
+  const h = harness();
+  await h.notifier.notifyAdmin({ title: 't', body: 'b' });
+  assert.equal(h.stored[0].linkUrl, null);
+  assert.equal(h.stored[0].context, null);
 });
 
 test('FCM data.route deep-links to the customer screen, or the attention queue for admin', async () => {

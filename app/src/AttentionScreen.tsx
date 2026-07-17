@@ -4,24 +4,14 @@ import { useAppData } from './AppData';
 import { AttentionCard } from './AttentionCard';
 import { DetailSheet } from './DetailSheet';
 import { ScreenHeader } from './ScreenHeader';
+import { useOptimisticDecide } from './useOptimisticDecide';
 import { relativeTime } from './lib/time';
 import type { DetailKind, UrgencyItem } from './types';
 
 export function AttentionScreen(): ReactElement {
-  const { attention, attentionLoading, feed, refetchAttention } = useAppData();
-  const [optimistic, setOptimistic] = useState<Record<string, string>>({});
+  const { attention, attentionLoading } = useAppData();
+  const { decide, decidedFor } = useOptimisticDecide();
   const [detail, setDetail] = useState<{ kind: DetailKind; id: string } | null>(null);
-
-  const decide = async (messageId: string, optionId: string) => {
-    setOptimistic((m) => ({ ...m, [messageId]: optionId }));
-    try {
-      await feed.decide(messageId, optionId);
-      refetchAttention();
-    } catch (err) {
-      setOptimistic((m) => { const next = { ...m }; delete next[messageId]; return next; });
-      throw err;
-    }
-  };
 
   const decisions = attention?.decisions ?? [];
   const urgency = attention?.urgency ?? [];
@@ -48,7 +38,7 @@ export function AttentionScreen(): ReactElement {
         {decisions.length > 0 && (
           <section className="space-y-2.5">
             {decisions.map((card) => (
-              <AttentionCard key={card.id} card={card} decidedOptionId={card.decidedOptionId ?? optimistic[card.id] ?? null} onDecide={decide} />
+              <AttentionCard key={card.id} card={card} decidedOptionId={decidedFor(card)} onDecide={decide} />
             ))}
           </section>
         )}

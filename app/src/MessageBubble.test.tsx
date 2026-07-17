@@ -1,7 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter, useLocation } from 'react-router-dom';
+import { type ReactElement } from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MessageBubble } from './MessageBubble';
 import type { Message } from './types';
+
+function Probe(): ReactElement {
+  const { pathname, search } = useLocation();
+  return <p data-testid="url">{`${pathname}${search}`}</p>;
+}
+
+function renderRouted(node: ReactElement): void {
+  render(<MemoryRouter initialEntries={['/activity']}>{node}<Probe /></MemoryRouter>);
+}
+
+afterEach(() => vi.unstubAllGlobals());
 
 function message(overrides: Partial<Message>): Message {
   return {
@@ -49,6 +62,28 @@ describe('MessageBubble', () => {
     expect(reject).toBeDisabled();
     expect(approve).toHaveAttribute('aria-pressed', 'true');
     expect(reject).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  // The same CardActions the Attention queue renders, so Activity and Assistant get #2/#3 free.
+  it('carries the shared card actions: Open Task on a linked row', () => {
+    const open = vi.fn();
+    vi.stubGlobal('open', open);
+    renderRouted(<MessageBubble onDecide={vi.fn()} message={message({
+      kind: 'notification', body: 'Task created for Acme.', linkUrl: 'https://account.ezyts.com/projects/tasks/t1',
+    })} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Open Task/ }));
+    expect(open).toHaveBeenCalledWith('https://account.ezyts.com/projects/tasks/t1', '_blank', 'noopener,noreferrer');
+  });
+
+  it('opens the thread behind an activity row when the row knows its origin', () => {
+    renderRouted(<MessageBubble onDecide={vi.fn()} message={message({
+      kind: 'notification', body: 'Task created for Acme.', customerRef: 'cust-3',
+      context: { contextRef: { kind: 'inbox', ref: 'i-4' } },
+    })} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open thread' }));
+    expect(screen.getByTestId('url')).toHaveTextContent('/customer/cust-3?focus=inbox%3Ai-4');
   });
 
   it('does not swallow a rejected decision as an unhandled rejection', async () => {

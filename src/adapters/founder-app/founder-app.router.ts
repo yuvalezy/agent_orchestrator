@@ -10,7 +10,7 @@ import { DeviceAuth } from './founder-app-auth';
 import type { FounderAppFeed } from './founder-app-feed';
 import type { AppFounderNotifier } from './app-founder-notifier';
 import { decodeCursor } from './founder-app-repo';
-import type { FeedMessage, FounderAppDevice, InsertMessageInput, MessagePage } from './founder-app-repo';
+import type { DismissResult, FeedMessage, FounderAppDevice, InsertMessageInput, MessagePage } from './founder-app-repo';
 import { camelizeDeep } from './founder-app-serialize';
 import { toUrgencyItem, toTimelineRow } from './founder-app-cockpit-view';
 import type { AttentionDecision, CustomerAugment } from './founder-app-cockpit-repo';
@@ -36,7 +36,7 @@ const ATTENTION_URGENCY_LIMIT = 20;
 export interface FounderAppCockpitReads {
   listCustomers: (input: { search?: unknown; cursor?: unknown; limit?: unknown }) => Promise<Page<Record<string, unknown>> | null>;
   customerDetail: (id: string) => Promise<Record<string, unknown> | null>;
-  customerTimeline: (id: string, input: { limit?: unknown; cursor?: unknown }) => Promise<Page<Record<string, unknown>> | null>;
+  customerTimeline: (id: string, input: { limit?: unknown; cursor?: unknown; omitNoiseDecisions?: boolean }) => Promise<Page<Record<string, unknown>> | null>;
   inboxDetail: (id: string) => Promise<Record<string, unknown> | null>;
   outboundDetail: (id: string) => Promise<Record<string, unknown> | null>;
   decisionDetail: (id: string) => Promise<Record<string, unknown> | null>;
@@ -55,6 +55,7 @@ export interface FounderAppRepo {
   insertMessage: (input: InsertMessageInput) => Promise<FeedMessage>;
   listMessages: (opts: { before?: string | null; beforeId?: string | null; limit: number }) => Promise<MessagePage>;
   getMessage: (id: string) => Promise<FeedMessage | null>;
+  dismissMessage: (id: string) => Promise<DismissResult>;
 }
 
 export interface FounderAppDeps {
@@ -280,6 +281,36 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
     }
   });
 
+  // ── Dismiss (acknowledge) ──────────────────────────────────────────────────────────
+  // "I've seen this" — the app's inbox-zero gesture, and NOT a decision: the task, the
+  // decision handler and Telegram are all untouched. It exists because approving what the
+  // assistant did meant doing nothing, which left the card in the queue forever.
+  //
+  // Ref-keyed in the repo (planDismiss), so the several rows that legitimately mirror one
+  // entity — tryR49Reconfirm re-notifies with the SAME ref — clear together. A 'question' is
+  // refused: askFounder asks a real fork that must be answered, and a new surface must not
+  // make it silently droppable.
+  router.post('/api/dismiss', async (req, res, next) => {
+    const body = (req.body ?? {}) as { messageId?: unknown };
+    if (typeof body.messageId !== 'string' || !UUID_RE.test(body.messageId)) {
+      return void res.status(400).json({ error: 'invalid message id' });
+    }
+    try {
+      const result = await deps.repo.dismissMessage(body.messageId);
+      if (!result.ok) {
+        return void (result.reason === 'not_found'
+          ? res.status(404).json({ error: 'not found' })
+          : res.status(409).json({ error: 'not dismissible' }));
+      }
+      // Re-publish exactly the rows THIS call changed, so every open client drops them from
+      // its queue without a refetch. An empty set is a legitimate re-dismiss no-op.
+      for (const row of result.rows) deps.feed.publish(row);
+      res.json({ data: result.rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // ── v2 cockpit reads (device-auth'd, camelCase, {data,nextCursor}) ───────────────────
   // The action queue: undecided app cards (customer name resolved) + top urgency items.
   router.get('/api/attention', async (_req, res, next) => {
@@ -331,9 +362,15 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
   router.get('/api/customers/:id/timeline', async (req, res, next) => {
     if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid customer id' });
     try {
-      const page = await deps.cockpit.customerTimeline(req.params.id, { cursor: req.query.cursor, limit: req.query.limit });
+      // omitNoiseDecisions is the app's own posture, NOT a client parameter: the cockpit drops
+      // the triage rows that carry no content by construction (an `{"intents":[]}` decision per
+      // no-op message). The console deliberately passes nothing — there, every decision row is
+      // evidence. Filtering happens in SQL, so keyset paging stays correct.
+      const page = await deps.cockpit.customerTimeline(req.params.id, { cursor: req.query.cursor, limit: req.query.limit, omitNoiseDecisions: true });
       if (!page) return void res.status(400).json({ error: 'invalid limit or cursor' });
-      res.json({ data: page.data.map(toTimelineRow), nextCursor: page.nextCursor });
+      // portalBaseUrl turns a task_ref into a tappable "Open Task" — formatted here, never in the
+      // client, which cannot see server config and would only guess a dead URL.
+      res.json({ data: page.data.map((row) => toTimelineRow(row, config.portalBaseUrl)), nextCursor: page.nextCursor });
     } catch (err) {
       next(err);
     }

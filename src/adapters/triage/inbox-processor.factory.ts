@@ -25,6 +25,7 @@ import { claimBatch, failStuck } from '../../inbox/inbox-repo';
 import { enqueueDraft, findOpenDraftByInbox } from '../../outbound/outbound-repo';
 import { recordDraftDecision } from '../../decisions/decisions';
 import { buildEzyPortalGateway } from '../ezy-portal';
+import { taskDeepLink } from '../shared/portal-url';
 import { buildLlmRouter } from '../llm/factory';
 import type { AgentLlmPort, DraftReviserPort, DraftVerifierPort } from '../../ports/llm.port';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
@@ -277,7 +278,10 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     llm,
     notifier,
     contactQueries: dbContactResolutionQueries,
-    deepLink: (taskRef) => `${env.EZY_PORTAL_BASE_URL}/projects/tasks/${taskRef}`, // best-effort (verify route)
+    // The ONE canonical formatter (adapters/shared/portal-url.ts) — it trims the base, encodes
+    // the ref, and yields no link at all rather than a malformed one. The route is real: the
+    // portal's ProjectsApp mounts `tasks/:id` → TaskDetailPage.
+    deepLink: (taskRef) => taskDeepLink(env.EZY_PORTAL_BASE_URL, taskRef),
     bumpSkipped: () => incrementCounter(SKIPPED_COUNTER_KEY),
     // M2: the muted-group @-mention path (summarize over write key + media over
     // read key). Lazily-keyed adapter — no secret resolved at build.

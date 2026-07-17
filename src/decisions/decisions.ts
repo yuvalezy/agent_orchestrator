@@ -43,6 +43,43 @@ export async function findTaskByInbox(inboxMessageId: string): Promise<string | 
   return rows[0]?.task_ref ?? null;
 }
 
+/** The intent fields a task was created from — structured extractor output (a generated
+ *  title/summary), never the customer's raw body. */
+export interface TaskIntentSummary {
+  suggestedTitle: string | null;
+  summary: string | null;
+  priority: string | null;
+}
+
+/**
+ * The intent that CREATED a task, recovered from its triage decision's agent_output. The R49
+ * re-notify holds only a task_ref — no intent, no message — so this is what lets its card name
+ * WHICH task is confirmed instead of "a task created from an earlier message".
+ *
+ * EARLIEST triage row wins (id is BIGSERIAL, so id ASC is chronological): a later same-topic
+ * message folds into the task as a comment and records its OWN triage row against the same
+ * task_ref, but the first one is the intent the task was actually made from. Same shape as the
+ * briefing's task_title lookup (adapters/query/briefing-repo.ts).
+ *
+ * Returns null when no triage row carries this ref — a real case, not just defensiveness: the
+ * meeting path's task fallback records its decision BEFORE the task exists, so its task_ref is
+ * NULL. Callers must degrade rather than assume.
+ */
+export async function findIntentByTaskRef(taskRef: string): Promise<TaskIntentSummary | null> {
+  const { rows } = await query<{ suggested_title: string | null; summary: string | null; priority: string | null }>(
+    `SELECT agent_output->>'suggested_title' AS suggested_title,
+            agent_output->>'summary'         AS summary,
+            agent_output->>'priority'        AS priority
+       FROM agent_decisions
+      WHERE task_ref = $1 AND decision_type = 'triage'
+      ORDER BY id ASC
+      LIMIT 1`,
+    [taskRef],
+  );
+  const r = rows[0];
+  return r ? { suggestedTitle: r.suggested_title, summary: r.summary, priority: r.priority } : null;
+}
+
 /**
  * Record a triage decision (create/comment/askFounder). Returns the new row's id, matching
  * recordDraftDecision's established shape — every existing caller ignores it.

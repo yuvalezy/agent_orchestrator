@@ -9,7 +9,7 @@ import {
   TicketThreadEntry,
 } from '../../ports';
 import { EzyPortalHttpClient } from './http-client';
-import { portalTaskUrl } from '../shared/portal-url';
+import { taskDeepLink } from '../shared/portal-url';
 
 /** Portal field limits (DA-verified vs task_input.go) — truncate defensively so a
  *  long LLM title/description never 422s. M1.5b should also validate upstream. */
@@ -329,15 +329,14 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
     // ref is a UUID (unquotable, unbrowsable) and every confirmation built from it
     // alone was a dead end. The code comes straight off the create response; the url
     // is formatted from this client's baseUrl (also the portal's UI origin) with the
-    // same portalTaskUrl the console links with — one formatter, one URL shape.
-    // Both stay optional: a portal response without `code`, or a base that
-    // portalTaskUrl rejects, degrades to today's ref-only TaskRef rather than
-    // fabricating a link.
+    // same taskDeepLink the triage factories link with — one formatter, one URL shape.
+    // Both stay optional: a portal response without `code`, or a base the formatter
+    // rejects, degrades to today's ref-only TaskRef rather than fabricating a link.
     return {
       ref: created.id,
       display: created.title,
       code: created.code,
-      url: portalTaskUrl(this.http.baseUrl, created.id) ?? undefined,
+      url: taskDeepLink(this.http.baseUrl, created.id),
     };
   }
 

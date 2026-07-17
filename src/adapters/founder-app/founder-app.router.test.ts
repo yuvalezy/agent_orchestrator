@@ -38,6 +38,9 @@ function makeRepo(): FounderAppRepo & {
       notificationRef: input.notificationRef ?? null,
       buttons: input.buttons ?? null,
       decidedOptionId: null,
+      linkUrl: input.linkUrl ?? null,
+      context: input.context ?? null,
+      dismissedAt: null,
       // Deterministic, monotonically increasing timestamps for stable keyset paging.
       createdAt: new Date(1_700_000_000_000 + seq).toISOString(),
     };
@@ -70,6 +73,19 @@ function makeRepo(): FounderAppRepo & {
       return { data: page, nextCursor: rows.length > limit && last ? encodeCursor(last.createdAt, last.id) : null };
     },
     getMessage: async (id) => messages.find((m) => m.id === id) ?? null,
+    // Mirror of the real dismissMessage/planDismiss: ref-keyed when the row has a ref (so the
+    // rows that mirror one entity clear together), id-keyed otherwise, and a 'question' is
+    // refused — directly and via the ref fanout.
+    dismissMessage: async (id) => {
+      const target = messages.find((m) => m.id === id) ?? null;
+      if (!target) return { ok: false, reason: 'not_found' };
+      if (target.kind === 'question') return { ok: false, reason: 'not_dismissible' };
+      const affected = target.notificationRef
+        ? messages.filter((m) => m.notificationRef === target.notificationRef && m.kind !== 'question' && !m.dismissedAt)
+        : messages.filter((m) => m.id === id && !m.dismissedAt);
+      for (const m of affected) m.dismissedAt = new Date(1_700_000_000_000).toISOString();
+      return { ok: true, rows: affected };
+    },
     // Mirror of the real markDecidedByRef: first-writer-wins over every buttoned row
     // sharing the ref; returns the rows it actually decided.
     markDecidedByRef: async (notificationRef, optionId) => {
@@ -270,6 +286,78 @@ test('decisions reject unknown options and are 503 when no handler is registered
   }, { registerHandler: false });
 });
 
+// ── Dismiss ──────────────────────────────────────────────────────────────────────────
+// The founder's actual complaint: approving what the assistant did meant doing nothing, so
+// the card sat in Attention forever. Dismiss is "I've seen this" — it decides nothing.
+
+test('dismiss clears every row mirroring one entity, and re-emits them over SSE', async () => {
+  await withApp(async ({ baseUrl, notifier, feed }) => {
+    const cookie = await login(baseUrl);
+    // tryR49Reconfirm legitimately re-notifies with the SAME ref — this is exactly the
+    // duplicate-card case the founder is looking at. Both rows must clear on one tap.
+    await notifier.notifyCustomerEvent('cust-1', { title: 'New task', body: 'b' }, [{ id: 'x:task-1', label: 'Cancel' }]);
+    await notifier.notifyCustomerEvent('cust-1', { title: 'Task (confirmed)', body: 'b' }, [{ id: 'x:task-1', label: 'Cancel' }]);
+    const messageId = (await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] }).data[0].id;
+
+    const published: FeedMessage[] = [];
+    feed.subscribe((m) => published.push(m));
+    const res = await fetch(`${baseUrl}/app/api/dismiss`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId }) });
+    assert.equal(res.status, 200);
+
+    const { data } = await res.json() as { data: FeedMessage[] };
+    assert.equal(data.length, 2, 'both rows sharing the ref clear on one tap');
+    assert.ok(data.every((row) => row.dismissedAt));
+    assert.equal(published.length, 2, 'every open client drops them without a refetch');
+    // Dismissing decides nothing — the task and the decision handler are untouched.
+    assert.ok(data.every((row) => row.decidedOptionId === null));
+  });
+});
+
+test('a re-dismiss is an idempotent no-op that publishes nothing', async () => {
+  await withApp(async ({ baseUrl, notifier, feed }) => {
+    const cookie = await login(baseUrl);
+    await notifier.notifyCustomerEvent('cust-1', { title: 'New task', body: 'b' }, [{ id: 'x:task-1', label: 'Cancel' }]);
+    const messageId = (await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] }).data[0].id;
+    const dismiss = () => fetch(`${baseUrl}/app/api/dismiss`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId }) });
+    await dismiss();
+
+    const published: FeedMessage[] = [];
+    feed.subscribe((m) => published.push(m));
+    const res = await dismiss();
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json() as { data: FeedMessage[] }).data, [], 'first-writer-wins: nothing left to change');
+    assert.equal(published.length, 0);
+  });
+});
+
+test('a question cannot be dismissed — a real fork must be answered, not dropped', async () => {
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    await notifier.askFounder('cust-1', { title: 'Which one?', body: 'b' }, [{ id: 'a:q-1', label: 'A' }, { id: 'b:q-1', label: 'B' }]);
+    const messageId = (await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] }).data[0].id;
+    const res = await fetch(`${baseUrl}/app/api/dismiss`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId }) });
+    assert.equal(res.status, 409);
+  });
+});
+
+test('dismiss validates its id and requires auth', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/dismiss`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId: 'nope' }) })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/dismiss`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId: crypto.randomUUID() }) })).status, 404);
+    assert.equal((await fetch(`${baseUrl}/app/api/dismiss`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messageId: crypto.randomUUID() }) })).status, 401);
+  });
+});
+
+test('the app timeline omits noise decisions; the console read model is never asked to', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    await fetch(`${baseUrl}/app/api/customers/${crypto.randomUUID()}/timeline`, { headers: { cookie } });
+    assert.equal(seen[0].omitNoiseDecisions, true, 'the cockpit drops content-free triage rows');
+  }, { cockpit: { customerTimeline: async (_id, input) => { seen.push(input as Record<string, unknown>); return { data: [], nextCursor: null }; } } });
+});
+
 test('push register enables the device; config echoes the public Firebase settings', async () => {
   await withApp(async ({ baseUrl, repo }) => {
     const cookie = await login(baseUrl);
@@ -348,11 +436,15 @@ test('GET /customers/:id and /timeline camelize the reused detail + timeline', a
     assert.equal(detail.data.displayName, 'Acme Corp');
     assert.equal(detail.data.preferredLanguage, 'en');
     const timeline = await (await fetch(`${baseUrl}/app/api/customers/${id}/timeline`, { headers: { cookie } })).json() as { data: Array<Record<string, unknown>>; nextCursor: string | null };
-    // Timeline rows are normalized to the render discriminant + detail-sheet target.
+    // Timeline rows are normalized to the render discriminant + detail-sheet target + the text the
+    // row is about. This stub's metadata predates the enrichment on purpose: it pins that a row
+    // missing every enriched key still serializes as explicit nulls (see founder-app-cockpit-view.test.ts).
+    // linkUrl proves the ROUTER threads its configured portal base into the mapper: the two rows
+    // that name a task get a browsable link, and the message — which names none — gets null.
     assert.deepEqual(timeline.data, [
-      { id: 'inbox:9', kind: 'inbound', itemKind: 'inbox', itemId: '9', title: 's', snippet: null, status: 'processed', createdAt: '2026-01-01T00:00:00.000Z' },
-      { id: 'decision:4', kind: 'decision', itemKind: 'decision', itemId: '4', title: 'triage', snippet: 'task-7', status: 'accepted', createdAt: '2026-01-01T00:00:00.000Z' },
-      { id: 'task_link:2', kind: 'notification', itemKind: null, itemId: null, title: 'task-7', snippet: null, status: 'linked', createdAt: '2026-01-01T00:00:00.000Z' },
+      { id: 'inbox:9', kind: 'inbound', itemKind: 'inbox', itemId: '9', title: 's', snippet: null, status: 'processed', createdAt: '2026-01-01T00:00:00.000Z', senderName: null, taskRef: null, linkUrl: null, category: null, priority: null },
+      { id: 'decision:4', kind: 'decision', itemKind: 'decision', itemId: '4', title: 'Triage', snippet: null, status: 'accepted', createdAt: '2026-01-01T00:00:00.000Z', senderName: null, taskRef: 'task-7', linkUrl: 'https://portal.example.com/projects/tasks/task-7', category: null, priority: null },
+      { id: 'task_link:2', kind: 'notification', itemKind: null, itemId: null, title: 'task-7', snippet: null, status: 'linked', createdAt: '2026-01-01T00:00:00.000Z', senderName: null, taskRef: 'task-7', linkUrl: 'https://portal.example.com/projects/tasks/task-7', category: null, priority: null },
     ]);
     // A non-UUID id is rejected before touching the repo.
     assert.equal((await fetch(`${baseUrl}/app/api/customers/not-a-uuid`, { headers: { cookie } })).status, 400);
@@ -363,6 +455,25 @@ test('GET /customers/:id and /timeline camelize the reused detail + timeline', a
         { created_at: '2026-01-01T00:00:00.000Z', entity_id: '9', event_type: 'inbox', status: 'processed', metadata: { channel_instance_id: 'ch1', subject: 's' } },
         { created_at: '2026-01-01T00:00:00.000Z', entity_id: '4', event_type: 'decision', status: 'accepted', metadata: { decision_type: 'triage', task_ref: 'task-7' } },
         { created_at: '2026-01-01T00:00:00.000Z', entity_id: '2', event_type: 'task_link', status: 'linked', metadata: { task_ref: 'task-7' } },
+      ], nextCursor: null }),
+    },
+    env: { EZY_PORTAL_BASE_URL: 'https://portal.example.com' },
+  });
+});
+
+test('with no portal configured, a task row carries no link rather than a broken one', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const id = crypto.randomUUID();
+    const timeline = await (await fetch(`${baseUrl}/app/api/customers/${id}/timeline`, { headers: { cookie } })).json() as { data: Array<Record<string, unknown>> };
+    assert.equal(timeline.data[0].taskRef, 'task-7', 'the row still knows its task');
+    assert.equal(timeline.data[0].linkUrl, null, 'it just has nowhere to send the founder');
+  }, {
+    // No EZY_PORTAL_BASE_URL: loadConsoleConfig leaves portalBaseUrl null, and portalTaskUrl
+    // fails closed — the app renders no "Open Task" button at all.
+    cockpit: {
+      customerTimeline: async () => ({ data: [
+        { created_at: '2026-01-01T00:00:00.000Z', entity_id: '4', event_type: 'decision', status: 'accepted', metadata: { decision_type: 'triage', task_ref: 'task-7' } },
       ], nextCursor: null }),
     },
   });

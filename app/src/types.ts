@@ -5,6 +5,13 @@ export type Severity = 'info' | 'action' | 'warning';
 
 export interface Button { id: string; label: string }
 
+/** A card's durable origin (server: migration 043). `contextRef` is the inbox/outbound row the
+ *  card was raised from — enough to open the thread behind it. */
+export interface MessageContext {
+  contextRef?: { kind: 'inbox' | 'outbound'; ref: string } | null;
+  entityRef?: string | null;
+}
+
 export interface Message {
   id: string;
   direction: Direction;
@@ -16,6 +23,12 @@ export interface Message {
   notificationRef: string | null;
   buttons: Button[] | null;
   decidedOptionId: string | null;
+  /** EZY Portal deep link (Notification.url). Absent → no "Open Task" button; never guess one. */
+  linkUrl?: string | null;
+  /** Where this card came from, so a tap can open its thread. */
+  context?: MessageContext | null;
+  /** Set once the founder acknowledged the card; dismissed cards leave the attention queue. */
+  dismissedAt?: string | null;
   createdAt: string;
   /** Client-only flag: an optimistic row not yet confirmed by the server. */
   pending?: boolean;
@@ -80,6 +93,8 @@ export interface CustomerDetail { id: string; displayName: string; [key: string]
 export type TimelineKind = 'inbound' | 'outbound' | 'decision' | 'notification';
 export type DetailKind = 'inbox' | 'outbound' | 'decision';
 
+/** One thread event. `id` is `${eventType}:${entityId}` — the same shape a card's
+ *  `context.contextRef` yields, so a card can point at its own row in the thread. */
 export interface TimelineRow {
   id: string;
   kind: TimelineKind;
@@ -89,6 +104,16 @@ export interface TimelineRow {
   snippet: string | null;
   status: string | null;
   createdAt: string;
+  /** Who sent it (inbound/outbound rows only). */
+  senderName: string | null;
+  /** The portal task this row concerns (decision + task-link rows). */
+  taskRef: string | null;
+  /** Browsable "Open Task" target, formatted server-side. Null → render no button; never
+   *  construct one client-side (the portal base is server config the app cannot see). */
+  linkUrl: string | null;
+  /** Triage classification, rendered as chips rather than concatenated into the title. */
+  category: string | null;
+  priority: string | null;
 }
 export interface TimelinePage { data: TimelineRow[]; nextCursor: string | null }
 

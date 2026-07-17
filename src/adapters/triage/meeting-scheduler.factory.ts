@@ -25,6 +25,7 @@ import {
   setMeetingDecisionId,
 } from '../../triage/meeting-repo';
 import { resolveMeetingHostTarget } from '../calendar/calendar-write-target';
+import { taskDeepLink } from '../shared/portal-url';
 import { buildDynamicMultiFreeBusy, buildFreeBusyAccounts } from '../calendar/google-freebusy';
 import { listEnabledCalendarAccounts } from '../connectors/calendar-accounts-repo';
 import { findContactEmail } from '../../customers/contact-resolution';
@@ -53,7 +54,7 @@ const HORIZON_DAYS = 7;
  * of the decision row rather than duplicated onto the meeting request — one source of truth, and
  * the decision row had to exist anyway for the audit.
  */
-function buildTaskFallback(taskTarget: TaskTargetPort, deepLink: (ref: string) => string) {
+function buildTaskFallback(taskTarget: TaskTargetPort, deepLink: (ref: string) => string | undefined) {
   return async (m: MeetingRequest): Promise<{ url?: string } | null> => {
     if (!m.decision_id) return null;
     const intent = (await findTriageIntent(m.decision_id)) as Intent | null;
@@ -140,7 +141,10 @@ export function buildMeetingSchedulerGated(
     }),
   );
 
-  const deepLink = (taskRef: string): string => `${env.EZY_PORTAL_BASE_URL}/projects/tasks/${taskRef}`;
+  // The ONE canonical formatter (adapters/shared/portal-url.ts) — it trims the base, encodes the
+  // ref, and yields no link at all rather than a malformed one. The route is real: the portal's
+  // ProjectsApp mounts `tasks/:id` → TaskDetailPage.
+  const deepLink = (taskRef: string): string | undefined => taskDeepLink(env.EZY_PORTAL_BASE_URL, taskRef);
 
   const scheduler = buildMeetingScheduler({
     freeBusy,

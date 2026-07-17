@@ -67,7 +67,7 @@ function fakes(
   const initiated: unknown[] = [];
   const clarified: string[] = [];
   const created: unknown[] = [];
-  const notified: Array<{ title: string; buttons: boolean }> = [];
+  const notified: Array<{ title: string; body: string; url?: string; buttons: boolean }> = [];
   const adminNotes: Array<{ title: string }> = [];
   const attached: Array<{ taskRef: string; filename: string; contentType: string; bytes: number }> = [];
   let skipped = 0;
@@ -111,7 +111,7 @@ function fakes(
     },
     notifier: {
       ensureCustomerTopic: async () => ({ ref: 't' }),
-      notifyCustomerEvent: async (_c, n, b) => { notified.push({ title: n.title, buttons: !!b }); },
+      notifyCustomerEvent: async (_c, n, b) => { notified.push({ title: n.title, body: n.body, url: n.url, buttons: !!b }); },
       notifyAdmin: async (n) => { adminNotes.push({ title: n.title }); },
       askFounder: async () => {},
       onDecision: () => {},
@@ -254,6 +254,58 @@ test('create path: known sender → createTask + bridge + decision + notify(butt
   await f.svc.process(row);
   assert.equal(f.created.length, 1, 'R49: createTask NOT called again');
   assert.equal(f.notified.length, 2, 'R49: re-notified on the short-circuit');
+});
+
+// ── the R49 confirmed card ────────────────────────────────────────────────────
+// It used to read, in its entirety, "A task created from an earlier message is confirmed." —
+// naming no task, on a feed where several such cards stack up. The task's own words are
+// recoverable from the triage decision that created it (findIntentByTaskRef), so recover them.
+
+test('R49 re-notify NAMES the task it is confirming (title + summary + a link to open it)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-r49-named', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+
+  const f = fakes([BUG], 'known');
+  const row = await seedInbox(`${TAG}-r49-named`, 'the export button is broken');
+  await f.svc.process(row); // creates task-1 + records its triage decision
+  await f.svc.process(row); // the reclaim → the R49 short-circuit re-notifies
+
+  assert.equal(f.created.length, 1, 'R49: no second task');
+  assert.equal(f.notified.length, 2);
+  const confirmed = f.notified[1];
+  assert.equal(confirmed.title, '🆕 Task (confirmed) · high', "carries the task's own priority, as the new-task card does");
+  assert.equal(confirmed.body, 'Triage Test Co: Fix export\n“Export fails”', 'the founder can see WHICH task is confirmed');
+  assert.equal(confirmed.url, 'http://portal/t/task-1', 'and can open it');
+  assert.equal(confirmed.buttons, true, 'the ❌ still rides along');
+});
+
+test('R49 re-notify degrades to the generic card when the task has no recorded intent', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name, project_ref, work_item_type_ref, telegram_topic_id)
+     VALUES ('bp-triage-r49-orphan', 'Triage Test Co', 'proj-1', 'wit-1', '99') RETURNING id`,
+  );
+  customerId = rows[0].id;
+
+  const f = fakes([BUG], 'known');
+  const row = await seedInbox(`${TAG}-r49-orphan`, 'the export button is broken');
+  // The meeting path's task fallback produces exactly this state: a bridge row for a task whose
+  // triage decision was recorded BEFORE the task existed, so no decision carries its task_ref.
+  await query(
+    `INSERT INTO agent_tasks (task_ref, customer_id, inbox_message_id, relationship)
+     VALUES ('ttest-orphan-task', $1, $2, 'created_from')`,
+    [customerId, row.id],
+  );
+  await f.svc.process(row);
+
+  assert.equal(f.created.length, 0, 'R49 short-circuit: the bridge row means the task exists');
+  assert.equal(f.notified.length, 1, 'the founder is still notified — a vague card beats none at all');
+  assert.equal(f.notified[0].title, '🆕 Task (confirmed)');
+  assert.equal(f.notified[0].body, 'A task created from an earlier message is confirmed.');
 });
 
 test('WP6: a THROWING brief loader is best-effort — triage still creates the task', async (t) => {

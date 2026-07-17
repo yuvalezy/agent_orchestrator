@@ -1,5 +1,5 @@
-import { type ReactElement, useCallback, useEffect, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { type ReactElement, useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { api } from './lib/api';
 import { useAppData } from './AppData';
@@ -8,8 +8,9 @@ import { Timeline } from './Timeline';
 import { AttentionCard } from './AttentionCard';
 import { CustomerAsk } from './CustomerAsk';
 import { DetailSheet } from './DetailSheet';
+import { useOptimisticDecide } from './useOptimisticDecide';
 import { cn } from './lib/utils';
-import type { CustomerDetail, DetailKind, TimelinePage, TimelineRow } from './types';
+import type { AttentionCard as AttentionCardData, CustomerDetail, DetailKind, TimelinePage, TimelineRow } from './types';
 
 type Tab = 'timeline' | 'pending' | 'ask';
 const tabs: ReadonlyArray<readonly [Tab, string]> = [['timeline', 'Timeline'], ['pending', 'Pending'], ['ask', 'Ask']];
@@ -17,9 +18,15 @@ const tabs: ReadonlyArray<readonly [Tab, string]> = [['timeline', 'Timeline'], [
 export function CustomerScreen(): ReactElement {
   const { id = '' } = useParams();
   const navigate = useNavigate();
-  const { attention, feed } = useAppData();
+  const [params] = useSearchParams();
+  const { attention } = useAppData();
   const [tab, setTab] = useState<Tab>('timeline');
   const [customer, setCustomer] = useState<CustomerDetail | null>(null);
+
+  // `?focus=<eventType>:<entityId>` is a card asking for the thread behind it (from anywhere:
+  // Attention, Pending, Activity, a push tap). Answering it means being on the timeline.
+  const focusId = params.get('focus');
+  useEffect(() => { if (focusId) setTab('timeline'); }, [focusId]);
 
   useEffect(() => {
     let live = true;
@@ -55,19 +62,34 @@ export function CustomerScreen(): ReactElement {
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-        {tab === 'timeline' && <TimelineTab customerId={id} />}
-        {tab === 'pending' && <PendingTab customerId={id} pending={pending} decide={feed.decide} />}
+        {tab === 'timeline' && <TimelineTab customerId={id} focusId={focusId} />}
+        {tab === 'pending' && <PendingTab customerId={id} pending={pending} />}
         {tab === 'ask' && <CustomerAsk customerId={id} />}
       </div>
     </div>
   );
 }
 
-function TimelineTab({ customerId }: { customerId: string }): ReactElement {
+/**
+ * Insert-or-replace by id, keeping the thread NEWEST-first (the API's order; `Timeline` reverses
+ * it to render). Mirrors `useFeed`'s merge — same job, opposite sort — so a live refresh adds
+ * what is new and updates what changed without discarding the pages already loaded.
+ */
+function mergeRows(current: TimelineRow[], incoming: TimelineRow[]): TimelineRow[] {
+  const map = new Map(current.map((row) => [row.id, row]));
+  for (const row of incoming) map.set(row.id, row);
+  return [...map.values()].sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+  });
+}
+
+function TimelineTab({ customerId, focusId }: { customerId: string; focusId: string | null }): ReactElement {
   const { feed } = useAppData();
   const [rows, setRows] = useState<TimelineRow[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [detail, setDetail] = useState<{ kind: DetailKind; id: string } | null>(null);
 
   const load = useCallback(async () => {
@@ -83,57 +105,67 @@ function TimelineTab({ customerId }: { customerId: string }): ReactElement {
     }
   }, [customerId]);
 
-  // Reload the thread when a live event might touch this customer.
-  useEffect(() => { void load(); }, [load, feed.eventToken]);
+  // Opening this customer (or switching to another) starts the thread fresh.
+  useEffect(() => { void load(); }, [load]);
+
+  // A live refresh MERGES; it must never re-seed. `feed.eventToken` bumps on EVERY row of the
+  // global SSE stream — including other customers' — so a full replace here would throw away the
+  // founder's paged-back history the moment the assistant did anything for anyone else, and
+  // strand their viewport (the reload is not routed through the hook's prepend pin). Merging
+  // keeps every loaded page, picks up status changes in place, and leaves `cursor` alone: it
+  // already points past the OLDEST page we hold, which a first-page refetch knows nothing about.
+  const token = feed.eventToken;
+  const seenToken = useRef(token);
+  useEffect(() => {
+    if (token === seenToken.current) return; // the mount tick — `load` above already ran
+    seenToken.current = token;
+    let live = true;
+    void api<TimelinePage>(`/customers/${customerId}/timeline`)
+      .then((page) => { if (live) setRows((current) => mergeRows(current, page.data)); })
+      .catch(() => { /* a dropped refresh just leaves the thread as it was */ });
+    return () => { live = false; };
+  }, [token, customerId]);
 
   const loadOlder = () => {
-    if (!cursor) return;
+    if (!cursor || loadingOlder) return;
+    setLoadingOlder(true);
     void api<TimelinePage>(`/customers/${customerId}/timeline?cursor=${encodeURIComponent(cursor)}`)
-      .then((page) => { setRows((current) => [...page.data, ...current]); setCursor(page.nextCursor); })
-      .catch(() => {});
+      // `rows` is newest-first (the API's own order; Timeline reverses it to read as a thread),
+      // so an older page APPENDS. Prepending — the shape this had while the list rendered
+      // newest-first — puts the oldest history below the newest once reversed.
+      .then((page) => { setRows((current) => [...current, ...page.data]); setCursor(page.nextCursor); })
+      .catch(() => { /* a failed scroll-back just leaves older history unloaded */ })
+      .finally(() => setLoadingOlder(false));
   };
 
   if (loading && rows.length === 0) return <Center><Loader2 className="animate-spin text-zinc-600" size={20} /></Center>;
   if (rows.length === 0) return <Center><p className="text-sm text-zinc-500">No activity recorded yet.</p></Center>;
 
+  // The thread owns its own scroll container (it has to: it pins the viewport on prepend and
+  // opens at the bottom), so this tab hands it the page state and stays out of the way.
   return (
-    <div className="h-full overflow-y-auto pb-6">
-      {cursor && (
-        <button onClick={loadOlder} className="mx-auto my-2 block rounded-full border border-zinc-800 px-4 py-1.5 text-xs text-zinc-400 active:bg-zinc-900">
-          Load earlier
-        </button>
-      )}
-      <Timeline rows={rows} onOpen={(kind, itemId) => setDetail({ kind, id: itemId })} />
+    <div className="flex h-full flex-col">
+      <Timeline
+        rows={rows}
+        hasMore={cursor !== null}
+        loadingOlder={loadingOlder}
+        onLoadOlder={loadOlder}
+        onOpen={(kind, itemId) => setDetail({ kind, id: itemId })}
+        focusId={focusId}
+      />
       <DetailSheet target={detail} onClose={() => setDetail(null)} />
     </div>
   );
 }
 
-function PendingTab({
-  customerId,
-  pending,
-  decide,
-}: {
-  customerId: string;
-  pending: import('./types').AttentionCard[];
-  decide: (messageId: string, optionId: string) => Promise<void>;
-}): ReactElement {
-  const [optimistic, setOptimistic] = useState<Record<string, string>>({});
-  const onDecide = async (messageId: string, optionId: string) => {
-    setOptimistic((m) => ({ ...m, [messageId]: optionId }));
-    try {
-      await decide(messageId, optionId);
-    } catch (err) {
-      setOptimistic((m) => { const next = { ...m }; delete next[messageId]; return next; });
-      throw err;
-    }
-  };
+function PendingTab({ customerId, pending }: { customerId: string; pending: AttentionCardData[] }): ReactElement {
+  const { decide, decidedFor } = useOptimisticDecide();
 
   if (pending.length === 0) return <Center><p className="text-sm text-zinc-500">Nothing pending for this customer.</p></Center>;
   return (
     <div className="h-full space-y-2.5 overflow-y-auto px-3 py-3 pb-6" key={customerId}>
       {pending.map((card) => (
-        <AttentionCard key={card.id} card={card} decidedOptionId={card.decidedOptionId ?? optimistic[card.id] ?? null} onDecide={onDecide} />
+        <AttentionCard key={card.id} card={card} decidedOptionId={decidedFor(card)} onDecide={decide} />
       ))}
     </div>
   );
