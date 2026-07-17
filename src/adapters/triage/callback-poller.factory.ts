@@ -169,7 +169,7 @@ export interface DecisionSink {
 }
 
 export function buildCallbackPollerWorker(
-  notifier: TelegramNotifier,
+  notifier: TelegramNotifier | null,
   options: {
     decisionSinks?: DecisionSink[];
     /** Runs AFTER the real decision handler, on EVERY surface's decision. The AO Founder
@@ -202,8 +202,11 @@ export function buildCallbackPollerWorker(
     appConfirm?: (text: string, customerId?: string | null) => Promise<void>;
   } = {},
 ): WorkerDefinition {
-  // Founder-facing outputs fan out to every surface; raw Telegram I/O stays on `notifier`.
+  // Founder-facing outputs fan out to every surface; raw Telegram I/O stays on `notifier` — which
+  // is NULL in an app-only boot (no Telegram configured). A founderNotifier is then REQUIRED: it
+  // is the only surface left for the handlers to speak through.
   const founderNotifier = options.founderNotifier ?? notifier;
+  if (!founderNotifier) throw new Error('buildCallbackPollerWorker: pass a Telegram notifier or an explicit founderNotifier');
 
   // Confirm a decision's outcome wherever the founder can see it: the Telegram thread reply is
   // possible only when the tap carried a thread (a Telegram tap), while the app mirror is always
@@ -211,15 +214,22 @@ export function buildCallbackPollerWorker(
   // acknowledged there rather than nowhere. Best-effort: a confirmation must never fail the
   // decision it reports on.
   const confirmDecision = async (d: DecisionEvent, text: string, customerId?: string | null): Promise<void> => {
-    if (d.threadId) await notifier.replyInThread(d.threadId, text);
+    if (d.threadId && notifier) await notifier.replyInThread(d.threadId, text);
     await options.appConfirm?.(text, customerId);
   };
   const taskTarget = buildEzyPortalGateway();
-  const cancel = buildCancelHandler({ taskTarget, notifier });
+  // Cancel confirms via notifyCustomerEvent (a MIRRORED verb) — route it through the fanout so an
+  // app-only boot works AND a Telegram-present cancel is mirrored to the app too.
+  const cancel = buildCancelHandler({ taskTarget, notifier: founderNotifier });
 
-  // Draft correction loop: the gated 🔁 Revise service + scope-flip handler (null when
-  // DRAFT_REVISE_ENABLED=false).
-  const revise = buildDraftReviserGated(notifier);
+  // Draft correction loop: the gated 🔁 Revise service + scope-flip handler. Telegram-only (the
+  // scope-flip is an inline Telegram button; the app has its own /api/drafts/:id/revise) → null in
+  // an app-only boot, and null when DRAFT_REVISE_ENABLED=false.
+  const revise = notifier ? buildDraftReviserGated(notifier) : null;
+
+  // Scheduling (Telegram natural-language commands) is wired only when Telegram is present — it is
+  // driven by onMessage. Declared here so routeDecision can reference it; null in an app-only boot.
+  let scheduling: ReturnType<typeof buildSchedulingGated> = null;
 
   // Marker arming with MUTUAL EXCLUSION (DA N2): a thread holds at most one pending
   // capture. threadMarkers owns the ordering (clear others, then set) and the TTL.
@@ -236,7 +246,10 @@ export function buildCallbackPollerWorker(
         approveDraft,
         cancelDraft,
         getDraftForEdit,
-        notifier,
+        // Draft confirmations go via notifyCustomerEvent (mirrored) — the fanout, so Approve/Reject
+        // taps confirm on the app too (and work at all in an app-only boot). The armEdit/armRevise
+        // markers below are Telegram-only; an app tap of Edit/Revise uses the dedicated endpoints.
+        notifier: founderNotifier,
         armEdit: armEditMarker,
         armRevise: revise ? armReviseMarker : undefined,
       })
@@ -247,7 +260,12 @@ export function buildCallbackPollerWorker(
   // scope-flip (Phase 2) when revise is wired; unknown ids no-op.
   // Backfill proposal approve/reject (bf:ok:/bf:no:) — only registered when BACKFILL_ENABLED,
   // so a tap does nothing until the feature is on.
-  const backfill = env.BACKFILL_ENABLED ? buildBackfillApproveHandler({ notifier }) : null;
+  // Backfill's ack is a Telegram thread reply, guarded on threadId (an app tap has none, so it
+  // skips the ack today). Pass a no-op replyInThread in an app-only boot — the approve/reject
+  // action itself is threadId-independent, so it still works; only the (already-optional) ack is lost.
+  const backfill = env.BACKFILL_ENABLED
+    ? buildBackfillApproveHandler({ notifier: notifier ?? { replyInThread: async (): Promise<void> => {} } })
+    : null;
 
   // Meeting duration/slot taps. A SECOND scheduler instance (the inbox processor builds its own
   // to ASK the questions; this one ANSWERS them). That is safe rather than sloppy: the scheduler
@@ -261,13 +279,22 @@ export function buildCallbackPollerWorker(
   // confirmations must land on every founder surface, or the app card dead-ends after the
   // duration tap (the reported bug). postAnswer stays Telegram-only — it is a plain line back
   // into the topic that captured the typed time, which no mirror owns.
-  const meetingWiring = buildMeetingSchedulerGated(taskTarget, founderNotifier, {
-    llm: () =>
-      buildLlmRouter({
-        notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
-      }),
-    postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
-  });
+  // The typed-time free-text hook (postAnswer into a thread) is Telegram-only; omit it in an
+  // app-only boot, where the PWA datetime picker is the typed-time path. The decision handler
+  // (duration/slot taps) is always built and always fans out through founderNotifier.
+  const meetingWiring = buildMeetingSchedulerGated(
+    taskTarget,
+    founderNotifier,
+    notifier
+      ? {
+          llm: () =>
+            buildLlmRouter({
+              notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
+            }),
+          postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+        }
+      : undefined,
+  );
   const meeting = meetingWiring?.decisions ?? null;
 
   // WP7(b): ✔ done / ✖ dismiss taps on /commitments cards — only registered when commitment tracking
@@ -321,11 +348,17 @@ export function buildCallbackPollerWorker(
       }
     : routeDecision;
 
-  notifier.onDecision(handleDecision);
   // Register the SAME composite handler on every extra surface (the AO Founder app), so a
-  // decision tapped there routes to the identical handler — and mirror-marking — a Telegram
-  // tap reaches (M6).
+  // decision tapped there routes to the identical handler — and mirror-marking — a Telegram tap
+  // reaches (M6). ALWAYS registered: an app tap must route whether or not Telegram is configured.
   for (const sink of options.decisionSinks ?? []) sink.onDecision(handleDecision);
+
+  // ── Telegram intake: the poll's onDecision + the whole free-text onMessage chain ───────────
+  // Wired ONLY when Telegram is configured. An app-only boot has registered the decision sinks
+  // above and stops here — there is no Telegram to poll and no thread free-text to capture. (The
+  // block below keeps its original indentation to keep this a minimal, reviewable diff.)
+  if (notifier) {
+  notifier.onDecision(handleDecision);
 
   // ── The composite free-text chain on onMessage ────────────────────────────────────────
   // WHICH links are wired is decided here (one per feature flag); the ORDER they run in —
@@ -379,7 +412,8 @@ export function buildCallbackPollerWorker(
   // through (so /ask and the free-text captures still see the message). Runs alongside /ask,
   // before revise/edit captures.
   const slash = buildSlashCommandsHandler(notifier);
-  const scheduling = buildSchedulingGated(notifier, threadMarkers);
+  scheduling = buildSchedulingGated(notifier, threadMarkers);
+  const sched = scheduling; // const capture: a `let` isn't narrowed inside the deferred onMessage cb
 
   const reviseCapture = revise
     ? buildDraftReviseMessageHandler({
@@ -411,15 +445,17 @@ export function buildCallbackPollerWorker(
       // chatter with no clarification pending — which is precisely what a query is. It
       // claims EVERY message while a clarification IS pending (including ones it failed to
       // interpret), so a founder mid-clarify can never fall through to the query engine.
-      scheduling: scheduling ? (m) => scheduling.onMessage(m) : null,
+      scheduling: sched ? (m) => sched.onMessage(m) : null,
       freeTextQuery,
     }),
   );
+  }
 
   return {
     name: 'telegram:callbacks',
     intervalMs: 3_000,
     run: async () => {
+      if (!notifier) return; // app-only boot: nothing to poll — the decision-sink wiring is the point
       const stored = await getAppState(OFFSET_KEY);
       const offset = stored ? Number(stored) : 0;
       const next = await notifier.poll(offset);

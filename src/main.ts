@@ -109,7 +109,7 @@ import { buildMeetingPrepWorkerFactory } from './adapters/proactive/meeting-prep
 import { buildCommitmentWorkerFactory } from './adapters/proactive/commitment.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
-import { FanoutFounderNotifier, WebPushMirror, WebPushNotifier, type NotifierMirror } from './adapters/push/web-push-notifier';
+import { FanoutFounderNotifier, HeadlessPrimaryNotifier, WebPushMirror, WebPushNotifier, type NotifierMirror } from './adapters/push/web-push-notifier';
 import { pushSubscriptionStorageEnabled } from './adapters/push/web-push-repo';
 
 // M2a: advisory-lock namespace for the knowledge-sync reconcile ('know' as int32).
@@ -325,61 +325,61 @@ async function main(): Promise<void> {
   }
   logger.info({ serviceDeskInstances: registry.serviceDeskAdapters().length }, 'service-desk pollers registered');
 
-  // M1.5b: the money-loop workers (inbox processor + Telegram callback poller).
-  // Both require Telegram (the loop notifies the founder) — skip cleanly if it is
-  // not configured so ingestion still runs. One shared notifier so onDecision is
-  // registered on the same instance the poller drives.
+  // M1.5b / Phase 1 decouple: the money-loop workers (inbox processor + callback wiring).
+  // Telegram is NO LONGER required — if it is unconfigured the loop runs APP-ONLY (a
+  // HeadlessPrimaryNotifier stands in as the fanout's primary and the AO Founder app is the
+  // surface). It still needs at least ONE founder surface (Telegram or the app), or it is skipped
+  // so ingestion still runs.
   const triageWorkers: WorkerDefinition[] = [];
   let notifier: FounderNotifierPort | null = null;
+  // buildTelegramNotifier throws when TELEGRAM_* is unset — now NON-fatal: telegram just stays null.
+  let telegram: ReturnType<typeof buildTelegramNotifier> | null = null;
   try {
-    const telegram = buildTelegramNotifier();
-    // Telegram stays primary/authoritative; each configured surface is a best-effort mirror
-    // (urgent web-push and/or the AO Founder app). One fanout, N mirrors — no forked class.
+    telegram = buildTelegramNotifier();
+  } catch (err) {
+    logger.info({ reason: (err as Error)?.message }, 'Telegram not configured — the money loop will run app-only if the founder app is enabled');
+  }
+  try {
+    // Telegram stays primary/authoritative WHEN PRESENT (behavior unchanged); each configured
+    // surface is a best-effort mirror (urgent web-push and/or the AO Founder app). One fanout, N
+    // mirrors — no forked class.
     const mirrors: NotifierMirror[] = [];
     if (webPushNotifier) mirrors.push(new WebPushMirror(webPushNotifier));
     if (founderAppNotifier) mirrors.push(founderAppNotifier);
-    notifier = mirrors.length > 0 ? new FanoutFounderNotifier(telegram, mirrors) : telegram;
-    // The PWA "another time" picker books through this fanout notifier, so a booking made in the
-    // app confirms on BOTH surfaces — a third stateless scheduler instance, safe for the same
-    // reason the callback poller's is (every transition is a guarded write). Null when scheduling
-    // is off → the /api/meeting-time endpoint answers 503.
-    bookAppMeetingTime = buildMeetingSchedulerGated(buildEzyPortalGateway(), notifier)?.bookLocalTime ?? null;
-    // The app registers the SAME decision router the Telegram poll drives, so an app tap
-    // resolves identically to a Telegram button tap.
-    // The app notifier is both a decision SINK (its own taps route to routeDecision) and
-    // the mirror hook: onDecided runs after EVERY decision (Telegram or app) to mark +
-    // re-emit the app's rows, so a Telegram-made decision clears the app's Attention card.
-    const appNotifier = founderAppNotifier;
-    triageWorkers.push(
-      buildInboxProcessorWorker(notifier),
-      buildCallbackPollerWorker(telegram, {
+    if (telegram || mirrors.length > 0) {
+      // Telegram present → exactly as before (fanout with telegram primary, or raw telegram when
+      // there are no mirrors). Telegram absent → a headless primary so the fanout delivers purely
+      // through its mirrors (the app). The `telegram && no-mirrors` case can't reach headless.
+      const primary: FounderNotifierPort = telegram ?? new HeadlessPrimaryNotifier();
+      notifier = telegram && mirrors.length === 0 ? telegram : new FanoutFounderNotifier(primary, mirrors);
+      // The PWA "another time" picker books through this fanout notifier, so a booking made in the
+      // app confirms on every surface. Null when scheduling is off → /api/meeting-time answers 503.
+      bookAppMeetingTime = buildMeetingSchedulerGated(buildEzyPortalGateway(), notifier)?.bookLocalTime ?? null;
+      // The app is a decision SINK (its own taps route to routeDecision) and the mirror hook
+      // (onDecided marks + re-emits its rows). buildCallbackPollerWorker registers the shared
+      // decision router on that sink as a BUILD-TIME side effect — so it is called even with no
+      // Telegram; only its POLL worker (which reads the Telegram Bot API) is registered when a
+      // Telegram exists to poll.
+      const appNotifier = founderAppNotifier;
+      const callbackWorker = buildCallbackPollerWorker(telegram, {
         decisionSinks: appNotifier ? [appNotifier] : [],
         onDecided: appNotifier ? (d) => appNotifier.recordDecision(d) : undefined,
-        // Founder-facing OUTPUTS of a decision tap (the meeting scheduler's "📅 Pick a time"
-        // and its confirmations) fan out to every surface — so a duration tapped in the app
-        // gets the slot card in the app, not just in Telegram. Telegram I/O stays on `telegram`.
         founderNotifier: notifier,
-        // Cancel/commitment acks are thread replies, not port notifications — mirror them onto
-        // the app feed (customer-scoped when the flow names one) so an app-tapped decision is
-        // confirmed too, not just silently cleared.
         appConfirm: appNotifier ? (text, customerId) => appNotifier.confirm(text, customerId) : undefined,
-      }),
-    );
-    if (env.TELEGRAM_SCHEDULING_ENABLED) {
-      triageWorkers.push(
-        buildScheduleDueWorker(
-          // The FANOUT notifier, not raw telegram: a fired reminder is delivered via the mirrored
-          // notifyCustomerEvent, so it lands on the founder's PWA (feed + push) as well as Telegram
-          // — reminders used to be trapped in the Telegram thread (replyInThread).
-          notifier,
-          env.TELEGRAM_SCHEDULING_INTERVAL_MS,
-          env.TELEGRAM_SCHEDULING_GRACE_MINUTES,
-        ),
-      );
+      });
+      triageWorkers.push(buildInboxProcessorWorker(notifier));
+      if (telegram) triageWorkers.push(callbackWorker);
+      if (env.TELEGRAM_SCHEDULING_ENABLED) {
+        // The FANOUT notifier, not raw telegram: a fired reminder is delivered via the mirrored
+        // notifyCustomerEvent, so it lands on the PWA (feed + push) as well as Telegram.
+        triageWorkers.push(buildScheduleDueWorker(notifier, env.TELEGRAM_SCHEDULING_INTERVAL_MS, env.TELEGRAM_SCHEDULING_GRACE_MINUTES));
+      }
+      logger.info(telegram ? 'money-loop workers registered (Telegram + app)' : 'money-loop workers registered (APP-ONLY — no Telegram)');
+    } else {
+      logger.warn('money-loop disabled — neither Telegram nor the founder app is configured');
     }
-    logger.info('money-loop workers registered (inbox processor + Telegram callback poller)');
   } catch (err) {
-    logger.warn({ reason: (err as Error)?.message }, 'money-loop disabled — Telegram not configured');
+    logger.warn({ reason: (err as Error)?.message }, 'money-loop disabled — worker registration failed');
   }
 
   // M1.8: the outbound drainer — registered ONLY when OUTBOUND_ENABLED (D-J kill-
