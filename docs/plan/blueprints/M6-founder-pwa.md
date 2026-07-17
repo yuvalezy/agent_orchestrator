@@ -20,7 +20,7 @@ Telegram remains wired and authoritative; the app is a second first-class surfac
 ```mermaid
 graph LR
   subgraph phone [Android phone]
-    PWA[AO Founder PWA<br/>app/ Vite+React] --- FSW[firebase-messaging-sw.js]
+    PWA[AO Founder PWA<br/>app/ Vite+React] --- FSW[sw.js<br/>app shell + native push]
   end
   PWA -- "/app/api (cookie device token)" --> R[founder-app.router.ts]
   FSW <-- push --> FCM[(Firebase FCM)]
@@ -51,8 +51,8 @@ graph LR
 Mounted at `/app` in `main.ts`, gated by the same `ConsoleConfig` presence as `/console`.
 
 - **Static**: serve the built `app/dist` (dev) / packaged copy (prod) with SPA fallback,
-  mirroring how the console serves `web/dist`. `firebase-messaging-sw.js`, `sw.js`, and
-  `manifest.webmanifest` must be reachable inside the `/app/` scope.
+  mirroring how the console serves `web/dist`. `sw.js` and `manifest.webmanifest` must be
+  reachable inside the `/app/` scope.
 - **Auth**: `POST /app/api/login {password, label}` — verify against the console bcrypt
   hash with the console's rate-limit pattern; mint an opaque 32-byte token, store its
   sha256 in `founder_app_devices`, set httpOnly cookie `ao_app_device` (SameSite=Lax,
@@ -102,11 +102,26 @@ dev server port **3102** with proxy `/app/api → http://localhost:3100`.
 - **Settings sheet**: push toggle (permission → `getToken({vapidKey, serviceWorkerRegistration})`
   → register), device label, logout, install-to-home-screen hint.
 - **PWA**: `manifest.webmanifest` (name "AO Founder", `display: standalone`, dark theme,
-  maskable icon), an app-shell service worker (precache, offline fallback), and
-  `firebase-messaging-sw.js` (compat `importScripts` from gstatic is allowed in SW) whose
-  Firebase config is fetched/injected at registration time — background push shows a
-  notification whose click focuses/opens the app. Push must degrade gracefully when
-  `GET /app/api/config` reports Firebase unconfigured.
+  maskable icon) and **ONE** service worker, `sw.js` — app shell (precache, offline
+  fallback) *and* background push. A scope allows a single registration, so a separate
+  `firebase-messaging-sw.js` would only fight `sw.js` for `/app/`.
+
+  **DEVIATION (shipped): no Firebase SDK in the worker.** The plan assumed the compat
+  `importScripts` from gstatic. It works, and it cost three bugs that were invisible from
+  outside the worker: the SDK suppresses notifications whenever any window of the whole
+  ORIGIN is visible (an open `/console` tab silently swallowed every push); a worker
+  snapshots its CSP at INSTALL time, so one installed under a policy that blocked
+  `importScripts` stays permanently FCM-less while the UI still reports push as "on"; and
+  the gstatic version must be hand-matched to the bundled SDK. FCM is only a relay — the
+  worker receives a plain push event carrying the envelope `fcm-sender.ts` sent, and
+  rendering it is ~15 lines. The SDK is needed solely to MINT the token, which happens in
+  the page. So the worker imports nothing, `script-src` stays `'self'`, and the
+  suppression rule is ours: scoped to visible `/app` clients, because an open console tab
+  is not the app, and an app on screen is already kept live by SSE.
+
+  Notification click focuses a running app and postMessages it the route (SPA nav, no
+  reload). Push degrades gracefully when `GET /app/api/config` reports Firebase
+  unconfigured.
 - Tests with vitest + testing-library, mirroring `web/`.
 
 ## Firebase setup (founder does once)

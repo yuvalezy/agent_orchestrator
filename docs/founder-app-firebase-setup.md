@@ -40,7 +40,8 @@ graph TD
    ```
 
    These values are **public** by design — they are echoed to the authed client at
-   `GET /app/api/config` so the service worker can initialize Firebase in the browser.
+   `GET /app/api/config` so the app can initialize Firebase and mint this device's push
+   token. (The service worker needs no config: it renders pushes natively.)
 
 ## 3. Cloud Messaging → Web Push certificate (the VAPID key)
 
