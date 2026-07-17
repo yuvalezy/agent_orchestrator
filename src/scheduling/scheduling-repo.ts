@@ -1,4 +1,5 @@
 import { query, withClient } from '../db';
+import { env } from '../config/env';
 
 export type ScheduleActionKind = 'customer_message' | 'reminder';
 export type ScheduleActionStatus =
@@ -338,6 +339,55 @@ export async function createScheduledAction(input: {
   );
   if (!existing.rows[0]) throw new Error('scheduled action conflict row missing');
   return { action: existing.rows[0], created: false };
+}
+
+/**
+ * An app-origin reminder (the Founder PWA), with NO Telegram anchors. Migration 045 made
+ * source_chat_id/source_message_id/source_thread_id/customer_id NULLABLE for exactly this:
+ * app reminders never collide on the (source_chat_id, source_message_id) unique index because
+ * Postgres treats NULLs as distinct, so this is a plain INSERT (no ON CONFLICT needed).
+ *
+ * expires_at is NOT NULL and reminders carry no channel fields, so it mirrors the grace window
+ * the Telegram path computes (execute_at + TELEGRAM_SCHEDULING_GRACE_MINUTES) — the same grace
+ * the due worker uses to decide a fired reminder is "too late". One-shot only (no recurrence).
+ */
+export async function createAppReminder(input: {
+  body: string;
+  executeAt: Date;
+  timezone: string;
+  customerId: string | null;
+  createdBy: string;
+}): Promise<{ id: string }> {
+  const expiresAt = new Date(input.executeAt.getTime() + env.TELEGRAM_SCHEDULING_GRACE_MINUTES * 60_000);
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO scheduled_actions
+       (source_chat_id, source_message_id, source_thread_id, created_by, customer_id,
+        action_kind, status, execute_at, expires_at, timezone, body)
+     VALUES (NULL, NULL, NULL, $1, $2, 'reminder', 'pending', $3, $4, $5, $6)
+     RETURNING id`,
+    [input.createdBy, input.customerId, input.executeAt, expiresAt, input.timezone, input.body],
+  );
+  return { id: rows[0].id };
+}
+
+/** Upcoming PENDING reminders (any origin), soonest first — the Founder PWA's reminder list. */
+export async function listUpcomingReminders(
+  limit: number,
+): Promise<Array<{ id: string; body: string; executeAt: string; customerId: string | null }>> {
+  const { rows } = await query<{ id: string; body: string; execute_at: Date; customer_id: string | null }>(
+    `SELECT id, body, execute_at, customer_id
+       FROM scheduled_actions
+      WHERE action_kind = 'reminder' AND status = 'pending' AND execute_at > now()
+      ORDER BY execute_at ASC, id
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    body: r.body,
+    executeAt: new Date(r.execute_at).toISOString(),
+    customerId: r.customer_id,
+  }));
 }
 
 export async function claimDue(limit: number): Promise<ScheduledAction[]> {

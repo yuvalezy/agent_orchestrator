@@ -26,6 +26,7 @@ import { AppFounderNotifier } from './adapters/founder-app/app-founder-notifier'
 import { FounderAppFeed } from './adapters/founder-app/founder-app-feed';
 import { buildFounderAppRouter } from './adapters/founder-app/founder-app.router';
 import { buildAppComposeGated } from './adapters/founder-app/compose-draft.factory';
+import { createAppReminder, listUpcomingReminders, cancelScheduledAction } from './scheduling/scheduling-repo';
 import { listAttentionDecisions, augmentCustomers } from './adapters/founder-app/founder-app-cockpit-repo';
 import {
   listCustomers,
@@ -264,6 +265,9 @@ async function main(): Promise<void> {
         // builder (like the reviser) that presents the composed card through the APP notifier.
         // undefined (→ 503) when KNOWLEDGE_DRAFT_ENABLED is off.
         composeDraft: buildAppComposeGated(founderAppNotifier),
+        // App-origin reminders (NULL Telegram anchors — see migration 045). The router anchors the
+        // datetime-local wall-clock in env.CALENDAR_TZ before calling create, so these are plain repo fns.
+        reminders: { create: createAppReminder, listUpcoming: listUpcomingReminders, cancel: cancelScheduledAction },
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {
           listCustomers,

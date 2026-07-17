@@ -1,6 +1,7 @@
 import { type ReactElement, type ReactNode } from 'react';
 import { ChevronLeft, Settings } from 'lucide-react';
 import { useOpenSettings } from './Ui';
+import { ReminderSheet } from './ReminderSheet';
 
 /** The sticky top bar every cockpit screen shares: optional back button, title +
  *  subtitle, and either a custom trailing slot or (on top-level screens) a settings gear. */
@@ -31,9 +32,12 @@ export function ScreenHeader({
       </div>
       {trailing}
       {settings && !trailing && (
-        <button aria-label="Settings" onClick={openSettings} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
-          <Settings size={20} />
-        </button>
+        <>
+          <ReminderSheet />
+          <button aria-label="Settings" onClick={openSettings} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
+            <Settings size={20} />
+          </button>
+        </>
       )}
     </header>
   );

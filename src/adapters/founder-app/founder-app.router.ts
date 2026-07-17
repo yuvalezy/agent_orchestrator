@@ -1,7 +1,9 @@
 import express, { Router, type NextFunction, type Request, type Response } from 'express';
 import helmet from 'helmet';
+import { DateTime } from 'luxon';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { env } from '../../config/env';
 import type { ConsoleConfig } from '../../config/console';
 import type { FirebaseConfig } from '../../config/firebase';
 import type { ConversationalQueryService } from '../../query/conversational-query-service';
@@ -48,6 +50,8 @@ const DEFAULT_PAGE = 50;
 const MAX_PAGE = 100;
 /** How many top urgency items ride along on the attention screen. */
 const ATTENTION_URGENCY_LIMIT = 20;
+/** How many upcoming reminders the PWA list returns (soonest first). */
+const REMINDERS_LIMIT = 50;
 
 /** The console read models the cockpit reuses (adapter-to-adapter; never fork the SQL). */
 export interface FounderAppCockpitReads {
@@ -112,6 +116,17 @@ export interface FounderAppDeps {
    *  app feed). OPTIONAL — absent when KNOWLEDGE_DRAFT_ENABLED is off → POST /api/drafts/compose
    *  answers 503. Built by buildAppComposeDraft with the SAME core presenter `/draft email` uses. */
   composeDraft?: (input: { customerId: string; prompt: string; by: string }) => Promise<{ ok: true; queueId: string } | { ok: false; reason: string }>;
+  /**
+   * App-origin reminders (the PWA's own scheduled_actions rows, no Telegram anchors). OPTIONAL so
+   * main.ts still compiles without them — absent → every /api/reminders route answers 503. Built
+   * in main.ts from scheduling-repo's createAppReminder/listUpcomingReminders/cancelScheduledAction,
+   * with the founder-tz (env.CALENDAR_TZ) already applied to executeAt by the router.
+   */
+  reminders?: {
+    create: (input: { body: string; executeAt: Date; timezone: string; customerId: string | null; createdBy: string }) => Promise<{ id: string }>;
+    listUpcoming: (limit: number) => Promise<Array<{ id: string; body: string; executeAt: string; customerId: string | null }>>;
+    cancel: (id: string) => Promise<{ result: 'cancelled' | 'already' | 'too_late'; customerId: string | null }>;
+  };
 }
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -504,6 +519,79 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
       const result = await deps.composeDraft({ customerId: body.customerId, prompt: body.prompt.trim(), by: 'founder-app' });
       if (!result.ok) return void res.status(409).json({ error: result.reason });
       res.json({ data: { queueId: result.queueId } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Reminders (app-origin scheduled_actions, no Telegram anchors) ────────────────────
+  // The PWA can create its own "nudge me at" reminders — the same scheduled_actions table
+  // Telegram writes to, but with NULL Telegram anchors and action_kind='reminder'. localTime is
+  // a bare wall-clock from a datetime-local input; the SERVER anchors it in the founder tz
+  // (env.CALENDAR_TZ), exactly as /api/meeting-time's factory does — never the phone's zone. The
+  // repo fns are OPTIONAL deps, so the routes 503 when reminders are unwired (money loop off).
+  router.post('/api/reminders', async (req, res, next) => {
+    const body = (req.body ?? {}) as { text?: unknown; localTime?: unknown; customerId?: unknown };
+    if (typeof body.text !== 'string' || !body.text.trim() || body.text.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'invalid text' });
+    }
+    if (typeof body.localTime !== 'string' || !LOCAL_TIME_RE.test(body.localTime)) {
+      return void res.status(400).json({ error: 'invalid time' });
+    }
+    if (body.customerId !== undefined && body.customerId !== null && (typeof body.customerId !== 'string' || !UUID_RE.test(body.customerId))) {
+      return void res.status(400).json({ error: 'invalid customer id' });
+    }
+    if (!deps.reminders) return void res.status(503).json({ error: 'reminders unavailable' });
+    // Anchor the wall-clock in the founder tz (the offered slots' zone), never the server's/phone's.
+    const dt = DateTime.fromISO(body.localTime, { zone: env.CALENDAR_TZ });
+    if (!dt.isValid) return void res.status(400).json({ error: 'invalid time' });
+    if (dt.toMillis() <= Date.now()) return void res.status(400).json({ error: 'time is in the past' });
+    const customerId = typeof body.customerId === 'string' ? body.customerId : null;
+    const text = body.text.trim();
+    try {
+      if (customerId && !(await deps.cockpit.customerDetail(customerId))) {
+        return void res.status(404).json({ error: 'customer not found' });
+      }
+      const { id } = await deps.reminders.create({
+        body: text,
+        executeAt: dt.toJSDate(),
+        timezone: env.CALENDAR_TZ,
+        customerId,
+        createdBy: 'founder-app',
+      });
+      res.json({ data: { id } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/api/reminders', async (_req, res, next) => {
+    if (!deps.reminders) return void res.status(503).json({ error: 'reminders unavailable' });
+    try {
+      const rows = await deps.reminders.listUpcoming(REMINDERS_LIMIT);
+      // Resolve the customer name off the reused cockpit read (null when unscoped or unknown).
+      const data = await Promise.all(rows.map(async (r) => {
+        let customerName: string | null = null;
+        if (r.customerId) {
+          const customer = await deps.cockpit.customerDetail(r.customerId);
+          customerName = typeof customer?.display_name === 'string' ? customer.display_name : null;
+        }
+        return { id: r.id, body: r.body, executeAt: r.executeAt, customerId: r.customerId, customerName };
+      }));
+      res.json({ data });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.delete('/api/reminders/:id', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid reminder id' });
+    if (!deps.reminders) return void res.status(503).json({ error: 'reminders unavailable' });
+    try {
+      // Reuses cancelScheduledAction: 'cancelled' (was pending), 'already' (gone/terminal), or
+      // 'too_late' (already firing/dispatched past the point of recall).
+      const { result } = await deps.reminders.cancel(req.params.id);
+      res.json({ data: { status: result } });
     } catch (err) {
       next(err);
     }

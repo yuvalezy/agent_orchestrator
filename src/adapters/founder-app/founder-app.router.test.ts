@@ -1015,3 +1015,160 @@ test('compose surfaces a no-email-route refusal as 409 with the reason', async (
     assert.equal(spy.calls.length, 1);
   }, { deps: { composeDraft: spy.fn }, cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
 });
+
+// ── App-origin reminders (PWA "nudge me at") ───────────────────────────────────────────
+// The PWA creates its own scheduled_actions reminders (NULL Telegram anchors, action_kind
+// 'reminder'). The router anchors the datetime-local wall-clock in the founder tz, refuses a past
+// time, verifies a named customer, and delegates persistence to the OPTIONAL reminders dep (absent
+// → 503). List resolves the customer name off the reused cockpit read; delete reuses cancel.
+
+interface ReminderRow { id: string; body: string; executeAt: string; customerId: string | null }
+
+/** A reminders spy backed by an in-memory store, mirroring the repo trio the router calls. */
+function remindersSpy(): {
+  dep: NonNullable<FounderAppDeps['reminders']>;
+  created: Array<{ body: string; executeAt: Date; timezone: string; customerId: string | null; createdBy: string }>;
+  rows: ReminderRow[];
+  cancelResult: { result: 'cancelled' | 'already' | 'too_late'; customerId: string | null };
+  cancelled: string[];
+} {
+  const created: Array<{ body: string; executeAt: Date; timezone: string; customerId: string | null; createdBy: string }> = [];
+  const rows: ReminderRow[] = [];
+  const cancelled: string[] = [];
+  const state = { cancelResult: { result: 'cancelled' as 'cancelled' | 'already' | 'too_late', customerId: null as string | null } };
+  return {
+    created,
+    rows,
+    cancelled,
+    get cancelResult() { return state.cancelResult; },
+    set cancelResult(v) { state.cancelResult = v; },
+    dep: {
+      create: async (input) => { created.push(input); const id = crypto.randomUUID(); rows.push({ id, body: input.body, executeAt: input.executeAt.toISOString(), customerId: input.customerId }); return { id }; },
+      listUpcoming: async (limit) => rows.slice(0, limit),
+      cancel: async (id) => { cancelled.push(id); return state.cancelResult; },
+    },
+  };
+}
+
+const FUTURE_LOCAL = '2099-01-01T09:00';
+
+test('POST /reminders anchors the wall-clock in the founder tz and persists via the dep', async () => {
+  const spy = remindersSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/reminders`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '  call the accountant  ', localTime: FUTURE_LOCAL }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: { id: string } };
+    assert.ok(typeof body.data.id === 'string' && body.data.id.length > 0);
+    assert.equal(spy.created.length, 1);
+    // Text trimmed, tz + createdBy applied, no customer scope.
+    assert.equal(spy.created[0].body, 'call the accountant');
+    assert.equal(spy.created[0].createdBy, 'founder-app');
+    assert.equal(spy.created[0].customerId, null);
+    // 09:00 in America/Panama (UTC-5, no DST) → 14:00 UTC.
+    assert.equal(spy.created[0].executeAt.toISOString(), '2099-01-01T14:00:00.000Z');
+  }, { deps: { reminders: spy.dep } });
+});
+
+test('POST /reminders scoped to a customer verifies existence and passes the id', async () => {
+  const spy = remindersSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const customerId = crypto.randomUUID();
+    const res = await fetch(`${baseUrl}/app/api/reminders`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'follow up', localTime: FUTURE_LOCAL, customerId }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(spy.created[0].customerId, customerId);
+  }, { deps: { reminders: spy.dep }, cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
+});
+
+test('POST /reminders is 400 on a past time and never touches the dep', async () => {
+  const spy = remindersSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/reminders`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'too late', localTime: '2000-01-01T09:00' }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(spy.created.length, 0);
+  }, { deps: { reminders: spy.dep } });
+});
+
+test('POST /reminders validates text, time, and customer id', async () => {
+  const spy = remindersSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const post = (b: unknown) => fetch(`${baseUrl}/app/api/reminders`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(b) });
+    assert.equal((await post({ text: '   ', localTime: FUTURE_LOCAL })).status, 400); // blank text
+    assert.equal((await post({ text: 'x', localTime: 'tomorrow' })).status, 400); // unparseable
+    assert.equal((await post({ text: 'x', localTime: '2099-13-40T09:00' })).status, 400); // impossible date
+    assert.equal((await post({ text: 'x', localTime: FUTURE_LOCAL, customerId: 'nope' })).status, 400); // bad id
+    assert.equal(spy.created.length, 0);
+  }, { deps: { reminders: spy.dep } });
+});
+
+test('POST /reminders is 404 for an unknown customer and never creates', async () => {
+  const spy = remindersSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/reminders`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'x', localTime: FUTURE_LOCAL, customerId: crypto.randomUUID() }),
+    });
+    assert.equal(res.status, 404);
+    assert.equal(spy.created.length, 0);
+  }, { deps: { reminders: spy.dep }, cockpit: { customerDetail: async () => null } });
+});
+
+test('GET /reminders lists upcoming reminders and resolves the customer name', async () => {
+  const spy = remindersSpy();
+  const customerId = crypto.randomUUID();
+  spy.rows.push(
+    { id: crypto.randomUUID(), body: 'unscoped nudge', executeAt: '2099-01-01T14:00:00.000Z', customerId: null },
+    { id: crypto.randomUUID(), body: 'scoped nudge', executeAt: '2099-01-02T14:00:00.000Z', customerId },
+  );
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const body = await (await fetch(`${baseUrl}/app/api/reminders`, { headers: { cookie } })).json() as { data: Array<Record<string, unknown>> };
+    assert.equal(body.data.length, 2);
+    assert.equal(body.data[0].customerName, null); // unscoped
+    assert.equal(body.data[1].customerName, 'Acme Corp'); // resolved off the cockpit read
+    assert.equal(body.data[1].customerId, customerId);
+    assert.equal(body.data[0].executeAt, '2099-01-01T14:00:00.000Z');
+  }, { deps: { reminders: spy.dep }, cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
+});
+
+test('DELETE /reminders/:id reuses cancel and reports its status', async () => {
+  const spy = remindersSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const id = crypto.randomUUID();
+    const res = await fetch(`${baseUrl}/app/api/reminders/${id}`, { method: 'DELETE', headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'cancelled' } });
+    assert.deepEqual(spy.cancelled, [id]);
+
+    // A too-late cancel echoes that status through unchanged.
+    spy.cancelResult = { result: 'too_late', customerId: null };
+    const late = await fetch(`${baseUrl}/app/api/reminders/${crypto.randomUUID()}`, { method: 'DELETE', headers: { cookie } });
+    assert.deepEqual(await late.json(), { data: { status: 'too_late' } });
+
+    // A non-UUID id is rejected before the dep.
+    assert.equal((await fetch(`${baseUrl}/app/api/reminders/not-a-uuid`, { method: 'DELETE', headers: { cookie } })).status, 400);
+  }, { deps: { reminders: spy.dep } });
+});
+
+test('every /reminders route is 503 when reminders are unwired', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/reminders`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ text: 'x', localTime: FUTURE_LOCAL }) })).status, 503);
+    assert.equal((await fetch(`${baseUrl}/app/api/reminders`, { headers: { cookie } })).status, 503);
+    assert.equal((await fetch(`${baseUrl}/app/api/reminders/${crypto.randomUUID()}`, { method: 'DELETE', headers: { cookie } })).status, 503);
+  });
+});
