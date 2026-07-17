@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="ember" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fcd34d"/>
+      <stop offset="1" stop-color="#d97706"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" fill="#0a0a0c"/>
+  <path d="M40 28h48a20 20 0 0 1 20 20v28a20 20 0 0 1-20 20H62l-20 16v-16h-2a20 20 0 0 1-20-20V48a20 20 0 0 1 20-20z" fill="url(#ember)"/>
+  <path d="M64 44l5.5 11.5L81 61l-11.5 5.5L64 78l-5.5-11.5L47 61l11.5-5.5z" fill="#0a0a0c"/>
+</svg>

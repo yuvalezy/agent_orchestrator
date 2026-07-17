@@ -20,6 +20,34 @@ import { buildConsoleRouter } from './adapters/console/console.router';
 import { buildQueryEngineService } from './adapters/query/factory';
 import { loadConsoleConfig } from './config/console';
 import { loadWebPushConfig } from './config/web-push';
+import { loadFirebaseConfig } from './config/firebase';
+import { buildFcmSender } from './adapters/founder-app/fcm-sender';
+import { AppFounderNotifier } from './adapters/founder-app/app-founder-notifier';
+import { FounderAppFeed } from './adapters/founder-app/founder-app-feed';
+import { buildFounderAppRouter } from './adapters/founder-app/founder-app.router';
+import { listAttentionDecisions, augmentCustomers } from './adapters/founder-app/founder-app-cockpit-repo';
+import {
+  listCustomers,
+  customerDetail,
+  customerTimeline,
+  inboxDetail,
+  outboundDetail,
+  decisionDetail,
+} from './adapters/console/console-repo';
+import { listUrgencyInbox } from './adapters/console/console-urgency-repo';
+import {
+  createDevice,
+  touchDeviceByTokenHash,
+  revokeDeviceByTokenHash,
+  setDeviceFcmToken,
+  unregisterDevicePush,
+  disableDevicePush,
+  insertMessage,
+  listMessages,
+  getMessage,
+  markDecidedByRef,
+  listPushDevices,
+} from './adapters/founder-app/founder-app-repo';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
@@ -73,7 +101,7 @@ import { buildMeetingPrepWorkerFactory } from './adapters/proactive/meeting-prep
 import { buildCommitmentWorkerFactory } from './adapters/proactive/commitment.worker';
 import { getAppState, setAppState } from './db/app-state';
 import type { FounderNotifierPort } from './ports/founder-notifier.port';
-import { FanoutFounderNotifier, WebPushNotifier } from './adapters/push/web-push-notifier';
+import { FanoutFounderNotifier, WebPushMirror, WebPushNotifier, type NotifierMirror } from './adapters/push/web-push-notifier';
 import { pushSubscriptionStorageEnabled } from './adapters/push/web-push-repo';
 
 // M2a: advisory-lock namespace for the knowledge-sync reconcile ('know' as int32).
@@ -177,6 +205,51 @@ async function main(): Promise<void> {
   } else {
     logger.info('founder console router not mounted (console secrets absent or invalid)');
   }
+
+  // M6: AO Founder PWA — a second first-class founder surface, gated by the SAME console
+  // secrets as /console (it reuses the founder bcrypt hash + rate-limit config). Builds
+  // the app feed + mirror notifier here; FCM is optional and self-disables (a logger.warn)
+  // when FIREBASE_* is absent/incomplete, leaving the rest of the app router working.
+  let founderAppNotifier: AppFounderNotifier | null = null;
+  if (consoleConfig) {
+    const firebaseConfig = loadFirebaseConfig();
+    let fcmSender = null;
+    if (firebaseConfig) {
+      fcmSender = await buildFcmSender(firebaseConfig);
+      logger.info(fcmSender ? 'founder-app FCM push enabled' : 'founder-app FCM push disabled (firebase-admin unavailable or service account invalid)');
+    } else {
+      logger.warn('founder-app FCM push disabled (FIREBASE_* config absent or incomplete)');
+    }
+    const feed = new FounderAppFeed();
+    founderAppNotifier = new AppFounderNotifier({ insertMessage, feed, listPushDevices, disableDevicePush, sendPush: fcmSender, markDecidedByRef });
+    const packagedAppAssets = path.join(__dirname, 'app');
+    const devAppAssets = path.join(process.cwd(), 'app', 'dist');
+    appDeps.founderAppRouter = buildFounderAppRouter(
+      consoleConfig,
+      existsSync(path.join(packagedAppAssets, 'index.html')) ? packagedAppAssets : devAppAssets,
+      {
+        repo: { createDevice, touchDeviceByTokenHash, revokeDeviceByTokenHash, setDeviceFcmToken, unregisterDevicePush, insertMessage, listMessages, getMessage },
+        feed,
+        // Same isolated founder query engine the console + Telegram /ask use (internal + customer scope).
+        query: buildQueryEngineService(async () => {}),
+        notifier: founderAppNotifier,
+        firebase: firebaseConfig,
+        // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
+        cockpit: {
+          listCustomers,
+          customerDetail,
+          customerTimeline,
+          inboxDetail,
+          outboundDetail,
+          decisionDetail,
+          listUrgencyInbox,
+          listAttentionDecisions,
+          augmentCustomers,
+        },
+      },
+    );
+    logger.info('founder app router mounted at /app');
+  }
   const ingestionWorkers: WorkerDefinition[] = [];
   if (wa) {
     appDeps.whatsappWebhook = buildWhatsAppWebhookRouter(wa.adapter, ingestInbound);
@@ -235,8 +308,25 @@ async function main(): Promise<void> {
   let notifier: FounderNotifierPort | null = null;
   try {
     const telegram = buildTelegramNotifier();
-    notifier = webPushNotifier ? new FanoutFounderNotifier(telegram, webPushNotifier) : telegram;
-    triageWorkers.push(buildInboxProcessorWorker(notifier), buildCallbackPollerWorker(telegram));
+    // Telegram stays primary/authoritative; each configured surface is a best-effort mirror
+    // (urgent web-push and/or the AO Founder app). One fanout, N mirrors — no forked class.
+    const mirrors: NotifierMirror[] = [];
+    if (webPushNotifier) mirrors.push(new WebPushMirror(webPushNotifier));
+    if (founderAppNotifier) mirrors.push(founderAppNotifier);
+    notifier = mirrors.length > 0 ? new FanoutFounderNotifier(telegram, mirrors) : telegram;
+    // The app registers the SAME decision router the Telegram poll drives, so an app tap
+    // resolves identically to a Telegram button tap.
+    // The app notifier is both a decision SINK (its own taps route to routeDecision) and
+    // the mirror hook: onDecided runs after EVERY decision (Telegram or app) to mark +
+    // re-emit the app's rows, so a Telegram-made decision clears the app's Attention card.
+    const appNotifier = founderAppNotifier;
+    triageWorkers.push(
+      buildInboxProcessorWorker(notifier),
+      buildCallbackPollerWorker(telegram, {
+        decisionSinks: appNotifier ? [appNotifier] : [],
+        onDecided: appNotifier ? (d) => appNotifier.recordDecision(d) : undefined,
+      }),
+    );
     if (env.TELEGRAM_SCHEDULING_ENABLED) {
       triageWorkers.push(
         buildScheduleDueWorker(

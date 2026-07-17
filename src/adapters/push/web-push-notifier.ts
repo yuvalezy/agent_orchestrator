@@ -57,19 +57,62 @@ export class WebPushNotifier {
   }
 }
 
-/** Telegram remains first/authoritative; push is an urgent, best-effort side channel. */
+/**
+ * A secondary founder surface fanned out ALONGSIDE the primary (Telegram). Each mirror
+ * receives the same notifications/questions and the same decision handler, so a tap on
+ * any surface routes to the one registered handler. Mirrors are best-effort: a throw is
+ * caught by the fanout and never blocks the primary or the other mirrors.
+ *
+ * Only the four founder-facing verbs are mirrored — ensureCustomerTopic and onMessage
+ * stay Telegram-only (a mirror owns no topics and captures no free-text replies).
+ */
+export interface NotifierMirror {
+  notifyCustomerEvent(customerId: string, n: Notification, buttons?: Array<{ id: string; label: string }>): Promise<void>;
+  notifyAdmin(n: Notification): Promise<void>;
+  askFounder(customerId: string, question: Notification, options: Array<{ id: string; label: string }>): Promise<void>;
+  onDecision(handler: (d: DecisionEvent) => Promise<void>): void;
+}
+
+/** Wraps the urgent web-push channel as a mirror. Behavior is unchanged from the old
+ *  inlined fanout: notifyAdmin/notifyCustomerEvent route to push (urgency-gated inside
+ *  WebPushNotifier); askFounder and decisions are not a web-push concern. */
+export class WebPushMirror implements NotifierMirror {
+  constructor(private readonly push: WebPushNotifier) {}
+  notifyCustomerEvent(customerId: string, n: Notification): Promise<void> {
+    return this.push.notify(n, `/console/?view=customers&customerId=${encodeURIComponent(customerId)}`);
+  }
+  notifyAdmin(n: Notification): Promise<void> {
+    return this.push.notify(n, '/console/?view=workers');
+  }
+  async askFounder(): Promise<void> {}
+  onDecision(): void {}
+}
+
+/** Telegram remains first/authoritative; every mirror is a best-effort side channel. */
 export class FanoutFounderNotifier implements FounderNotifierPort {
-  constructor(private readonly primary: FounderNotifierPort, private readonly push: WebPushNotifier) {}
+  constructor(private readonly primary: FounderNotifierPort, private readonly mirrors: NotifierMirror[]) {}
   ensureCustomerTopic(customerId: string, name: string): Promise<{ ref: string }> { return this.primary.ensureCustomerTopic(customerId, name); }
   async notifyCustomerEvent(customerId: string, n: Notification, buttons?: Array<{ id: string; label: string }>): Promise<void> {
     await this.primary.notifyCustomerEvent(customerId, n, buttons);
-    await this.push.notify(n, `/console/?view=customers&customerId=${encodeURIComponent(customerId)}`).catch(() => logger.warn('web push delivery failed after customer notification'));
+    for (const mirror of this.mirrors) {
+      await mirror.notifyCustomerEvent(customerId, n, buttons).catch(() => logger.warn('mirror delivery failed after customer notification'));
+    }
   }
   async notifyAdmin(n: Notification): Promise<void> {
     await this.primary.notifyAdmin(n);
-    await this.push.notify(n, '/console/?view=workers').catch(() => logger.warn('web push delivery failed after admin notification'));
+    for (const mirror of this.mirrors) {
+      await mirror.notifyAdmin(n).catch(() => logger.warn('mirror delivery failed after admin notification'));
+    }
   }
-  askFounder(customerId: string, question: Notification, options: Array<{ id: string; label: string }>): Promise<void> { return this.primary.askFounder(customerId, question, options); }
-  onDecision(handler: (d: DecisionEvent) => Promise<void>): void { this.primary.onDecision(handler); }
+  async askFounder(customerId: string, question: Notification, options: Array<{ id: string; label: string }>): Promise<void> {
+    await this.primary.askFounder(customerId, question, options);
+    for (const mirror of this.mirrors) {
+      await mirror.askFounder(customerId, question, options).catch(() => logger.warn('mirror delivery failed after founder question'));
+    }
+  }
+  onDecision(handler: (d: DecisionEvent) => Promise<void>): void {
+    this.primary.onDecision(handler);
+    for (const mirror of this.mirrors) mirror.onDecision(handler);
+  }
   onMessage(handler: (m: MessageEvent) => Promise<void>): void { this.primary.onMessage?.(handler); }
 }
