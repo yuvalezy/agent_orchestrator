@@ -1,7 +1,7 @@
 import type { WorkerDefinition } from '../../workers/worker-runner';
 import { logger } from '../../logger';
 import { TelegramError } from '../telegram/telegram-client';
-import type { TelegramNotifier } from '../telegram/telegram-notifier';
+import type { FounderNotifierPort, Notification } from '../../ports/founder-notifier.port';
 import {
   claimDue,
   completeReminder,
@@ -49,8 +49,27 @@ export async function settleFiredReminder(
   return { kind: rearmed ? 'rearmed' : 'rearm_missed', next };
 }
 
+/**
+ * Deliver a fired reminder over a MIRRORED founder-notifier verb so it fans out to every surface
+ * (Telegram topic + app feed + push) instead of the Telegram-only replyInThread. A reminder that
+ * carries a customer_id lands on THAT customer's app screen via notifyCustomerEvent; a reminder
+ * with no customer falls back to the admin surface. Exported so the delivery choice is unit-testable
+ * with a fake notifier. Any send failure propagates so run()'s catch keeps today's retry semantics.
+ */
+export async function deliverReminder(
+  notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent' | 'notifyAdmin'>,
+  action: Pick<ScheduledAction, 'customer_id' | 'body'>,
+): Promise<void> {
+  const n: Notification = { title: '⏰ Reminder', body: action.body, severity: 'action' };
+  if (action.customer_id) {
+    await notifier.notifyCustomerEvent(action.customer_id, n);
+  } else {
+    await notifier.notifyAdmin(n);
+  }
+}
+
 export function buildScheduleDueWorker(
-  notifier: Pick<TelegramNotifier, 'replyInThread' | 'notifyCustomerEvent' | 'notifyAdmin'>,
+  notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent' | 'notifyAdmin'>,
   intervalMs: number,
   graceMinutes: number,
 ): WorkerDefinition {
@@ -89,7 +108,7 @@ export function buildScheduleDueWorker(
             const dispatched = await dispatchCustomerMessage(action.id);
             if (!dispatched) throw new Error('customer dispatch precondition failed');
           } else {
-            await notifier.replyInThread(action.source_thread_id, `⏰ Reminder\n\n${action.body}`);
+            await deliverReminder(notifier, action);
             // WP5(b): a recurring reminder re-arms to its next occurrence; a one-shot completes.
             const settled = await settleFiredReminder(action, now, graceMinutes, {
               rearm: rearmRecurringReminder,

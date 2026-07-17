@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DateTime } from 'luxon';
-import { settleFiredReminder } from './schedule.worker';
+import { deliverReminder, settleFiredReminder } from './schedule.worker';
 import type { ScheduledAction } from '../../scheduling/scheduling-repo';
+import type { FounderNotifierPort, Notification } from '../../ports/founder-notifier.port';
 
 // WP5(b): after a reminder fires, a recurring one RE-ARMS to its next occurrence and a one-shot
 // COMPLETES. The exactly-once discipline itself is the SQL guard in rearmRecurringReminder
@@ -27,6 +28,51 @@ function repo() {
     }),
   };
 }
+
+// TRACK R: a fired reminder is delivered through a MIRRORED founder-notifier verb (fans out to the
+// Telegram topic + app feed + push), NOT the Telegram-only replyInThread. A reminder that carries a
+// customer_id lands on that customer's app screen via notifyCustomerEvent; one with no customer
+// falls back to notifyAdmin. Delivery failures propagate so run()'s retry classification is intact.
+
+function fakeNotifier() {
+  const customerEvents: Array<{ customerId: string; n: Notification }> = [];
+  const adminEvents: Notification[] = [];
+  const notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent' | 'notifyAdmin'> = {
+    notifyCustomerEvent: async (customerId, n) => { customerEvents.push({ customerId, n }); },
+    notifyAdmin: async (n) => { adminEvents.push(n); },
+  };
+  return { customerEvents, adminEvents, notifier };
+}
+
+function deliverable(over: Partial<ScheduledAction> = {}): Pick<ScheduledAction, 'customer_id' | 'body'> {
+  return { customer_id: 'cust-1', body: 'Call the plumber', ...over };
+}
+
+test('a fired reminder is delivered via notifyCustomerEvent (mirrored), never replyInThread', async () => {
+  const f = fakeNotifier();
+  await deliverReminder(f.notifier, deliverable());
+  assert.equal(f.customerEvents.length, 1);
+  assert.equal(f.adminEvents.length, 0);
+  assert.equal(f.customerEvents[0].customerId, 'cust-1');
+  assert.deepEqual(f.customerEvents[0].n, { title: '⏰ Reminder', body: 'Call the plumber', severity: 'action' });
+});
+
+test('a reminder with no customer_id falls back to notifyAdmin', async () => {
+  const f = fakeNotifier();
+  await deliverReminder(f.notifier, deliverable({ customer_id: '' }));
+  assert.equal(f.customerEvents.length, 0);
+  assert.equal(f.adminEvents.length, 1);
+  assert.deepEqual(f.adminEvents[0], { title: '⏰ Reminder', body: 'Call the plumber', severity: 'action' });
+});
+
+test('a delivery failure propagates so run() can apply its retry classification', async () => {
+  const boom = new Error('send failed');
+  const notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent' | 'notifyAdmin'> = {
+    notifyCustomerEvent: async () => { throw boom; },
+    notifyAdmin: async () => { throw boom; },
+  };
+  await assert.rejects(() => deliverReminder(notifier, deliverable()), boom);
+});
 
 test('a one-shot reminder completes and is NEVER re-armed', async () => {
   const r = repo();

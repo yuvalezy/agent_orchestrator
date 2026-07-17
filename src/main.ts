@@ -368,7 +368,10 @@ async function main(): Promise<void> {
     if (env.TELEGRAM_SCHEDULING_ENABLED) {
       triageWorkers.push(
         buildScheduleDueWorker(
-          telegram,
+          // The FANOUT notifier, not raw telegram: a fired reminder is delivered via the mirrored
+          // notifyCustomerEvent, so it lands on the founder's PWA (feed + push) as well as Telegram
+          // — reminders used to be trapped in the Telegram thread (replyInThread).
+          notifier,
           env.TELEGRAM_SCHEDULING_INTERVAL_MS,
           env.TELEGRAM_SCHEDULING_GRACE_MINUTES,
         ),
