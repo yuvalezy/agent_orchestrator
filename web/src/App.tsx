@@ -1,6 +1,7 @@
 import { type FormEvent, type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, BarChart3, BookOpen, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, MessageSquareText, Plug, RefreshCw, Send, ShieldAlert, ShieldCheck, SlidersHorizontal, Users } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, MessageSquareText, Plug, RefreshCw, Send, ShieldAlert, ShieldCheck, SlidersHorizontal, Smartphone, Users } from 'lucide-react';
+import QRCode from 'qrcode';
 import { api, type ApiError, setCsrfToken } from './lib/api';
 import { cn } from './lib/utils';
 import { ApprovalsView } from './ApprovalsView';
@@ -16,6 +17,8 @@ type Overview = {
     backlog: { inbox: Bucket; outboundQueue: Bucket }; workers: Worker[];
     queueStates: { inbox: QueueState[]; outbound: QueueState[] };
     activeChannels: Channel[]; featureFlags: FeatureFlag[]; capabilities: Capability[];
+    /** FOUNDER_APP_PUBLIC_URL — null when unset, which hides the install card. */
+    founderAppUrl: string | null;
   };
 };
 type Bucket = { pending: number; failed: number; oldestPendingAgeSeconds: number | null };
@@ -166,7 +169,7 @@ function OverviewView({ onSelect }: { onSelect: (view: View) => void }): ReactEl
   const data = overview.data.data;
   return <section><PageTitle eyebrow="Live system" title="Operations overview" description="Bounded runtime state from the orchestrator database, worker registry, and active configuration." />
     <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><Metric label="Database" value={data.db === 'ok' ? 'Connected' : 'Unavailable'} tone={data.db === 'ok' ? 'good' : 'bad'} /><Metric label="Inbox pending" value={String(data.backlog.inbox.pending)} detail={`${data.backlog.inbox.failed} failed`} onClick={() => onSelect('inbox')} /><Metric label="Outbound pending" value={String(data.backlog.outboundQueue.pending)} detail={`${data.backlog.outboundQueue.failed} failed`} /><Metric label="Workers" value={String(data.workers.length)} detail={`${data.workers.filter((w) => w.state === 'failing_backoff' || w.state === 'stale' || w.registration === 'not_registered').length} need attention`} onClick={() => onSelect('workers')} /></div>
-    <div className="mt-7 grid gap-5 xl:grid-cols-2"><Panel title="Attention needed"><Attention workers={data.workers} /></Panel><Panel title="Capabilities"><div className="space-y-3">{data.capabilities.map((capability) => <div key={capability.name} className="flex items-start justify-between gap-3 text-sm"><div><p className="font-medium text-zinc-200">{capability.name}</p><p className="mt-1 text-xs text-zinc-500">{capability.detail}</p></div><StateBadge enabled={capability.available} offLabel="unavailable" /></div>)}</div></Panel><Panel title="Queue state"><QueueStates label="Inbox" rows={data.queueStates.inbox} /><QueueStates label="Outbound" rows={data.queueStates.outbound} /></Panel><Panel title="Active channel instances"><div className="space-y-3">{data.activeChannels.length === 0 && <p className="text-sm text-zinc-500">No active channel instances in the database.</p>}{data.activeChannels.map((channel) => <div key={channel.name} className="flex items-center justify-between gap-3 text-sm"><span className="font-mono text-xs text-zinc-200">{channel.name}</span><span className="text-xs text-zinc-500">{channel.channelType} · {channel.provider}</span></div>)}</div></Panel><Panel title="Feature switches"><div className="grid gap-3 sm:grid-cols-2">{data.featureFlags.map((flag) => <div key={flag.name} className="flex items-center justify-between gap-3 text-sm"><span className="text-zinc-300">{flag.name}</span><StateBadge enabled={flag.enabled} onLabel="enabled" /></div>)}</div></Panel></div>
+    <div className="mt-7 grid gap-5 xl:grid-cols-2"><Panel title="Attention needed"><Attention workers={data.workers} /></Panel><Panel title="Capabilities"><div className="space-y-3">{data.capabilities.map((capability) => <div key={capability.name} className="flex items-start justify-between gap-3 text-sm"><div><p className="font-medium text-zinc-200">{capability.name}</p><p className="mt-1 text-xs text-zinc-500">{capability.detail}</p></div><StateBadge enabled={capability.available} offLabel="unavailable" /></div>)}</div></Panel><Panel title="Queue state"><QueueStates label="Inbox" rows={data.queueStates.inbox} /><QueueStates label="Outbound" rows={data.queueStates.outbound} /></Panel><Panel title="Active channel instances"><div className="space-y-3">{data.activeChannels.length === 0 && <p className="text-sm text-zinc-500">No active channel instances in the database.</p>}{data.activeChannels.map((channel) => <div key={channel.name} className="flex items-center justify-between gap-3 text-sm"><span className="font-mono text-xs text-zinc-200">{channel.name}</span><span className="text-xs text-zinc-500">{channel.channelType} · {channel.provider}</span></div>)}</div></Panel><Panel title="Feature switches"><div className="grid gap-3 sm:grid-cols-2">{data.featureFlags.map((flag) => <div key={flag.name} className="flex items-center justify-between gap-3 text-sm"><span className="text-zinc-300">{flag.name}</span><StateBadge enabled={flag.enabled} onLabel="enabled" /></div>)}</div></Panel>{data.founderAppUrl && <Panel title="AO Founder on your phone"><FounderAppCard url={data.founderAppUrl} /></Panel>}</div>
   </section>;
 }
 
@@ -245,6 +248,36 @@ function DecisionsView(): ReactElement {
 
 function PageTitle({ eyebrow, title, description }: { eyebrow: string; title: string; description: string }): ReactElement { return <div><p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-300">{eyebrow}</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">{title}</h1><p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">{description}</p></div>; }
 function Panel({ title, children }: { title: string; children: ReactNode }): ReactElement { return <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5"><h2 className="mb-4 text-sm font-semibold">{title}</h2>{children}</section>; }
+
+/**
+ * The install handle for the phone app. A QR rather than a link because the console is
+ * read on a desktop and the target is a different device — retyping a tailnet hostname
+ * with a port is exactly the friction this removes. Rendered client-side to a data: URL,
+ * which the console's img-src ('self' data:) already permits.
+ */
+function FounderAppCard({ url }: { url: string }): ReactElement {
+  const [qr, setQr] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    // Zinc-200 on transparent so the code inherits the panel instead of punching a
+    // white tile into it. Scanners only need the contrast, not the light background.
+    QRCode.toDataURL(url, { width: 320, margin: 1, errorCorrectionLevel: 'M', color: { dark: '#e4e4e7ff', light: '#00000000' } })
+      .then((dataUrl) => { if (!cancelled) setQr(dataUrl); })
+      .catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [url]);
+  return <div className="flex flex-col items-center gap-4 sm:flex-row sm:items-start">
+    <div className="grid size-40 shrink-0 place-items-center rounded-lg border border-zinc-800 bg-zinc-950 p-2">
+      {qr ? <img src={qr} alt={`QR code linking to ${url}`} className="size-full" /> : <span className="text-xs text-zinc-500">{failed ? 'QR unavailable' : 'Generating…'}</span>}
+    </div>
+    <div className="min-w-0 text-center sm:text-left">
+      <p className="text-sm text-zinc-300">Scan with your phone to open AO Founder, then use the browser menu to install it to your home screen.</p>
+      <a href={url} target="_blank" rel="noreferrer" className="mt-3 block break-all font-mono text-xs text-emerald-300 hover:text-emerald-200">{url}</a>
+      <p className="mt-3 text-xs text-zinc-500">Reachable only where this origin is — on the tailnet, that means your phone needs Tailscale connected. Push notifications arrive regardless; they come from Google, not through this URL.</p>
+    </div>
+  </div>;
+}
 function Metric({ label, value, detail, tone, onClick }: { label: string; value: string; detail?: string; tone?: 'good' | 'bad'; onClick?: () => void }): ReactElement { return <button onClick={onClick} className={cn('rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 text-left', onClick && 'hover:border-zinc-600')}><p className="text-sm text-zinc-400">{label}</p><p className={cn('mt-3 text-2xl font-semibold', tone === 'good' && 'text-emerald-300', tone === 'bad' && 'text-red-300')}>{value}</p>{detail && <p className="mt-2 text-xs text-zinc-500">{detail}</p>}</button>; }
 function Badge({ value }: { value: string }): ReactElement { const bad = ['failed', 'rejected', 'cancelled'].includes(value); return <span className={cn('rounded-full px-2 py-1 text-xs font-medium', bad ? 'bg-red-400/15 text-red-300' : value === 'pending' ? 'bg-amber-400/15 text-amber-200' : 'bg-zinc-800 text-zinc-300')}>{value}</span>; }
 function decisionLabel(value: unknown): string { return ({ triage: 'Triage', draft_reply: 'Draft review', human_override: 'Human override', backfill_task_proposal: 'Backfill proposal' } as Record<string, string>)[String(value)] ?? display(value); }

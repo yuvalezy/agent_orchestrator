@@ -157,7 +157,9 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, de
 
   router.get('/api/overview', async (_req, res, next) => {
     try {
-      res.json({ data: await getConsoleOverview() });
+      // founderAppUrl rides along the way insights carries portalUrl: config-derived, so
+      // it belongs to the router, not to the DB-reading overview service.
+      res.json({ data: { ...(await getConsoleOverview()), founderAppUrl: config.founderAppUrl } });
     } catch (err) {
       next(err);
     }

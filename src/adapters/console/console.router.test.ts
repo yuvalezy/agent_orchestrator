@@ -213,3 +213,26 @@ test('console API requires auth, creates no-store session, and rejects mutation 
     assert.equal(invalidTimeline.status, 400);
   });
 });
+
+test('overview echoes the founder app URL so the console can render its install QR', async () => {
+  const overviewFor = async (env: NodeJS.ProcessEnv): Promise<unknown> => {
+    let value: unknown = 'unset';
+    await withConsole(async (baseUrl) => {
+      const login = await fetch(`${baseUrl}/console/api/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'correct horse battery staple' }) });
+      const cookie = login.headers.get('set-cookie')?.split(';')[0];
+      assert.ok(cookie);
+      const overview = await fetch(`${baseUrl}/console/api/overview`, { headers: { cookie } });
+      assert.equal(overview.status, 200);
+      value = ((await overview.json()) as { data: { founderAppUrl: unknown } }).data.founderAppUrl;
+    }, {}, env);
+    return value;
+  };
+
+  // The phone's origin is not derivable from the process — it must be configured.
+  assert.equal(await overviewFor({ FOUNDER_APP_PUBLIC_URL: 'https://fedora.tail1234.ts.net:8443/app/' }), 'https://fedora.tail1234.ts.net:8443/app');
+  // Absent → null, and the console hides the card rather than rendering a dead QR.
+  assert.equal(await overviewFor({}), null);
+  // Not a URL, and a non-http scheme, both fail closed the same way.
+  assert.equal(await overviewFor({ FOUNDER_APP_PUBLIC_URL: 'not a url' }), null);
+  assert.equal(await overviewFor({ FOUNDER_APP_PUBLIC_URL: 'ftp://phone.example.com/app' }), null);
+});

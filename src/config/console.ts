@@ -3,6 +3,8 @@ export interface ConsoleConfig {
   passwordHash: string;
   sessionSecret: string;
   portalBaseUrl: string | null;
+  /** Where the founder's phone reaches /app. Null → the console hides the install card. */
+  founderAppUrl: string | null;
   sessionTtlMs: number;
   loginWindowMs: number;
   loginMaxAttempts: number;
@@ -35,6 +37,10 @@ export function loadConsoleConfig(source: NodeJS.ProcessEnv = process.env): Cons
     passwordHash,
     sessionSecret,
     portalBaseUrl: optionalHttpUrl(source.EZY_PORTAL_BASE_URL),
+    // The origin the PWA is installed from — a tailnet name, a tunnel, or a real
+    // domain. It is NOT derivable here: the service only ever sees localhost, and the
+    // phone reaches it through something the process cannot observe.
+    founderAppUrl: optionalHttpUrl(source.FOUNDER_APP_PUBLIC_URL),
     sessionTtlMs: positiveInt(source.CONSOLE_SESSION_TTL_MS, 43_200_000),
     loginWindowMs: positiveInt(source.CONSOLE_LOGIN_WINDOW_MS, 900_000),
     loginMaxAttempts: positiveInt(source.CONSOLE_LOGIN_MAX_ATTEMPTS, 5),
