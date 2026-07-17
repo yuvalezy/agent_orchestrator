@@ -176,8 +176,24 @@ export function buildCallbackPollerWorker(
      *  app wires this to mark + re-emit its mirrored rows, so a Telegram-made decision
      *  clears the app's Attention card too (not just app-made ones). */
     onDecided?: (d: DecisionEvent) => Promise<void>;
+    /**
+     * The FANOUT founder notifier (Telegram + every mirror, e.g. the AO Founder app), used for
+     * the founder-facing OUTPUTS a decision tap produces here — above all the meeting scheduler's
+     * "📅 Pick a time" follow-up and its booking confirmations. Telegram I/O (poll, replies,
+     * onMessage/onDecision) stays on the concrete `notifier`; only surfaces that a founder is
+     * meant to SEE on every device route through this.
+     *
+     * Defaults to `notifier` (Telegram only) when absent — so a boot with no mirrors, and every
+     * test, behaves exactly as before. When it IS the fanout, a duration tapped on ANY surface
+     * produces the slot card on ALL of them, which is the whole point of the app being a mirror:
+     * without it the app showed "Wants to talk" (posted by the inbox processor's fanout scheduler)
+     * but then went silent, because THIS scheduler answered only into Telegram.
+     */
+    founderNotifier?: FounderNotifierPort;
   } = {},
 ): WorkerDefinition {
+  // Founder-facing outputs fan out to every surface; raw Telegram I/O stays on `notifier`.
+  const founderNotifier = options.founderNotifier ?? notifier;
   const taskTarget = buildEzyPortalGateway();
   const cancel = buildCancelHandler({ taskTarget, notifier });
 
@@ -221,7 +237,11 @@ export function buildCallbackPollerWorker(
   //
   // Unlike the inbox processor's instance, this one gets the free-text deps: this factory owns
   // the founder's MESSAGES, so it is the only place a typed "thursday 3pm" can be read.
-  const meetingWiring = buildMeetingSchedulerGated(taskTarget, notifier, {
+  // founderNotifier (fanout), NOT the raw Telegram notifier: askForSlot + the booking
+  // confirmations must land on every founder surface, or the app card dead-ends after the
+  // duration tap (the reported bug). postAnswer stays Telegram-only — it is a plain line back
+  // into the topic that captured the typed time, which no mirror owns.
+  const meetingWiring = buildMeetingSchedulerGated(taskTarget, founderNotifier, {
     llm: () =>
       buildLlmRouter({
         notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),

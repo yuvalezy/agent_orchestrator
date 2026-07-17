@@ -78,6 +78,22 @@ describe('AttentionCard', () => {
     expect(screen.queryByRole('button', { name: /View thread/ })).not.toBeInTheDocument();
   });
 
+  it('offers "Another time…" only on an undecided slot card', () => {
+    const slots = [{ id: 'ms0', label: 'Fri 13:00' }, { id: 'ms1', label: 'Fri 16:00' }, { id: 'mtask', label: 'Just make a task' }];
+    // A "Pick a time" card, still open → the typed-time affordance is offered.
+    const { rerender } = render(<AttentionCard card={card({ buttons: slots })} decidedOptionId={null} onDecide={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /Another time/ })).toBeInTheDocument();
+
+    // Once decided, it is gone (the card is leaving the queue).
+    rerender(<AttentionCard card={card({ buttons: slots })} decidedOptionId="ms0" onDecide={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /Another time/ })).not.toBeInTheDocument();
+  });
+
+  it('does NOT offer "Another time…" on a non-slot card (a duration or draft card)', () => {
+    render(<AttentionCard card={card({ buttons: [{ id: 'md30', label: '30 min' }, { id: 'mtask', label: 'Just make a task' }] })} decidedOptionId={null} onDecide={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /Another time/ })).not.toBeInTheDocument();
+  });
+
   it('keeps the draft expander OUT of the card tap — no button inside a button', () => {
     renderRouted(
       <AttentionCard

@@ -369,6 +369,90 @@ test('decisions reject unknown options and are 503 when no handler is registered
   }, { registerHandler: false });
 });
 
+// ── Typed time on a "Pick a time" card (PWA equal of Telegram's "reply with a time") ──────
+
+/** Post a "📅 Pick a time" card (slot buttons + meeting ref) and return its message id. */
+async function pickTimeCard(baseUrl: string, notifier: AppFounderNotifier, cookie: string, ref = 'mtg-9'): Promise<string> {
+  await notifier.askFounder('cust-1', { title: '📅 Pick a time', body: 'b' }, [
+    { id: `ms0:${ref}`, label: 'Fri 17 Jul, 13:00' },
+    { id: `ms1:${ref}`, label: 'Fri 17 Jul, 16:00' },
+    { id: `mtask:${ref}`, label: 'Just make a task' },
+  ]);
+  const rows = await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] };
+  return rows.data[0].id;
+}
+
+test('a typed time books through the injected handler and clears the card from the queue', async () => {
+  const calls: Array<{ meetingId: string; localTime: string; by: string }> = [];
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+
+    const res = await fetch(`${baseUrl}/app/api/meeting-time`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ messageId, localTime: '2026-08-01T15:00' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'booked' } });
+    // The handler was called with the card's meeting ref (its notification_ref).
+    assert.deepEqual(calls, [{ meetingId: 'mtg-9', localTime: '2026-08-01T15:00', by: 'founder-app' }]);
+    // Booked → the card is marked decided (first-writer-wins) so it leaves the attention queue.
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, 'mtyped');
+  }, { deps: { meetingReply: () => async (input) => { calls.push(input); return { status: 'booked' }; } } });
+});
+
+test('a busy/past typed time is reported unavailable and the card stays open', async () => {
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+
+    const res = await fetch(`${baseUrl}/app/api/meeting-time`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ messageId, localTime: '2026-08-01T15:00' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'unavailable' } });
+    // Not booked → the card is untouched, still awaiting an answer.
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, null);
+  }, { deps: { meetingReply: () => async () => ({ status: 'unavailable' }) } });
+});
+
+test('a typed time is refused on the wrong card, on a decided card, and when scheduling is off', async () => {
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+
+    // Bad inputs.
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting-time`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId: 'not-a-uuid', localTime: '2026-08-01T15:00' }) })).status, 400);
+    const realId = await pickTimeCard(baseUrl, notifier, cookie);
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting-time`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId: realId, localTime: 'tomorrow-ish' }) })).status, 400);
+
+    // A non-scheduling card (no slot buttons) is refused.
+    await notifier.notifyCustomerEvent('cust-1', { title: 'New task', body: 'b' }, [{ id: 'x:task-1', label: 'Cancel' }]);
+    const taskId = (await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] }).data[0].id;
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting-time`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId: taskId, localTime: '2026-08-01T15:00' }) })).status, 400);
+  }, { deps: { meetingReply: () => async () => ({ status: 'booked' }) } });
+});
+
+test('a typed time is 503 when meeting scheduling is not wired', async () => {
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+    // No meetingReply dep (money loop off) → 503, exactly as /decisions is without a handler.
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting-time`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId, localTime: '2026-08-01T15:00' }) })).status, 503);
+  });
+});
+
+test('a typed time on an already-decided card is refused (409)', async () => {
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+    // Simulate a slot already tapped: the row is marked decided.
+    const row = repo.messages.find((m) => m.id === messageId);
+    if (row) row.decidedOptionId = 'ms0';
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting-time`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId, localTime: '2026-08-01T15:00' }) })).status, 409);
+  }, { deps: { meetingReply: () => async () => ({ status: 'booked' }) } });
+});
+
 // ── Dismiss ──────────────────────────────────────────────────────────────────────────
 // The founder's actual complaint: approving what the assistant did meant doing nothing, so
 // the card sat in Attention forever. Dismiss is "I've seen this" — it decides nothing.

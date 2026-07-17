@@ -15,6 +15,7 @@ import { camelizeDeep } from './founder-app-serialize';
 import { toUrgencyItem, toTimelineRow } from './founder-app-cockpit-view';
 import type { AttentionDecision, CustomerAugment } from './founder-app-cockpit-repo';
 import type { Page } from '../console/console-repo';
+import type { AppMeetingTimeOutcome } from '../triage/meeting-scheduler.factory';
 
 // The AO Founder PWA API + static shell (M6), mounted at /app and gated by the same
 // ConsoleConfig presence as /console. Auth is a DB-backed device token (a phone stays
@@ -23,6 +24,16 @@ import type { Page } from '../console/console-repo';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NUMERIC_ID_RE = /^\d+$/;
+/** A bare wall-clock from `<input type="datetime-local">`: "2026-07-17T15:00" (seconds optional).
+ *  No zone by design — the server anchors it in the meeting's founder tz. */
+const LOCAL_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
+/** A "📅 Pick a time" card's signature: its slot buttons are `ms0…`. Only that card takes a
+ *  typed time — a duration card (`md30`) is a step too early (no slot to override yet). */
+const SLOT_BUTTON_RE = /^ms\d+$/;
+/** Marks a "Pick a time" card resolved when the founder booked by TYPING rather than tapping a
+ *  slot — no slot button was chosen, so a sentinel clears it from the queue (first-writer-wins,
+ *  exactly the markDecidedByRef path a tap uses). Never a real, tappable option. */
+const MEETING_TYPED_TIME_OPTION = 'mtyped';
 const MAX_LABEL = 120;
 const MAX_TEXT = 4000;
 const MAX_FCM_TOKEN = 4096;
@@ -74,6 +85,13 @@ export interface FounderAppDeps {
   firebase: FirebaseConfig | null;
   /** v2 cockpit read models (reused console-repo SQL + app-specific augmentation). */
   cockpit: FounderAppCockpitReads;
+  /**
+   * Book a founder-chosen wall-clock time on a pending meeting — the PWA's equal to Telegram's
+   * "reply with a time". A GETTER, not the handler itself: the fanout notifier it books through
+   * is constructed after this router (the money-loop), so it is late-bound. Absent, or returning
+   * null (meeting scheduling off / Telegram not configured) → `POST /api/meeting-time` answers 503.
+   */
+  meetingReply?: () => ((input: { meetingId: string; localTime: string; by: string }) => Promise<AppMeetingTimeOutcome>) | null;
 }
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -336,6 +354,45 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
       if (!dispatched) return void res.status(503).json({ error: 'decisions unavailable' });
       // Return the row as the shared hook left it (decided, unless its ref was empty).
       res.json({ data: (await deps.repo.getMessage(body.messageId)) ?? row });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Typed time on a "📅 Pick a time" card ────────────────────────────────────────────
+  // The PWA's equal to Telegram's "reply with a time — thursday 3pm". A rich client needs no
+  // natural-language parse: a native datetime picker yields an unambiguous wall-clock, which the
+  // scheduler anchors in the founder's tz and books through onTypedTime — the SAME code a Telegram
+  // typed reply reaches, so a busy/past time is refused and re-notified identically. On a booking
+  // we clear the card the first-writer-wins way a tapped slot does; the confirmation card itself
+  // arrives separately over SSE (the scheduler notified through the fanout mirror).
+  router.post('/api/meeting-time', async (req, res, next) => {
+    const body = (req.body ?? {}) as { messageId?: unknown; localTime?: unknown };
+    if (typeof body.messageId !== 'string' || !UUID_RE.test(body.messageId)) {
+      return void res.status(400).json({ error: 'invalid message id' });
+    }
+    if (typeof body.localTime !== 'string' || !LOCAL_TIME_RE.test(body.localTime)) {
+      return void res.status(400).json({ error: 'invalid time' });
+    }
+    const book = deps.meetingReply?.();
+    if (!book) return void res.status(503).json({ error: 'meeting scheduling unavailable' });
+    try {
+      const row = await deps.repo.getMessage(body.messageId);
+      if (!row) return void res.status(404).json({ error: 'not found' });
+      // Only a "Pick a time" card (slot buttons + a meeting ref) takes a typed time.
+      if (!row.notificationRef || !row.buttons?.some((b) => SLOT_BUTTON_RE.test(b.id))) {
+        return void res.status(400).json({ error: 'not a scheduling card' });
+      }
+      // Already resolved (a slot tapped, or a time already typed) → refuse, mirroring /decisions.
+      if (row.decidedOptionId) return void res.status(409).json({ error: 'already decided' });
+
+      const outcome = await book({ meetingId: row.notificationRef, localTime: body.localTime, by: 'founder-app' });
+      if (outcome.status === 'booked') {
+        // Mark + re-emit every app row on this meeting, so the card leaves the attention queue on
+        // every open client — the ONE mirror-marking path a tapped decision also uses.
+        await deps.notifier.recordDecision({ notificationRef: row.notificationRef, optionId: MEETING_TYPED_TIME_OPTION, by: 'founder-app' });
+      }
+      res.json({ data: { status: outcome.status } });
     } catch (err) {
       next(err);
     }

@@ -4,7 +4,12 @@ import { cn } from './lib/utils';
 import { relativeTime } from './lib/time';
 import { CardActions, ThreadTap, threadPath } from './CardActions';
 import { DecisionChips, type DecideHandler } from './DecisionChips';
+import { MeetingTimeReply } from './MeetingTimeReply';
 import type { AttentionCard as AttentionCardData, Severity } from './types';
+
+/** A "📅 Pick a time" card is known by its slot buttons (`ms0…`); only there does typing a time
+ *  make sense (a duration card is a step too early). Mirrors the server's SLOT_BUTTON_RE. */
+const isSlotCard = (card: AttentionCardData): boolean => (card.buttons ?? []).some((b) => /^ms\d+$/.test(b.id));
 
 const accent: Record<Severity, string> = {
   info: 'bg-sky-400',
@@ -66,6 +71,9 @@ export function AttentionCard({
         {card.buttons && card.buttons.length > 0 && (
           <div className="mt-3">
             <DecisionChips messageId={card.id} buttons={card.buttons} decidedOptionId={decidedOptionId} onDecide={onDecide} />
+            {/* Typing a time is only offered while the question stands and only on a slot card —
+                once decided the card is on its way out of the queue. */}
+            {decidedOptionId === null && isSlotCard(card) && <MeetingTimeReply messageId={card.id} />}
           </div>
         )}
       </div>

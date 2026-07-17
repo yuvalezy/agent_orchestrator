@@ -57,6 +57,7 @@ import {
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
+import { buildMeetingSchedulerGated, type MeetingWiring } from './adapters/triage/meeting-scheduler.factory';
 import { buildScheduleDueWorker } from './adapters/scheduling/schedule.worker';
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
 import { seedHolidays } from './adapters/outbound/holiday-seeder';
@@ -221,6 +222,9 @@ async function main(): Promise<void> {
   // the app feed + mirror notifier here; FCM is optional and self-disables (a logger.warn)
   // when FIREBASE_* is absent/incomplete, leaving the rest of the app router working.
   let founderAppNotifier: AppFounderNotifier | null = null;
+  // Late-bound: the PWA "another time" picker books through the fanout notifier, which is built
+  // below in the money-loop. The router only reads this at request time, so a getter suffices.
+  let bookAppMeetingTime: MeetingWiring['bookLocalTime'] | null = null;
   if (consoleConfig) {
     const firebaseConfig = loadFirebaseConfig();
     let fcmSender = null;
@@ -249,6 +253,7 @@ async function main(): Promise<void> {
         query: buildQueryEngineService(async () => {}),
         notifier: founderAppNotifier,
         firebase: firebaseConfig,
+        meetingReply: () => bookAppMeetingTime,
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {
           listCustomers,
@@ -329,6 +334,11 @@ async function main(): Promise<void> {
     if (webPushNotifier) mirrors.push(new WebPushMirror(webPushNotifier));
     if (founderAppNotifier) mirrors.push(founderAppNotifier);
     notifier = mirrors.length > 0 ? new FanoutFounderNotifier(telegram, mirrors) : telegram;
+    // The PWA "another time" picker books through this fanout notifier, so a booking made in the
+    // app confirms on BOTH surfaces — a third stateless scheduler instance, safe for the same
+    // reason the callback poller's is (every transition is a guarded write). Null when scheduling
+    // is off → the /api/meeting-time endpoint answers 503.
+    bookAppMeetingTime = buildMeetingSchedulerGated(buildEzyPortalGateway(), notifier)?.bookLocalTime ?? null;
     // The app registers the SAME decision router the Telegram poll drives, so an app tap
     // resolves identically to a Telegram button tap.
     // The app notifier is both a decision SINK (its own taps route to routeDecision) and
@@ -340,6 +350,10 @@ async function main(): Promise<void> {
       buildCallbackPollerWorker(telegram, {
         decisionSinks: appNotifier ? [appNotifier] : [],
         onDecided: appNotifier ? (d) => appNotifier.recordDecision(d) : undefined,
+        // Founder-facing OUTPUTS of a decision tap (the meeting scheduler's "📅 Pick a time"
+        // and its confirmations) fan out to every surface — so a duration tapped in the app
+        // gets the slot card in the app, not just in Telegram. Telegram I/O stays on `telegram`.
+        founderNotifier: notifier,
       }),
     );
     if (env.TELEGRAM_SCHEDULING_ENABLED) {

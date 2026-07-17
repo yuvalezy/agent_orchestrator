@@ -91,6 +91,18 @@ function buildTaskFallback(taskTarget: TaskTargetPort, deepLink: (ref: string) =
   };
 }
 
+/**
+ * The outcome of booking a founder-picked wall-clock time from a rich client (the PWA's
+ * "another time" datetime picker). `unavailable` means onTypedTime refused it (busy/past) and
+ * ALREADY told the founder through the notifier — which now fans out to the app feed too — so the
+ * caller adds no message of its own; it just reports the status back for inline UI.
+ */
+export type AppMeetingTimeOutcome =
+  | { status: 'booked' }
+  | { status: 'unavailable' }
+  | { status: 'not_pending' }
+  | { status: 'invalid' };
+
 export interface MeetingWiring {
   scheduler: MeetingScheduler;
   decisions: MeetingDecisionHandler;
@@ -98,6 +110,15 @@ export interface MeetingWiring {
    *  Only present when an LLM is supplied to parse the time (the callback poller has one; the
    *  inbox processor does not need this hook at all — it never reads founder messages). */
   freeText?: ReturnType<typeof buildMeetingFreeTextHook>;
+  /**
+   * Book a wall-clock time the founder chose in a rich client (the PWA datetime picker),
+   * interpreted in the meeting's OWN founder tz — the same zone the offered slots were rendered
+   * in, never the server's or the phone's. This is the PWA's equal to Telegram's "reply with a
+   * time": it reuses `onTypedTime` verbatim, so a busy or past time is refused and re-notified
+   * identically, and a booking books through the SAME fanout notifier (Telegram + app). No LLM —
+   * a native picker yields an unambiguous instant, so there is nothing to parse.
+   */
+  bookLocalTime: (input: { meetingId: string; localTime: string; by: string }) => Promise<AppMeetingTimeOutcome>;
 }
 
 /**
@@ -191,9 +212,31 @@ export function buildMeetingSchedulerGated(
     slotOptions: { count: 4, leadMinutes: 60, horizonDays: HORIZON_DAYS },
   });
 
+  // Glue, not scheduling: turn a UI wall-clock string into the absolute instant the core port
+  // speaks in, anchored in the founder's zone. Kept out of core (which deals only in Dates) — the
+  // wall-clock↔zone mapping is a client-shape concern that belongs at the composition edge.
+  const bookLocalTime = async ({
+    meetingId,
+    localTime,
+    by,
+  }: {
+    meetingId: string;
+    localTime: string;
+    by: string;
+  }): Promise<AppMeetingTimeOutcome> => {
+    const m = await getMeetingRequest(meetingId);
+    // Same guard onTypedTime applies, checked here so the caller can distinguish a stale card
+    // (nothing to do) from a real refusal (busy/past, which onTypedTime notifies about).
+    if (!m || m.status !== 'awaiting_slot' || !m.duration_minutes) return { status: 'not_pending' };
+    const dt = DateTime.fromISO(localTime, { zone: m.founder_tz ?? env.CALENDAR_TZ });
+    if (!dt.isValid) return { status: 'invalid' };
+    return { status: (await scheduler.onTypedTime(meetingId, dt.toJSDate(), by)) ? 'booked' : 'unavailable' };
+  };
+
   return {
     scheduler,
     decisions: buildMeetingDecisionHandler(scheduler),
+    bookLocalTime,
     freeText: freeTextDeps
       ? buildMeetingFreeTextHook(((interpreter) => ({
           onTypedTime: (meetingId, startsAt, by) => scheduler.onTypedTime(meetingId, startsAt, by),
