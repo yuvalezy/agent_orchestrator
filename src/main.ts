@@ -355,8 +355,9 @@ async function main(): Promise<void> {
         // gets the slot card in the app, not just in Telegram. Telegram I/O stays on `telegram`.
         founderNotifier: notifier,
         // Cancel/commitment acks are thread replies, not port notifications — mirror them onto
-        // the app feed so an app-tapped decision is confirmed too (not just silently cleared).
-        appConfirm: appNotifier ? (text) => appNotifier.confirm(text) : undefined,
+        // the app feed (customer-scoped when the flow names one) so an app-tapped decision is
+        // confirmed too, not just silently cleared.
+        appConfirm: appNotifier ? (text, customerId) => appNotifier.confirm(text, customerId) : undefined,
       }),
     );
     if (env.TELEGRAM_SCHEDULING_ENABLED) {

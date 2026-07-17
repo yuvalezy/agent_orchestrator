@@ -196,9 +196,10 @@ export function buildCallbackPollerWorker(
      * commitment done/dismiss. Those reach Telegram via `replyInThread`, which no mirror owns AND
      * which an app tap can't even use (it carries no thread). Wiring this makes the app show the
      * same ack: a Telegram tap's reply is mirrored, and an app tap is finally acknowledged at all.
-     * Absent (no app configured) → Telegram-only, exactly as before.
+     * `customerId` (when the flow knows it) scopes the ack to that customer's screen. Absent (no
+     * app configured) → Telegram-only, exactly as before.
      */
-    appConfirm?: (text: string) => Promise<void>;
+    appConfirm?: (text: string, customerId?: string | null) => Promise<void>;
   } = {},
 ): WorkerDefinition {
   // Founder-facing outputs fan out to every surface; raw Telegram I/O stays on `notifier`.
@@ -209,9 +210,9 @@ export function buildCallbackPollerWorker(
   // attempted — so a Telegram tap's ack is mirrored to the app, and an app tap (no thread) is
   // acknowledged there rather than nowhere. Best-effort: a confirmation must never fail the
   // decision it reports on.
-  const confirmDecision = async (d: DecisionEvent, text: string): Promise<void> => {
+  const confirmDecision = async (d: DecisionEvent, text: string, customerId?: string | null): Promise<void> => {
     if (d.threadId) await notifier.replyInThread(d.threadId, text);
-    await options.appConfirm?.(text);
+    await options.appConfirm?.(text, customerId);
   };
   const taskTarget = buildEzyPortalGateway();
   const cancel = buildCancelHandler({ taskTarget, notifier });
@@ -287,15 +288,16 @@ export function buildCallbackPollerWorker(
   // and routes it here, so typing an option and tapping it land in the same handler.
   const routeDecision = async (d: DecisionEvent): Promise<void> => {
     if (d.optionId === 'sc') {
-      const result = await cancelScheduledAction(d.notificationRef);
+      const { result, customerId } = await cancelScheduledAction(d.notificationRef);
       const text = result === 'cancelled'
         ? '✅ Scheduled action cancelled.'
         : result === 'too_late'
           ? '⚠️ Too late to cancel; the action is already running or sending.'
           : 'This scheduled action was already handled.';
       // The outcome matters here (a 'too_late' is real news), so confirm it on every surface the
-      // founder can see — not just the Telegram thread it used to be trapped in.
-      await confirmDecision(d, text);
+      // founder can see — not just the Telegram thread it used to be trapped in — scoped to the
+      // action's customer so it lands on their screen.
+      await confirmDecision(d, text, customerId);
       return;
     }
     if (scheduling && scheduling.isScheduleOption(d.optionId)) return scheduling.onDecision(d);

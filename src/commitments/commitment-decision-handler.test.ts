@@ -16,13 +16,13 @@ const silentLog = { info() {} };
 interface Harness {
   handler: ReturnType<typeof buildCommitmentDecisionHandler>;
   calls: Array<{ id: string; status: 'done' | 'dismissed' }>;
-  posts: Array<{ threadId: string | undefined; text: string }>;
+  posts: Array<{ threadId: string | undefined; text: string; customerId: string | null }>;
 }
 
 /** A store that transitions an open commitment ONCE (guarded on status='open'), like the repo. */
 function harness(open: Set<string>): Harness {
   const calls: Array<{ id: string; status: 'done' | 'dismissed' }> = [];
-  const posts: Array<{ threadId: string | undefined; text: string }> = [];
+  const posts: Array<{ threadId: string | undefined; text: string; customerId: string | null }> = [];
   const handler = buildCommitmentDecisionHandler({
     setStatus: async (id, status): Promise<CommitmentTransition> => {
       calls.push({ id, status });
@@ -33,9 +33,9 @@ function harness(open: Set<string>): Harness {
       return id === 'gone' ? { result: 'unknown' } : { result: 'already' };
     },
     // The handler is surface-agnostic now: it confirms every resolved tap and leaves the WHERE to
-    // the composition root. We capture the DecisionEvent's threadId to prove that routing input
-    // still flows through.
-    confirm: async (d, text) => void posts.push({ threadId: d.threadId, text }),
+    // the composition root. We capture the DecisionEvent's threadId + the scoping customer to prove
+    // both routing inputs flow through.
+    confirm: async (d, text, customerId) => void posts.push({ threadId: d.threadId, text, customerId }),
     log: silentLog,
   });
   return { handler, calls, posts };
@@ -62,6 +62,7 @@ test('✔ done on an open commitment transitions it once and confirms', async ()
   await h.handler.handle(ev(COMMITMENT_DONE_OPTION, '5'));
   assert.deepEqual(h.calls, [{ id: '5', status: 'done' }]);
   assert.equal(h.posts[0].text, '✔ Marked done.');
+  assert.equal(h.posts[0].customerId, 'cust-1'); // scoped to the resolved commitment's customer
   assert.equal(open.has('5'), false);
 });
 
@@ -77,7 +78,9 @@ test('a re-delivered tap is idempotent: the second sees "already resolved"', asy
   await h.handler.handle(ev(COMMITMENT_DONE_OPTION, '7'));
   await h.handler.handle(ev(COMMITMENT_DONE_OPTION, '7')); // repeat tap on the now-resolved item
   assert.equal(h.posts[0].text, '✔ Marked done.');
+  assert.equal(h.posts[0].customerId, 'cust-1');
   assert.equal(h.posts[1].text, 'That commitment was already resolved.');
+  assert.equal(h.posts[1].customerId, null); // no open row to read a customer from → unscoped
 });
 
 test('a tap on an unknown id says the commitment is gone', async () => {
@@ -94,5 +97,5 @@ test('a missing ref is ignored entirely; a threadless event still writes AND con
   // fires: routing it (app feed, since there's no thread) is the composition root's job now.
   await h.handler.handle({ optionId: COMMITMENT_DONE_OPTION, notificationRef: '3', by: 'founder-app' });
   assert.deepEqual(h.calls, [{ id: '3', status: 'done' }]);
-  assert.deepEqual(h.posts, [{ threadId: undefined, text: '✔ Marked done.' }]);
+  assert.deepEqual(h.posts, [{ threadId: undefined, text: '✔ Marked done.', customerId: 'cust-1' }]);
 });

@@ -473,23 +473,31 @@ export async function reclaimStuck(runningMinutes: number): Promise<{ reset: num
   });
 }
 
-export async function cancelScheduledAction(actionId: string): Promise<'cancelled' | 'already' | 'too_late'> {
+/** The cancel outcome plus the action's owning customer (null only when the row is already gone),
+ *  so a confirmation can be shown on that customer's surface rather than unscoped. */
+export interface CancelScheduledActionResult {
+  result: 'cancelled' | 'already' | 'too_late';
+  customerId: string | null;
+}
+
+export async function cancelScheduledAction(actionId: string): Promise<CancelScheduledActionResult> {
   return withClient(async (client) => {
     try {
       await client.query('BEGIN');
-      const { rows } = await client.query<{ status: ScheduleActionStatus }>(
-        `SELECT status FROM scheduled_actions WHERE id = $1 FOR UPDATE`,
+      const { rows } = await client.query<{ status: ScheduleActionStatus; customer_id: string }>(
+        `SELECT status, customer_id FROM scheduled_actions WHERE id = $1 FOR UPDATE`,
         [actionId],
       );
       const status = rows[0]?.status;
+      const customerId = rows[0]?.customer_id ?? null;
       if (!status) {
         await client.query('ROLLBACK');
-        return 'already';
+        return { result: 'already', customerId: null };
       }
       if (status === 'pending') {
         await client.query(`UPDATE scheduled_actions SET status = 'cancelled', completed_at = now() WHERE id = $1`, [actionId]);
         await client.query('COMMIT');
-        return 'cancelled';
+        return { result: 'cancelled', customerId };
       }
       if (status === 'dispatched') {
         const q = await client.query(
@@ -500,15 +508,16 @@ export async function cancelScheduledAction(actionId: string): Promise<'cancelle
         if ((q.rowCount ?? 0) === 1) {
           await client.query(`UPDATE scheduled_actions SET status = 'cancelled', completed_at = now() WHERE id = $1`, [actionId]);
           await client.query('COMMIT');
-          return 'cancelled';
+          return { result: 'cancelled', customerId };
         }
         await client.query('ROLLBACK');
-        return 'too_late';
+        return { result: 'too_late', customerId };
       }
       await client.query('ROLLBACK');
-      return status === 'cancelled' || status === 'completed' || status === 'missed' || status === 'failed'
-        ? 'already'
-        : 'too_late';
+      return {
+        result: status === 'cancelled' || status === 'completed' || status === 'missed' || status === 'failed' ? 'already' : 'too_late',
+        customerId,
+      };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw err;

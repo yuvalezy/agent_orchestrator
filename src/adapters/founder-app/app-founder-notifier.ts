@@ -141,9 +141,12 @@ export class AppFounderNotifier implements NotifierMirror {
    * noise. It lands in Activity, never the attention queue (no buttons), so it reads as an ack
    * rather than a new thing to act on. Best-effort by contract — a decision must resolve whether
    * or not its confirmation could be shown.
+   *
+   * `customerId`, when known, scopes the ack to that customer so it surfaces on their screen (and
+   * timeline) rather than only the global feed; null when the flow can't name a customer.
    */
-  async confirm(text: string): Promise<void> {
-    await this.record({ direction: 'out', kind: 'notification', body: text, severity: 'info' }, { push: false });
+  async confirm(text: string, customerId?: string | null): Promise<void> {
+    await this.record({ direction: 'out', kind: 'notification', body: text, severity: 'info', customerRef: customerId ?? null }, { push: false });
   }
 
   /** Persist, announce, and (unless suppressed) best-effort push. Storing must not fail on a

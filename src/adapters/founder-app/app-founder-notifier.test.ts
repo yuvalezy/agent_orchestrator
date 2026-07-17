@@ -83,15 +83,23 @@ test('notifyAdmin stores an out/notification row, publishes it, and pushes it', 
 
 test('confirm stores + publishes an info ack but does NOT push (the founder just acted)', async () => {
   const h = harness();
-  await h.notifier.confirm('✅ Scheduled action cancelled.');
+  await h.notifier.confirm('✅ Scheduled action cancelled.', 'cust-3');
   assert.equal(h.stored.length, 1);
   const row = h.stored[0];
   assert.equal(row.kind, 'notification');
   assert.equal(row.body, '✅ Scheduled action cancelled.');
   assert.equal(row.severity, 'info');
+  assert.equal(row.customerRef, 'cust-3'); // scoped to the customer's screen when known
   assert.equal(row.buttons, null); // never lands in the attention queue — it's an ack, not a task
   assert.deepEqual(h.published, h.stored); // re-emitted over SSE
   assert.equal(h.pushed.length, 0); // no push back to the device that just tapped
+});
+
+test('confirm with no customer stores an unscoped ack (lands in the global feed)', async () => {
+  const h = harness();
+  await h.notifier.confirm('This scheduled action was already handled.');
+  assert.equal(h.stored[0].customerRef, null);
+  assert.equal(h.pushed.length, 0);
 });
 
 test('FCM fans out for ALL severities, not just urgent (unlike web-push)', async () => {

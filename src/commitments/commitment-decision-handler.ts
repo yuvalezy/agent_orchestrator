@@ -30,8 +30,10 @@ export interface CommitmentDecisionDeps {
    * — the Telegram thread the card lives in, the app feed, or both — is the composition root's
    * call, decided from the DecisionEvent (a Telegram tap carries a threadId; an app tap does not).
    * A threadless tap used to get no confirmation at all; now the app mirror catches it.
+   * `customerId` (known only when a tap actually resolved an open commitment) scopes the app ack
+   * to that customer; null for an already-resolved or unknown id.
    */
-  confirm: (d: DecisionEvent, text: string) => Promise<void>;
+  confirm: (d: DecisionEvent, text: string, customerId: string | null) => Promise<void>;
   log: { info: (o: object, m: string) => void };
 }
 
@@ -51,7 +53,9 @@ export function buildCommitmentDecisionHandler(deps: CommitmentDecisionDeps): Co
         outcome.result === 'changed' ? (status === 'done' ? '✔ Marked done.' : '✖ Dismissed.')
         : outcome.result === 'already' ? 'That commitment was already resolved.'
         : 'That commitment is no longer available.';
-      await deps.confirm(d, text);
+      // The customer is on the record only when THIS tap resolved it ('changed'); an already-
+      // resolved or unknown id yields no row to read one from → unscoped.
+      await deps.confirm(d, text, outcome.result === 'changed' ? outcome.customerId : null);
     },
   };
 }
