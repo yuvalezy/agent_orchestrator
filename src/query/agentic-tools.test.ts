@@ -16,6 +16,8 @@ interface Spies {
   recentConversation: Array<{ id: string; limit: number }>;
   commitments: Array<string | null>;
   brief: string[];
+  contacts: string[];
+  meetings: Array<{ days: number; id: string | null }>;
   resolved: string[];
 }
 
@@ -28,6 +30,8 @@ function depsWithSpies(overrides: Partial<AgenticToolDeps> = {}): { deps: Agenti
     recentConversation: [],
     commitments: [],
     brief: [],
+    contacts: [],
+    meetings: [],
     resolved: [],
   };
   const deps: AgenticToolDeps = {
@@ -57,10 +61,17 @@ function depsWithSpies(overrides: Partial<AgenticToolDeps> = {}): { deps: Agenti
       spies.commitments.push(id);
       return [{ label: 'commit', content: 'x' }];
     },
-    upcomingMeetings: async () => [{ label: 'meeting', content: 'x' }],
+    upcomingMeetings: async (days, id) => {
+      spies.meetings.push({ days, id });
+      return [{ label: 'meeting', content: 'x' }];
+    },
     customerBrief: async (id) => {
       spies.brief.push(id);
       return [{ label: 'brief', content: 'x' }];
+    },
+    listContacts: async (id) => {
+      spies.contacts.push(id);
+      return [{ label: 'Shlomo (primary contact)', content: 'email: shlomo@acme.com' }];
     },
     listCustomers: async () => [{ label: 'Acme', content: 'Acme' }],
     resolveCustomer: async (name) => {
@@ -79,14 +90,23 @@ const CUSTOMER: QueryScope = { kind: 'customer', customerId: 'c-1', customerName
 const ALL: QueryScope = { kind: 'all' };
 const INTERNAL: QueryScope = { kind: 'internal' };
 
-test('customer scope: only the 5 customer-pinned tools, NO cross-customer / internal tools', () => {
+test('customer scope: only the customer-pinned tools, NO cross-customer / internal tools', () => {
   const { deps } = depsWithSpies();
   const tools = buildAgenticToolset(deps, CUSTOMER);
   assert.deepEqual(
     names(tools).sort(),
-    ['customer_brief', 'list_open_tasks', 'open_commitments', 'recent_conversation', 'search_memory'].sort(),
+    [
+      'customer_brief',
+      'list_contacts',
+      'list_open_tasks',
+      'open_commitments',
+      'recent_conversation',
+      'search_memory',
+      'upcoming_meetings',
+    ].sort(),
   );
-  for (const forbidden of ['search_internal_knowledge', 'pending_approvals', 'awaiting_reply', 'upcoming_meetings', 'list_customers']) {
+  // upcoming_meetings IS present in customer scope but pinned to this customer's contacts (see below).
+  for (const forbidden of ['search_internal_knowledge', 'pending_approvals', 'awaiting_reply', 'list_customers']) {
     assert.ok(!names(tools).includes(forbidden), `${forbidden} must be absent in customer scope`);
   }
 });
@@ -100,6 +120,8 @@ test('customer scope: every tool receives the PINNED customerId (never another i
   await byName(tools, 'recent_conversation').invoke({ limit: 4 });
   await byName(tools, 'open_commitments').invoke({ customer: 'SomeoneElse' }); // arg IGNORED
   await byName(tools, 'customer_brief').invoke({});
+  await byName(tools, 'list_contacts').invoke({ customer: 'SomeoneElse' }); // arg IGNORED
+  await byName(tools, 'upcoming_meetings').invoke({ days: 5 });
 
   assert.deepEqual(spies.searchCustomer, [{ q: 'pricing', k: 3, id: 'c-1' }]);
   assert.equal(spies.searchAll.length, 0, 'customer scope never calls the cross-customer search');
@@ -107,6 +129,8 @@ test('customer scope: every tool receives the PINNED customerId (never another i
   assert.deepEqual(spies.recentConversation, [{ id: 'c-1', limit: 4 }]);
   assert.deepEqual(spies.commitments, ['c-1']);
   assert.deepEqual(spies.brief, ['c-1']);
+  assert.deepEqual(spies.contacts, ['c-1'], 'list_contacts is pinned to the customer, not the model arg');
+  assert.deepEqual(spies.meetings, [{ days: 5, id: 'c-1' }], 'upcoming_meetings is pinned to the customer id');
   assert.equal(spies.resolved.length, 0, 'customer scope never resolves a name (the pin is absolute)');
 });
 
@@ -118,6 +142,7 @@ test('all scope: cross-customer tools present, search_internal_knowledge ABSENT'
     [
       'awaiting_reply',
       'customer_brief',
+      'list_contacts',
       'list_customers',
       'list_open_tasks',
       'open_commitments',
@@ -157,11 +182,30 @@ test('all scope: an unresolved customer name → unavailable (never a wrong cust
   assert.deepEqual(spies.resolved, ['Ghost']);
 });
 
-test('all scope: recent_conversation / customer_brief require a customer → unavailable without one', async () => {
+test('all scope: recent_conversation / customer_brief / list_contacts require a customer → unavailable without one', async () => {
   const { deps } = depsWithSpies();
   const tools = buildAgenticToolset(deps, ALL);
   assert.equal((await byName(tools, 'recent_conversation').invoke({})).kind, 'unavailable');
   assert.equal((await byName(tools, 'customer_brief').invoke({})).kind, 'unavailable');
+  assert.equal((await byName(tools, 'list_contacts').invoke({})).kind, 'unavailable');
+});
+
+test('all scope: list_contacts resolves a named customer; upcoming_meetings is global (null id)', async () => {
+  const { deps, spies } = depsWithSpies();
+  const tools = buildAgenticToolset(deps, ALL);
+
+  const contacts = await byName(tools, 'list_contacts').invoke({ customer: 'Acme' });
+  assert.equal(contacts.kind, 'sources');
+  assert.deepEqual(spies.contacts, ['c-acme'], 'resolved id passed to list_contacts');
+
+  await byName(tools, 'upcoming_meetings').invoke({ days: 3 });
+  assert.deepEqual(spies.meetings, [{ days: 3, id: null }], 'non-customer scope → global calendar, null id');
+});
+
+test('a null list_contacts dep reports unavailable (never throws)', async () => {
+  const { deps } = depsWithSpies({ listContacts: null });
+  const tools = buildAgenticToolset(deps, CUSTOMER);
+  assert.equal((await byName(tools, 'list_contacts').invoke({})).kind, 'unavailable');
 });
 
 test('internal scope: the all-scope toolset PLUS search_internal_knowledge', async () => {

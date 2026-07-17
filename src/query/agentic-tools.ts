@@ -7,8 +7,9 @@ import type { AgenticTool, AgenticToolResult, AgenticToolSource, AgenticToolset 
 // HERE and is the security boundary of this feature:
 //   • customer scope  → EVERY tool is pinned to scope.customerId; the model's own `customer` argument
 //                        is IGNORED, and the cross-customer / founder-global tools are NOT EXPOSED
-//                        (list_customers, pending_approvals, awaiting_reply, upcoming_meetings,
-//                        search_internal_knowledge). A customer-scoped query can never reach another
+//                        (list_customers, pending_approvals, awaiting_reply, search_internal_knowledge).
+//                        upcoming_meetings IS exposed but pinned — it surfaces only meetings matched to
+//                        THIS customer's contact emails. A customer-scoped query can never reach another
 //                        customer's data — the injected dep fns receive scope.customerId, nothing else.
 //   • all scope       → cross-customer allowed; a `customer` argument is RESOLVED by name to an id.
 //   • internal scope  → the 'all' toolset PLUS search_internal_knowledge (the founder-only Project
@@ -66,10 +67,13 @@ export interface AgenticToolDeps {
   awaitingReply: (() => Promise<AgenticToolSource[]>) | null;
   /** Open commitments — one customer (id) or, when null, all. */
   openCommitments: ((customerId: string | null) => Promise<AgenticToolSource[]>) | null;
-  /** Upcoming meetings within `days`; null when the calendar is off. */
-  upcomingMeetings: ((days: number) => Promise<AgenticToolSource[]>) | null;
+  /** Upcoming meetings within `days`. A non-null customerId scopes to that customer (matched
+   *  by the customer's contact emails); null = the founder-global calendar. Null dep = calendar off. */
+  upcomingMeetings: ((days: number, customerId: string | null) => Promise<AgenticToolSource[]>) | null;
   /** The relationship brief for a customer. */
   customerBrief: ((customerId: string) => Promise<AgenticToolSource[]>) | null;
+  /** The people on file at a customer (name + email/phone/whatsapp/telegram + primary flag). */
+  listContacts: ((customerId: string) => Promise<AgenticToolSource[]>) | null;
   /** Every customer (name + a one-line state). */
   listCustomers: (() => Promise<AgenticToolSource[]>) | null;
   /** Resolve a customer NAME → id (all / internal scope); null when not wired. */
@@ -229,6 +233,46 @@ export function buildAgenticToolset(deps: AgenticToolDeps, scope: QueryScope): A
     },
   });
 
+  // ── list_contacts (every scope; requires a customer) ─────────────────────────────────────────────
+  tools.push({
+    name: 'list_contacts',
+    description: pinned
+      ? "The people on file at this customer — name, email, phone, WhatsApp, Telegram, and who is the primary contact. Use this to find a person (e.g. before scheduling a call or drafting an email to them)."
+      : 'The people on file at a customer, by name — email, phone, WhatsApp, Telegram, and who is primary.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: pinned ? [] : ['customer'],
+      properties: pinned ? {} : { customer: { type: 'string', description: 'Customer name.' } },
+    },
+    invoke: async (input) => {
+      const resolved = await resolveScopedCustomer(deps, scope, input.customer);
+      if ('error' in resolved) return unavailable(resolved.error);
+      if (resolved.id === null) return unavailable('name a customer for list_contacts');
+      const id = resolved.id;
+      return guard(deps.listContacts ? () => deps.listContacts!(id) : null, 'contact reads unavailable');
+    },
+  });
+
+  // ── upcoming_meetings (every scope) — pinned to this customer's contacts in customer scope ────────
+  tools.push({
+    name: 'upcoming_meetings',
+    description: pinned
+      ? "Upcoming meetings with this customer on the founder's calendar (matched by the customer's contact emails)."
+      : "Upcoming meetings on the founder's calendar within the next few days.",
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: [],
+      properties: { days: { type: 'integer', description: `How many days ahead (1–${MAX_MEETING_DAYS}, default ${MAX_MEETING_DAYS}).` } },
+    },
+    invoke: async (input) => {
+      const days = clampLimit(input.days, MAX_MEETING_DAYS, MAX_MEETING_DAYS);
+      // pinnedId (customer scope) filters to this customer's meetings; null (all/internal) = global.
+      return guard(deps.upcomingMeetings ? () => deps.upcomingMeetings!(days, pinnedId) : null, 'calendar unavailable');
+    },
+  });
+
   // ── Cross-customer / founder-global tools: EXPOSED ONLY outside customer scope (isolation) ────────
   if (!pinned) {
     tools.push({
@@ -242,20 +286,6 @@ export function buildAgenticToolset(deps: AgenticToolDeps, scope: QueryScope): A
       description: 'Threads where the founder replied and the customer has gone silent (who + how long).',
       parameters: { type: 'object', additionalProperties: false, required: [], properties: {} },
       invoke: async () => guard(deps.awaitingReply, 'awaiting-reply reads unavailable'),
-    });
-    tools.push({
-      name: 'upcoming_meetings',
-      description: "Upcoming meetings on the founder's calendar within the next few days.",
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        required: [],
-        properties: { days: { type: 'integer', description: `How many days ahead (1–${MAX_MEETING_DAYS}, default ${MAX_MEETING_DAYS}).` } },
-      },
-      invoke: async (input) => {
-        const days = clampLimit(input.days, MAX_MEETING_DAYS, MAX_MEETING_DAYS);
-        return guard(deps.upcomingMeetings ? () => deps.upcomingMeetings!(days) : null, 'calendar unavailable');
-      },
     });
     tools.push({
       name: 'list_customers',

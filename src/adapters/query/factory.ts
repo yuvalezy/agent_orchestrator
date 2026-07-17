@@ -286,6 +286,21 @@ function buildAgenticToolDeps(input: AgenticToolDepsInput): AgenticToolDeps {
     }));
   };
 
+  /** The raw portal contact rows for a customer via its bound bpRef (empty when none). Shared by the
+   *  list_contacts tool and the customer-scoped upcoming_meetings filter (contact emails → matchEmails). */
+  const contactRowsForCustomer = async (customerId: string) => {
+    const config = await loadCustomerConfig(customerId);
+    if (!config?.bpRef) return [];
+    return taskTarget.listContacts(config.bpRef);
+  };
+
+  /** Lower-cased contact emails for a customer (deduped), used to match this customer's calendar events. */
+  const contactEmailsForCustomer = async (customerId: string): Promise<string[]> => {
+    const rows = await contactRowsForCustomer(customerId);
+    const emails = rows.map((c) => c.email).filter((e): e is string => !!e).map((e) => e.trim().toLowerCase());
+    return Array.from(new Set(emails));
+  };
+
   return {
     // customer + shared memory search, k-aware (hybrid when HYBRID_RETRIEVAL_ENABLED — WP4).
     searchCustomerMemory: async (queryText, k, customerId) => {
@@ -376,9 +391,14 @@ function buildAgenticToolDeps(input: AgenticToolDepsInput): AgenticToolDeps {
       });
     },
     upcomingMeetings: calendar
-      ? async (days) => {
-          const events = await calendar.listUpcomingEvents({ lookaheadDays: days, matchEmails: [], maxEvents: 20 });
-          return events.map((e) => ({
+      ? async (days, customerId) => {
+          // Customer scope: match this customer's contact emails and surface ONLY matched events; a
+          // customer with no email on file yields no matches (we cannot attribute a meeting to them).
+          // Founder-global (null): every upcoming event.
+          const matchEmails = customerId ? await contactEmailsForCustomer(customerId) : [];
+          const events = await calendar.listUpcomingEvents({ lookaheadDays: days, matchEmails, maxEvents: 20 });
+          const relevant = customerId ? events.filter((e) => e.matchedCustomer) : events;
+          return relevant.map((e) => ({
             label: `Meeting · ${new Date(e.startsAt).toISOString().slice(0, 16).replace('T', ' ')}`,
             content: `${e.title}${e.allDay ? ' (all day)' : ''}`,
           }));
@@ -387,6 +407,21 @@ function buildAgenticToolDeps(input: AgenticToolDepsInput): AgenticToolDeps {
     customerBrief: async (customerId) => {
       const brief = await getCustomerBrief(customerId);
       return brief ? [{ label: 'Relationship brief', content: brief }] : [];
+    },
+    listContacts: async (customerId) => {
+      const rows = await contactRowsForCustomer(customerId);
+      return rows.map((c) => ({
+        label: `${c.name}${c.isPrimary ? ' (primary contact)' : ''}`,
+        content:
+          [
+            c.email ? `email: ${c.email}` : null,
+            c.phone ? `phone: ${c.phone}` : null,
+            c.whatsapp ? `whatsapp: ${c.whatsapp}` : null,
+            c.telegram ? `telegram: ${c.telegram}` : null,
+          ]
+            .filter((x): x is string => !!x)
+            .join(' · ') || '(no contact channels on file)',
+      }));
     },
     listCustomers: async () => (await listCustomers()).map((c) => ({ label: c.customerName, content: c.customerName })),
     resolveCustomer: async (name) => input.findCustomerByName(name),
