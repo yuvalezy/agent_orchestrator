@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg';
 import { query, withClient } from '../../db';
+import { logger } from '../../logger';
 
 export interface Page<T> {
   data: T[];
@@ -363,6 +364,27 @@ async function audit(client: PoolClient, context: ConsoleAuditContext, action: s
      VALUES ($1, $2, $3, $4, $5, jsonb_build_object('before_status', $6::text, 'after_status', $7::text))`,
     [context.actor, action, entityType, entityId, context.requestId, before, after],
   );
+}
+
+/** Best-effort console audit row for a non-transactional action (post-success). Never throws — an
+ *  audit-insert failure must not fail the request whose side effect already committed. `metadata`
+ *  is stored as safe JSON (callers pass only opaque refs, never message bodies). */
+export async function auditConsoleAction(
+  context: ConsoleAuditContext,
+  action: string,
+  entityType: string,
+  entityId: string,
+  metadata: Record<string, unknown> = {},
+): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO console_audit_events (actor, action, entity_type, entity_id, request_id, safe_metadata)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+      [context.actor, action, entityType, entityId, context.requestId, JSON.stringify(metadata)],
+    );
+  } catch (err) {
+    logger.warn({ action, entityType, entityId, reason: (err as Error)?.message }, 'console audit insert failed (non-fatal)');
+  }
 }
 
 export async function requeueInbox(id: string, context: ConsoleAuditContext): Promise<MutationResult> {

@@ -20,6 +20,8 @@ import type { QueryService } from '../../query/query-service';
 import { listUrgencyInbox } from './console-urgency-repo';
 import { portalTaskUrl } from '../shared/portal-url';
 import { buildConsolePushRouter } from './console-push.router';
+import { buildConsoleOnboardingRouter } from './console-onboarding.router';
+import type { OnboardingService } from '../onboarding';
 import type { WebPushConfig } from '../../config/web-push';
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -73,6 +75,9 @@ export interface ConsoleRouterDeps {
   query?: QueryService | null;
   /** Optional web-push configuration. Private VAPID data stays server-side. */
   webPush?: WebPushConfig | null;
+  /** Customer onboarding + backfill (portal search, preview, onboard, backfill jobs). Absent in
+   *  isolated router tests that don't exercise the onboarding screen. */
+  onboarding?: OnboardingService;
 }
 
 function parseGuidanceBody(value: unknown): { scope: GuidanceScope; customerId: string | null; kind: GuidanceKind; fact: string } | null {
@@ -431,6 +436,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, de
   router.use('/api/push', buildConsolePushRouter(deps.webPush ?? null));
   router.use('/api/settings', buildConsoleSettingsRouter());
   router.use('/api/connectors', buildConsoleConnectorsRouter({ sessionSecret: config.sessionSecret }));
+  if (deps.onboarding) router.use('/api/onboarding', buildConsoleOnboardingRouter({ onboarding: deps.onboarding }));
 
   router.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
 

@@ -67,6 +67,13 @@ interface EzyProjectDetail {
   projectTypeId: string;
 }
 
+interface EzyProjectListItem {
+  id: string;
+  code: string;
+  name: string;
+  status: string;
+}
+
 interface EzyWorkItemType {
   id: string;
   name: string;
@@ -239,6 +246,19 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
       perPage: '50',
     });
     return res.data.map((bp) => ({ ref: bp.id, name: bp.name, code: bp.code }));
+  }
+
+  /** Search projects by code/name/description (console onboarding picker). Same list envelope as
+   *  the BP search: {data,…}. Refs are opaque UUIDs to core. */
+  async searchProjects(
+    q: string,
+  ): Promise<Array<{ ref: string; code: string; name: string; status: string }>> {
+    const res = await this.http.get<Paged<EzyProjectListItem>>('/api/projects/projects', {
+      search: q,
+      page: '1',
+      pageSize: '50',
+    });
+    return res.data.map((p) => ({ ref: p.id, code: p.code, name: p.name, status: p.status }));
   }
 
   async listContacts(ref: string): Promise<

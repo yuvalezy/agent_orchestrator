@@ -77,6 +77,7 @@ import { buildLlmRouter } from './adapters/llm/factory';
 import { buildCustomerAwareDocSource } from './adapters/knowledge/customer-sources';
 import { buildPortalTaskSource } from './adapters/knowledge/portal-task-source';
 import { buildEzyPortalGateway } from './adapters/ezy-portal/factory';
+import { buildOnboardingService } from './adapters/onboarding';
 import { listTaskInventoryCustomers } from './customers/task-inventory-customers';
 import { listCustomerDocSources } from './customers/customer-doc-sources';
 import { seedTaskFingerprints } from './knowledge/task-fingerprint-seed';
@@ -206,6 +207,9 @@ async function main(): Promise<void> {
       // console renders failures itself, so it intentionally has no Telegram alert.
       query: buildQueryEngineService(async () => {}),
       webPush: webPushNotifier ? webPushConfig : null,
+      // Customer onboarding + backfill screen: portal search/preview + the shared onboard/seed
+      // composition the CLI uses. Builds its own EZY gateway + Telegram notifier (same factories).
+      onboarding: buildOnboardingService(),
     });
     logger.info('founder console router mounted at /console');
   } else {

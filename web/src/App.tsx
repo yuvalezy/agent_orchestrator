@@ -1,6 +1,6 @@
 import { type FormEvent, type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, BarChart3, BookOpen, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, MessageSquareText, Plug, RefreshCw, Send, ShieldAlert, ShieldCheck, SlidersHorizontal, Smartphone, Users } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, CheckCircle2, CircleAlert, ClipboardList, LogOut, Menu, MessageSquareText, Plug, RefreshCw, Send, ShieldAlert, ShieldCheck, SlidersHorizontal, Smartphone, UserPlus, Users } from 'lucide-react';
 import QRCode from 'qrcode';
 import { api, type ApiError, setCsrfToken } from './lib/api';
 import { cn } from './lib/utils';
@@ -11,6 +11,7 @@ import { ConnectorsView } from './ConnectorsView';
 import { MemoryView } from './MemoryView';
 import { QueryView } from './QueryView';
 import { UrgencyInboxView } from './UrgencyInboxView';
+import { OnboardingView } from './OnboardingView';
 
 type Overview = {
   data: {
@@ -42,6 +43,7 @@ const nav = [
   ['urgency', 'Priority inbox', ShieldAlert],
   ['outbound', 'Outbound', Send],
   ['customers', 'Conversations', Users],
+  ['onboarding', 'Onboarding', UserPlus],
   ['decisions', 'Decisions', ShieldCheck],
   ['insights', 'Insights', BarChart3],
   ['memory', 'Memory', BookOpen],
@@ -157,7 +159,7 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">
       <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-zinc-800 bg-zinc-950/85 px-5 backdrop-blur"><button onClick={() => setMenuOpen(true)} className="md:hidden"><Menu /></button><div className="text-sm text-zinc-400">Founder-only · Tailscale protected</div><button onClick={() => client.invalidateQueries()} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900 hover:text-white" title="Refresh"><RefreshCw size={17} /></button></header>
-      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'urgency' && <UrgencyInboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'memory' && <MemoryView />}{view === 'query' && <QueryView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
+      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'urgency' && <UrgencyInboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'onboarding' && <OnboardingView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'memory' && <MemoryView />}{view === 'query' && <QueryView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
     </main>
   </div>;
 }
