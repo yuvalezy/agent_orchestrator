@@ -12,8 +12,10 @@
  * (getToken needs it); the worker only has to render what arrives, which is
  * ~15 lines. See the commit message for the three separate bugs the SDK-in-worker
  * arrangement cost us. */
-const CACHE = 'ao-founder-shell-v3';
-const SHELL = ['/app/', '/app/index.html', '/app/offline.html', '/app/manifest.webmanifest', '/app/icon.svg'];
+const CACHE = 'ao-founder-shell-v4';
+// icon-192.png is precached because a notification must render while offline, and
+// Android will not rasterize an SVG for a notification icon.
+const SHELL = ['/app/', '/app/index.html', '/app/offline.html', '/app/manifest.webmanifest', '/app/icon.svg', '/app/icon-192.png'];
 
 // ── Background push ───────────────────────────────────────────────────────────────────
 /** Does the founder currently have the APP itself on screen? */
@@ -44,8 +46,10 @@ self.addEventListener('push', (event) => {
       body: data.body || 'New update from your assistant.',
       tag: data.tag || 'ao-founder',
       renotify: false,
-      icon: '/app/icon.svg',
-      badge: '/app/icon.svg',
+      // PNG, not the SVG: Android silently falls back to a generic bell rather than
+      // rasterize an SVG here, so the notification would arrive unbranded.
+      icon: '/app/icon-192.png',
+      badge: '/app/icon-192.png',
       // A founder-attention alert that auto-dismisses while they are away is an alert
       // they never got; Telegram's would still be waiting for them.
       requireInteraction: data.severity === 'warning',
