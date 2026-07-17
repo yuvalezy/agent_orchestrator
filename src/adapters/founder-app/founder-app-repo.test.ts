@@ -4,9 +4,14 @@ import { after, test } from 'node:test';
 import { closePool, query } from '../../db';
 import {
   dismissMessage,
+  getOrCreateChatSession,
   getMessage,
+  insertChatExchange,
   insertMessage,
+  listChatMessages,
+  listRecentChatTurns,
   planDismiss,
+  resetChatSession,
   type FeedMessage,
   type InsertMessageInput,
 } from './founder-app-repo';
@@ -55,11 +60,12 @@ test('an unknown message is a refusal the router can turn into a 404', () => {
 // ── SQL-backed (skips until 043 is applied to the target database) ──────────────────────────
 
 const created: string[] = [];
+const chatScopes: string[] = [];
 
 async function migrated(): Promise<boolean> {
   const res = await query(
     `SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'founder_app_messages' AND column_name = 'dismissed_at'`,
+      WHERE table_name = 'founder_app_messages' AND column_name = 'conversation_relation'`,
   ).catch(() => null);
   return Boolean(res?.rows[0]);
 }
@@ -79,6 +85,9 @@ async function seed(input: Partial<InsertMessageInput> & { notificationRef?: str
 after(async () => {
   if (created.length > 0) {
     await query('DELETE FROM founder_app_messages WHERE id = ANY($1::uuid[])', [created]).catch(() => {});
+  }
+  if (chatScopes.length > 0) {
+    await query('DELETE FROM founder_app_chat_sessions WHERE scope_key = ANY($1::text[])', [chatScopes]).catch(() => {});
   }
   await closePool();
 });
@@ -136,4 +145,39 @@ test('the url and origin context survive a round-trip through the feed', async (
   const reloaded = await getMessage(row.id);
   assert.equal(reloaded?.linkUrl, linkUrl);
   assert.deepEqual(reloaded?.context, context);
+});
+
+test('chat sessions persist scoped context, stop at a new-topic boundary, and reset without deleting audit rows', async (t) => {
+  if (!(await migrated())) return t.skip('migration 044 not applied to this database');
+  const customerRef = crypto.randomUUID();
+  const scopeKey = `customer:${customerRef}`;
+  chatScopes.push(scopeKey);
+
+  const session = await getOrCreateChatSession(customerRef);
+  const first = await insertChatExchange({
+    sessionId: session.id, customerRef, question: 'Old topic', answer: 'Old answer', relation: 'new_topic',
+  });
+  const second = await insertChatExchange({
+    sessionId: session.id, customerRef, question: 'Fresh topic', answer: 'Fresh answer', relation: 'new_topic',
+  });
+  const third = await insertChatExchange({
+    sessionId: session.id, customerRef, question: 'What about it?', answer: 'Follow-up answer', relation: 'follow_up',
+  });
+  created.push(...first.map((row) => row.id), ...second.map((row) => row.id), ...third.map((row) => row.id));
+
+  assert.deepEqual(await listRecentChatTurns(session.id), [
+    { role: 'user', content: 'Fresh topic' },
+    { role: 'assistant', content: 'Fresh answer' },
+    { role: 'user', content: 'What about it?' },
+    { role: 'assistant', content: 'Follow-up answer' },
+  ]);
+  const page = await listChatMessages(session.id, { limit: 10 });
+  assert.deepEqual(page.data.map((row) => row.body), [
+    'Follow-up answer', 'What about it?', 'Fresh answer', 'Fresh topic', 'Old answer', 'Old topic',
+  ]);
+
+  const reset = await resetChatSession(customerRef);
+  assert.notEqual(reset.id, session.id);
+  assert.deepEqual((await listChatMessages(reset.id, { limit: 10 })).data, []);
+  assert.equal((await listChatMessages(session.id, { limit: 10 })).data.length, 6, 'reset retains the ended session as audit');
 });

@@ -48,6 +48,11 @@ import {
   dismissMessage,
   markDecidedByRef,
   listPushDevices,
+  getOrCreateChatSession,
+  resetChatSession,
+  listChatMessages,
+  listRecentChatTurns,
+  insertChatExchange,
 } from './adapters/founder-app/founder-app-repo';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
@@ -229,7 +234,12 @@ async function main(): Promise<void> {
       consoleConfig,
       existsSync(path.join(packagedAppAssets, 'index.html')) ? packagedAppAssets : devAppAssets,
       {
-        repo: { createDevice, touchDeviceByTokenHash, revokeDeviceByTokenHash, setDeviceFcmToken, unregisterDevicePush, insertMessage, listMessages, getMessage, dismissMessage },
+        repo: {
+          createDevice, touchDeviceByTokenHash, revokeDeviceByTokenHash, setDeviceFcmToken,
+          unregisterDevicePush, insertMessage, listMessages, getMessage, dismissMessage,
+          getOrCreateChatSession, resetChatSession, listChatMessages, listRecentChatTurns,
+          insertChatExchange,
+        },
         feed,
         // Same isolated founder query engine the console + Telegram /ask use (internal + customer scope).
         query: buildQueryEngineService(async () => {}),

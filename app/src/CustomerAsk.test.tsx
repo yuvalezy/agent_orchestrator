@@ -10,13 +10,17 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('CustomerAsk', () => {
   it('posts {text, customerId} and threads the optimistic question with the scoped answer', async () => {
-    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => jsonResponse({ data: [
-      { id: 'in-1', direction: 'in', kind: 'chat', title: null, body: 'What did Acme last order?', severity: null, customerRef: 'cust-7', notificationRef: null, buttons: null, decidedOptionId: null, createdAt: '2026-07-16T10:00:01.000Z' },
-      { id: 'out-1', direction: 'out', kind: 'chat', title: null, body: 'Two pallets of widgets on Jul 2.', severity: null, customerRef: 'cust-7', notificationRef: null, buttons: null, decidedOptionId: null, createdAt: '2026-07-16T10:00:02.000Z' },
-    ] }));
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (!init?.method) return jsonResponse({ data: [], nextCursor: null, conversationId: 'session-1' });
+      return jsonResponse({ conversationId: 'session-1', data: [
+        { id: 'in-1', direction: 'in', kind: 'chat', title: null, body: 'What did Acme last order?', severity: null, customerRef: 'cust-7', notificationRef: null, buttons: null, decidedOptionId: null, createdAt: '2026-07-16T10:00:01.000Z' },
+        { id: 'out-1', direction: 'out', kind: 'chat', title: null, body: 'Two pallets of widgets on Jul 2.', severity: null, customerRef: 'cust-7', notificationRef: null, buttons: null, decidedOptionId: null, createdAt: '2026-07-16T10:00:02.000Z' },
+      ] });
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     render(<CustomerAsk customerId="cust-7" />);
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled());
     fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'What did Acme last order?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send' }));
 
@@ -25,8 +29,25 @@ describe('CustomerAsk', () => {
     // Scoped answer arrives.
     await waitFor(() => expect(screen.getByText('Two pallets of widgets on Jul 2.')).toBeInTheDocument());
 
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls.find((call) => (call[1] as RequestInit | undefined)?.method === 'POST')!;
     expect(url).toBe('/app/api/messages');
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({ text: 'What did Acme last order?', customerId: 'cust-7' });
+  });
+
+  it('loads persisted scoped history and New chat clears it only after reset succeeds', async () => {
+    const prior = { id: 'out-old', direction: 'out', kind: 'chat', title: null, body: 'Prior answer', severity: null, customerRef: 'cust-7', notificationRef: null, buttons: null, decidedOptionId: null, createdAt: '2026-07-16T09:00:00.000Z' };
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/chat/reset') && init?.method === 'POST') return jsonResponse({ data: { conversationId: 'session-2' } });
+      return jsonResponse({ data: [prior], nextCursor: null, conversationId: 'session-1' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<CustomerAsk customerId="cust-7" />);
+    await waitFor(() => expect(screen.getByText('Prior answer')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+    await waitFor(() => expect(screen.queryByText('Prior answer')).not.toBeInTheDocument());
+
+    const reset = fetchMock.mock.calls.find((call) => String(call[0]).endsWith('/chat/reset'))!;
+    expect(JSON.parse((reset[1] as RequestInit).body as string)).toEqual({ customerId: 'cust-7' });
   });
 });

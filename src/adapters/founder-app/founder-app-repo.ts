@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { query } from '../../db';
+import { query, withClient } from '../../db';
 
 // DB access for the AO Founder PWA (M6). Devices (migration 037) + the message feed
 // (migration 038). No message content is ever logged from here — the router/notifier
@@ -42,7 +42,24 @@ export interface FeedMessage {
   context?: MessageContext | null;
   /** When the founder acknowledged the card on the app surface; null while it still needs a look. */
   dismissedAt?: string | null;
+  /** Durable visible chat thread. Null for notifications/questions and pre-044 rows. */
+  chatSessionId?: string | null;
+  /** Automatic topic decision on founder turns; assistant rows carry null. */
+  conversationRelation?: ConversationRelation | null;
   createdAt: string;
+}
+
+export type ConversationRelation = 'new_topic' | 'follow_up' | 'unresolved';
+
+/** A bounded founder/assistant turn passed to conversational query resolution. */
+export interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatSession {
+  id: string;
+  customerRef: string | null;
 }
 
 export interface InsertMessageInput {
@@ -56,6 +73,8 @@ export interface InsertMessageInput {
   buttons?: Array<{ id: string; label: string }> | null;
   linkUrl?: string | null;
   context?: MessageContext | null;
+  chatSessionId?: string | null;
+  conversationRelation?: ConversationRelation | null;
 }
 
 /** SHA-256 of the opaque device token — the ONLY form stored (037). */
@@ -157,7 +176,7 @@ export async function listPushDevices(): Promise<FounderAppDevice[]> {
 }
 
 const MESSAGE_COLUMNS =
-  'id, direction, kind, title, body, severity, customer_ref, notification_ref, buttons, decided_option_id, link_url, context, dismissed_at, created_at';
+  'id, direction, kind, title, body, severity, customer_ref, notification_ref, buttons, decided_option_id, link_url, context, dismissed_at, chat_session_id, conversation_relation, created_at';
 
 /** pg hands back a Date for timestamptz but the wire format is a plain ISO string. */
 function toIso(value: Date | string): string {
@@ -178,6 +197,8 @@ function mapMessage(row: {
   link_url: string | null;
   context: MessageContext | null;
   dismissed_at: Date | string | null;
+  chat_session_id: string | null;
+  conversation_relation: ConversationRelation | null;
   created_at: Date | string;
 }): FeedMessage {
   return {
@@ -194,6 +215,8 @@ function mapMessage(row: {
     linkUrl: row.link_url,
     context: row.context,
     dismissedAt: row.dismissed_at ? toIso(row.dismissed_at) : null,
+    chatSessionId: row.chat_session_id,
+    conversationRelation: row.conversation_relation,
     createdAt: toIso(row.created_at),
   };
 }
@@ -204,8 +227,8 @@ type MessageRow = Parameters<typeof mapMessage>[0];
 export async function insertMessage(input: InsertMessageInput): Promise<FeedMessage> {
   const { rows } = await query<MessageRow>(
     `INSERT INTO founder_app_messages
-       (direction, kind, title, body, severity, customer_ref, notification_ref, buttons, link_url, context)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb)
+       (direction, kind, title, body, severity, customer_ref, notification_ref, buttons, link_url, context, chat_session_id, conversation_relation)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11, $12)
      RETURNING ${MESSAGE_COLUMNS}`,
     [
       input.direction,
@@ -218,15 +241,177 @@ export async function insertMessage(input: InsertMessageInput): Promise<FeedMess
       input.buttons ? JSON.stringify(input.buttons) : null,
       input.linkUrl ?? null,
       input.context ? JSON.stringify(input.context) : null,
+      input.chatSessionId ?? null,
+      input.conversationRelation ?? null,
     ],
   );
   return mapMessage(rows[0]);
+}
+
+function chatScopeKey(customerRef: string | null): string {
+  return customerRef ? `customer:${customerRef}` : 'internal';
+}
+
+/** Resolve the one active visible chat for a scope, creating it on first use. The
+ * advisory transaction lock makes first-use and reset races deterministic across
+ * processes, not merely within one Node instance. */
+export async function getOrCreateChatSession(customerRef: string | null): Promise<ChatSession> {
+  const scopeKey = chatScopeKey(customerRef);
+  return withClient(async (client) => {
+    await client.query('BEGIN');
+    try {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [scopeKey]);
+      await client.query(
+        `INSERT INTO founder_app_chat_sessions (scope_key, customer_ref)
+         VALUES ($1, $2)
+         ON CONFLICT (scope_key) WHERE ended_at IS NULL DO NOTHING`,
+        [scopeKey, customerRef],
+      );
+      const { rows } = await client.query<{ id: string; customer_ref: string | null }>(
+        `SELECT id, customer_ref
+           FROM founder_app_chat_sessions
+          WHERE scope_key = $1 AND ended_at IS NULL`,
+        [scopeKey],
+      );
+      if (!rows[0]) throw new Error('active chat session was not created');
+      await client.query('COMMIT');
+      return { id: rows[0].id, customerRef: rows[0].customer_ref };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
+/** End the current visible thread and atomically replace it with an empty one. Old
+ * rows stay attached to the ended session for the Activity audit stream. */
+export async function resetChatSession(customerRef: string | null): Promise<ChatSession> {
+  const scopeKey = chatScopeKey(customerRef);
+  return withClient(async (client) => {
+    await client.query('BEGIN');
+    try {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [scopeKey]);
+      await client.query(
+        `UPDATE founder_app_chat_sessions
+            SET ended_at = now()
+          WHERE scope_key = $1 AND ended_at IS NULL`,
+        [scopeKey],
+      );
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO founder_app_chat_sessions (scope_key, customer_ref)
+         VALUES ($1, $2)
+         RETURNING id`,
+        [scopeKey, customerRef],
+      );
+      await client.query('COMMIT');
+      return { id: rows[0].id, customerRef };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
+/** Recent context in chronological order. A classifier-confirmed new-topic founder
+ * turn is a hard semantic boundary; legacy/unresolved rows remain available until a
+ * later turn establishes one. */
+export async function listRecentChatTurns(sessionId: string, limit = 12): Promise<ChatTurn[]> {
+  const { rows } = await query<MessageRow>(
+    `SELECT ${MESSAGE_COLUMNS}
+       FROM founder_app_messages
+      WHERE chat_session_id = $1 AND kind = 'chat'
+      ORDER BY created_at DESC, id DESC
+      LIMIT $2`,
+    [sessionId, limit],
+  );
+  const chronological = rows.reverse();
+  let boundary = -1;
+  for (let i = 0; i < chronological.length; i += 1) {
+    if (chronological[i].direction === 'in' && chronological[i].conversation_relation === 'new_topic') boundary = i;
+  }
+  return chronological.slice(boundary >= 0 ? boundary : 0).map((row) => ({
+    role: row.direction === 'in' ? 'user' : 'assistant',
+    content: row.body,
+  }));
+}
+
+/** Persist one successful chat exchange as a unit: callers never expose a founder
+ * turn without its answer, or an answer without the turn it answered. */
+export async function insertChatExchange(input: {
+  sessionId: string;
+  customerRef: string | null;
+  question: string;
+  answer: string;
+  relation: ConversationRelation;
+}): Promise<[FeedMessage, FeedMessage]> {
+  return withClient(async (client) => {
+    await client.query('BEGIN');
+    try {
+      const session = await client.query(
+        `SELECT 1
+           FROM founder_app_chat_sessions
+          WHERE id = $1 AND customer_ref IS NOT DISTINCT FROM $2
+          FOR SHARE`,
+        [input.sessionId, input.customerRef],
+      );
+      if (!session.rows[0]) throw new Error('chat session scope mismatch');
+      const { rows } = await client.query<MessageRow>(
+        `INSERT INTO founder_app_messages
+           (direction, kind, body, customer_ref, chat_session_id, conversation_relation, created_at)
+         VALUES
+           ('in',  'chat', $3, $2, $1, $5, clock_timestamp()),
+           ('out', 'chat', $4, $2, $1, NULL, clock_timestamp() + interval '1 millisecond')
+         RETURNING ${MESSAGE_COLUMNS}`,
+        [input.sessionId, input.customerRef, input.question, input.answer, input.relation],
+      );
+      if (rows.length !== 2) throw new Error('chat exchange insert was incomplete');
+      const mapped = rows.map(mapMessage);
+      const inbound = mapped.find((row) => row.direction === 'in');
+      const outbound = mapped.find((row) => row.direction === 'out');
+      if (!inbound || !outbound) throw new Error('chat exchange directions were invalid');
+      await client.query('COMMIT');
+      return [inbound, outbound];
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  });
 }
 
 export interface MessagePage {
   data: FeedMessage[];
   /** Opaque cursor for the next OLDER page (pass back as `before`); null when exhausted. */
   nextCursor: string | null;
+}
+
+/** A newest-first page from one durable visible chat session. */
+export async function listChatMessages(
+  sessionId: string,
+  opts: { before?: string | null; beforeId?: string | null; limit: number },
+): Promise<MessagePage> {
+  const params: unknown[] = [sessionId];
+  let cursor = '';
+  if (opts.before && opts.beforeId) {
+    params.push(opts.before, opts.beforeId);
+    cursor = `AND (created_at, id) < ($2::timestamptz, $3::uuid)`;
+  } else if (opts.before) {
+    params.push(opts.before);
+    cursor = `AND created_at < $2::timestamptz`;
+  }
+  params.push(opts.limit + 1);
+  const { rows } = await query<MessageRow>(
+    `SELECT ${MESSAGE_COLUMNS}
+       FROM founder_app_messages
+      WHERE chat_session_id = $1 AND kind = 'chat'
+      ${cursor}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${params.length}`,
+    params,
+  );
+  const page = rows.slice(0, opts.limit).map(mapMessage);
+  const hasMore = rows.length > opts.limit;
+  const last = page[page.length - 1];
+  return { data: page, nextCursor: hasMore && last ? encodeCursor(last.createdAt, last.id) : null };
 }
 
 /**

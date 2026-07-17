@@ -38,6 +38,10 @@ export interface Message {
  *  value to request the next (older) page, or null when the feed is exhausted. */
 export interface MessagePage { data: Message[]; nextCursor: string | null }
 
+/** Current durable chat session. Rows are newest-first on the wire, matching MessagePage. */
+export interface ChatPage extends MessagePage { conversationId: string }
+export interface ChatPost { data: Message[]; conversationId: string }
+
 /** GET /app/api/config — Firebase is null when push is not configured server-side. */
 export interface AppConfig {
   firebase: FirebaseWebConfig | null;

@@ -10,7 +10,7 @@ import { FounderAppFeed } from './founder-app-feed';
 import { AppFounderNotifier } from './app-founder-notifier';
 import { buildFounderAppRouter, type FounderAppCockpitReads, type FounderAppDeps, type FounderAppRepo } from './founder-app.router';
 import { encodeCursor, hashDeviceToken, type FeedMessage, type InsertMessageInput } from './founder-app-repo';
-import type { QueryService } from '../../query/query-service';
+import type { ConversationalQueryService } from '../../query/conversational-query-service';
 import type { DecisionEvent } from '../../ports/founder-notifier.port';
 
 const PASSWORD = 'correct horse battery staple';
@@ -24,6 +24,7 @@ function makeRepo(): FounderAppRepo & {
 } {
   const devices = new Map<string, DeviceRow>();
   const messages: FeedMessage[] = [];
+  const activeChats = new Map<string, string>();
   let seq = 0;
   const insert = (input: InsertMessageInput): FeedMessage => {
     seq += 1;
@@ -41,6 +42,8 @@ function makeRepo(): FounderAppRepo & {
       linkUrl: input.linkUrl ?? null,
       context: input.context ?? null,
       dismissedAt: null,
+      chatSessionId: input.chatSessionId ?? null,
+      conversationRelation: input.conversationRelation ?? null,
       // Deterministic, monotonically increasing timestamps for stable keyset paging.
       createdAt: new Date(1_700_000_000_000 + seq).toISOString(),
     };
@@ -86,6 +89,37 @@ function makeRepo(): FounderAppRepo & {
       for (const m of affected) m.dismissedAt = new Date(1_700_000_000_000).toISOString();
       return { ok: true, rows: affected };
     },
+    getOrCreateChatSession: async (customerRef) => {
+      const key = customerRef ? `customer:${customerRef}` : 'internal';
+      let id = activeChats.get(key);
+      if (!id) { id = crypto.randomUUID(); activeChats.set(key, id); }
+      return { id, customerRef };
+    },
+    resetChatSession: async (customerRef) => {
+      const key = customerRef ? `customer:${customerRef}` : 'internal';
+      const id = crypto.randomUUID();
+      activeChats.set(key, id);
+      return { id, customerRef };
+    },
+    listChatMessages: async (sessionId, { before, beforeId, limit }) => {
+      let rows = messages.filter((m) => m.kind === 'chat' && m.chatSessionId === sessionId)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+      if (before) rows = rows.filter((r) => r.createdAt < before || (r.createdAt === before && !!beforeId && r.id < beforeId));
+      const page = rows.slice(0, limit);
+      const last = page[page.length - 1];
+      return { data: page, nextCursor: rows.length > limit && last ? encodeCursor(last.createdAt, last.id) : null };
+    },
+    listRecentChatTurns: async (sessionId, limit = 12) => {
+      const rows = messages.filter((m) => m.kind === 'chat' && m.chatSessionId === sessionId)
+        .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)).slice(-limit);
+      let boundary = -1;
+      rows.forEach((row, i) => { if (row.direction === 'in' && row.conversationRelation === 'new_topic') boundary = i; });
+      return rows.slice(boundary >= 0 ? boundary : 0).map((row) => ({ role: row.direction === 'in' ? 'user' as const : 'assistant' as const, content: row.body }));
+    },
+    insertChatExchange: async ({ sessionId, customerRef, question, answer, relation }) => [
+      insert({ direction: 'in', kind: 'chat', body: question, customerRef, chatSessionId: sessionId, conversationRelation: relation }),
+      insert({ direction: 'out', kind: 'chat', body: answer, customerRef, chatSessionId: sessionId }),
+    ],
     // Mirror of the real markDecidedByRef: first-writer-wins over every buttoned row
     // sharing the ref; returns the rows it actually decided.
     markDecidedByRef: async (notificationRef, optionId) => {
@@ -104,8 +138,12 @@ async function config(env: NodeJS.ProcessEnv = {}): Promise<ConsoleConfig> {
   return cfg;
 }
 
-const stubQuery: QueryService = {
+const stubQuery: ConversationalQueryService = {
   answer: async (question, opts) => ({ scope: opts?.customer ? { kind: 'customer', customerId: opts.customer.customerId, customerName: opts.customer.customerName } : { kind: 'internal' }, answer: `answered: ${question}`, citations: [] }),
+  answerTurn: async (question, _history, opts) => ({
+    result: { scope: opts?.customer ? { kind: 'customer', customerId: opts.customer.customerId, customerName: opts.customer.customerName } : { kind: 'internal' }, answer: `answered: ${question}`, citations: [] },
+    relation: 'new_topic',
+  }),
 };
 
 function defaultCockpit(): FounderAppCockpitReads {
@@ -221,6 +259,51 @@ test('POST /messages stores the founder turn, routes it through the query engine
     assert.deepEqual([body.data[0].direction, body.data[0].kind, body.data[0].body], ['in', 'chat', 'what is the SLA?']);
     assert.deepEqual([body.data[1].direction, body.data[1].kind, body.data[1].body], ['out', 'chat', 'answered: what is the SLA?']);
     assert.equal(repo.messages.length, 2);
+  });
+});
+
+test('a second chat turn receives the first exchange as chronological context', async () => {
+  const histories: Array<Array<{ role: string; content: string }>> = [];
+  const query: ConversationalQueryService = {
+    answer: stubQuery.answer,
+    answerTurn: async (question, history) => {
+      histories.push(history);
+      return { result: { scope: { kind: 'internal' }, answer: `reply:${question}`, citations: [] }, relation: history.length ? 'follow_up' : 'new_topic' };
+    },
+  };
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const post = (text: string) => fetch(`${baseUrl}/app/api/messages`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ text }),
+    });
+    assert.equal((await post('Draft the reply.')).status, 201);
+    assert.equal((await post('Make it shorter.')).status, 201);
+    assert.deepEqual(histories, [[], [
+      { role: 'user', content: 'Draft the reply.' },
+      { role: 'assistant', content: 'reply:Draft the reply.' },
+    ]]);
+  }, { deps: { query } });
+});
+
+test('GET /chat persists the active thread and New chat rotates to an empty session', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    await fetch(`${baseUrl}/app/api/messages`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ text: 'Remember this.' }),
+    });
+    const before = await (await fetch(`${baseUrl}/app/api/chat`, { headers: { cookie } })).json() as { data: FeedMessage[]; conversationId: string };
+    assert.deepEqual(before.data.map((row) => row.body), ['answered: Remember this.', 'Remember this.']);
+
+    const reset = await fetch(`${baseUrl}/app/api/chat/reset`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(reset.status, 201);
+    const nextId = (await reset.json() as { data: { conversationId: string } }).data.conversationId;
+    assert.notEqual(nextId, before.conversationId);
+
+    const after = await (await fetch(`${baseUrl}/app/api/chat`, { headers: { cookie } })).json() as { data: FeedMessage[]; conversationId: string };
+    assert.equal(after.conversationId, nextId);
+    assert.deepEqual(after.data, []);
   });
 });
 

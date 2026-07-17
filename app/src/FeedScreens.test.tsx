@@ -24,6 +24,11 @@ function stubFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     const path = url.split('?')[0];
     if (path === '/app/api/messages') return new Response(JSON.stringify({ data: FEED, nextCursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (path === '/app/api/chat') return new Response(JSON.stringify({
+      data: FEED.filter((message) => message.kind === 'chat' && !message.customerRef),
+      nextCursor: null,
+      conversationId: 'internal-session',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (path === '/app/api/attention') return new Response(JSON.stringify({ decisions: [], urgency: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     throw new Error(`unexpected fetch: ${path}`);
   }));

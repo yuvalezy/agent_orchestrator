@@ -193,6 +193,31 @@ export interface AnswerResult {
   usedSourceIndexes: number[];
 }
 
+/** Prior Founder PWA chat supplied only to resolve what the current turn refers to.
+ * It is never promoted to a knowledge source for the grounded answer. */
+export interface ConversationTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface ConversationContextRequest {
+  history: ConversationTurn[];
+  current: string;
+}
+
+export interface ConversationContextResult {
+  relation: 'new_topic' | 'follow_up';
+  /** A self-contained retrieval question. Ignored when relation is new_topic. */
+  standaloneQuestion: string;
+}
+
+/** Resolve elliptical follow-ups before retrieval. This classifier may reuse prior
+ * words but cannot make those words evidence; the query engine still grounds the
+ * final answer exclusively in its normal isolated corpus. */
+export interface ConversationContextPort {
+  resolveConversationContext(input: ConversationContextRequest, customerId?: string | null): Promise<ConversationContextResult>;
+}
+
 export interface ScheduleInterpretRequest {
   commandText: string;
   repliedText?: string | null;

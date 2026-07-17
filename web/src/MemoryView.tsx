@@ -2,6 +2,7 @@ import { type FormEvent, type ReactElement, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BookOpen, Brain, CircleAlert, Plus, RotateCcw, Search, ShieldCheck, X } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
+import { DetailValue } from './lib/copyable';
 
 type Row = Record<string, unknown>;
 type Page = { data: Row[]; nextCursor: string | null };
@@ -40,7 +41,7 @@ function GuidanceForm({ customerId, initial, submitLabel, pending, error, onSubm
 }
 
 function Detail({ title, row, loading, error, children }: { title: string; row?: Row; loading: boolean; error: Error | null; children?: ReactElement }): ReactElement {
-  return <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5"><h2 className="font-semibold">{title}</h2>{loading && <p className="mt-4 text-sm text-zinc-400">Loading selected record…</p>}{error && <p className="mt-4 text-sm text-red-300">{error.message}</p>}{!loading && !error && !row && <p className="mt-4 text-sm text-zinc-500">Select a record to inspect its stored content.</p>}{row && <div className="mt-4 space-y-4 text-sm">{Object.entries(row).map(([key, value]) => <div key={key}><p className="text-xs font-medium uppercase tracking-wide text-zinc-500">{key.replaceAll('_', ' ')}</p><pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 text-xs text-zinc-300">{typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '—')}</pre></div>)}{children && <div className="border-t border-zinc-800 pt-4">{children}</div>}</div>}</section>;
+  return <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5"><h2 className="font-semibold">{title}</h2>{loading && <p className="mt-4 text-sm text-zinc-400">Loading selected record…</p>}{error && <p className="mt-4 text-sm text-red-300">{error.message}</p>}{!loading && !error && !row && <p className="mt-4 text-sm text-zinc-500">Select a record to inspect its stored content.</p>}{row && <div className="mt-4 space-y-4 text-sm">{Object.entries(row).map(([key, value]) => <div key={key}><p className="text-xs font-medium uppercase tracking-wide text-zinc-500">{key.replaceAll('_', ' ')}</p><DetailValue value={value} /></div>)}{children && <div className="border-t border-zinc-800 pt-4">{children}</div>}</div>}</section>;
 }
 
 function CustomerMemory(): ReactElement {

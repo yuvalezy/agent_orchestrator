@@ -8,6 +8,7 @@ import { buildInternalKnowledgeSearch } from '../../knowledge/internal-search';
 import { buildScopeResolver, type QueryScope, type ResolvedCustomer } from '../../query/scope';
 import { buildQueryService, type QueryCitation, type QueryService } from '../../query/query-service';
 import { buildAgenticQueryService } from '../../query/agentic-query-service';
+import { buildConversationalQueryService, type ConversationalQueryService } from '../../query/conversational-query-service';
 import { buildAgenticToolset, type AgenticToolDeps, type AgenticToolSource } from '../../query/agentic-tools';
 import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
 import { buildLlmRouter } from '../llm/factory';
@@ -95,7 +96,7 @@ async function listCustomers(): Promise<Array<{ customerId: string; customerName
  * the key is unset (it resolves lazily; a query then surfaces the failure — founder
  * tool). `notifyAdmin` feeds the LLM router's failover/cap notices.
  */
-export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<void>): QueryService | null {
+export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<void>): ConversationalQueryService | null {
   if (!env.QUERY_ENGINE_ENABLED) {
     logger.info('founder query engine NOT wired (QUERY_ENGINE_ENABLED=false) — /ask is dormant');
     return null;
@@ -227,21 +228,24 @@ export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<vo
   // WP8: when the agentic loop is off, the single-shot engine above IS the query engine (byte-
   // identical to before this feature). When on, DECORATE it — the loop tries first and falls back
   // to `service` on unavailable/failure — so the single-shot path stays the default and fallback.
+  let baseService: QueryService = service;
   if (!env.QUERY_AGENTIC_ENABLED) {
     logger.info('founder query engine wired (QUERY_ENGINE_ENABLED=true) — single-shot /ask + free-text');
-    return service;
+  } else {
+    const toolDeps = buildAgenticToolDeps({ embedQuestion, retrieveAllCustomers, internalSearch, findCustomerByName });
+    baseService = buildAgenticQueryService({
+      scopeResolver,
+      buildToolset: (scope: QueryScope) => buildAgenticToolset(toolDeps, scope),
+      agentic: synth,
+      inner: service,
+      log: logger,
+    });
+    logger.info('founder query engine wired + AGENTIC loop (QUERY_AGENTIC_ENABLED=true) — read-only tool loop, single-shot fallback');
   }
 
-  const toolDeps = buildAgenticToolDeps({ embedQuestion, retrieveAllCustomers, internalSearch, findCustomerByName });
-  const agenticService = buildAgenticQueryService({
-    scopeResolver,
-    buildToolset: (scope: QueryScope) => buildAgenticToolset(toolDeps, scope),
-    agentic: synth,
-    inner: service,
-    log: logger,
-  });
-  logger.info('founder query engine wired + AGENTIC loop (QUERY_AGENTIC_ENABLED=true) — read-only tool loop, single-shot fallback');
-  return agenticService;
+  // answer() stays stateless for Telegram/console. Founder PWA chat opts into the
+  // richer answerTurn() surface, which resolves follow-ups before either base engine.
+  return buildConversationalQueryService({ inner: baseService, contextualizer: synth, log: logger });
 }
 
 // ── WP8: the concrete read-only tool deps (adapter reads) the CORE toolset is assembled from ──────

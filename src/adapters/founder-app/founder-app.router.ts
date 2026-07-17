@@ -4,13 +4,13 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { ConsoleConfig } from '../../config/console';
 import type { FirebaseConfig } from '../../config/firebase';
-import type { QueryService } from '../../query/query-service';
+import type { ConversationalQueryService } from '../../query/conversational-query-service';
 import { logger } from '../../logger';
 import { DeviceAuth } from './founder-app-auth';
 import type { FounderAppFeed } from './founder-app-feed';
 import type { AppFounderNotifier } from './app-founder-notifier';
 import { decodeCursor } from './founder-app-repo';
-import type { DismissResult, FeedMessage, FounderAppDevice, InsertMessageInput, MessagePage } from './founder-app-repo';
+import type { ChatSession, ChatTurn, ConversationRelation, DismissResult, FeedMessage, FounderAppDevice, InsertMessageInput, MessagePage } from './founder-app-repo';
 import { camelizeDeep } from './founder-app-serialize';
 import { toUrgencyItem, toTimelineRow } from './founder-app-cockpit-view';
 import type { AttentionDecision, CustomerAugment } from './founder-app-cockpit-repo';
@@ -56,13 +56,18 @@ export interface FounderAppRepo {
   listMessages: (opts: { before?: string | null; beforeId?: string | null; limit: number }) => Promise<MessagePage>;
   getMessage: (id: string) => Promise<FeedMessage | null>;
   dismissMessage: (id: string) => Promise<DismissResult>;
+  getOrCreateChatSession: (customerRef: string | null) => Promise<ChatSession>;
+  resetChatSession: (customerRef: string | null) => Promise<ChatSession>;
+  listChatMessages: (sessionId: string, opts: { before?: string | null; beforeId?: string | null; limit: number }) => Promise<MessagePage>;
+  listRecentChatTurns: (sessionId: string, limit?: number) => Promise<ChatTurn[]>;
+  insertChatExchange: (input: { sessionId: string; customerRef: string | null; question: string; answer: string; relation: ConversationRelation }) => Promise<[FeedMessage, FeedMessage]>;
 }
 
 export interface FounderAppDeps {
   repo: FounderAppRepo;
   feed: FounderAppFeed;
   /** The founder query engine (internal scope); null when QUERY_ENGINE_ENABLED is off. */
-  query: QueryService | null;
+  query: ConversationalQueryService | null;
   /** The app mirror — holds the shared decision handler and the FCM fan-out. */
   notifier: AppFounderNotifier;
   /** Public Firebase config echoed to the authed client; null disables push client-side. */
@@ -205,6 +210,55 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
     }
   });
 
+  // ── Durable scoped chat ────────────────────────────────────────────────────────────
+  // GET is deliberately separate from the global Activity feed: it returns only the
+  // currently active visible conversation for one exact scope.
+  router.get('/api/chat', async (req, res, next) => {
+    const rawCustomerId = req.query.customerId;
+    if (rawCustomerId !== undefined && (typeof rawCustomerId !== 'string' || !UUID_RE.test(rawCustomerId))) {
+      return void res.status(400).json({ error: 'invalid customer id' });
+    }
+    let cursor: { before: string; beforeId: string } | null = null;
+    if (typeof req.query.before === 'string' && req.query.before) {
+      cursor = decodeCursor(req.query.before);
+      if (!cursor) return void res.status(400).json({ error: 'invalid cursor' });
+    }
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, MAX_PAGE) : DEFAULT_PAGE;
+    const customerId = typeof rawCustomerId === 'string' ? rawCustomerId : null;
+    try {
+      if (customerId && !(await deps.cockpit.customerDetail(customerId))) {
+        return void res.status(404).json({ error: 'customer not found' });
+      }
+      const session = await deps.repo.getOrCreateChatSession(customerId);
+      const page = await deps.repo.listChatMessages(session.id, {
+        before: cursor?.before ?? null,
+        beforeId: cursor?.beforeId ?? null,
+        limit,
+      });
+      res.json({ ...page, conversationId: session.id });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/api/chat/reset', async (req, res, next) => {
+    const rawCustomerId = (req.body as { customerId?: unknown } | undefined)?.customerId;
+    if (rawCustomerId !== undefined && rawCustomerId !== null && (typeof rawCustomerId !== 'string' || !UUID_RE.test(rawCustomerId))) {
+      return void res.status(400).json({ error: 'invalid customer id' });
+    }
+    const customerId = typeof rawCustomerId === 'string' ? rawCustomerId : null;
+    try {
+      if (customerId && !(await deps.cockpit.customerDetail(customerId))) {
+        return void res.status(404).json({ error: 'customer not found' });
+      }
+      const session = await deps.repo.resetChatSession(customerId);
+      res.status(201).json({ data: { conversationId: session.id } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.post('/api/messages', async (req, res, next) => {
     const body = (req.body ?? {}) as { text?: unknown; customerId?: unknown };
     const text = body.text;
@@ -226,15 +280,21 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
         if (!customer || typeof customer.display_name !== 'string') return void res.status(404).json({ error: 'customer not found' });
         customerName = customer.display_name;
       }
-      const inbound = await deps.repo.insertMessage({ direction: 'in', kind: 'chat', body: trimmed, customerRef: customerId });
-      deps.feed.publish(inbound);
-      const result = customerId
-        ? await deps.query.answer(trimmed, { customer: { customerId, customerName: customerName! } })
-        : await deps.query.answer(trimmed, { forceInternal: true });
-      const answerBody = result.answer ?? "I don't have anything on that yet.";
-      const outbound = await deps.repo.insertMessage({ direction: 'out', kind: 'chat', body: answerBody, customerRef: customerId });
-      deps.feed.publish(outbound);
-      res.status(201).json({ data: [inbound, outbound] });
+      const session = await deps.repo.getOrCreateChatSession(customerId);
+      const history = await deps.repo.listRecentChatTurns(session.id);
+      const answered = customerId
+        ? await deps.query.answerTurn(trimmed, history, { customer: { customerId, customerName: customerName! } })
+        : await deps.query.answerTurn(trimmed, history, { forceInternal: true });
+      const answerBody = answered.result.answer ?? "I don't have anything on that yet.";
+      const exchange = await deps.repo.insertChatExchange({
+        sessionId: session.id,
+        customerRef: customerId,
+        question: trimmed,
+        answer: answerBody,
+        relation: answered.relation,
+      });
+      for (const row of exchange) deps.feed.publish(row);
+      res.status(201).json({ data: exchange, conversationId: session.id });
     } catch (err) {
       next(err);
     }

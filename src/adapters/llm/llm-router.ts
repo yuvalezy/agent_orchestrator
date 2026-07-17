@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../../db';
 import { logger } from '../../logger';
-import type { AgentLlmPort, AgenticAnswerInput, AgenticAnswerPort, AgenticAnswerResult, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, CommitmentExtractionResult, CommitmentExtractorPort, ComposeMessageRequest, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, MeetingPrepRequest, MeetingPrepResult, MeetingPrepSynthesizerPort, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
+import type { AgentLlmPort, AgenticAnswerInput, AgenticAnswerPort, AgenticAnswerResult, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, CommitmentExtractionResult, CommitmentExtractorPort, ComposeMessageRequest, ConversationContextPort, ConversationContextRequest, ConversationContextResult, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, MeetingPrepRequest, MeetingPrepResult, MeetingPrepSynthesizerPort, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
 import { costUsd } from './pricing';
 import { runAgenticLoop } from './agentic-loop';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
@@ -17,6 +17,7 @@ import { BRIEF_SCHEMA, BRIEF_SYSTEM, briefUserMessage, parseBrief } from './brie
 import { MEETING_PREP_SCHEMA, MEETING_PREP_SYSTEM, meetingPrepUserMessage, parseMeetingPrep } from './meeting-prep-prompt';
 import { COMMITMENT_SCHEMA, COMMITMENT_SYSTEM, commitmentUserMessage, parseCommitmentExtraction } from './commitment-extract-prompt';
 import { COMPOSE_SCHEMA, COMPOSE_SYSTEM, SCHEDULE_SCHEMA, SCHEDULE_SYSTEM, composeUserMessage, parseComposedBody, parseScheduleInterpretation, scheduleUserMessage } from './schedule-prompt';
+import { CONVERSATION_CONTEXT_SCHEMA, CONVERSATION_CONTEXT_SYSTEM, conversationContextUserMessage, parseConversationContext } from './conversation-context-prompt';
 
 export type LlmRole = 'triage' | 'classify' | 'draft' | 'answer';
 
@@ -56,7 +57,7 @@ const AGENTIC_DEFAULTS = { maxIterations: 6, maxCostUsd: 0.15, maxTokens: 1500 }
  * SAME strict schema drives every provider (golden schema, DA B3). One admin
  * notice per call that failed over. Never logs message bodies (R27 extension).
  */
-export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, MeetingPrepSynthesizerPort, CommitmentExtractorPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort, AgenticAnswerPort {
+export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingSynthesizerPort, WeeklyReviewSynthesizerPort, CustomerBriefSynthesizerPort, MeetingPrepSynthesizerPort, CommitmentExtractorPort, DraftReviserPort, DraftVerifierPort, CorrectionClassifierPort, ScheduleInterpreterPort, AgenticAnswerPort, ConversationContextPort {
   constructor(private readonly deps: LlmRouterDeps) {}
 
   private chainFor(role: LlmRole): string[] {
@@ -217,6 +218,26 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       maxTokens: 1500,
       validate: parseAnswer,
       customerId: null,
+    });
+  }
+
+  /** Resolve an app-chat follow-up before retrieval. The cheap classify chain is
+   * sufficient for reference resolution and keeps this extra turn below answer-model
+   * cost; the final answer still goes through the normal grounded answer path. */
+  async resolveConversationContext(
+    input: ConversationContextRequest,
+    customerId: string | null = null,
+  ): Promise<ConversationContextResult> {
+    return this.callStructured<ConversationContextResult>({
+      role: 'classify',
+      schema: CONVERSATION_CONTEXT_SCHEMA,
+      system: CONVERSATION_CONTEXT_SYSTEM,
+      messages: [{ role: 'user', content: conversationContextUserMessage(input) }],
+      // A revision follow-up may need to carry a long prior draft verbatim into the
+      // standalone question; the validator caps it at 16k characters.
+      maxTokens: 4096,
+      validate: parseConversationContext,
+      customerId,
     });
   }
 
