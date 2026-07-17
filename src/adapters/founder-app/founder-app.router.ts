@@ -1,4 +1,5 @@
 import express, { Router, type NextFunction, type Request, type Response } from 'express';
+import helmet from 'helmet';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { ConsoleConfig } from '../../config/console';
@@ -90,10 +91,41 @@ function device(res: Response): FounderAppDevice {
   return res.locals.appDevice as FounderAppDevice;
 }
 
+/**
+ * Enabling push is cross-origin, and app.ts's global `helmet()` ships a 'self'-only
+ * default policy that blocks it: getToken() calls Firebase Installations and then FCM
+ * registration, and a CSP-blocked fetch rejects as a bare "Failed to fetch" — which is
+ * exactly what the push toggle reported.
+ *
+ * This stayed invisible until FIREBASE_* was configured: with push unconfigured the
+ * toggle never renders, so nothing ever crossed an origin. The policy was always wrong;
+ * the app simply never reached the part of itself that needed it.
+ *
+ * Scoped to THIS router on purpose — it re-sets the header only for /app, so the console
+ * and every other surface keep the strict default. script-src stays 'self': the worker
+ * handles push natively and pulls in no third-party script (app/public/sw.js).
+ */
+const FIREBASE_CSP = helmet.contentSecurityPolicy({
+  useDefaults: true,
+  directives: {
+    // getToken() → Firebase Installations (mints the app instance id) → FCM
+    // registration (exchanges it + the VAPID key for the device token). Delivery
+    // itself needs nothing here: it arrives over the browser's own push channel.
+    'connect-src': [
+      "'self'",
+      'https://firebaseinstallations.googleapis.com',
+      'https://fcmregistrations.googleapis.com',
+      'https://fcm.googleapis.com',
+    ],
+    'worker-src': ["'self'"],
+  },
+});
+
 export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string | undefined, deps: FounderAppDeps): Router {
   const router = Router();
   const auth = new DeviceAuth(config);
 
+  router.use(FIREBASE_CSP);
   router.use('/api', noStore);
 
   // ── Public: device login ───────────────────────────────────────────────────────────
