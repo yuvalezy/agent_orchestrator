@@ -925,3 +925,93 @@ test('revise validates its instruction and message id', async () => {
     assert.equal(spy.calls.length, 0);
   }, { deps: { reviser: spy.service } });
 });
+
+// ── Compose a NEW draft (PWA equal of Telegram's /draft email <prompt>) ────────────────
+// Unlike edit/revise (which act on an existing card), compose MINTS a draft from a customer id +
+// prompt. It's an OPTIONAL dep (absent = KNOWLEDGE_DRAFT_ENABLED off → 503); the router validates
+// the input + customer existence and delegates the whole compose→enqueue→present flow to the dep.
+
+type ComposeResult = Awaited<ReturnType<NonNullable<FounderAppDeps['composeDraft']>>>;
+
+/** A composeDraft spy: records each call and returns a fixed result (default: an enqueued queueId). */
+function composeSpy(result: ComposeResult = { ok: true, queueId: 'q-compose-1' }): {
+  fn: NonNullable<FounderAppDeps['composeDraft']>;
+  calls: Array<{ customerId: string; prompt: string; by: string }>;
+} {
+  const calls: Array<{ customerId: string; prompt: string; by: string }> = [];
+  const fn: NonNullable<FounderAppDeps['composeDraft']> = async (input) => {
+    calls.push(input);
+    return result;
+  };
+  return { fn, calls };
+}
+
+test('compose delegates to composeDraft (trimmed prompt, by=founder-app) and returns the queueId', async () => {
+  const spy = composeSpy({ ok: true, queueId: 'q-compose-9' });
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const customerId = crypto.randomUUID();
+    const res = await fetch(`${baseUrl}/app/api/drafts/compose`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ customerId, prompt: '  thank them for the payment  ' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { queueId: 'q-compose-9' } });
+    assert.deepEqual(spy.calls, [{ customerId, prompt: 'thank them for the payment', by: 'founder-app' }]);
+  }, { deps: { composeDraft: spy.fn }, cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
+});
+
+test('compose is 503 when the drafter is not wired (KNOWLEDGE_DRAFT_ENABLED off)', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/drafts/compose`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ customerId: crypto.randomUUID(), prompt: 'hi there' }),
+    });
+    // No composeDraft dep (feature off) → 503, exactly as /decisions is without a handler.
+    assert.equal(res.status, 503);
+    assert.deepEqual(await res.json(), { error: 'draft compose unavailable' });
+  }, { cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
+});
+
+test('compose is 404 for an unknown customer and never calls composeDraft', async () => {
+  const spy = composeSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/drafts/compose`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ customerId: crypto.randomUUID(), prompt: 'hello' }),
+    });
+    assert.equal(res.status, 404);
+    assert.deepEqual(await res.json(), { error: 'customer not found' });
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { composeDraft: spy.fn }, cockpit: { customerDetail: async () => null } });
+});
+
+test('compose validates its customer id and prompt before touching the customer or dep', async () => {
+  const spy = composeSpy();
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    // Bad customer id → 400.
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/compose`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ customerId: 'nope', prompt: 'hi' }) })).status, 400);
+    // Blank prompt → 400.
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/compose`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ customerId: crypto.randomUUID(), prompt: '   ' }) })).status, 400);
+    // Missing prompt → 400.
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/compose`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ customerId: crypto.randomUUID() }) })).status, 400);
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { composeDraft: spy.fn }, cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
+});
+
+test('compose surfaces a no-email-route refusal as 409 with the reason', async () => {
+  const spy = composeSpy({ ok: false, reason: 'no_email_route' });
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/drafts/compose`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ customerId: crypto.randomUUID(), prompt: 'thank them' }),
+    });
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), { error: 'no_email_route' });
+    assert.equal(spy.calls.length, 1);
+  }, { deps: { composeDraft: spy.fn }, cockpit: { customerDetail: async () => ({ id: 'c1', display_name: 'Acme Corp' }) } });
+});

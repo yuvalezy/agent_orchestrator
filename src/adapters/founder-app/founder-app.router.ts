@@ -106,6 +106,12 @@ export interface FounderAppDeps {
    *  new app card. null when DRAFT_REVISE_ENABLED is off → POST /api/drafts/:id/revise answers 404.
    *  reviseFromInstruction NEVER throws. */
   reviser: DraftReviserService | null;
+  /** Compose a NEW customer draft email — the PWA's equal of Telegram's `/draft email <prompt>`.
+   *  Composes grounded in the customer's knowledge, enqueues is_draft=true, opens the audit
+   *  decision, and presents the Approve/Edit/Reject card through the APP notifier (it lands in the
+   *  app feed). OPTIONAL — absent when KNOWLEDGE_DRAFT_ENABLED is off → POST /api/drafts/compose
+   *  answers 503. Built by buildAppComposeDraft with the SAME core presenter `/draft email` uses. */
+  composeDraft?: (input: { customerId: string; prompt: string; by: string }) => Promise<{ ok: true; queueId: string } | { ok: false; reason: string }>;
 }
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -468,6 +474,36 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
       // NEVER throws; regenerates synchronously; on success re-presents a fresh draft card (SSE + FCM).
       await deps.reviser.reviseFromInstruction({ queueId, instruction, by: 'founder-app' });
       res.json({ data: { queueId, revised: true } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Compose a NEW draft email (the PWA's equal of Telegram's /draft email <prompt>) ───
+  // Composes a customer email grounded in their knowledge, enqueues it is_draft=true, opens the
+  // audit decision, and presents the Approve/Edit/Reject card through the APP notifier so it lands
+  // in the app feed — the SAME core presenter `/draft email` uses. Unlike edit/revise (which act on
+  // an EXISTING card keyed by the app message UUID), this MINTS a new draft, so it takes a customer
+  // id + prompt directly. composeDraft absent (feature off / KNOWLEDGE_DRAFT_ENABLED off) → 503; an
+  // unknown customer → 404; a no-email-route / already-resolved refusal → 409 (the reason echoed).
+  router.post('/api/drafts/compose', async (req, res, next) => {
+    const body = (req.body ?? {}) as { customerId?: unknown; prompt?: unknown };
+    if (typeof body.customerId !== 'string' || !UUID_RE.test(body.customerId)) {
+      return void res.status(400).json({ error: 'invalid customer id' });
+    }
+    if (typeof body.prompt !== 'string' || !body.prompt.trim() || body.prompt.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'prompt is required' });
+    }
+    if (!deps.composeDraft) return void res.status(503).json({ error: 'draft compose unavailable' });
+    try {
+      // The customer's language, name and knowledge ground the draft — an unknown customer can't be
+      // drafted to (and would only cost an LLM call), so verify existence before composing.
+      if (!(await deps.cockpit.customerDetail(body.customerId))) {
+        return void res.status(404).json({ error: 'customer not found' });
+      }
+      const result = await deps.composeDraft({ customerId: body.customerId, prompt: body.prompt.trim(), by: 'founder-app' });
+      if (!result.ok) return void res.status(409).json({ error: result.reason });
+      res.json({ data: { queueId: result.queueId } });
     } catch (err) {
       next(err);
     }
