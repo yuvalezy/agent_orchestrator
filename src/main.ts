@@ -194,6 +194,10 @@ async function main(): Promise<void> {
   } else if (process.env.CONSOLE_WEB_PUSH_ENABLED === 'true') {
     logger.warn('web push disabled (missing/invalid VAPID configuration or encryption key)');
   }
+  // Late-bound onboarding notifier: the console's onboarding service is built here, before the
+  // money-loop fanout exists, but its notifier is a getter resolved at request time → assigned the
+  // fanout below. This is what lets onboarding run without Telegram.
+  let onboardingNotifier: FounderNotifierPort | null = null;
   if (consoleConfig) {
     // Production copies Vite output to dist/web; tsx development serves the
     // separately built web/dist directory from the repository root.
@@ -211,9 +215,10 @@ async function main(): Promise<void> {
       // console renders failures itself, so it intentionally has no Telegram alert.
       query: buildQueryEngineService(async () => {}),
       webPush: webPushNotifier ? webPushConfig : null,
-      // Customer onboarding + backfill screen: portal search/preview + the shared onboard/seed
-      // composition the CLI uses. Builds its own EZY gateway + Telegram notifier (same factories).
-      onboarding: buildOnboardingService(),
+      // Customer onboarding + backfill screen. The notifier is a late-bound GETTER (like
+      // bookAppMeetingTime) → the money-loop fanout, resolved at request time, so onboarding runs
+      // app-only too (Telegram absent → headless-primary fanout → synthetic topic + app-feed cards).
+      onboarding: buildOnboardingService({ notifier: () => onboardingNotifier ?? new HeadlessPrimaryNotifier() }),
     });
     logger.info('founder console router mounted at /console');
   } else {
@@ -370,6 +375,7 @@ async function main(): Promise<void> {
       // through its mirrors (the app). The `telegram && no-mirrors` case can't reach headless.
       const primary: FounderNotifierPort = telegram ?? new HeadlessPrimaryNotifier();
       notifier = telegram && mirrors.length === 0 ? telegram : new FanoutFounderNotifier(primary, mirrors);
+      onboardingNotifier = notifier; // late-bind the console onboarding service to the same fanout
       // The PWA "another time" picker books through this fanout notifier, so a booking made in the
       // app confirms on every surface. Null when scheduling is off → /api/meeting-time answers 503.
       bookAppMeetingTime = buildMeetingSchedulerGated(buildEzyPortalGateway(), notifier)?.bookLocalTime ?? null;

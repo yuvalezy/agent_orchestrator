@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import { env } from '../../config/env';
 import { logger } from '../../logger';
 import { query } from '../../db';
@@ -132,12 +133,20 @@ function summarize(result: Awaited<ReturnType<typeof seedBackfillDry>>): DrySumm
 
 export interface OnboardingServiceDeps {
   ezy?: ReturnType<typeof buildEzyPortalGateway>;
-  notifier?: ReturnType<typeof buildTelegramNotifier>;
+  /**
+   * The founder notifier onboarding posts through (customer topic + welcome/backfill cards) — a
+   * GETTER, resolved at ACTION time (an onboarding request runs long after boot). This is what
+   * lets the money-loop's fanout notifier be used even though it is built after this service, and
+   * it is why onboarding no longer HARD-REQUIRES Telegram: an app-only boot passes a getter that
+   * returns a headless-primary-backed fanout (customer topics become synthetic refs; cards fan out
+   * to the app). Absent → the Telegram notifier (throws only if actually used with Telegram unset).
+   */
+  notifier?: () => Pick<FounderNotifierPort, 'ensureCustomerTopic' | 'notifyCustomerEvent'>;
 }
 
 export function buildOnboardingService(deps: OnboardingServiceDeps = {}): OnboardingService {
   const ezy = deps.ezy ?? buildEzyPortalGateway();
-  const notifier = deps.notifier ?? buildTelegramNotifier();
+  const resolveNotifier = deps.notifier ?? ((): ReturnType<typeof buildTelegramNotifier> => buildTelegramNotifier());
   // In-process guard so a second dry/live for the same customer 409s instead of racing. A server
   // restart clears it; a live sweep left 'in_progress' by a crash is recoverable by re-running
   // (processed threads are skipped by their app_state markers) — same semantics as the CLI.
@@ -166,7 +175,7 @@ export function buildOnboardingService(deps: OnboardingServiceDeps = {}): Onboar
       } else {
         // The live sweep drives backfill_status in_progress→done itself. It assumes the inventory
         // was already synced (the dry preview does that) — the UI runs dry first.
-        const { cardsPosted } = await runLiveSweep(customerId, notifier);
+        const { cardsPosted } = await runLiveSweep(customerId, resolveNotifier());
         logger.info({ customerId, cardsPosted }, 'console live backfill complete');
       }
     } catch (err) {
@@ -221,7 +230,7 @@ export function buildOnboardingService(deps: OnboardingServiceDeps = {}): Onboar
         const r = await onboardCustomerCore(input, {
           ezy,
           wa: buildWhatsAppDirectoryClient(),
-          notifier,
+          notifier: resolveNotifier(),
         });
         return { ok: true, customerId: r.customerId, created: r.created, waBlocked: r.waBlocked, workItemTypeRef: r.workItemTypeRef };
       } catch (err) {
