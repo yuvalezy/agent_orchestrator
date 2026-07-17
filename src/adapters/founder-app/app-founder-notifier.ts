@@ -134,13 +134,28 @@ export class AppFounderNotifier implements NotifierMirror {
     for (const row of decided) this.deps.feed.publish(row);
   }
 
-  /** Persist, announce, and best-effort push. Storing must not fail on a push error. */
-  private async record(input: InsertMessageInput): Promise<FeedMessage> {
+  /**
+   * Mirror a decision's confirmation TEXT onto the app feed — the app equal of the Telegram
+   * thread reply a cancel/commitment tap produces. SSE-only (push suppressed): the founder just
+   * acted, on THIS device for an app tap or in Telegram for a Telegram tap, so a push back is
+   * noise. It lands in Activity, never the attention queue (no buttons), so it reads as an ack
+   * rather than a new thing to act on. Best-effort by contract — a decision must resolve whether
+   * or not its confirmation could be shown.
+   */
+  async confirm(text: string): Promise<void> {
+    await this.record({ direction: 'out', kind: 'notification', body: text, severity: 'info' }, { push: false });
+  }
+
+  /** Persist, announce, and (unless suppressed) best-effort push. Storing must not fail on a
+   *  push error. */
+  private async record(input: InsertMessageInput, opts: { push?: boolean } = {}): Promise<FeedMessage> {
     const row = await this.deps.insertMessage(input);
     this.deps.feed.publish(row);
-    await this.pushToDevices(row).catch((err) =>
-      logger.warn({ reason: (err as Error)?.message }, 'founder-app FCM push failed (best-effort)'),
-    );
+    if (opts.push !== false) {
+      await this.pushToDevices(row).catch((err) =>
+        logger.warn({ reason: (err as Error)?.message }, 'founder-app FCM push failed (best-effort)'),
+      );
+    }
     return row;
   }
 

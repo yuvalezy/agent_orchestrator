@@ -16,13 +16,13 @@ const silentLog = { info() {} };
 interface Harness {
   handler: ReturnType<typeof buildCommitmentDecisionHandler>;
   calls: Array<{ id: string; status: 'done' | 'dismissed' }>;
-  posts: Array<{ threadId: string; text: string }>;
+  posts: Array<{ threadId: string | undefined; text: string }>;
 }
 
 /** A store that transitions an open commitment ONCE (guarded on status='open'), like the repo. */
 function harness(open: Set<string>): Harness {
   const calls: Array<{ id: string; status: 'done' | 'dismissed' }> = [];
-  const posts: Array<{ threadId: string; text: string }> = [];
+  const posts: Array<{ threadId: string | undefined; text: string }> = [];
   const handler = buildCommitmentDecisionHandler({
     setStatus: async (id, status): Promise<CommitmentTransition> => {
       calls.push({ id, status });
@@ -32,7 +32,10 @@ function harness(open: Set<string>): Harness {
       }
       return id === 'gone' ? { result: 'unknown' } : { result: 'already' };
     },
-    postAnswer: async (threadId, text) => void posts.push({ threadId, text }),
+    // The handler is surface-agnostic now: it confirms every resolved tap and leaves the WHERE to
+    // the composition root. We capture the DecisionEvent's threadId to prove that routing input
+    // still flows through.
+    confirm: async (d, text) => void posts.push({ threadId: d.threadId, text }),
     log: silentLog,
   });
   return { handler, calls, posts };
@@ -83,12 +86,13 @@ test('a tap on an unknown id says the commitment is gone', async () => {
   assert.equal(h.posts[0].text, 'That commitment is no longer available.');
 });
 
-test('a missing ref is ignored entirely; a threadless event writes but posts no confirmation', async () => {
+test('a missing ref is ignored entirely; a threadless event still writes AND confirms', async () => {
   const h = harness(new Set(['3']));
   await h.handler.handle(ev(COMMITMENT_DONE_OPTION, '')); // no ref → ignored entirely
   assert.equal(h.calls.length, 0);
-  // A DecisionEvent with no threadId (e.g. a typed answer) — the write still happens, no confirm posts.
-  await h.handler.handle({ optionId: COMMITMENT_DONE_OPTION, notificationRef: '3', by: 'founder' });
+  // A DecisionEvent with no threadId (an app tap) — the write happens and the confirmation still
+  // fires: routing it (app feed, since there's no thread) is the composition root's job now.
+  await h.handler.handle({ optionId: COMMITMENT_DONE_OPTION, notificationRef: '3', by: 'founder-app' });
   assert.deepEqual(h.calls, [{ id: '3', status: 'done' }]);
-  assert.equal(h.posts.length, 0);
+  assert.deepEqual(h.posts, [{ threadId: undefined, text: '✔ Marked done.' }]);
 });

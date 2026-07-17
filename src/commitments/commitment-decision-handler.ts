@@ -25,8 +25,13 @@ export interface CommitmentDecisionHandler {
 
 export interface CommitmentDecisionDeps {
   setStatus: (id: string, status: 'done' | 'dismissed') => Promise<CommitmentTransition>;
-  /** Post the confirmation back to the thread the card lives in (the founder's topic). */
-  postAnswer: (threadId: string, text: string) => Promise<void>;
+  /**
+   * Confirm the outcome for this decision. The handler stays surface-agnostic: WHERE the ack goes
+   * — the Telegram thread the card lives in, the app feed, or both — is the composition root's
+   * call, decided from the DecisionEvent (a Telegram tap carries a threadId; an app tap does not).
+   * A threadless tap used to get no confirmation at all; now the app mirror catches it.
+   */
+  confirm: (d: DecisionEvent, text: string) => Promise<void>;
   log: { info: (o: object, m: string) => void };
 }
 
@@ -41,15 +46,12 @@ export function buildCommitmentDecisionHandler(deps: CommitmentDecisionDeps): Co
       const outcome = await deps.setStatus(id, status);
       // Counts/flags + the id only — never the commitment text.
       deps.log.info({ commitmentId: id, status, result: outcome.result }, 'commitment: resolve tap');
-      if (!d.threadId) return; // nowhere to confirm (a typed answer with no thread) — the write still happened
 
-      if (outcome.result === 'changed') {
-        await deps.postAnswer(d.threadId, status === 'done' ? '✔ Marked done.' : '✖ Dismissed.');
-      } else if (outcome.result === 'already') {
-        await deps.postAnswer(d.threadId, 'That commitment was already resolved.');
-      } else {
-        await deps.postAnswer(d.threadId, 'That commitment is no longer available.');
-      }
+      const text =
+        outcome.result === 'changed' ? (status === 'done' ? '✔ Marked done.' : '✖ Dismissed.')
+        : outcome.result === 'already' ? 'That commitment was already resolved.'
+        : 'That commitment is no longer available.';
+      await deps.confirm(d, text);
     },
   };
 }

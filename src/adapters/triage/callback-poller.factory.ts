@@ -190,10 +190,29 @@ export function buildCallbackPollerWorker(
      * but then went silent, because THIS scheduler answered only into Telegram.
      */
     founderNotifier?: FounderNotifierPort;
+    /**
+     * Mirror a decision's CONFIRMATION TEXT onto the app feed (the AO Founder app). Some acks are
+     * plain thread replies, not port notifications — the scheduled-action cancel and the
+     * commitment done/dismiss. Those reach Telegram via `replyInThread`, which no mirror owns AND
+     * which an app tap can't even use (it carries no thread). Wiring this makes the app show the
+     * same ack: a Telegram tap's reply is mirrored, and an app tap is finally acknowledged at all.
+     * Absent (no app configured) → Telegram-only, exactly as before.
+     */
+    appConfirm?: (text: string) => Promise<void>;
   } = {},
 ): WorkerDefinition {
   // Founder-facing outputs fan out to every surface; raw Telegram I/O stays on `notifier`.
   const founderNotifier = options.founderNotifier ?? notifier;
+
+  // Confirm a decision's outcome wherever the founder can see it: the Telegram thread reply is
+  // possible only when the tap carried a thread (a Telegram tap), while the app mirror is always
+  // attempted — so a Telegram tap's ack is mirrored to the app, and an app tap (no thread) is
+  // acknowledged there rather than nowhere. Best-effort: a confirmation must never fail the
+  // decision it reports on.
+  const confirmDecision = async (d: DecisionEvent, text: string): Promise<void> => {
+    if (d.threadId) await notifier.replyInThread(d.threadId, text);
+    await options.appConfirm?.(text);
+  };
   const taskTarget = buildEzyPortalGateway();
   const cancel = buildCancelHandler({ taskTarget, notifier });
 
@@ -256,7 +275,9 @@ export function buildCallbackPollerWorker(
   const commitments = env.COMMITMENT_TRACKING_ENABLED
     ? buildCommitmentDecisionHandler({
         setStatus: setCommitmentStatus,
-        postAnswer: (threadId, text) => notifier.replyInThread(threadId, text),
+        // Confirm on every surface (thread reply if a Telegram tap, app feed always) — so an
+        // app-tapped ✔/✖ is acknowledged instead of silently clearing.
+        confirm: confirmDecision,
         log: logger,
       })
     : null;
@@ -267,14 +288,14 @@ export function buildCallbackPollerWorker(
   const routeDecision = async (d: DecisionEvent): Promise<void> => {
     if (d.optionId === 'sc') {
       const result = await cancelScheduledAction(d.notificationRef);
-      if (d.threadId) {
-        const text = result === 'cancelled'
-          ? '✅ Scheduled action cancelled.'
-          : result === 'too_late'
-            ? '⚠️ Too late to cancel; the action is already running or sending.'
-            : 'This scheduled action was already handled.';
-        await notifier.replyInThread(d.threadId, text);
-      }
+      const text = result === 'cancelled'
+        ? '✅ Scheduled action cancelled.'
+        : result === 'too_late'
+          ? '⚠️ Too late to cancel; the action is already running or sending.'
+          : 'This scheduled action was already handled.';
+      // The outcome matters here (a 'too_late' is real news), so confirm it on every surface the
+      // founder can see — not just the Telegram thread it used to be trapped in.
+      await confirmDecision(d, text);
       return;
     }
     if (scheduling && scheduling.isScheduleOption(d.optionId)) return scheduling.onDecision(d);
