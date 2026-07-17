@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import webpush from 'web-push';
-import { buildPushMessage, FanoutFounderNotifier, WebPushMirror, WebPushNotifier, type NotifierMirror } from './web-push-notifier';
+import { buildPushMessage, FanoutFounderNotifier, HeadlessPrimaryNotifier, WebPushMirror, WebPushNotifier, type NotifierMirror } from './web-push-notifier';
 import type { DecisionEvent } from '../../ports/founder-notifier.port';
 
 const vapid = webpush.generateVAPIDKeys();
@@ -88,4 +88,61 @@ test('fanout mirrors every verb + the decision handler to N mirrors, isolating a
   assert.ok(handler);
   await (handler as unknown as (d: DecisionEvent) => Promise<void>)({ notificationRef: 'ref', optionId: 'x', by: 'test' });
   assert.deepEqual(primaryDecisions, [{ notificationRef: 'ref', optionId: 'x', by: 'test' }]);
+});
+
+test('a real primary keeps the unchanged primary-first-then-mirrors delivery order', async () => {
+  const seen: string[] = [];
+  const mirror: NotifierMirror = {
+    notifyCustomerEvent: async () => { seen.push('mirror:customer'); },
+    notifyAdmin: async () => { seen.push('mirror:admin'); },
+    askFounder: async () => { seen.push('mirror:ask'); },
+    onDecision: () => { seen.push('mirror:onDecision'); },
+  };
+  const notifier = new FanoutFounderNotifier({
+    ensureCustomerTopic: async () => ({ ref: 'tg-topic' }),
+    notifyCustomerEvent: async () => { seen.push('primary:customer'); },
+    notifyAdmin: async () => { seen.push('primary:admin'); },
+    askFounder: async () => { seen.push('primary:ask'); },
+    onDecision: () => { seen.push('primary:onDecision'); },
+  }, [mirror]);
+
+  notifier.onDecision(async () => {});
+  await notifier.notifyAdmin({ title: 't', body: 'b' });
+  await notifier.notifyCustomerEvent('c1', { title: 't', body: 'b' });
+  await notifier.askFounder('c1', { title: 'q', body: 'b' }, [{ id: 'x:ref', label: 'X' }]);
+  assert.equal((await notifier.ensureCustomerTopic('c1', 'Acme')).ref, 'tg-topic');
+  // Each verb runs the real primary FIRST, then the mirror — byte-identical to pre-headless.
+  assert.deepEqual(seen, [
+    'primary:onDecision', 'mirror:onDecision',
+    'primary:admin', 'mirror:admin',
+    'primary:customer', 'mirror:customer',
+    'primary:ask', 'mirror:ask',
+  ]);
+});
+
+test('a HeadlessPrimaryNotifier lets the fanout deliver purely through the app mirror', async () => {
+  const seen: string[] = [];
+  let handler: ((d: DecisionEvent) => Promise<void>) | null = null;
+  const appMirror: NotifierMirror = {
+    notifyCustomerEvent: async () => { seen.push('app:customer'); },
+    notifyAdmin: async () => { seen.push('app:admin'); },
+    askFounder: async () => { seen.push('app:ask'); },
+    onDecision: (h) => { handler = h; },
+  };
+  const notifier = new FanoutFounderNotifier(new HeadlessPrimaryNotifier(), [appMirror]);
+
+  const decisions: DecisionEvent[] = [];
+  notifier.onDecision(async (d) => { decisions.push(d); });
+  await notifier.notifyAdmin({ title: 't', body: 'b' });
+  await notifier.notifyCustomerEvent('c1', { title: 't', body: 'b' });
+  await notifier.askFounder('c1', { title: 'q', body: 'b' }, [{ id: 'x:ref', label: 'X' }]);
+
+  // No real primary — every mirrored verb still reaches the app mirror.
+  assert.deepEqual(seen, ['app:admin', 'app:customer', 'app:ask']);
+  // The synthetic topic ref satisfies the port without minting a Telegram forum topic.
+  assert.equal((await notifier.ensureCustomerTopic('c1', 'Acme')).ref, 'headless:c1');
+  // onDecision still registers the shared handler on the mirror, so an app tap dispatches it.
+  assert.ok(handler);
+  await (handler as unknown as (d: DecisionEvent) => Promise<void>)({ notificationRef: 'ref', optionId: 'x', by: 'app' });
+  assert.deepEqual(decisions, [{ notificationRef: 'ref', optionId: 'x', by: 'app' }]);
 });

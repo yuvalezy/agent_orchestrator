@@ -88,7 +88,30 @@ export class WebPushMirror implements NotifierMirror {
   onDecision(): void {}
 }
 
-/** Telegram remains first/authoritative; every mirror is a best-effort side channel. */
+/**
+ * A stand-in PRIMARY for a Telegram-less money loop. Every founder-facing verb is a
+ * no-op, so `new FanoutFounderNotifier(new HeadlessPrimaryNotifier(), [appNotifier, …])`
+ * delivers PURELY through its mirrors (the AO Founder app, urgent web-push) while the
+ * fanout's primary-first contract stays intact — the primary simply does nothing before
+ * each mirror runs, so the observable mirror behavior is byte-identical to a real primary
+ * whose verbs happen to succeed silently.
+ *
+ * Semantics of the two Telegram-only concepts in a mirror-only world:
+ *  - ensureCustomerTopic returns a SYNTHETIC ref (`headless:<customerId>`): a mirror owns no
+ *    forum topic, so there is nothing to create or claim — the ref only satisfies the port.
+ *  - onMessage / onDecision are no-ops here: free-text capture and inbound taps arrive on the
+ *    mirrors themselves (the app router dispatches its own taps), never through this primary.
+ */
+export class HeadlessPrimaryNotifier implements FounderNotifierPort {
+  async ensureCustomerTopic(customerId: string): Promise<{ ref: string }> { return { ref: `headless:${customerId}` }; }
+  async notifyCustomerEvent(): Promise<void> {}
+  async notifyAdmin(): Promise<void> {}
+  async askFounder(): Promise<void> {}
+  onDecision(): void {}
+  onMessage(): void {}
+}
+
+/** Telegram (or a HeadlessPrimaryNotifier stand-in) remains first/authoritative; every mirror is a best-effort side channel. */
 export class FanoutFounderNotifier implements FounderNotifierPort {
   constructor(private readonly primary: FounderNotifierPort, private readonly mirrors: NotifierMirror[]) {}
   ensureCustomerTopic(customerId: string, name: string): Promise<{ ref: string }> { return this.primary.ensureCustomerTopic(customerId, name); }
