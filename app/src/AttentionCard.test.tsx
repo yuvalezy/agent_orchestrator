@@ -89,6 +89,26 @@ describe('AttentionCard', () => {
     expect(screen.queryByRole('button', { name: /Another time/ })).not.toBeInTheDocument();
   });
 
+  it('renders DraftControls (Edit/Revise) on a draft card, MeetingTimeReply on a slot card, plain chips otherwise', () => {
+    // Draft card: buttons carry `de` → the richer Edit/Revise controls, not raw chips.
+    const draft = [{ id: 'da', label: 'Approve' }, { id: 'de', label: 'Edit' }, { id: 'dr', label: 'Reject' }, { id: 'dv', label: 'Revise' }];
+    const { rerender } = render(<AttentionCard card={card({ buttons: draft })} decidedOptionId={null} onDecide={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Revise' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Another time/ })).not.toBeInTheDocument();
+
+    // Slot card (ms\d+): the typed-time affordance, no Edit control.
+    const slots = [{ id: 'ms0', label: 'Fri 13:00' }, { id: 'ms1', label: 'Fri 16:00' }];
+    rerender(<AttentionCard card={card({ buttons: slots })} decidedOptionId={null} onDecide={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /Another time/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+
+    // Plain non-draft buttoned card: the raw decision chips, no Edit control.
+    rerender(<AttentionCard card={card({ buttons: [{ id: 'ok', label: 'Got it' }] })} decidedOptionId={null} onDecide={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Got it' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+  });
+
   it('does NOT offer "Another time…" on a non-slot card (a duration or draft card)', () => {
     render(<AttentionCard card={card({ buttons: [{ id: 'md30', label: '30 min' }, { id: 'mtask', label: 'Just make a task' }] })} decidedOptionId={null} onDecide={vi.fn()} />);
     expect(screen.queryByRole('button', { name: /Another time/ })).not.toBeInTheDocument();

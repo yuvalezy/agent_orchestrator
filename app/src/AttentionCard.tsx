@@ -4,6 +4,7 @@ import { cn } from './lib/utils';
 import { relativeTime } from './lib/time';
 import { CardActions, ThreadTap, threadPath } from './CardActions';
 import { DecisionChips, type DecideHandler } from './DecisionChips';
+import { DraftControls, isDraftCard } from './DraftControls';
 import { MeetingTimeReply } from './MeetingTimeReply';
 import type { AttentionCard as AttentionCardData, Severity } from './types';
 
@@ -70,7 +71,13 @@ export function AttentionCard({
 
         {card.buttons && card.buttons.length > 0 && (
           <div className="mt-3">
-            <DecisionChips messageId={card.id} buttons={card.buttons} decidedOptionId={decidedOptionId} onDecide={onDecide} />
+            {/* A draft card (buttons carry `de`) gets the richer Edit/Revise controls so those
+                affordances never dead-end; every other buttoned card keeps the plain chips. */}
+            {isDraftCard(card.buttons) ? (
+              <DraftControls card={card} decidedOptionId={decidedOptionId} onDecide={onDecide} />
+            ) : (
+              <DecisionChips messageId={card.id} buttons={card.buttons} decidedOptionId={decidedOptionId} onDecide={onDecide} />
+            )}
             {/* Typing a time is only offered while the question stands and only on a slot card —
                 once decided the card is on its way out of the queue. */}
             {decidedOptionId === null && isSlotCard(card) && <MeetingTimeReply messageId={card.id} />}

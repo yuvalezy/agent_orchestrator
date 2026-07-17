@@ -12,6 +12,8 @@ import { buildFounderAppRouter, type FounderAppCockpitReads, type FounderAppDeps
 import { encodeCursor, hashDeviceToken, type FeedMessage, type InsertMessageInput } from './founder-app-repo';
 import type { ConversationalQueryService } from '../../query/conversational-query-service';
 import type { DecisionEvent } from '../../ports/founder-notifier.port';
+import type { DraftResolution } from '../../outbound/outbound-repo';
+import type { DraftReviserService } from '../../triage/draft-revise';
 
 const PASSWORD = 'correct horse battery staple';
 
@@ -171,7 +173,7 @@ async function withApp(
   // Mirror the production composite handleDecision: the real router THEN the mirror hook
   // (recordDecision marks + re-emits). So the app endpoint's dispatch marks via the shared path.
   if (opts.registerHandler !== false) notifier.onDecision(async (d) => { decisions.push(d); await notifier.recordDecision(d); });
-  const deps: FounderAppDeps = { repo, feed, query: stubQuery, notifier, firebase: null, cockpit: { ...defaultCockpit(), ...opts.cockpit }, ...opts.deps };
+  const deps: FounderAppDeps = { repo, feed, query: stubQuery, notifier, firebase: null, editDraft: null, reviser: null, cockpit: { ...defaultCockpit(), ...opts.cockpit }, ...opts.deps };
   const server = createServer(buildApp({ founderAppRouter: buildFounderAppRouter(await config(opts.env), undefined, deps) }));
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -687,4 +689,239 @@ test('POST /messages with an unknown customerId is 404', async () => {
     const res = await fetch(`${baseUrl}/app/api/messages`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ text: 'hi', customerId: crypto.randomUUID() }) });
     assert.equal(res.status, 404);
   }, { cockpit: { customerDetail: async () => null } });
+});
+
+// ── Draft Edit + Revise (PWA parity with the console/Telegram edit + revise paths) ─────
+// Edit and Revise carry the new body / instruction in the POST body and reuse the EXACT core
+// fns (replaceDraftBodyAndApprove / reviser.reviseFromInstruction) — keyed by the app message
+// UUID, not the queueId. Approve/Reject stay on /api/decisions; only Edit/Revise dead-ended.
+
+/** Seed a draft card (Approve/Edit/Reject/Revise) and return its app message id. partitionButtons
+ *  stores bare ids ('da'/'de'/'dr'/'dv') with notification_ref = queueId. Omit 'dv' to model a
+ *  card presented with DRAFT_REVISE_ENABLED off (Edit but no Revise). */
+async function draftCard(
+  baseUrl: string,
+  notifier: AppFounderNotifier,
+  cookie: string,
+  q = 'q-77',
+  opts: { revise?: boolean } = {},
+): Promise<string> {
+  const buttons = [
+    { id: `da:${q}`, label: 'Approve' },
+    { id: `de:${q}`, label: 'Edit' },
+    { id: `dr:${q}`, label: 'Reject' },
+  ];
+  if (opts.revise !== false) buttons.push({ id: `dv:${q}`, label: 'Revise' });
+  await notifier.notifyCustomerEvent('cust-1', { title: '✍️ Suggested reply', body: 'b', severity: 'action' }, buttons);
+  const rows = await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] };
+  return rows.data[0].id;
+}
+
+/** An editDraft spy: records its args, returns a resolution (or null to model already-resolved). */
+function editSpy(resolve = true): { fn: FounderAppDeps['editDraft']; calls: Array<[string, string, string]> } {
+  const calls: Array<[string, string, string]> = [];
+  const fn = async (id: string, body: string, by: string): Promise<DraftResolution | null> => {
+    calls.push([id, body, by]);
+    return resolve ? { queueId: id, decisionId: 'd1', customerId: null } : null;
+  };
+  return { fn, calls };
+}
+
+test('edit replaces the draft body via the core fn and clears the card from the queue', async () => {
+  const spy = editSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie, 'q-100');
+
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/edit`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ body: 'new reply' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { queueId: 'q-100', status: 'approved' } });
+    // The SAME core fn the console/Telegram edit calls, with the queueId + by='founder-app'.
+    assert.deepEqual(spy.calls, [['q-100', 'new reply', 'founder-app']]);
+    // Marked decided the mirror way → drops from the attention queue on every open client.
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, 'de');
+  }, { deps: { editDraft: spy.fn } });
+});
+
+test('edit is 404 when draft editing is not enabled, and never calls the core fn', async () => {
+  const spy = editSpy();
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/edit`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x' }),
+    });
+    assert.equal(res.status, 404);
+    assert.deepEqual(await res.json(), { error: 'draft editing not enabled' });
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { editDraft: null } });
+});
+
+test('edit refuses a non-draft card (no de button) with 400', async () => {
+  const spy = editSpy();
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    await notifier.notifyCustomerEvent('cust-1', { title: 'New task', body: 'b' }, [{ id: 'x:task-1', label: 'Cancel' }]);
+    const messageId = (await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] }).data[0].id;
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/edit`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x' }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'not an editable draft' });
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { editDraft: spy.fn } });
+});
+
+test('edit on an already-decided card is refused (409) and never calls the core fn', async () => {
+  const spy = editSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    const row = repo.messages.find((m) => m.id === messageId);
+    if (row) row.decidedOptionId = 'da'; // already approved elsewhere
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/edit`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x' }),
+    });
+    assert.equal(res.status, 409);
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { editDraft: spy.fn } });
+});
+
+test('edit returns 409 when the core fn reports the draft was resolved elsewhere (guarded null)', async () => {
+  const spy = editSpy(false); // guarded null → resolved concurrently
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/edit`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x' }),
+    });
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), { error: 'already decided' });
+    assert.equal(spy.calls.length, 1); // the core fn ran; it, not the router, detected the race
+  }, { deps: { editDraft: spy.fn } });
+});
+
+test('edit validates its body and message id', async () => {
+  const spy = editSpy();
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    // Blank body → 400 before any lookup.
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/${messageId}/edit`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: '   ' }) })).status, 400);
+    // Invalid message id → 400.
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/not-a-uuid/edit`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x' }) })).status, 400);
+    // Unknown (well-formed) message id → 404.
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/${crypto.randomUUID()}/edit`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x' }) })).status, 404);
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { editDraft: spy.fn } });
+});
+
+/** A reviser spy that records each call and (via a lazily-set repo ref) the card's decided state
+ *  AT call time — so a test can assert the old card was marked decided BEFORE regeneration ran. */
+function reviseSpy(): {
+  service: DraftReviserService;
+  calls: Array<{ queueId: string; instruction: string; by: string }>;
+  setRepo: (r: ReturnType<typeof makeRepo>) => void;
+  decidedAtCall: () => string | null | undefined;
+} {
+  const calls: Array<{ queueId: string; instruction: string; by: string }> = [];
+  let repoRef: ReturnType<typeof makeRepo> | null = null;
+  let decided: string | null | undefined;
+  return {
+    calls,
+    setRepo: (r) => { repoRef = r; },
+    decidedAtCall: () => decided,
+    service: {
+      reviseFromInstruction: async (i) => {
+        calls.push(i);
+        decided = repoRef?.messages.find((m) => m.notificationRef === i.queueId)?.decidedOptionId;
+      },
+    },
+  };
+}
+
+test('revise marks the old card decided BEFORE regenerating and reuses the core reviser', async () => {
+  const spy = reviseSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    spy.setRepo(repo);
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie, 'q-200');
+
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/revise`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ instruction: 'be concise' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { queueId: 'q-200', revised: true } });
+    assert.deepEqual(spy.calls, [{ queueId: 'q-200', instruction: 'be concise', by: 'founder-app' }]);
+    // Ordering: the old card was ALREADY decided 'dv' when the reviser ran (so its new card,
+    // sharing the ref, isn't swept by the mark) — mirroring the Telegram onDecided-first flow.
+    assert.equal(spy.decidedAtCall(), 'dv');
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, 'dv');
+  }, { deps: { reviser: spy.service } });
+});
+
+test('revise is 404 when disabled — the reviser never runs and the old card is untouched', async () => {
+  const spy = reviseSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    spy.setRepo(repo);
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/revise`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ instruction: 'x' }),
+    });
+    assert.equal(res.status, 404);
+    assert.deepEqual(await res.json(), { error: 'revise not enabled' });
+    assert.equal(spy.calls.length, 0);
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, null); // not marked
+  }, { deps: { reviser: null } });
+});
+
+test('revise refuses a card without a dv button (400) and never marks it', async () => {
+  const spy = reviseSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    spy.setRepo(repo);
+    const cookie = await login(baseUrl);
+    // A draft presented with revise off: Approve/Edit/Reject, no dv.
+    const messageId = await draftCard(baseUrl, notifier, cookie, 'q-300', { revise: false });
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/revise`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ instruction: 'x' }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'not a revisable draft' });
+    assert.equal(spy.calls.length, 0);
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, null);
+  }, { deps: { reviser: spy.service } });
+});
+
+test('revise on an already-decided card is refused (409) and never marks or regenerates', async () => {
+  const spy = reviseSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    spy.setRepo(repo);
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    const row = repo.messages.find((m) => m.id === messageId);
+    if (row) row.decidedOptionId = 'da';
+    const res = await fetch(`${baseUrl}/app/api/drafts/${messageId}/revise`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ instruction: 'x' }),
+    });
+    assert.equal(res.status, 409);
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { reviser: spy.service } });
+});
+
+test('revise validates its instruction and message id', async () => {
+  const spy = reviseSpy();
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    spy.setRepo(repo);
+    const cookie = await login(baseUrl);
+    const messageId = await draftCard(baseUrl, notifier, cookie);
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/${messageId}/revise`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ instruction: '  ' }) })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/not-a-uuid/revise`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ instruction: 'x' }) })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/drafts/${crypto.randomUUID()}/revise`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ instruction: 'x' }) })).status, 404);
+    assert.equal(spy.calls.length, 0);
+  }, { deps: { reviser: spy.service } });
 });

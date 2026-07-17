@@ -56,7 +56,7 @@ import {
 } from './adapters/founder-app/founder-app-repo';
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
-import { buildCallbackPollerWorker } from './adapters/triage/callback-poller.factory';
+import { buildCallbackPollerWorker, buildDraftReviserService } from './adapters/triage/callback-poller.factory';
 import { buildMeetingSchedulerGated, type MeetingWiring } from './adapters/triage/meeting-scheduler.factory';
 import { buildScheduleDueWorker } from './adapters/scheduling/schedule.worker';
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
@@ -71,7 +71,7 @@ import {
   finalizeReleaseNoteNotification,
   resolvePrimaryChannel,
 } from './outbound/release-note-repo';
-import { enqueueDraft } from './outbound/outbound-repo';
+import { enqueueDraft, replaceDraftBodyAndApprove } from './outbound/outbound-repo';
 import { recordReleaseNoteDraftDecision } from './decisions/decisions';
 import { loadCustomerConfig } from './triage/context-loader';
 import { buildLlmRouter } from './adapters/llm/factory';
@@ -254,6 +254,11 @@ async function main(): Promise<void> {
         notifier: founderAppNotifier,
         firebase: firebaseConfig,
         meetingReply: () => bookAppMeetingTime,
+        // Edit reuses the exact core fn the console/Telegram edit path calls; gated by the drafter flag.
+        editDraft: env.KNOWLEDGE_DRAFT_ENABLED ? replaceDraftBodyAndApprove : null,
+        // 🔁 Revise: the SAME shared builder the console uses, but with the APP notifier so a regenerated
+        // draft re-presents as a NEW app card (not a no-op like the console). null when DRAFT_REVISE_ENABLED off.
+        reviser: buildDraftReviserService(founderAppNotifier),
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {
           listCustomers,

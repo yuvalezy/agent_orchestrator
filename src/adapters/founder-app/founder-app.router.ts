@@ -16,6 +16,8 @@ import { toUrgencyItem, toTimelineRow } from './founder-app-cockpit-view';
 import type { AttentionDecision, CustomerAugment } from './founder-app-cockpit-repo';
 import type { Page } from '../console/console-repo';
 import type { AppMeetingTimeOutcome } from '../triage/meeting-scheduler.factory';
+import type { replaceDraftBodyAndApprove } from '../../outbound/outbound-repo';
+import type { DraftReviserService } from '../../triage/draft-revise';
 
 // The AO Founder PWA API + static shell (M6), mounted at /app and gated by the same
 // ConsoleConfig presence as /console. Auth is a DB-backed device token (a phone stays
@@ -34,6 +36,10 @@ const SLOT_BUTTON_RE = /^ms\d+$/;
  *  slot — no slot button was chosen, so a sentinel clears it from the queue (first-writer-wins,
  *  exactly the markDecidedByRef path a tap uses). Never a real, tappable option. */
 const MEETING_TYPED_TIME_OPTION = 'mtyped';
+/** A draft card's signature: bare option ids stored by partitionButtons. Edit needs 'de';
+ *  Revise needs 'dv' (only present when DRAFT_REVISE_ENABLED was on at present-time). */
+const DRAFT_EDIT_OPT = 'de';
+const DRAFT_REVISE_OPT = 'dv';
 const MAX_LABEL = 120;
 const MAX_TEXT = 4000;
 const MAX_FCM_TOKEN = 4096;
@@ -92,6 +98,14 @@ export interface FounderAppDeps {
    * null (meeting scheduling off / Telegram not configured) → `POST /api/meeting-time` answers 503.
    */
   meetingReply?: () => ((input: { meetingId: string; localTime: string; by: string }) => Promise<AppMeetingTimeOutcome>) | null;
+  /** Edit+approve a draft in place (replace body → approve). null when KNOWLEDGE_DRAFT_ENABLED
+   *  is off → POST /api/drafts/:id/edit answers 404. The SAME core fn the console + Telegram edit
+   *  path calls (no thread marker — the new body rides in the POST body). */
+  editDraft: typeof replaceDraftBodyAndApprove | null;
+  /** The 🔁 Revise service, built with the APP notifier so a regenerated draft re-presents as a
+   *  new app card. null when DRAFT_REVISE_ENABLED is off → POST /api/drafts/:id/revise answers 404.
+   *  reviseFromInstruction NEVER throws. */
+  reviser: DraftReviserService | null;
 }
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -393,6 +407,67 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
         await deps.notifier.recordDecision({ notificationRef: row.notificationRef, optionId: MEETING_TYPED_TIME_OPTION, by: 'founder-app' });
       }
       res.json({ data: { status: outcome.status } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Edit a draft reply (replace body → approve) ──────────────────────────────────────
+  // The PWA's equal to Telegram's ✏️ Edit + the console's /drafts/:id/edit. Keyed by the app
+  // message UUID (the card-identity model /api/decisions uses), not the queueId: getMessage
+  // resolves the row, validates it is an editable draft card (has 'de'), and the new body rides
+  // in the POST body — no thread marker. Reuses the EXACT core fn the console/Telegram path calls.
+  router.post('/api/drafts/:messageId/edit', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.messageId)) return void res.status(400).json({ error: 'invalid message id' });
+    const body = (req.body as { body?: unknown } | undefined)?.body;
+    if (typeof body !== 'string' || !body.trim() || body.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'body is required' });
+    }
+    if (!deps.editDraft) return void res.status(404).json({ error: 'draft editing not enabled' });
+    try {
+      const row = await deps.repo.getMessage(req.params.messageId);
+      if (!row) return void res.status(404).json({ error: 'not found' });
+      if (!row.notificationRef || !row.buttons?.some((b) => b.id === DRAFT_EDIT_OPT)) {
+        return void res.status(400).json({ error: 'not an editable draft' });
+      }
+      if (row.decidedOptionId) return void res.status(409).json({ error: 'already decided' });
+      const queueId = row.notificationRef;
+      const result = await deps.editDraft(queueId, body, 'founder-app');
+      if (!result) return void res.status(409).json({ error: 'already decided' }); // guarded null = resolved elsewhere
+      // Leave the attention queue the ONE mirror-marking way a tapped decision does — mark + re-emit
+      // every app row on this ref (the SAME path /api/meeting-time uses after a booking).
+      await deps.notifier.recordDecision({ notificationRef: queueId, optionId: DRAFT_EDIT_OPT, by: 'founder-app' });
+      res.json({ data: { queueId, status: 'approved' } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Revise a draft reply (🔁 regenerate from a founder instruction) ───────────────────
+  // The PWA's equal to Telegram's 🔁 Revise + the console's /drafts/:id/revise. The reviser
+  // re-presents through the APP notifier and inserts a NEW card on the SAME ref, so the old card
+  // is marked decided BEFORE regenerating (first-writer-wins while only it exists) — mirroring the
+  // Telegram flow, where tapping 🔁 clears the old app card via onDecided before the instruction lands.
+  router.post('/api/drafts/:messageId/revise', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.messageId)) return void res.status(400).json({ error: 'invalid message id' });
+    const instruction = (req.body as { instruction?: unknown } | undefined)?.instruction;
+    if (typeof instruction !== 'string' || !instruction.trim() || instruction.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'instruction is required' });
+    }
+    if (!deps.reviser) return void res.status(404).json({ error: 'revise not enabled' });
+    try {
+      const row = await deps.repo.getMessage(req.params.messageId);
+      if (!row) return void res.status(404).json({ error: 'not found' });
+      if (!row.notificationRef || !row.buttons?.some((b) => b.id === DRAFT_REVISE_OPT)) {
+        return void res.status(400).json({ error: 'not a revisable draft' });
+      }
+      if (row.decidedOptionId) return void res.status(409).json({ error: 'already decided' });
+      const queueId = row.notificationRef;
+      // Mark the OLD card decided BEFORE regenerating (see route comment above).
+      await deps.notifier.recordDecision({ notificationRef: queueId, optionId: DRAFT_REVISE_OPT, by: 'founder-app' });
+      // NEVER throws; regenerates synchronously; on success re-presents a fresh draft card (SSE + FCM).
+      await deps.reviser.reviseFromInstruction({ queueId, instruction, by: 'founder-app' });
+      res.json({ data: { queueId, revised: true } });
     } catch (err) {
       next(err);
     }
