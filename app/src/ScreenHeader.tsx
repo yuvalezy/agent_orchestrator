@@ -19,7 +19,7 @@ export function ScreenHeader({
 }): ReactElement {
   const openSettings = useOpenSettings();
   return (
-    <header className="safe-top safe-x z-10 flex items-center gap-2 border-b border-zinc-800/80 bg-zinc-950/85 px-3 py-3 backdrop-blur-xl">
+    <header className="safe-top safe-x z-10 flex shrink-0 items-center gap-2 border-b border-zinc-800/80 bg-zinc-950/85 px-3 py-3 backdrop-blur-xl">
       {onBack && (
         <button aria-label="Back" onClick={onBack} className="grid size-9 shrink-0 place-items-center rounded-full text-zinc-300 active:bg-zinc-800">
           <ChevronLeft size={22} />

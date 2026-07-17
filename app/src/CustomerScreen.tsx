@@ -8,6 +8,7 @@ import { Timeline } from './Timeline';
 import { AttentionCard } from './AttentionCard';
 import { CustomerAsk } from './CustomerAsk';
 import { DetailSheet } from './DetailSheet';
+import { Screen, Pane, ScrollArea } from './Layout';
 import { useOptimisticDecide } from './useOptimisticDecide';
 import { cn } from './lib/utils';
 import type { AttentionCard as AttentionCardData, CustomerDetail, DetailKind, TimelinePage, TimelineRow } from './types';
@@ -38,7 +39,7 @@ export function CustomerScreen(): ReactElement {
   const pending = (attention?.decisions ?? []).filter((card) => (card.customerId ?? card.customerRef) === id);
 
   return (
-    <div className="flex h-full flex-col">
+    <Screen>
       <ScreenHeader title={customer?.displayName ?? 'Customer'} subtitle={pending.length > 0 ? `${pending.length} pending` : undefined} onBack={() => navigate('/customers')} />
 
       <div className="safe-x px-3 pt-3">
@@ -61,12 +62,14 @@ export function CustomerScreen(): ReactElement {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-hidden">
+      {/* Pane = a bounded flex-col, so the active tab (esp. the flex-1 Ask chat) gets a real
+          height to scroll inside instead of growing to content and hiding its tail. */}
+      <Pane className="overflow-hidden">
         {tab === 'timeline' && <TimelineTab customerId={id} focusId={focusId} />}
         {tab === 'pending' && <PendingTab customerId={id} pending={pending} />}
         {tab === 'ask' && <CustomerAsk customerId={id} />}
-      </div>
-    </div>
+      </Pane>
+    </Screen>
   );
 }
 
@@ -144,7 +147,7 @@ function TimelineTab({ customerId, focusId }: { customerId: string; focusId: str
   // The thread owns its own scroll container (it has to: it pins the viewport on prepend and
   // opens at the bottom), so this tab hands it the page state and stays out of the way.
   return (
-    <div className="flex h-full flex-col">
+    <Screen>
       <Timeline
         rows={rows}
         hasMore={cursor !== null}
@@ -154,7 +157,7 @@ function TimelineTab({ customerId, focusId }: { customerId: string; focusId: str
         focusId={focusId}
       />
       <DetailSheet target={detail} onClose={() => setDetail(null)} />
-    </div>
+    </Screen>
   );
 }
 
@@ -163,11 +166,11 @@ function PendingTab({ customerId, pending }: { customerId: string; pending: Atte
 
   if (pending.length === 0) return <Center><p className="text-sm text-zinc-500">Nothing pending for this customer.</p></Center>;
   return (
-    <div className="h-full space-y-2.5 overflow-y-auto px-3 py-3 pb-6" key={customerId}>
+    <ScrollArea className="space-y-2.5 px-3 py-3 pb-6" key={customerId}>
       {pending.map((card) => (
         <AttentionCard key={card.id} card={card} decidedOptionId={decidedFor(card)} onDecide={decide} />
       ))}
-    </div>
+    </ScrollArea>
   );
 }
 

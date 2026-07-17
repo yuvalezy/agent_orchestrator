@@ -4,6 +4,7 @@ import { useAppData } from './AppData';
 import { AttentionCard } from './AttentionCard';
 import { DetailSheet } from './DetailSheet';
 import { ScreenHeader } from './ScreenHeader';
+import { Screen, ScrollArea } from './Layout';
 import { useOptimisticDecide } from './useOptimisticDecide';
 import { relativeTime } from './lib/time';
 import type { DetailKind, UrgencyItem } from './types';
@@ -18,9 +19,9 @@ export function AttentionScreen(): ReactElement {
   const pending = decisions.length;
 
   return (
-    <div className="flex h-full flex-col">
+    <Screen>
       <ScreenHeader title="Attention" subtitle={pending > 0 ? `${pending} waiting on you` : 'Your action queue'} settings />
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-6 pt-2">
+      <ScrollArea className="px-3 pb-6 pt-2">
         {attentionLoading && !attention && (
           <div className="flex justify-center py-16"><Loader2 className="animate-spin text-zinc-600" size={22} /></div>
         )}
@@ -56,10 +57,10 @@ export function AttentionScreen(): ReactElement {
             </div>
           </section>
         )}
-      </div>
+      </ScrollArea>
 
       <DetailSheet target={detail} onClose={() => setDetail(null)} />
-    </div>
+    </Screen>
   );
 }
 

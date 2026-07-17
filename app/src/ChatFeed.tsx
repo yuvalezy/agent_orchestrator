@@ -1,6 +1,7 @@
 import { type ReactElement, type ReactNode, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, Loader2 } from 'lucide-react';
 import { MessageBubble } from './MessageBubble';
+import { Pane, ScrollArea } from './Layout';
 import { dayKey, dayLabel } from './lib/time';
 import type { Feed } from './useFeed';
 import type { Message } from './types';
@@ -78,14 +79,14 @@ export function ChatFeed({
   }
 
   return (
-    <div className="relative min-h-0 flex-1">
-      <div ref={scrollRef} onScroll={onScroll} className="feed-scroll h-full overflow-y-auto overscroll-contain py-3">
+    <Pane className="relative">
+      <ScrollArea ref={scrollRef} onScroll={onScroll} className="feed-scroll overscroll-contain py-3">
         {feed.loadingMore && (
           <div className="flex justify-center py-2"><Loader2 className="animate-spin text-zinc-600" size={16} /></div>
         )}
         {renderRows(messages, feed.decide)}
         <div ref={bottomRef} className="h-px" />
-      </div>
+      </ScrollArea>
 
       {showNewPill && (
         <button
@@ -97,7 +98,7 @@ export function ChatFeed({
           New messages
         </button>
       )}
-    </div>
+    </Pane>
   );
 }
 

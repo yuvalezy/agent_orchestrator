@@ -4,6 +4,7 @@ import { ChevronRight, Loader2, Search, Users } from 'lucide-react';
 import { api } from './lib/api';
 import { useAppData } from './AppData';
 import { ScreenHeader } from './ScreenHeader';
+import { Screen, ScrollArea } from './Layout';
 import { relativeTime } from './lib/time';
 import type { CustomerPage, CustomerRow } from './types';
 
@@ -48,7 +49,7 @@ export function CustomersScreen(): ReactElement {
   };
 
   return (
-    <div className="flex h-full flex-col">
+    <Screen>
       <ScreenHeader title="Customers" subtitle="Everyone you're running" settings />
       <div className="safe-x px-3 pt-3">
         <div className="flex items-center gap-2 rounded-2xl border border-zinc-800 bg-zinc-900 px-3.5 py-2.5 focus-within:border-ember-500/60">
@@ -63,7 +64,7 @@ export function CustomersScreen(): ReactElement {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-6 pt-3">
+      <ScrollArea className="px-3 pb-6 pt-3">
         {loading && rows.length === 0 && (
           <div className="flex justify-center py-16"><Loader2 className="animate-spin text-zinc-600" size={22} /></div>
         )}
@@ -108,8 +109,8 @@ export function CustomersScreen(): ReactElement {
             {loadingMore ? <Loader2 size={15} className="animate-spin" /> : 'Load more'}
           </button>
         )}
-      </div>
-    </div>
+      </ScrollArea>
+    </Screen>
   );
 }
 

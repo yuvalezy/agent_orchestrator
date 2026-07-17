@@ -3,6 +3,7 @@ import { Loader2, Sparkles, SquareCheckBig } from 'lucide-react';
 import { cn } from './lib/utils';
 import { dayKey, dayLabel, messageTime } from './lib/time';
 import { OpenTaskButton } from './CardActions';
+import { ScrollArea } from './Layout';
 import { useThreadScroll } from './useThreadScroll';
 import type { DetailKind, TimelineRow } from './types';
 
@@ -54,12 +55,12 @@ export function Timeline({
   }, [focusId]);
 
   return (
-    <div
+    <ScrollArea
       ref={scrollRef}
       onScroll={onScroll}
       role="log"
       aria-label="Conversation timeline"
-      className="feed-scroll h-full overflow-y-auto overscroll-contain px-3 py-3 pb-6"
+      className="feed-scroll overscroll-contain px-3 py-3 pb-6"
     >
       {hasMore && (
         <div className="flex justify-center">
@@ -80,7 +81,7 @@ export function Timeline({
 
       {renderRows(ordered, { focusId, flashId, focusRef, onOpen })}
       <div ref={bottomRef} className="h-px" />
-    </div>
+    </ScrollArea>
   );
 }
 

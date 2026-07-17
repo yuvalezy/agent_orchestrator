@@ -32,7 +32,9 @@ export function SettingsSheet({
         aria-modal="true"
         aria-label="Settings"
         className={cn(
-          'safe-bottom absolute inset-x-0 bottom-0 rounded-t-3xl border-t border-zinc-800 bg-zinc-950 px-4 pb-4 pt-3 shadow-2xl transition-transform duration-300 ease-out',
+          // max-h + scroll so the top rows stay reachable on a short viewport (mirrors DetailSheet);
+          // without it a bottom-anchored panel pushes its first row off the top edge.
+          'safe-bottom absolute inset-x-0 bottom-0 max-h-[85dvh] overflow-y-auto rounded-t-3xl border-t border-zinc-800 bg-zinc-950 px-4 pb-4 pt-3 shadow-2xl transition-transform duration-300 ease-out',
           open ? 'translate-y-0' : 'translate-y-full',
         )}
       >

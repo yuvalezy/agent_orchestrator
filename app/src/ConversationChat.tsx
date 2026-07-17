@@ -4,6 +4,7 @@ import { api } from './lib/api';
 import { useOptionalAppData } from './AppData';
 import { Composer } from './Composer';
 import { MessageBubble } from './MessageBubble';
+import { Pane, ScrollArea } from './Layout';
 import { useThreadScroll } from './useThreadScroll';
 import type { ChatPage, ChatPost, Message } from './types';
 
@@ -152,7 +153,7 @@ export function ConversationChat({
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <Pane>
       <div className="safe-x flex justify-end border-b border-zinc-900 px-3 py-2">
         <button
           type="button"
@@ -165,7 +166,7 @@ export function ConversationChat({
         </button>
       </div>
 
-      <div ref={scroll.scrollRef} onScroll={scroll.onScroll} className="min-h-0 flex-1 overflow-y-auto py-3">
+      <ScrollArea ref={scroll.scrollRef} onScroll={scroll.onScroll} className="py-3">
         {loading ? (
           <div className="grid h-full place-items-center"><Loader2 size={20} className="animate-spin text-zinc-600" /></div>
         ) : messages.length === 0 ? (
@@ -186,8 +187,8 @@ export function ConversationChat({
           </div>
         )}
         <div ref={scroll.bottomRef} className="h-px" />
-      </div>
+      </ScrollArea>
       <Composer onSend={(text) => void send(text)} sending={sending || resetting || loading} />
-    </div>
+    </Pane>
   );
 }
