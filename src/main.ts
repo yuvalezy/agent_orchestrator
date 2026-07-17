@@ -25,6 +25,7 @@ import { buildFcmSender } from './adapters/founder-app/fcm-sender';
 import { AppFounderNotifier } from './adapters/founder-app/app-founder-notifier';
 import { FounderAppFeed } from './adapters/founder-app/founder-app-feed';
 import { buildFounderAppRouter } from './adapters/founder-app/founder-app.router';
+import { buildAppComposeGated } from './adapters/founder-app/compose-draft.factory';
 import { listAttentionDecisions, augmentCustomers } from './adapters/founder-app/founder-app-cockpit-repo';
 import {
   listCustomers,
@@ -259,6 +260,10 @@ async function main(): Promise<void> {
         // 🔁 Revise: the SAME shared builder the console uses, but with the APP notifier so a regenerated
         // draft re-presents as a NEW app card (not a no-op like the console). null when DRAFT_REVISE_ENABLED off.
         reviser: buildDraftReviserService(founderAppNotifier),
+        // Compose a NEW draft (the app equal of Telegram's /draft email) — a self-contained gated
+        // builder (like the reviser) that presents the composed card through the APP notifier.
+        // undefined (→ 503) when KNOWLEDGE_DRAFT_ENABLED is off.
+        composeDraft: buildAppComposeGated(founderAppNotifier),
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {
           listCustomers,

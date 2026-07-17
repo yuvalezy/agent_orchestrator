@@ -1,5 +1,20 @@
 import { buildDraftEmailPresenter, type DraftEmailPresenterDeps } from '../../query/draft-email';
 import type { ResolvedCustomerRef } from '../../query/commands';
+import { env } from '../../config/env';
+import { logger } from '../../logger';
+import { query } from '../../db';
+import { tryResolveCredential } from '../../config/credentials';
+import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
+import type { KnowledgeRetriever } from '../../knowledge/retrieval';
+import { buildKnowledgeRetriever } from '../../knowledge/retrieval';
+import { memoryRepo } from '../../knowledge/memory-repo';
+import { buildEmbeddingAdapter } from '../knowledge/openai-embeddings.client';
+import { buildLlmRouter } from '../llm/factory';
+import { renderCitations } from '../../triage/response-drafter';
+import { loadCustomerConfig } from '../../triage/context-loader';
+import { resolveScheduleRoute } from '../../scheduling/scheduling-repo';
+import { enqueueDraft } from '../../outbound/outbound-repo';
+import { recordFounderDraftDecision } from '../../decisions/decisions';
 
 // COMPOSE-a-new-draft for the Founder PWA (Track C) — the app equal of Telegram's
 // `/draft email <prompt>`. The Telegram surface COMPOSES a customer email, enqueues it
@@ -68,4 +83,109 @@ export function buildAppComposeDraft(
     if (queueId === null) return { ok: false, reason: 'compose_failed' };
     return { ok: true, queueId };
   };
+}
+
+/** Resolve a customer's ref (id + display name) by id — the app compose input carries only the id,
+ *  but the presenter's compose + audit decision need the NAME. Reverse-direction sibling of
+ *  slash-commands' resolveThreadCustomer/findCustomerByName: a direct agent_customers read, no
+ *  secret, never logs the argument. null → unknown customer (the router already 404s; this is the
+ *  defensive race guard buildAppComposeDraft expects). */
+async function resolveCustomerById(customerId: string): Promise<ResolvedCustomerRef | null> {
+  const { rows } = await query<{ id: string; display_name: string }>(
+    'SELECT id, display_name FROM agent_customers WHERE id = $1',
+    [customerId],
+  );
+  const r = rows[0];
+  return r ? { customerId: r.id, customerName: r.display_name } : null;
+}
+
+/**
+ * Build the GATED app compose-draft capability — the `composeDraft` dep buildFounderAppRouter reads
+ * (undefined when off → POST /api/drafts/compose answers 503). Self-builds its LLM router + embedding
+ * + knowledge retriever exactly like buildDraftReviserService (a composition root may import
+ * adapters); gated by KNOWLEDGE_DRAFT_ENABLED — the SAME flag `/draft email`'s presenter is gated by,
+ * so app compose lights up with the Telegram command, not on its own.
+ *
+ * Wires the SAME core primitives `/draft email` inlines (resolveScheduleRoute → resolveEmailRoute,
+ * loadCustomerConfig + retriever + llm.draftReply + renderCitations → compose, enqueueDraft,
+ * recordFounderDraftDecision), but with the APP `notifier` — so a composed draft card lands in the
+ * app feed (SSE + FCM) rather than a Telegram topic. Kept self-contained (not extracted from
+ * slash-commands) to match buildDraftReviserService's established pattern and leave the tested
+ * `/draft email` path untouched.
+ */
+export function buildAppComposeGated(
+  notifier: Pick<FounderNotifierPort, 'notifyCustomerEvent' | 'notifyAdmin'>,
+): ((input: AppComposeDraftInput) => Promise<AppComposeDraftResult>) | undefined {
+  if (!env.KNOWLEDGE_DRAFT_ENABLED) {
+    logger.info('app compose-draft NOT wired (KNOWLEDGE_DRAFT_ENABLED=false)');
+    return undefined;
+  }
+  if (!tryResolveCredential('OPENAI_API_KEY')) {
+    logger.warn('⚠️  KNOWLEDGE_DRAFT_ENABLED=true but OPENAI_API_KEY is UNSET — app compose degrades until it is set (route resolves, but composing the body fails).');
+  }
+  const llm = buildLlmRouter({
+    notifyAdmin: (msg) => notifier.notifyAdmin({ title: 'LLM gateway', body: msg, severity: 'warning' }),
+  });
+  const embedding = buildEmbeddingAdapter(
+    () => tryResolveCredential('OPENAI_API_KEY'),
+    env.OPENAI_BASE_URL,
+    { model: env.OPENAI_EMBEDDING_MODEL, dim: env.OPENAI_EMBEDDING_DIM },
+  );
+  // Grounded retrieval when enabled; otherwise a no-op retriever ([]) so a compose still produces a
+  // (clearly ungrounded) draft — identical degrade to buildDraftReviserService.
+  const retriever: KnowledgeRetriever = env.KNOWLEDGE_RETRIEVAL_ENABLED
+    ? buildKnowledgeRetriever({
+        embedding,
+        search: memoryRepo.search.bind(memoryRepo),
+        // WP4: hybrid (vector + FTS, RRF) only when flagged on — else vector-only, byte-identical.
+        hybridSearch: env.HYBRID_RETRIEVAL_ENABLED ? memoryRepo.hybridSearch.bind(memoryRepo) : undefined,
+        options: {
+          kCustomer: env.KNOWLEDGE_RETRIEVAL_K_CUSTOMER,
+          kShared: env.KNOWLEDGE_RETRIEVAL_K_SHARED,
+          maxDistance: env.KNOWLEDGE_RETRIEVAL_MAX_DISTANCE,
+        },
+      })
+    : { retrieve: async () => [] };
+  if (!env.KNOWLEDGE_RETRIEVAL_ENABLED) {
+    logger.warn('⚠️  KNOWLEDGE_DRAFT_ENABLED=true but KNOWLEDGE_RETRIEVAL_ENABLED=false — app compose drafts WITHOUT retrieved knowledge (ungrounded).');
+  }
+  logger.info('app compose-draft wired (KNOWLEDGE_DRAFT_ENABLED=true)');
+  return buildAppComposeDraft({
+    // The customer's email SEND route (reply-from account + primary contact). A NEW mail, so no reply
+    // origin → resolveScheduleRoute falls to the primary 1:1 email route (the SAME `/draft email` uses).
+    resolveEmailRoute: async (customerId) => {
+      const route = await resolveScheduleRoute(customerId, ['email'], null);
+      return route
+        ? {
+            channelInstanceId: route.channelInstanceId,
+            channelType: route.channelType,
+            recipientAddress: route.recipientAddress,
+            recipientLabel: route.recipientLabel,
+          }
+        : null;
+    },
+    compose: async ({ prompt, customer }) => {
+      const config = await loadCustomerConfig(customer.customerId);
+      const language = config?.preferredLanguage ?? 'en';
+      const knowledge = await retriever.retrieve(prompt, customer.customerId);
+      const result = await llm.draftReply({
+        question: prompt,
+        language,
+        customerName: customer.customerName,
+        knowledge,
+      });
+      return {
+        body: result.body,
+        // No knowledge → no citations (renderCitations' fallback would otherwise cite nothing).
+        citations: knowledge.length > 0 ? renderCitations(knowledge, result.usedSourceIndexes) : [],
+        grounded: knowledge.length > 0,
+        language,
+      };
+    },
+    enqueueDraft,
+    recordDraftDecision: recordFounderDraftDecision,
+    notifier,
+    log: logger,
+    resolveCustomer: resolveCustomerById,
+  });
 }

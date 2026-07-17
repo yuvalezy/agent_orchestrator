@@ -7,6 +7,7 @@ import { ScreenHeader } from './ScreenHeader';
 import { Timeline } from './Timeline';
 import { AttentionCard } from './AttentionCard';
 import { CustomerAsk } from './CustomerAsk';
+import { ComposeReply } from './ComposeReply';
 import { DetailSheet } from './DetailSheet';
 import { Screen, Pane, ScrollArea } from './Layout';
 import { useOptimisticDecide } from './useOptimisticDecide';
@@ -164,12 +165,18 @@ function TimelineTab({ customerId, focusId }: { customerId: string; focusId: str
 function PendingTab({ customerId, pending }: { customerId: string; pending: AttentionCardData[] }): ReactElement {
   const { decide, decidedFor } = useOptimisticDecide();
 
-  if (pending.length === 0) return <Center><p className="text-sm text-zinc-500">Nothing pending for this customer.</p></Center>;
+  // "Draft a reply" lives at the top so it's reachable whether or not anything is pending — a
+  // composed draft lands back here (and in the feed) as its own Approve/Edit/Reject card via SSE.
   return (
     <ScrollArea className="space-y-2.5 px-3 py-3 pb-6" key={customerId}>
-      {pending.map((card) => (
-        <AttentionCard key={card.id} card={card} decidedOptionId={decidedFor(card)} onDecide={decide} />
-      ))}
+      <ComposeReply customerId={customerId} />
+      {pending.length === 0 ? (
+        <p className="pt-1 text-sm text-zinc-500">Nothing pending for this customer.</p>
+      ) : (
+        pending.map((card) => (
+          <AttentionCard key={card.id} card={card} decidedOptionId={decidedFor(card)} onDecide={decide} />
+        ))
+      )}
     </ScrollArea>
   );
 }
