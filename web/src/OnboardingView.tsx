@@ -2,6 +2,7 @@ import { type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { Building2, CheckCircle2, CircleAlert, FolderKanban, MessageCircle, Sparkles, UserPlus } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
+import { Select } from './lib/select';
 
 // Customer Onboarding + Backfill screen. A guided flow: search EZY Portal for a business partner
 // (already-onboarded ones are flagged and cannot be picked), preview its WhatsApp/email contacts,
@@ -232,10 +233,7 @@ export function OnboardingView(): ReactElement {
               {workItemTypes.data && witList.length === 0 && <ErrorText message="This project type has no work item types — the portal would reject task creation. Pick another project." />}
               {witList.length === 1 && <p className="text-sm text-zinc-300">{witList[0].name} <span className="text-zinc-500">(only option — selected automatically)</span></p>}
               {witList.length > 1 && (
-                <select value={witRef} onChange={(e) => setWitRef(e.target.value)} className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm">
-                  <option value="" disabled>Choose a work item type…</option>
-                  {witList.map((t) => <option key={t.ref} value={t.ref}>{t.name}</option>)}
-                </select>
+                <Select value={witRef} onChange={setWitRef} sort searchable placeholder="Choose a work item type…" aria-label="Work item type" options={witList.map((t) => ({ value: t.ref, label: t.name }))} />
               )}
             </div>
           )}

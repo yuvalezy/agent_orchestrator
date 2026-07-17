@@ -2,6 +2,7 @@ import { type ReactElement, type ReactNode, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, CircleAlert, LoaderCircle, Pencil, Send, Sparkles, X } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
+import { Select } from './lib/select';
 
 // The Approvals surface: clear pending draft replies + backfill task proposals in the UI instead of
 // Telegram. Every action hits a /console/api/approvals endpoint that reuses the SAME core fn the
@@ -203,10 +204,7 @@ function ProposalsTab({ query }: { query: ReturnType<typeof useQuery<{ data: Pro
         {['', 'urgent', 'high', 'medium', 'low'].map((p) => (
           <button key={p || 'all'} onClick={() => setPriority(p)} className={`rounded-full px-2.5 py-1 ${priority === p ? 'bg-zinc-700 text-white' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-200'}`}>{p || 'all priorities'}</button>
         ))}
-        <select value={customer} onChange={(e) => setCustomer(e.target.value)} className="rounded bg-zinc-900 px-2 py-1 text-zinc-300 outline-none ring-1 ring-zinc-800">
-          <option value="">all customers</option>
-          {customers.map((c) => <option key={c} value={c}>{c}</option>)}
-        </select>
+        <Select value={customer} onChange={setCustomer} searchable sort aria-label="Customer filter" className="py-1" options={[{ value: '', label: 'all customers' }, ...customers.map((c) => ({ value: c, label: c }))]} />
         <span className="text-zinc-500">{rows.length} shown</span>
       </div>
       {err && <ErrorState message={err} />}

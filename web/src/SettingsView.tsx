@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CircleAlert, RotateCw } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
 import { PushNotificationsPanel } from './PushNotificationsPanel';
+import { Select } from './lib/select';
 
 // Settings surface (Contract B3 + pass-2 tuning knobs): render the DB-authoritative config
 // grouped by category. Booleans are toggles; enums are selects; numbers/strings are inputs that
@@ -44,14 +45,15 @@ const inputCls = 'rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 te
 /** Enum select — value props are always concrete strings (never empty). Applies on change. */
 function EnumControl({ s, disabled, pending, onSave }: { s: SettingRow; disabled: boolean; pending: boolean; onSave: (v: string) => void }): ReactElement {
   return (
-    <select
-      className={inputCls}
+    <Select
+      className="bg-zinc-950 py-1.5"
+      minWidthClassName="min-w-32"
       disabled={disabled || pending}
       value={String(s.value)}
-      onChange={(e) => e.target.value !== String(s.value) && onSave(e.target.value)}
-    >
-      {(s.options ?? []).map((o) => <option key={o} value={o}>{o}</option>)}
-    </select>
+      aria-label={s.key}
+      onChange={(v) => v !== String(s.value) && onSave(v)}
+      options={(s.options ?? []).map((o) => ({ value: o, label: o }))}
+    />
   );
 }
 
