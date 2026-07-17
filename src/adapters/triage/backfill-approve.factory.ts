@@ -1,6 +1,5 @@
 import { logger } from '../../logger';
 import type { DecisionEvent } from '../../ports/founder-notifier.port';
-import type { TelegramNotifier } from '../telegram/telegram-notifier';
 import { buildEzyPortalGateway } from '../ezy-portal/factory';
 import {
   claimBackfillProposalDecision,
@@ -15,7 +14,7 @@ import { approveBackfillProposal, rejectBackfillProposal } from '../../knowledge
 // Backfill proposal APPROVE/REJECT handler (ADAPTER — composition of the core approve logic with
 // the EZY gateway + decisions repo + notifier). Consumes only backfill options; returns false
 // otherwise so the composite onDecision router falls through. Idempotent via the core's outcome
-// guard; posts a one-time confirmation in the card's thread.
+// guard; posts a one-time confirmation via the surface-agnostic `confirm` (thread reply and/or app).
 //
 // ⚠︎ callback_data is split by the notifier on the FIRST ':' → optionId=before, notificationRef=
 // after. So the CLEAN encoding is `bfok:<decisionId>` / `bfno:<decisionId>` (optionId='bfok'|
@@ -57,16 +56,20 @@ export function renderTaskCreated(r: { title: string; code?: string; url?: strin
 }
 
 export function buildBackfillApproveHandler(deps: {
-  notifier: Pick<TelegramNotifier, 'replyInThread'>;
+  /**
+   * Confirm the outcome for this decision. Surface-agnostic like the commitment handler: WHERE the
+   * ack lands — the Telegram thread the card lives in, the app feed, or both — is the composition
+   * root's call, decided from the DecisionEvent (a Telegram tap carries a threadId; an app tap does
+   * not). A threadless app tap used to get no confirmation at all; now the app mirror catches it.
+   */
+  confirm: (d: DecisionEvent, text: string) => Promise<void>;
   approve?: typeof approveBackfillProposal;
   reject?: typeof rejectBackfillProposal;
 }): BackfillApproveHandler {
   const portal = buildEzyPortalGateway();
   const approveProposal = deps.approve ?? approveBackfillProposal;
   const rejectProposal = deps.reject ?? rejectBackfillProposal;
-  const confirm = async (d: DecisionEvent, text: string): Promise<void> => {
-    if (d.threadId) await deps.notifier.replyInThread(d.threadId, text);
-  };
+  const confirm = deps.confirm;
 
   return {
     isBackfillOption: (optionId) => optionId === 'bfok' || optionId === 'bfno' || optionId === 'bf',

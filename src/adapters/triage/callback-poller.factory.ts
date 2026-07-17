@@ -260,11 +260,11 @@ export function buildCallbackPollerWorker(
   // scope-flip (Phase 2) when revise is wired; unknown ids no-op.
   // Backfill proposal approve/reject (bf:ok:/bf:no:) — only registered when BACKFILL_ENABLED,
   // so a tap does nothing until the feature is on.
-  // Backfill's ack is a Telegram thread reply, guarded on threadId (an app tap has none, so it
-  // skips the ack today). Pass a no-op replyInThread in an app-only boot — the approve/reject
-  // action itself is threadId-independent, so it still works; only the (already-optional) ack is lost.
+  // Confirm on every surface (thread reply if a Telegram tap, app feed always) via confirmDecision —
+  // so an app-tapped approve/reject is acknowledged instead of silently clearing, and a Telegram tap's
+  // ack is mirrored to the app too. Surface-agnostic like the commitment handler.
   const backfill = env.BACKFILL_ENABLED
-    ? buildBackfillApproveHandler({ notifier: notifier ?? { replyInThread: async (): Promise<void> => {} } })
+    ? buildBackfillApproveHandler({ confirm: confirmDecision })
     : null;
 
   // Meeting duration/slot taps. A SECOND scheduler instance (the inbox processor builds its own

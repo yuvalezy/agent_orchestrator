@@ -52,10 +52,10 @@ test('a title with markup characters is sent verbatim (plain text — no parse_m
   assert.equal(renderTaskCreated({ code: 'TSK-2', title: 'Fix _totals_ in *Q3* [report]' }), '✅ Task created: TSK-2 — Fix _totals_ in *Q3* [report]');
 });
 
-test('an approved tap posts the code + link confirmation into the card thread', async () => {
+test('an approved tap posts the code + link confirmation via the surface-agnostic confirm', async () => {
   const replies: string[] = [];
   const handler = buildBackfillApproveHandler({
-    notifier: { replyInThread: async (_threadId, text) => { replies.push(text); } },
+    confirm: async (_d, text) => { replies.push(text); },
     approve: async () => ({ ok: true, created: true, taskRef: 'uuid-1', title: 'Investigate reports arriving with zero values', code: 'TSK-00247', url: 'https://account.ezyts.com/projects/tasks/uuid-1' }),
     reject: async () => ({ resolved: false }),
   });
@@ -63,10 +63,23 @@ test('an approved tap posts the code + link confirmation into the card thread', 
   assert.deepEqual(replies, ['✅ Task created: TSK-00247 — Investigate reports arriving with zero values\nhttps://account.ezyts.com/projects/tasks/uuid-1']);
 });
 
+test('an app tap (no thread) is still confirmed — confirm is called regardless of threadId', async () => {
+  const replies: string[] = [];
+  const handler = buildBackfillApproveHandler({
+    confirm: async (_d, text) => { replies.push(text); },
+    approve: async () => ({ ok: true, created: true, taskRef: 'uuid-1', title: 'Build X', code: 'TSK-1', url: 'https://p/projects/tasks/u1' }),
+    reject: async () => ({ resolved: false }),
+  });
+  // No threadId (an app tap): the handler must still call confirm, where the old notifier-guarded
+  // path went silent.
+  await handler.handle({ optionId: 'bfok', notificationRef: '19', by: 'founder-app' });
+  assert.deepEqual(replies, ['✅ Task created: TSK-1 — Build X\nhttps://p/projects/tasks/u1']);
+});
+
 test('a Telegram action that lost to another surface posts no duplicate confirmation', async () => {
   const replies: string[] = [];
   const handler = buildBackfillApproveHandler({
-    notifier: { replyInThread: async (_threadId, text) => { replies.push(text); } },
+    confirm: async (_d, text) => { replies.push(text); },
     approve: async () => ({ ok: true, created: false, reason: 'already-resolved' }),
     reject: async () => ({ resolved: false }),
   });
