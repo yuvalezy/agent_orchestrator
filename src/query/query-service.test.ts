@@ -54,7 +54,10 @@ function serviceWith(opts: {
     scopeResolver: buildScopeResolver({ findCustomer: async () => opts.customerMatch ?? null }),
     retrieveInternal: (q) => opts.internal.fn(q),
     retrieveCustomer: (q, id) => opts.customer.fn(q, id),
-    retrieveAllCustomers: (q) => all.fn(q),
+    retrieveAllCustomers: async (q) => {
+      const citations = await all.fn(q);
+      return { citations, totalCustomers: citations.length };
+    },
     synth: opts.synth,
   });
 }

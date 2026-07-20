@@ -40,15 +40,25 @@ const SNIPPET_CHARS = 900;
 
 /** Max customers fanned out for one cross-customer (Admin topic) query. The fan-out is N
  *  indexed vector searches sharing ONE embedding, but N grows with the book of business
- *  and the founder is waiting on a Telegram reply, so it is bounded.
+ *  and the founder is waiting on a reply, so it is bounded.
  *
- *  ⚠︎ KNOWN GAP: past this cap the answer silently covers only the first N customers by
- *  name. The skip is LOGGED (`skipped` below) but NOT surfaced to the founder, so a
- *  cross-customer answer over a bigger book would read as complete when it isn't — the
- *  exact shape of lie an aggregate shouldn't tell. Harmless while the book is well under
- *  the cap; before it approaches 25, the truncation needs to reach the reply (a flag on
- *  QueryResult → formatAnswer), not just the log. */
+ *  Past this cap only the first N customers (by name) are covered. On the AGENTIC founder-chat
+ *  path the truncation is now surfaced to the founder as a `Coverage` source (`fanoutCoverageNote`
+ *  below), so a partial answer never reads as complete. The single-shot /ask path still only LOGS
+ *  the skip (`skipped` below) — harmless while the book is well under the cap; when it approaches
+ *  25 the single-shot reply also needs the note (a flag on QueryResult → formatAnswer). */
 const MAX_CROSS_CUSTOMER_FANOUT = 25;
+
+/** Founder-visible note prepended to a cross-customer TOOL result when the fan-out was bounded
+ *  below the book size — turns a silently-partial aggregate into an explicitly-partial one, with
+ *  the way to get the rest (name a customer). Null when the whole book fit. */
+function fanoutCoverageNote(total: number): AgenticToolSource | null {
+  if (total <= MAX_CROSS_CUSTOMER_FANOUT) return null;
+  return {
+    label: 'Coverage',
+    content: `Partial: this searched ${MAX_CROSS_CUSTOMER_FANOUT} of ${total} customers (bounded fan-out). Name a specific customer to cover the rest.`,
+  };
+}
 
 /** Citations kept from a cross-customer merge, ranked by distance. Roughly the per-scope
  *  budget — the synthesis prompt has a finite context and the founder a finite screen. */
@@ -165,9 +175,9 @@ export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<vo
   // shared chunk once PER customer. So the shared leg is fetched ONCE (customerId null → shared
   // only) and subtracted from every customer leg by content; a customer row byte-identical to a
   // shared row is attributed to the shared corpus.
-  const retrieveAllCustomers = async (question: string): Promise<QueryCitation[]> => {
+  const retrieveAllCustomers = async (question: string): Promise<{ citations: QueryCitation[]; totalCustomers: number }> => {
     const vec = await embedQuestion(question);
-    if (!vec) return [];
+    if (!vec) return { citations: [], totalCustomers: 0 };
 
     const [shared, customers] = await Promise.all([searchMemory(vec, null), listCustomers()]);
     const sharedContent = new Set(shared.map((h) => h.content));
@@ -196,7 +206,7 @@ export function buildQueryEngineService(notifyAdmin: (msg: string) => Promise<vo
       { customers: fanned.length, skipped: customers.length - fanned.length, cited: merged.length },
       'query: cross-customer fan-out',
     );
-    return merged;
+    return { citations: merged, totalCustomers: customers.length };
   };
 
   const service = buildQueryService({
@@ -259,7 +269,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 interface AgenticToolDepsInput {
   embedQuestion: (q: string) => Promise<number[] | null>;
-  retrieveAllCustomers: (question: string) => Promise<QueryCitation[]>;
+  retrieveAllCustomers: (question: string) => Promise<{ citations: QueryCitation[]; totalCustomers: number }>;
   internalSearch: { search: (q: string, k?: number) => Promise<Array<{ repo: string; path: string; section: string | null; snippet: string }>> };
   findCustomerByName: (question: string) => Promise<ResolvedCustomer | null>;
 }
@@ -312,10 +322,14 @@ function buildAgenticToolDeps(input: AgenticToolDepsInput): AgenticToolDeps {
         : await memoryRepo.search(vec, customerId, opts);
       return results.map((r) => ({ label: memoryLabel(r.metadata, r.memoryType), content: snippet(r.content) }));
     },
-    // cross-customer fan-out (reuses the single-shot Admin-topic retriever).
+    // cross-customer fan-out (reuses the single-shot Admin-topic retriever). Surfaces partial
+    // coverage to the founder when the book exceeds the fan-out cap (a silently-truncated
+    // aggregate is the exact lie this tool must not tell).
     searchAllMemory: async (queryText) => {
-      const hits = await input.retrieveAllCustomers(queryText);
-      return hits.map((h) => ({ label: h.label, content: h.snippet }));
+      const { citations, totalCustomers } = await input.retrieveAllCustomers(queryText);
+      const sources = citations.map((h) => ({ label: h.label, content: h.snippet }));
+      const note = fanoutCoverageNote(totalCustomers);
+      return note ? [note, ...sources] : sources;
     },
     // internal Project-Brain corpus (structurally separate from customer data).
     searchInternalKnowledge: async (queryText, k) => {
@@ -328,13 +342,16 @@ function buildAgenticToolDeps(input: AgenticToolDepsInput): AgenticToolDeps {
     listOpenTasks: async (customerId) => {
       if (customerId) return openTasksForCustomer(customerId);
       // Cross-customer: a BOUNDED fan-out over onboarded customers (a founder tool, so bounded).
-      const customers = (await listCustomers()).slice(0, MAX_CROSS_CUSTOMER_FANOUT);
+      const all = await listCustomers();
+      const customers = all.slice(0, MAX_CROSS_CUSTOMER_FANOUT);
       const per = await Promise.all(
         customers.map(async (c) =>
           (await openTasksForCustomer(c.customerId)).map((s) => ({ label: `${c.customerName} › ${s.label}`, content: s.content })),
         ),
       );
-      return per.flat();
+      const sources = per.flat();
+      const note = fanoutCoverageNote(all.length);
+      return note ? [note, ...sources] : sources;
     },
     recentConversation: async (customerId, limit) => {
       const { rows } = await query<{ direction: string; subject: string | null; body: string | null; received_at: Date }>(

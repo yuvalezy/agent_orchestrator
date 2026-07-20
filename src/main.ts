@@ -416,7 +416,10 @@ async function main(): Promise<void> {
       logger.warn('⚠️  OUTBOUND_ENABLED=true but WHATSAPP_MANAGER_WRITE_KEY is UNSET — sends fall back to the read key and will 403 until a write key is set (POST /admin/credentials). See D-M.');
     }
     if (!notifier) {
-      logger.warn('⚠️  OUTBOUND_ENABLED=true but Telegram is unconfigured — drainer alerts/notes will be dropped (no-op notifier).');
+      // `notifier` is null only when NEITHER Telegram nor the founder app is configured (see the
+      // money-loop wiring above): with the app present the drainer's alerts/notes reach it via the
+      // fanout. So the real condition is "no founder surface at all", not "Telegram unconfigured".
+      logger.warn('⚠️  OUTBOUND_ENABLED=true but no founder surface (neither Telegram nor the founder app) is configured — drainer alerts/notes will be dropped (no-op notifier).');
     }
     outboundWorkers.push(
       buildOutboundDrainerWorker({

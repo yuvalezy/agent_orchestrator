@@ -95,11 +95,17 @@ export function buildScheduleDueWorker(
         const now = new Date();
         if (now.getTime() > new Date(action.expires_at).getTime()) {
           await markActionTerminal(action.id, 'missed', 'execution grace expired');
-          await notifier.notifyCustomerEvent(action.customer_id, {
+          const missed = {
             title: '⏱️ Scheduled action missed',
             body: `The ${action.action_kind === 'reminder' ? 'reminder' : 'customer message'} scheduled for ${new Date(action.execute_at).toISOString()} was more than ${graceMinutes} minutes late and was not executed.`,
-            severity: 'warning',
-          }).catch(() => undefined);
+            severity: 'warning' as const,
+          };
+          // Same routing as deliverReminder: a customer-scoped action lands on that customer's
+          // screen; an app-origin/founder-scoped one (null customer, migration 045) goes to admin.
+          await (action.customer_id
+            ? notifier.notifyCustomerEvent(action.customer_id, missed)
+            : notifier.notifyAdmin(missed)
+          ).catch(() => undefined);
           continue;
         }
 

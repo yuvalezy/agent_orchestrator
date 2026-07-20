@@ -56,8 +56,9 @@ export interface QueryServiceDeps {
   retrieveCustomer: (question: string, customerId: string) => Promise<QueryCitation[]>;
   /** Cross-customer retrieval for the Admin topic (`all` scope): a fan-out of EXACT-id
    *  customer retrievals, merged and ranked. Citations MUST name their customer (the
-   *  founder cannot act on an aggregate they can't attribute). */
-  retrieveAllCustomers: (question: string) => Promise<QueryCitation[]>;
+   *  founder cannot act on an aggregate they can't attribute). Also reports the book size
+   *  (`totalCustomers`) so callers can tell a bounded fan-out apart from a complete one. */
+  retrieveAllCustomers: (question: string) => Promise<{ citations: QueryCitation[]; totalCustomers: number }>;
   /** LLM synthesis (LlmRouter.synthesizeAnswer, role 'answer'). */
   synth: AnswerSynthesizerPort;
 }
@@ -94,7 +95,7 @@ export function buildQueryService(deps: QueryServiceDeps): QueryService {
         scope.kind === 'internal'
           ? await deps.retrieveInternal(question)
           : scope.kind === 'all'
-            ? await deps.retrieveAllCustomers(question)
+            ? (await deps.retrieveAllCustomers(question)).citations
             : await deps.retrieveCustomer(question, scope.customerId);
 
       // Nothing relevant → omit the answer gracefully. Do NOT call the LLM: with no

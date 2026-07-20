@@ -72,11 +72,14 @@ export async function listFounderEmails(): Promise<string[]> {
 
 export interface ScheduledAction {
   id: string;
-  source_chat_id: string;
-  source_message_id: string;
-  source_thread_id: string;
+  // Migration 045 dropped NOT NULL on these four: an app-origin reminder (Founder PWA) has no
+  // Telegram anchor (chat/message/thread) and may not concern a customer at all. Telegram-origin
+  // rows still populate them. Readers must treat all four as possibly absent.
+  source_chat_id: string | null;
+  source_message_id: string | null;
+  source_thread_id: string | null;
   created_by: string;
-  customer_id: string;
+  customer_id: string | null;
   action_kind: ScheduleActionKind;
   status: ScheduleActionStatus;
   execute_at: Date;
