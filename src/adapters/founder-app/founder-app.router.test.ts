@@ -1267,3 +1267,113 @@ test('POST /transcribe requires a device cookie', async () => {
     },
   });
 });
+
+// ── Calendar day view ─────────────────────────────────────────────────────────────────────
+
+/** A fake FounderAppCalendar dep that records what it was asked and returns fixed reads/writes. */
+function fakeCalendar(overrides: Partial<NonNullable<FounderAppDeps['calendar']>> = {}): NonNullable<FounderAppDeps['calendar']> {
+  return {
+    listRange: async () => [
+      { id: 'e1', calendarLabel: 'Work', title: 'Standup', startsAt: new Date('2026-07-20T13:00:00Z'), endsAt: new Date('2026-07-20T13:15:00Z'), allDay: false },
+    ],
+    businessHoursForDay: async () => ({ startMinutes: 540, endMinutes: 1080 }), // 09:00–18:00
+    meetingForCard: async () => null,
+    block: async () => ({ status: 'booked' }),
+    ...overrides,
+  };
+}
+
+test('GET /calendar returns the day, tz, business hours and per-calendar tagged events', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: { day: string; tz: string; businessHours: unknown; events: Array<Record<string, unknown>>; meeting?: unknown } };
+    assert.equal(body.data.day, '2026-07-20');
+    assert.equal(typeof body.data.tz, 'string');
+    assert.deepEqual(body.data.businessHours, { startMinutes: 540, endMinutes: 1080 });
+    assert.equal(body.data.events.length, 1);
+    assert.deepEqual(body.data.events[0], { id: 'e1', calendarLabel: 'Work', title: 'Standup', startsAt: '2026-07-20T13:00:00.000Z', endsAt: '2026-07-20T13:15:00.000Z', allDay: false });
+    assert.equal(body.data.meeting, undefined); // no messageId → no meeting block
+  }, { deps: { calendar: fakeCalendar() } });
+});
+
+test('GET /calendar with messageId resolves a pending "Pick a time" card to its meeting', async () => {
+  let askedFor: string | null = null;
+  const calendar = fakeCalendar({
+    meetingForCard: async (id) => { askedFor = id; return { durationMinutes: 30, proposedSlots: [{ startsAt: '2026-07-20T13:00:00.000Z', endsAt: '2026-07-20T13:30:00.000Z' }] }; },
+  });
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie, 'mtg-77');
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20&messageId=${messageId}`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: { meeting?: { messageId: string; durationMinutes: number; proposedSlots: unknown[] } } };
+    assert.equal(askedFor, 'mtg-77'); // resolved via the card's notificationRef, exactly like /meeting-time
+    assert.deepEqual(body.data.meeting, { messageId, durationMinutes: 30, proposedSlots: [{ startsAt: '2026-07-20T13:00:00.000Z', endsAt: '2026-07-20T13:30:00.000Z' }] });
+  }, { deps: { calendar } });
+});
+
+test('GET /calendar still returns events when messageId does not resolve to a pending meeting', async () => {
+  await withApp(async ({ baseUrl, repo }) => {
+    const cookie = await login(baseUrl);
+    // A plain notification card (no slot buttons) → not a scheduling card → meeting omitted.
+    const [row] = await repo.insertChatExchange({ sessionId: 'ignored', customerRef: null, question: 'q', answer: 'a', relation: 'new_topic' });
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20&messageId=${row.id}`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: { events: unknown[]; meeting?: unknown } };
+    assert.equal(body.data.events.length, 1); // day view is useful standalone
+    assert.equal(body.data.meeting, undefined);
+  }, { deps: { calendar: fakeCalendar() } });
+});
+
+test('GET /calendar rejects a bad day / bad messageId, and 503s when the calendar dep is absent', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar?day=20-07-2026`, { headers: { cookie } })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar`, { headers: { cookie } })).status, 400); // day required
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20&messageId=nope`, { headers: { cookie } })).status, 400);
+  }, { deps: { calendar: fakeCalendar() } });
+  // No calendar dep wired → 503.
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } })).status, 503);
+  });
+});
+
+test('POST /calendar/block validates input and returns the booking status', async () => {
+  const calls: Array<{ localTime: string; durationMinutes: number; title?: string }> = [];
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const ok = await fetch(`${baseUrl}/app/api/calendar/block`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30, title: 'Focus' }),
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { data: { status: 'booked' } });
+    assert.deepEqual(calls, [{ localTime: '2026-08-01T15:00', durationMinutes: 30, title: 'Focus' }]);
+
+    // Bad inputs never reach the builder.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: 'nope', durationMinutes: 30 }) })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 0 }) })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 481 }) })).status, 400);
+    assert.equal(calls.length, 1); // only the valid one ran
+  }, { deps: { calendar: fakeCalendar({ block: async (input) => { calls.push(input); return { status: 'booked' }; } }) } });
+});
+
+test('POST /calendar/block passes an unavailable status through and 503s when the calendar dep is absent', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar/block`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30 }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'unavailable' } });
+  }, { deps: { calendar: fakeCalendar({ block: async () => ({ status: 'unavailable' }) }) } });
+
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30 }) })).status, 503);
+  });
+});

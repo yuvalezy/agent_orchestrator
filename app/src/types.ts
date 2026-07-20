@@ -5,11 +5,31 @@ export type Severity = 'info' | 'action' | 'warning';
 
 export interface Button { id: string; label: string }
 
+/** The meeting-draft view a `mkbook`/`mkcancel` card carries on its context (see the FROZEN shared
+ *  contract). Duplicated as `MeetingDraftView` in MeetingDraftCard, which owns the render. */
+export interface MeetingDraftAttendeeRef { name: string; email: string | null; unresolved: boolean }
+export interface MeetingDraftContext {
+  id: string;
+  status: 'drafting' | 'booked' | 'cancelled';
+  title: string;
+  startsAt: string | null;
+  durationMinutes: number;
+  timezone: string;
+  attendees: MeetingDraftAttendeeRef[];
+  conflicts: string[];
+  needs: string[];
+  messageId: string | null;
+  meetLink: string | null;
+  htmlLink: string | null;
+}
+
 /** A card's durable origin (server: migration 043). `contextRef` is the inbox/outbound row the
- *  card was raised from — enough to open the thread behind it. */
+ *  card was raised from — enough to open the thread behind it. `meetingDraft` rides here on a
+ *  meeting-draft card (`founder_app_messages.context.meetingDraft`). */
 export interface MessageContext {
   contextRef?: { kind: 'inbox' | 'outbound'; ref: string } | null;
   entityRef?: string | null;
+  meetingDraft?: MeetingDraftContext | null;
 }
 
 export interface Message {
@@ -123,3 +143,35 @@ export interface TimelinePage { data: TimelineRow[]; nextCursor: string | null }
 
 /** Detail-sheet passthrough: an opaque key/value record rendered generically. */
 export type DetailRow = Record<string, unknown>;
+
+// ── Calendar day view ───────────────────────────────────────────────────────
+
+/** One event on the day grid. `startsAt`/`endsAt` are ISO instants rendered in the day's `tz`;
+ *  `allDay` rows skip the grid and show as a banner. `calendarLabel` names the source calendar
+ *  and drives the block's stable color. */
+export interface CalendarEvent {
+  id: string;
+  calendarLabel: string;
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  allDay: boolean;
+}
+
+/** When the day view is opened from a pending "pick a time" card, the meeting it will book:
+ *  its duration and the four slots the card already suggested (highlighted on the grid). */
+export interface CalendarMeeting {
+  messageId: string;
+  durationMinutes: number;
+  proposedSlots: { startsAt: string; endsAt: string }[];
+}
+
+/** GET /app/api/calendar?day=…[&messageId=…] → `{ data: CalendarDay }`. `businessHours` minutes are
+ *  from local midnight in `tz`; null when no business hours are configured. */
+export interface CalendarDay {
+  day: string;
+  tz: string;
+  businessHours: { startMinutes: number; endMinutes: number } | null;
+  events: CalendarEvent[];
+  meeting?: CalendarMeeting;
+}

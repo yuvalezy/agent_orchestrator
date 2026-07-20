@@ -61,6 +61,7 @@ relative to `EZY_PORTAL_BASE_URL`.
 | `getCustomer(ref)` | `GET /api/business-partners/bp/:ref` | Returns `{ref, name, website?, email?}`. |
 | `searchCustomers(q)` | `GET /api/business-partners/bp?query=&page=1&perPage=50` | Directory search for onboarding. |
 | `listContacts(ref)` | `GET /api/business-partners/contacts?bpId=&page=1&perPage=100` | Contacts carry `email/phone/mobile/whatsapp/telegram/isPrimary`. |
+| `searchProjects(q)` | `GET /api/projects/projects?search=&page=1&pageSize=50` | Project directory search for console onboarding — the portal has no BP→project link, so the operator picks the target project. Returns `{ref, code, name, status}`. |
 | `listWorkItemTypes(projectRef)` | `GET /api/projects/projects/:ref` → `GET /api/projects/work-item-types?projectTypeId=` | **Two-hop** (see below). |
 | `createTask(input)` | `POST /api/projects/tasks` | camelCase body; `workItemTypeId` required. |
 | `addComment(task, body)` | `POST /api/projects/tasks/:ref/comments` `{body}` | |

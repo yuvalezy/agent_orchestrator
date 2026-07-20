@@ -24,7 +24,9 @@ export interface ClaimedOutbound {
   retry_count: number;
   timezone: string | null; // customer tz (null → drainer uses OUTBOUND_DEFAULT_TZ)
   faith: string | null; // customer faith (null → 'none')
-  is_group: boolean | null; // from agent_customer_contacts (null → treat as 1:1)
+  is_group: boolean | null; // from agent_customer_contacts, keyed on the SEND TARGET
+  // (thread_key ?? recipient_address), NOT the recipient — a reply into a group thread
+  // targets the group id and must route as a group send (null → treat as 1:1)
   attachment_ref: OutboundAttachmentRef | null; // M2 Milestone B (JSONB → parsed object)
   scheduled_action_id: string | null;
   bypass_send_window: boolean;
@@ -38,8 +40,12 @@ export interface ClaimedOutbound {
  * the M1.8 WhatsApp-only claim (D-B: email not armed on gate day). retry_count is
  * NOT touched on claim (D-C); updated_at is left to the trigger. Joins
  * channel_instances (channel_type), LEFT JOINs agent_customers (tz/faith) and
- * agent_customer_contacts on (channel_type, recipient_address) (is_group → group
- * routing, R37). An empty `channelTypes` claims nothing.
+ * agent_customer_contacts on (channel_type, COALESCE(thread_key, recipient_address))
+ * (is_group → group routing, R37). The contact is matched on the SEND TARGET, not the
+ * recipient: the adapter sends to `thread_key ?? recipient_address`, so a reply into a
+ * group thread (thread_key = group id, recipient_address = the individual who spoke)
+ * must resolve is_group from the GROUP contact — otherwise it POSTs { number: <groupId> }
+ * and whatsapp_manager 403s it as "not whitelisted". An empty `channelTypes` claims nothing.
  */
 export async function claimDue(limit: number, channelTypes: string[]): Promise<ClaimedOutbound[]> {
   if (channelTypes.length === 0) return [];
@@ -71,7 +77,8 @@ export async function claimDue(limit: number, channelTypes: string[]): Promise<C
        JOIN channel_instances ci ON ci.id = c.channel_instance_id
        LEFT JOIN agent_customers cust ON cust.id = c.customer_id
        LEFT JOIN agent_customer_contacts cc
-              ON cc.channel_type = ci.channel_type AND cc.address = c.recipient_address
+              ON cc.channel_type = ci.channel_type
+             AND cc.address = COALESCE(c.thread_key, c.recipient_address)
       ORDER BY c.id ASC`,
     [limit, channelTypes],
   );

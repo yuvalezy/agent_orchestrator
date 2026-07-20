@@ -20,6 +20,11 @@ export interface FounderAppDevice {
 export interface MessageContext {
   contextRef?: { kind: 'inbox' | 'outbound'; ref: string };
   entityRef?: string;
+  /** A meeting-draft card's current state (a MeetingDraftView from app-meeting-draft.ts). Carried
+   *  as `unknown` to keep this repo layer decoupled from the scheduling module — the router sets it
+   *  from the strongly-typed view, and the PWA reads it as its own local card type. Evolves in place
+   *  across refine turns via updateMessageCard. */
+  meetingDraft?: unknown;
 }
 
 export interface FeedMessage {
@@ -246,6 +251,28 @@ export async function insertMessage(input: InsertMessageInput): Promise<FeedMess
     ],
   );
   return mapMessage(rows[0]);
+}
+
+/**
+ * Evolve a notification card in place: replace its body and/or context and return the fresh row so
+ * the caller can re-emit it over SSE. Used by the meeting-draft flow to refine ONE card across turns
+ * (add attendee, change time) instead of stacking a new card per edit. COALESCE keeps an omitted
+ * field unchanged; a context of `null` is passed as a JSON null we deliberately don't apply (there
+ * is no "clear the context" need here). Returns null when the id is gone (a raced dismiss).
+ */
+export async function updateMessageCard(
+  id: string,
+  patch: { body?: string; context?: MessageContext | null },
+): Promise<FeedMessage | null> {
+  const { rows } = await query<MessageRow>(
+    `UPDATE founder_app_messages
+        SET body = COALESCE($2, body),
+            context = COALESCE($3::jsonb, context)
+      WHERE id = $1
+      RETURNING ${MESSAGE_COLUMNS}`,
+    [id, patch.body ?? null, patch.context ? JSON.stringify(patch.context) : null],
+  );
+  return rows[0] ? mapMessage(rows[0]) : null;
 }
 
 function chatScopeKey(customerRef: string | null): string {

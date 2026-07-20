@@ -11,6 +11,7 @@ import { CustomersScreen } from './CustomersScreen';
 import { CustomerScreen } from './CustomerScreen';
 import { ActivityScreen } from './ActivityScreen';
 import { AssistantScreen } from './AssistantScreen';
+import { CalendarScreen } from './CalendarScreen';
 import { SettingsSheet, type InstallPrompt } from './SettingsSheet';
 import type { AppConfig } from './types';
 
@@ -91,6 +92,7 @@ function AppShell({ onLoggedOut }: { onLoggedOut: () => void }): ReactElement {
             <Route path="/customer/:id" element={<CustomerScreen />} />
             <Route path="/activity" element={<ActivityScreen />} />
             <Route path="/assistant" element={<AssistantScreen />} />
+            <Route path="/calendar" element={<CalendarScreen />} />
             <Route path="*" element={<Navigate to="/attention" replace />} />
           </Routes>
         </main>

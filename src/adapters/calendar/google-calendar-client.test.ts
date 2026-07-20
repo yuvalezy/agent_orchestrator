@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CalendarHttpError, GoogleCalendarClient, dateInTz, normalizeEvent } from './google-calendar-client';
+import { CalendarHttpError, GoogleCalendarClient, dateInTz, normalizeEvent, normalizeRangeEvent } from './google-calendar-client';
 
 // Unit tests for the Google Calendar READ adapter (no network — fake fetchImpl). Verifies the
 // event normalization (title/time/all-day, attendee dedup+lowercasing, customer match) and the
@@ -101,6 +101,53 @@ test('listUpcomingEvents: honors a per-customer calendarId', async () => {
   const client = new GoogleCalendarClient(() => CRED, () => NOW, fetchImpl);
   await client.listUpcomingEvents({ lookaheadDays: 3, matchEmails: [], calendarId: 'team@group.calendar.google.com' });
   assert.ok(calls.some((u) => u.includes('calendars/team%40group.calendar.google.com/events')));
+});
+
+// ── normalizeRangeEvent (pure) + listEventsInRange (fake fetch) ─────────────────────
+
+test('normalizeRangeEvent: timed event keeps title/start/end, drops attendees + body', () => {
+  const ev = normalizeRangeEvent({
+    id: 'r1',
+    summary: '  Standup  ',
+    start: { dateTime: '2026-07-20T13:00:00Z' },
+    end: { dateTime: '2026-07-20T13:15:00Z' },
+    attendees: [{ email: 'someone@x.com' }],
+  });
+  assert.deepEqual(ev, {
+    id: 'r1',
+    title: 'Standup',
+    startsAt: new Date('2026-07-20T13:00:00Z'),
+    endsAt: new Date('2026-07-20T13:15:00Z'),
+    allDay: false,
+  });
+});
+
+test('normalizeRangeEvent: all-day → allDay true; missing summary → Untitled; no end → falls back to start', () => {
+  const allDay = normalizeRangeEvent({ id: 'r2', start: { date: '2026-07-20' }, end: { date: '2026-07-21' } });
+  assert.equal(allDay.title, 'Untitled');
+  assert.equal(allDay.allDay, true);
+  assert.equal(allDay.endsAt.toISOString(), '2026-07-21T00:00:00.000Z');
+
+  const noEnd = normalizeRangeEvent({ id: 'r3', summary: 'X', start: { dateTime: '2026-07-20T13:00:00Z' } });
+  assert.equal(noEnd.endsAt.toISOString(), noEnd.startsAt.toISOString()); // end := start when absent
+});
+
+test('listEventsInRange: sends the explicit window, drains every page, does NOT cap', async () => {
+  const { fetchImpl, calls } = mockFetch({
+    _: { items: [{ id: 'a', start: { dateTime: '2026-07-20T09:00:00Z' } }, { id: 'b', start: { dateTime: '2026-07-20T10:00:00Z' } }], nextPageToken: 'p2' },
+    p2: { items: [{ id: 'c', start: { dateTime: '2026-07-20T11:00:00Z' } }] },
+  });
+  const client = new GoogleCalendarClient(() => CRED, () => NOW, fetchImpl);
+  const timeMin = new Date('2026-07-20T05:00:00Z');
+  const timeMax = new Date('2026-07-21T05:00:00Z');
+  const events = await client.listEventsInRange({ timeMin, timeMax });
+  assert.deepEqual(events.map((e) => e.id), ['a', 'b', 'c']); // all three, across both pages, uncapped
+  const listUrl = calls.find((u) => u.includes('/events') && !u.includes('pageToken'))!;
+  const p = new URL(listUrl).searchParams;
+  assert.equal(p.get('timeMin'), timeMin.toISOString());
+  assert.equal(p.get('timeMax'), timeMax.toISOString());
+  assert.equal(p.get('singleEvents'), 'true');
+  assert.equal(p.get('orderBy'), 'startTime');
 });
 
 // ── createEvent (WRITE) ───────────────────────────────────────────────────────────

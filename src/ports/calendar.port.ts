@@ -60,6 +60,48 @@ export interface CalendarPort {
 }
 
 /**
+ * One event within an ARBITRARY range read (the founder-app day view), tagged with the
+ * `calendar_accounts` label it came from so a day across N calendars stays legible. Distinct from
+ * `CalendarEvent`: no attendee/customer-match machinery (the day view is not a meeting-context
+ * reader), and `endsAt` is never null (Google returns an end for every `singleEvents` item; a
+ * date-only all-day event's exclusive end date stands in). NEVER carries the event body — same
+ * privacy posture as CalendarEvent.
+ */
+export interface RangeEvent {
+  id: string;
+  /** The `calendar_accounts` row's human label this event was read from. */
+  calendarLabel: string;
+  /** Event title (Google `summary`); 'Untitled' when absent. */
+  title: string;
+  startsAt: Date;
+  /** EXCLUSIVE end instant (matches Google + CreateEventInput). */
+  endsAt: Date;
+  /** True for a date-only (all-day) event. */
+  allDay: boolean;
+}
+
+export interface ListEventsInRangeInput {
+  /** Inclusive lower bound. */
+  timeMin: Date;
+  /** Exclusive upper bound. */
+  timeMax: Date;
+  /** Target calendar id; defaults to 'primary' when omitted. */
+  calendarId?: string;
+}
+
+/**
+ * List EVERY event in an explicit `[timeMin, timeMax)` window — uncapped, titles included,
+ * per-calendar tagged. Split from `CalendarPort.listUpcomingEvents`, which is now-anchored,
+ * forward-only and CAPPED (a meeting-context reader): a day view needs an arbitrary/past day and
+ * all of it. Best-effort per account, exactly like the meeting-context read (a per-account miss
+ * skips that account) — NOT the fail-closed posture of `CalendarFreeBusyPort`, because a missed
+ * event costs a line in a day view, not a double-booking.
+ */
+export interface CalendarRangePort {
+  listEventsInRange(input: ListEventsInRangeInput): Promise<RangeEvent[]>;
+}
+
+/**
  * One event to CREATE. `startsAt`/`endsAt` are absolute instants; `endsAt` is EXCLUSIVE (as
  * Google treats it). `timeZone` is the IANA zone the event is rendered in — and, for an
  * `allDay` event, the zone whose local day `startsAt` is projected onto (an instant alone

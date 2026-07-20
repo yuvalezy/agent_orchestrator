@@ -35,7 +35,7 @@ export interface GatedScheduling extends ScheduleHandlers {
  * Null when meetings are off, which the handler reports rather than ignoring: a founder who
  * typed a command deserves an answer.
  */
-function buildMeetingCommandDeps(): MeetingCommandDeps | null {
+export function buildMeetingCommandDeps(): MeetingCommandDeps | null {
   if (!env.MEETING_SCHEDULING_ENABLED) return null;
 
   const freeBusy = buildDynamicMultiFreeBusy(() =>

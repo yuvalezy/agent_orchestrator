@@ -1,5 +1,6 @@
 import { type ReactElement, type ReactNode } from 'react';
-import { ChevronLeft, Settings } from 'lucide-react';
+import { CalendarDays, ChevronLeft, Settings } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { useOpenSettings } from './Ui';
 import { ReminderSheet } from './ReminderSheet';
 
@@ -19,6 +20,7 @@ export function ScreenHeader({
   trailing?: ReactNode;
 }): ReactElement {
   const openSettings = useOpenSettings();
+  const navigate = useNavigate();
   return (
     <header className="safe-top safe-x z-10 flex shrink-0 items-center gap-2 border-b border-zinc-800/80 bg-zinc-950/85 px-3 py-3 backdrop-blur-xl">
       {onBack && (
@@ -33,6 +35,9 @@ export function ScreenHeader({
       {trailing}
       {settings && !trailing && (
         <>
+          <button aria-label="Calendar" onClick={() => navigate('/calendar')} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
+            <CalendarDays size={20} />
+          </button>
           <ReminderSheet />
           <button aria-label="Settings" onClick={openSettings} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
             <Settings size={20} />

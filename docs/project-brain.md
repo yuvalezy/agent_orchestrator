@@ -11,6 +11,12 @@ cosine search), but over a **separate, isolated corpus**.
 > Telegram `/ask <question>` reaches this corpus too, behind the default-off
 > `QUERY_ENGINE_ENABLED` flag (a founder-only surface — it does **not** weaken the
 > customer-drafting isolation). See [integrations/telegram.md § Founder commands](./integrations/telegram.md#founder-commands-ask-pending-briefing-help).
+>
+> The **Founder PWA** also reaches it: the Assistant (internal-scope) chat keeps a
+> **durable session** (`founder_app_chat_sessions`, migration 044) and resolves
+> follow-ups — a `classify`-role call decides `new_topic` vs `follow_up` and rewrites
+> an elliptical message into a self-contained retrieval question before the grounded
+> `answer` pass. Telegram `/ask` stays **stateless** (one shot, no history).
 
 ## Add the MCP server (copy one line)
 
@@ -50,6 +56,7 @@ flowchart TD
   MCP[stdio MCP server<br/>scripts/mcp-project-brain.ts] -->|search / get / resync| IK
   CC[Claude Code / Codex] <-->|MCP tools| MCP
   TG[Telegram /ask *optional*] --> IK
+  PWA[Founder PWA chat *optional*<br/>durable session + follow-ups] --> IK
   IK -. NEVER .-> CUST[customer reply drafting]
 ```
 

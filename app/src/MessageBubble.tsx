@@ -5,6 +5,7 @@ import { messageTime } from './lib/time';
 import { CardActions, ThreadTap, threadPath } from './CardActions';
 import { DecisionChips, type DecideHandler } from './DecisionChips';
 import { DraftControls, isDraftCard } from './DraftControls';
+import { MeetingDraftCard, isMeetingDraftCard } from './MeetingDraftCard';
 import type { Message, Severity } from './types';
 
 export type { DecideHandler };
@@ -88,8 +89,11 @@ function AssistantBubble({
             {hasButtons && (
               <div className="mt-3">
                 {/* A draft notification appears in the feed too — swap in the Edit/Revise controls
-                    so those never dead-end on this surface either. */}
-                {isDraftCard(message.buttons) ? (
+                    so those never dead-end on this surface either. A meeting-draft card carries the
+                    same refine/Book it/Cancel affordances wherever it lands. */}
+                {isMeetingDraftCard(message.buttons) ? (
+                  <MeetingDraftCard card={message} decidedOptionId={message.decidedOptionId} onDecide={onDecide} />
+                ) : isDraftCard(message.buttons) ? (
                   <DraftControls card={message} decidedOptionId={message.decidedOptionId} onDecide={onDecide} />
                 ) : (
                   <DecisionChips messageId={message.id} buttons={message.buttons!} decidedOptionId={message.decidedOptionId} onDecide={onDecide} />

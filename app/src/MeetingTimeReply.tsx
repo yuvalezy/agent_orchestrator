@@ -18,8 +18,9 @@ type State =
   | { kind: 'note'; message: string };
 
 /** What the server said, mapped to a line the founder reads. `booked` needs none — the card
- *  drops from the queue and a confirmation lands in the feed. */
-function noteFor(status: string): { booked: boolean; message: string } {
+ *  drops from the queue and a confirmation lands in the feed. Shared with the calendar day view,
+ *  whose /meeting-time and /calendar/block calls return the same status vocabulary. */
+export function noteFor(status: string): { booked: boolean; message: string } {
   switch (status) {
     case 'booked': return { booked: true, message: '' };
     case 'unavailable': return { booked: false, message: "You're busy then (or it's in the past) — pick another time." };

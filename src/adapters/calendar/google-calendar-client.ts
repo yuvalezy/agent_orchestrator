@@ -8,7 +8,9 @@ import type {
   CreateEventInput,
   CreatedEvent,
   FreeBusyInput,
+  ListEventsInRangeInput,
   ListUpcomingEventsInput,
+  RangeEvent,
 } from '../../ports/calendar.port';
 
 // GoogleCalendarClient (M5(d)) — raw fetch, no SDK (HTTP-only, invariant #5). OAuth2
@@ -295,6 +297,31 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
     } while (pageToken);
     return out;
   }
+
+  /**
+   * events.list over an EXPLICIT `[timeMin, timeMax)` window with FULL pagination and NO cap —
+   * the founder-app day view (any past/future day, all of it). `singleEvents` expands recurrences
+   * and `orderBy=startTime` sorts within a page; the fan-out sorts the merged set. The returned
+   * events carry NO `calendarLabel` (the account-tagging composite adds it) and never the body.
+   */
+  async listEventsInRange(input: ListEventsInRangeInput): Promise<Omit<RangeEvent, 'calendarLabel'>[]> {
+    const calendarId = input.calendarId?.trim() || 'primary';
+    const timeMin = input.timeMin.toISOString();
+    const timeMax = input.timeMax.toISOString();
+
+    const out: Omit<RangeEvent, 'calendarLabel'>[] = [];
+    let pageToken: string | undefined;
+    do {
+      const qs = new URLSearchParams({ timeMin, timeMax, singleEvents: 'true', orderBy: 'startTime', maxResults: '250' });
+      if (pageToken) qs.set('pageToken', pageToken);
+      const page = await this.get<{ items?: GoogleEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(calendarId)}/events?${qs.toString()}`,
+      );
+      for (const item of page.items ?? []) out.push(normalizeRangeEvent(item));
+      pageToken = page.nextPageToken;
+    } while (pageToken);
+    return out;
+  }
 }
 
 /**
@@ -339,5 +366,25 @@ export function normalizeEvent(item: GoogleEvent, match: Set<string>): CalendarE
     location: item.location?.trim() || null,
     attendeeEmails: emails,
     matchedCustomer: emails.some((e) => match.has(e)),
+  };
+}
+
+/**
+ * Normalize a Google events.list item → the range-view shape (no attendee/customer machinery, no
+ * label — the composite tags that). `endsAt` never null: an item with no end date falls back to
+ * its start, so the day view can always draw a block. Exported for unit test (no network).
+ */
+export function normalizeRangeEvent(item: GoogleEvent): Omit<RangeEvent, 'calendarLabel'> {
+  const start = item.start ?? {};
+  const end = item.end ?? {};
+  const allDay = !start.dateTime && !!start.date;
+  const startsAt = new Date(start.dateTime ?? start.date ?? 0);
+  const endRaw = end.dateTime ?? end.date;
+  return {
+    id: item.id ?? '',
+    title: item.summary?.trim() || 'Untitled',
+    startsAt,
+    endsAt: endRaw ? new Date(endRaw) : startsAt,
+    allDay,
   };
 }

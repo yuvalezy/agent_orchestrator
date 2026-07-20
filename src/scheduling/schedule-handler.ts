@@ -149,7 +149,7 @@ export interface MeetingCommandDeps {
  * for a command that was perfectly clear. Date arithmetic is not a judgement call, so it
  * does not belong in the prompt; the model only reports whether a day was named.
  */
-function validatedExecution(iso: string | null, timezone: string, now: Date, explicitDate: boolean): Date | null {
+export function validatedExecution(iso: string | null, timezone: string, now: Date, explicitDate: boolean): Date | null {
   if (!iso) return null;
   const parsed = DateTime.fromISO(iso, { setZone: true });
   if (!parsed.isValid) return null;
@@ -171,7 +171,7 @@ function validatedExecution(iso: string | null, timezone: string, now: Date, exp
  *  Deliberately NOT validatedExecution: that one's offset guard polices the model's
  *  wording, and our own stored instant is UTC by construction, so it would always fail.
  *  The only thing that can go wrong between asking and answering is the time lapsing. */
-function stillFuture(iso: string, now: Date): Date | null {
+export function stillFuture(iso: string, now: Date): Date | null {
   const parsed = DateTime.fromISO(iso, { setZone: true });
   if (!parsed.isValid) return null;
   const date = parsed.toJSDate();

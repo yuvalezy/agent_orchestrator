@@ -129,7 +129,11 @@ Override any `(provider, role)` model with `LLM_MODEL_<PROVIDER>_<ROLE>`
 The `answer` role synthesizes cited founder-query replies for Telegram `/ask`
 (`QUERY_ENGINE_ENABLED`) and the console query view. It is segregated from
 `AgentLlmPort` as `AnswerSynthesizerPort` so the customer-drafting path can't
-accidentally route through it.
+accidentally route through it. The `classify` role backs both the dedup
+verdict and the Founder PWA's `new_topic`/`follow_up` resolver
+(`ConversationContextPort` — the cheap pre-retrieval step that turns an
+elliptical follow-up into a self-contained question before the grounded
+`answer` pass).
 
 ```bash
 # e.g. drive triage with opus, keep the cheap classify model

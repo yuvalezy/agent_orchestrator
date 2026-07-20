@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { type ReactElement } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { AppDataProvider } from './AppData';
 import { ActivityScreen } from './ActivityScreen';
 import { AssistantScreen } from './AssistantScreen';
@@ -35,7 +36,7 @@ function stubFetch(): void {
 }
 
 function renderScreen(node: ReactElement): void {
-  render(<AppDataProvider config={null} deviceLabel="dev">{node}</AppDataProvider>);
+  render(<MemoryRouter><AppDataProvider config={null} deviceLabel="dev">{node}</AppDataProvider></MemoryRouter>);
 }
 
 afterEach(() => vi.unstubAllGlobals());

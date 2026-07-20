@@ -25,7 +25,9 @@ import { buildFcmSender } from './adapters/founder-app/fcm-sender';
 import { AppFounderNotifier } from './adapters/founder-app/app-founder-notifier';
 import { FounderAppFeed } from './adapters/founder-app/founder-app-feed';
 import { buildFounderAppRouter } from './adapters/founder-app/founder-app.router';
+import { buildFounderAppCalendar } from './adapters/founder-app/founder-app-calendar';
 import { buildAppComposeGated } from './adapters/founder-app/compose-draft.factory';
+import { buildAppMeetingDraftGated } from './adapters/founder-app/meeting-draft.factory';
 import { createAppReminder, listUpcomingReminders, cancelScheduledAction } from './scheduling/scheduling-repo';
 import { buildOpenAiTranscriptionClient } from './adapters/llm/openai-transcription.client';
 import { listAttentionDecisions, augmentCustomers } from './adapters/founder-app/founder-app-cockpit-repo';
@@ -46,6 +48,7 @@ import {
   unregisterDevicePush,
   disableDevicePush,
   insertMessage,
+  updateMessageCard,
   listMessages,
   getMessage,
   dismissMessage,
@@ -278,9 +281,17 @@ async function main(): Promise<void> {
         // builder (like the reviser) that presents the composed card through the APP notifier.
         // undefined (→ 503) when KNOWLEDGE_DRAFT_ENABLED is off.
         composeDraft: buildAppComposeGated(founderAppNotifier),
+        // The marquee: iterative meeting scheduling in the customer chat. Self-gated by
+        // MEETING_SCHEDULING_ENABLED (→ undefined → 503). Reuses the Telegram lane's booking primitive
+        // (buildMeetingCommandDeps) and evolves ONE feed card via insertMessage/updateMessageCard.
+        meetingDraft: buildAppMeetingDraftGated({ notifier: founderAppNotifier, feed, insertMessage, updateMessageCard }),
         // App-origin reminders (NULL Telegram anchors — see migration 045). The router anchors the
         // datetime-local wall-clock in env.CALENDAR_TZ before calling create, so these are plain repo fns.
         reminders: { create: createAppReminder, listUpcoming: listUpcomingReminders, cancel: cancelScheduledAction },
+        // Calendar day view — every event across every calendar for a navigable day + business
+        // hours + a standalone "block time" write. Gated on CALENDAR_ENABLED (→ undefined → 503),
+        // the SAME flag the meeting-context/dueAt calendar reads gate on.
+        calendar: env.CALENDAR_ENABLED ? buildFounderAppCalendar() : undefined,
         transcribe: (input) => appTranscription.transcribe(input),
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {

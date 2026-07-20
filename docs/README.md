@@ -74,6 +74,8 @@ npm run migrate
 # 5. Onboard your first customer (creates the customer, imports contacts,
 #    opens their Telegram topic). bp-ref / project-ref are EZY Portal uuids.
 npm run onboard -- --bp-ref=<uuid> --project-ref=<uuid>
+#   …or do it from the console Onboarding tab (guided: search the customer,
+#      preview contacts, pick the project, then run the backfill).
 ```
 
 Verify it is alive with `curl -s http://localhost:3100/health | jq`. Full run/operate detail — logs, workers, all scripts — is in [operations.md](./operations.md).
@@ -91,3 +93,4 @@ Verify it is alive with `curl -s http://localhost:3100/health | jq`. Full run/op
 | [integrations/ezy-portal.md](./integrations/ezy-portal.md) | EZY Portal task target — create/find/comment/status and the dedup contract. |
 | [integrations/llm.md](./integrations/llm.md) | LLM gateway — providers, routing, model/effort overrides, cost cap. |
 | [project-brain.md](./project-brain.md) | Project Brain — the internal-knowledge RAG, its stdio MCP server (search / get / resync), and how to register it in Claude Code. |
+| [founder-app-firebase-setup.md](./founder-app-firebase-setup.md) | Founder PWA — Firebase Cloud Messaging (push) setup; the app works without it. |

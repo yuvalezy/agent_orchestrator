@@ -1,10 +1,12 @@
 import { type ReactElement, useState } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { CalendarDays, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from './lib/utils';
 import { relativeTime } from './lib/time';
 import { CardActions, ThreadTap, threadPath } from './CardActions';
 import { DecisionChips, type DecideHandler } from './DecisionChips';
 import { DraftControls, isDraftCard } from './DraftControls';
+import { MeetingDraftCard, isMeetingDraftCard } from './MeetingDraftCard';
 import { MeetingTimeReply } from './MeetingTimeReply';
 import type { AttentionCard as AttentionCardData, Severity } from './types';
 
@@ -71,19 +73,44 @@ export function AttentionCard({
 
         {card.buttons && card.buttons.length > 0 && (
           <div className="mt-3">
-            {/* A draft card (buttons carry `de`) gets the richer Edit/Revise controls so those
-                affordances never dead-end; every other buttoned card keeps the plain chips. */}
-            {isDraftCard(card.buttons) ? (
+            {/* A meeting-draft card (buttons carry `mkbook`) renders its own refine/Book it/Cancel
+                surface; a draft card (`de`) gets the Edit/Revise controls; every other buttoned
+                card keeps the plain chips. */}
+            {isMeetingDraftCard(card.buttons) ? (
+              <MeetingDraftCard card={card} decidedOptionId={decidedOptionId} onDecide={onDecide} />
+            ) : isDraftCard(card.buttons) ? (
               <DraftControls card={card} decidedOptionId={decidedOptionId} onDecide={onDecide} />
             ) : (
               <DecisionChips messageId={card.id} buttons={card.buttons} decidedOptionId={decidedOptionId} onDecide={onDecide} />
             )}
-            {/* Typing a time is only offered while the question stands and only on a slot card —
-                once decided the card is on its way out of the queue. */}
-            {decidedOptionId === null && isSlotCard(card) && <MeetingTimeReply messageId={card.id} />}
+            {/* Typing a time — or opening the full day calendar to see the schedule and tap an open
+                slot — is only offered while the question stands and only on a slot card; once
+                decided the card is on its way out of the queue. */}
+            {decidedOptionId === null && isSlotCard(card) && (
+              <div className="flex flex-wrap items-center gap-x-2">
+                <MeetingTimeReply messageId={card.id} />
+                <ViewCalendarChip messageId={card.id} />
+              </div>
+            )}
           </div>
         )}
       </div>
     </article>
+  );
+}
+
+/** Opens the full day calendar carrying this meeting's messageId, so tapping a free time in the
+ *  day view books THIS pending meeting. Styled to sit beside MeetingTimeReply's "Another time…". */
+function ViewCalendarChip({ messageId }: { messageId: string }): ReactElement {
+  const navigate = useNavigate();
+  return (
+    <button
+      type="button"
+      onClick={() => navigate(`/calendar?messageId=${encodeURIComponent(messageId)}`)}
+      className="mt-2 inline-flex min-h-11 items-center gap-1.5 rounded-full px-3.5 text-xs font-medium text-zinc-300 transition active:bg-zinc-800"
+    >
+      <CalendarDays size={14} />
+      View calendar
+    </button>
   );
 }

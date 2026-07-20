@@ -8,6 +8,7 @@ import { Timeline } from './Timeline';
 import { AttentionCard } from './AttentionCard';
 import { CustomerAsk } from './CustomerAsk';
 import { ComposeReply } from './ComposeReply';
+import { MeetingComposer } from './MeetingComposer';
 import { DetailSheet } from './DetailSheet';
 import { Screen, Pane, ScrollArea } from './Layout';
 import { useOptimisticDecide } from './useOptimisticDecide';
@@ -169,7 +170,10 @@ function PendingTab({ customerId, pending }: { customerId: string; pending: Atte
   // composed draft lands back here (and in the feed) as its own Approve/Edit/Reject card via SSE.
   return (
     <ScrollArea className="space-y-2.5 px-3 py-3 pb-6" key={customerId}>
-      <ComposeReply customerId={customerId} />
+      <div className="flex flex-wrap gap-2">
+        <ComposeReply customerId={customerId} />
+        <MeetingComposer customerId={customerId} />
+      </div>
       {pending.length === 0 ? (
         <p className="pt-1 text-sm text-zinc-500">Nothing pending for this customer.</p>
       ) : (

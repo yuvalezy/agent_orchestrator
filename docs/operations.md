@@ -208,6 +208,30 @@ failures do not delay workflows, and lock screens receive only a generic alert
 that links to `/console`. On iOS, browser push support generally requires a
 Home-Screen web app; use Telegram when it is unavailable.
 
+### Onboarding screen
+
+The console's **Onboarding** tab (`/console` → Onboarding) is the guided,
+preferred alternative to the `npm run onboard` CLI — it shares the exact same
+`src/adapters/onboarding/` composition (onboard-core + backfill-seed +
+onboarding-service), so the two are equivalent, not two implementations to keep
+in sync. The screen walks the operator through the flow end to end:
+
+1. **Search the customer** in the EZY Portal directory (already-onboarded
+   customers are flagged and **blocked with a `409`** before any write).
+2. **Preview its contacts** — the WhatsApp/email rows that will be imported.
+3. **Pick the target project** (the portal carries no BP→project link, so the
+   operator chooses it); its work-item-type is auto-resolved via the two-hop
+   lookup, exactly like the CLI's `--work-item-type-ref`.
+4. **Onboard** — same idempotent `bp_ref` upsert + contact import + Telegram
+   topic creation as the CLI.
+5. **Backfill** — a **dry preview** first (writes nothing), then the **live
+   sweep** as an explicit second action (posts the Telegram approval cards).
+
+The router is mounted at `/api/onboarding` (`GET /customers`,
+`GET /projects`, `GET /customers/:bpRef/preview`,
+`GET /projects/:ref/work-item-types`, `POST /`, `GET /:customerId/backfill`,
+`POST /:customerId/backfill/:mode`).
+
 ### Settings & Connectors
 
 The console's **Settings** and **Connectors** tabs are the DB-authoritative
@@ -344,6 +368,9 @@ flag reference in [configuration.md § Feature flags](./configuration.md#feature
 | `lint` / `lint:boundary` | `npm run lint` · `npm run lint:boundary` | ESLint; the boundary check enforces the `src/core` ↔ `src/adapters` import rule (D1). |
 
 ## Onboarding a customer
+
+There are two equivalent paths — the **console Onboarding screen** (guided,
+preferred — see [above](#onboarding-screen)) and the **CLI**:
 
 ```bash
 npm run onboard -- --bp-ref=<uuid> --project-ref=<uuid> [--work-item-type-ref=<uuid>]

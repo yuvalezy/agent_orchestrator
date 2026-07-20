@@ -13,6 +13,8 @@ const PREFIX = '999000100'; // this file's recipient namespace (digits-only WA a
 
 after(async () => {
   await query(`DELETE FROM agent_outbound_queue WHERE recipient_address LIKE '${PREFIX}%'`).catch(() => {});
+  await query(`DELETE FROM agent_customer_contacts WHERE address LIKE '${PREFIX}%'`).catch(() => {});
+  await query(`DELETE FROM agent_customers WHERE bp_ref LIKE '${PREFIX}%'`).catch(() => {});
   await closePool();
 });
 
@@ -69,6 +71,41 @@ test('claimDue: claims due WA rows; excludes drafts, not-yet-due, and non-whatsa
   const emailIds = new Set(claimedEmail.map((r) => r.id));
   assert.equal(emailIds.has(emailId), true, 'email row claimed when email is armed');
   assert.equal(claimedEmail.find((r) => r.id === emailId)!.channel_type, 'email');
+});
+
+test('claimDue: is_group is keyed on the SEND TARGET (thread_key), not the recipient', async (t) => {
+  const inst = await dbReady();
+  if (!inst) return t.skip('no database reachable');
+
+  // A group thread: the reply targets the group id (thread_key), addressing the
+  // individual who spoke in it (recipient_address). Group routing must be resolved
+  // from the GROUP contact — otherwise the adapter POSTs { number: <groupId> } and
+  // whatsapp_manager 403s it "not whitelisted" (the 6254/6157 incident).
+  const groupAddr = `${PREFIX}7000`;
+  const individualAddr = `${PREFIX}7001`;
+  const { rows: cust } = await query<{ id: string }>(
+    `INSERT INTO agent_customers (bp_ref, display_name) VALUES ($1, 'seam-test') RETURNING id`,
+    [`${PREFIX}7`],
+  );
+  const customerId = cust[0].id;
+  await query(
+    `INSERT INTO agent_customer_contacts (customer_id, channel_type, address, is_group)
+     VALUES ($1, 'whatsapp', $2, true), ($1, 'whatsapp', $3, false)`,
+    [customerId, groupAddr, individualAddr],
+  );
+  const { rows: q } = await query<{ id: string }>(
+    `INSERT INTO agent_outbound_queue
+       (customer_id, channel_instance_id, recipient_address, thread_key, body, status, is_draft)
+     VALUES ($1, $2, $3, $4, 'test body', 'approved', false)
+     RETURNING id`,
+    [customerId, inst.wa, individualAddr, groupAddr],
+  );
+  const rowId = q[0].id;
+
+  const claimed = await repo.claimDue(200, ['whatsapp']);
+  const row = claimed.find((r) => r.id === rowId);
+  assert.ok(row, 'the group-threaded row is claimed');
+  assert.equal(row!.is_group, true, 'is_group resolved from the group thread_key, not the individual recipient');
 });
 
 test('deferUntil: parks the row without bumping retry_count', async (t) => {

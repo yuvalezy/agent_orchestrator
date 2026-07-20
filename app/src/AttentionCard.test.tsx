@@ -80,8 +80,9 @@ describe('AttentionCard', () => {
 
   it('offers "Another time…" only on an undecided slot card', () => {
     const slots = [{ id: 'ms0', label: 'Fri 13:00' }, { id: 'ms1', label: 'Fri 16:00' }, { id: 'mtask', label: 'Just make a task' }];
-    // A "Pick a time" card, still open → the typed-time affordance is offered.
-    const { rerender } = render(<AttentionCard card={card({ buttons: slots })} decidedOptionId={null} onDecide={vi.fn()} />);
+    // A "Pick a time" card, still open → the typed-time affordance is offered. Wrapped in a router
+    // because a slot card now also carries a "View calendar" chip that navigates.
+    const { rerender } = render(<AttentionCard card={card({ buttons: slots })} decidedOptionId={null} onDecide={vi.fn()} />, { wrapper: MemoryRouter });
     expect(screen.getByRole('button', { name: /Another time/ })).toBeInTheDocument();
 
     // Once decided, it is gone (the card is leaving the queue).
@@ -92,7 +93,8 @@ describe('AttentionCard', () => {
   it('renders DraftControls (Edit/Revise) on a draft card, MeetingTimeReply on a slot card, plain chips otherwise', () => {
     // Draft card: buttons carry `de` → the richer Edit/Revise controls, not raw chips.
     const draft = [{ id: 'da', label: 'Approve' }, { id: 'de', label: 'Edit' }, { id: 'dr', label: 'Reject' }, { id: 'dv', label: 'Revise' }];
-    const { rerender } = render(<AttentionCard card={card({ buttons: draft })} decidedOptionId={null} onDecide={vi.fn()} />);
+    // Wrapped in a router: the slot-card rerender below carries a navigating "View calendar" chip.
+    const { rerender } = render(<AttentionCard card={card({ buttons: draft })} decidedOptionId={null} onDecide={vi.fn()} />, { wrapper: MemoryRouter });
     expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Revise' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Another time/ })).not.toBeInTheDocument();

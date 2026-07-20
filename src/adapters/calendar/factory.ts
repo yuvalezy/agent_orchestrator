@@ -1,7 +1,12 @@
 import { env } from '../../config/env';
-import type { CalendarPort } from '../../ports/calendar.port';
+import type { CalendarPort, CalendarRangePort } from '../../ports/calendar.port';
 import { listEnabledCalendarAccounts } from '../connectors/calendar-accounts-repo';
-import { buildCalendarAccounts, buildDynamicMultiCalendar } from './google-calendar-accounts';
+import {
+  buildCalendarAccounts,
+  buildCalendarRangeAccounts,
+  buildDynamicMultiCalendar,
+  buildDynamicMultiCalendarRange,
+} from './google-calendar-accounts';
 
 /**
  * Build a read-only Google Calendar adapter spanning the founder's DYNAMIC, console-managed
@@ -16,6 +21,26 @@ import { buildCalendarAccounts, buildDynamicMultiCalendar } from './google-calen
 export function buildCalendarAdapter(): CalendarPort {
   return buildDynamicMultiCalendar(() =>
     buildCalendarAccounts({
+      listEnabled: async () =>
+        (await listEnabledCalendarAccounts()).map((a) => ({
+          label: a.label,
+          credentialName: a.credentialName,
+          calendarId: a.calendarId,
+        })),
+      legacyCalendarId: env.CALENDAR_ID,
+    }),
+  );
+}
+
+/**
+ * Build the arbitrary-range reader over the SAME dynamic account list (the founder-app day view).
+ * A sibling of buildCalendarAdapter — same live account roster + legacy fallback + short-TTL cache
+ * — but it lists an explicit `[timeMin, timeMax)` window uncapped and per-calendar tagged, rather
+ * than the now-anchored capped meeting-context read. See CalendarRangePort.
+ */
+export function buildCalendarRangeAdapter(): CalendarRangePort {
+  return buildDynamicMultiCalendarRange(() =>
+    buildCalendarRangeAccounts({
       listEnabled: async () =>
         (await listEnabledCalendarAccounts()).map((a) => ({
           label: a.label,

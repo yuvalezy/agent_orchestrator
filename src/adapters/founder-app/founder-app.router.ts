@@ -18,8 +18,10 @@ import { toUrgencyItem, toTimelineRow } from './founder-app-cockpit-view';
 import type { AttentionDecision, CustomerAugment } from './founder-app-cockpit-repo';
 import type { Page } from '../console/console-repo';
 import type { AppMeetingTimeOutcome } from '../triage/meeting-scheduler.factory';
+import type { FounderAppCalendar } from './founder-app-calendar';
 import type { replaceDraftBodyAndApprove } from '../../outbound/outbound-repo';
 import type { DraftReviserService } from '../../triage/draft-revise';
+import type { MeetingDraftView } from '../../scheduling/app-meeting-draft';
 import { TranscriptionError } from '../llm/openai-transcription.client';
 
 // The AO Founder PWA API + static shell (M6), mounted at /app and gated by the same
@@ -32,6 +34,8 @@ const NUMERIC_ID_RE = /^\d+$/;
 /** A bare wall-clock from `<input type="datetime-local">`: "2026-07-17T15:00" (seconds optional).
  *  No zone by design — the server anchors it in the meeting's founder tz. */
 const LOCAL_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
+/** A calendar day the day view is asked for: "2026-07-20". No zone — anchored in env.CALENDAR_TZ. */
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** A "📅 Pick a time" card's signature: its slot buttons are `ms0…`. Only that card takes a
  *  typed time — a duration card (`md30`) is a step too early (no slot to override yet). */
 const SLOT_BUTTON_RE = /^ms\d+$/;
@@ -50,6 +54,8 @@ const MAX_FCM_TOKEN = 4096;
  *  upload can never succeed — reject it at the door rather than stream it to the adapter. */
 const MAX_AUDIO_BYTES = '25mb';
 const MAX_OPTION_ID = 64;
+/** Sanity cap on a standalone block-time duration (8h) — a fat-fingered value can't reserve a week. */
+const MAX_BLOCK_MINUTES = 480;
 const DEFAULT_PAGE = 50;
 const MAX_PAGE = 100;
 /** How many top urgency items ride along on the attention screen. */
@@ -121,6 +127,19 @@ export interface FounderAppDeps {
    *  answers 503. Built by buildAppComposeDraft with the SAME core presenter `/draft email` uses. */
   composeDraft?: (input: { customerId: string; prompt: string; by: string }) => Promise<{ ok: true; queueId: string } | { ok: false; reason: string }>;
   /**
+   * Iterative meeting scheduling from a customer chat — the marquee chief-of-staff flow. The founder
+   * proposes a meeting in words ("meeting with Shlomo at 2pm"), refines the SAME draft across turns
+   * ("add Dana", "15:00 thursday"), then books it. Each verb also keeps the draft's ONE feed card in
+   * sync (insert first turn, update-in-place on refine). Customer-scoped: attendees resolve against
+   * THAT customer's contacts. OPTIONAL — absent (MEETING_SCHEDULING_ENABLED off) → the routes answer
+   * 503. Built by buildAppMeetingDraftGated over the SAME booking primitive the Telegram lane uses.
+   */
+  meetingDraft?: {
+    proposeOrRefine: (input: { chatSessionId: string; customerId: string; customerName: string; utterance: string }) => Promise<MeetingDraftView>;
+    book: (input: { draftId: string }) => Promise<{ ok: true; view: MeetingDraftView } | { ok: false; reason: string; view: MeetingDraftView }>;
+    cancel: (input: { draftId: string }) => Promise<MeetingDraftView>;
+  };
+  /**
    * App-origin reminders (the PWA's own scheduled_actions rows, no Telegram anchors). OPTIONAL so
    * main.ts still compiles without them — absent → every /api/reminders route answers 503. Built
    * in main.ts from scheduling-repo's createAppReminder/listUpcomingReminders/cancelScheduledAction,
@@ -131,6 +150,14 @@ export interface FounderAppDeps {
     listUpcoming: (limit: number) => Promise<Array<{ id: string; body: string; executeAt: string; customerId: string | null }>>;
     cancel: (id: string) => Promise<{ result: 'cancelled' | 'already' | 'too_late'; customerId: string | null }>;
   };
+  /**
+   * The calendar day view — every event across every founder calendar for a navigable day, the
+   * founder's business-hours window, a pending meeting's proposed slots (to highlight), and a
+   * standalone "block my time" write. OPTIONAL so main.ts still compiles without it — absent (or
+   * CALENDAR_ENABLED off) → GET /api/calendar and POST /api/calendar/block answer 503. Built by
+   * buildFounderAppCalendar at the composition edge (all tz anchoring + send-window reuse there).
+   */
+  calendar?: FounderAppCalendar;
   /**
    * Transcribe a founder voice note recorded in the PWA chat composer — the SAME OpenAI adapter
    * the Telegram voice path uses (buildOpenAiTranscriptionClient). OPTIONAL so main.ts still
@@ -444,6 +471,17 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
           ? res.json({ data: row })
           : res.status(409).json({ error: 'already decided' }));
       }
+      // A meeting-draft card's Cancel is NOT a shared-decision option — the card carries no decision
+      // ref (its live actions POST to /api/meeting-draft). Intercept it here: cancel the draft (frees
+      // the session's active-draft slot and flips the card terminal), then dismiss the card so it
+      // leaves the attention queue. Never reaches the decision bus.
+      if (body.optionId === 'mkcancel') {
+        const draftId = (row.context?.meetingDraft as { id?: string } | null | undefined)?.id;
+        if (draftId && deps.meetingDraft) await deps.meetingDraft.cancel({ draftId });
+        const dismissed = await deps.repo.dismissMessage(body.messageId);
+        if (dismissed.ok) for (const r of dismissed.rows) deps.feed.publish(r);
+        return void res.json({ data: dismissed.ok ? dismissed.rows : row });
+      }
       // Dispatch through the SHARED composite handler: it runs the real decision handler
       // (idempotent via claimOverride) and THEN the mirror hook, which marks EVERY app row
       // sharing this ref as decided (first-writer-wins) and re-emits them over SSE. This is
@@ -588,6 +626,130 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
       const result = await deps.composeDraft({ customerId: body.customerId, prompt: body.prompt.trim(), by: 'founder-app' });
       if (!result.ok) return void res.status(409).json({ error: result.reason });
       res.json({ data: { queueId: result.queueId } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Meeting draft — iterative meeting scheduling in the customer chat ─────────────────
+  // The marquee chief-of-staff flow. `text` is a natural-language utterance: the first proposes the
+  // meeting ("meeting with Shlomo at 2pm"), each subsequent one REFINES the same draft ("add Dana",
+  // "make it 15:00 thursday", "45 min"). Every call re-interprets the accumulated utterances against
+  // THIS customer's contacts, revalidates free/busy, and evolves ONE card (the gateway handles the
+  // feed). NOTHING is booked here — see /book. Customer-scoped (unknown customer → 404); meetingDraft
+  // absent (MEETING_SCHEDULING_ENABLED off) → 503.
+  router.post('/api/meeting-draft', async (req, res, next) => {
+    const body = (req.body ?? {}) as { customerId?: unknown; text?: unknown };
+    if (typeof body.customerId !== 'string' || !UUID_RE.test(body.customerId)) {
+      return void res.status(400).json({ error: 'invalid customer id' });
+    }
+    if (typeof body.text !== 'string' || !body.text.trim() || body.text.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'text is required' });
+    }
+    if (!deps.meetingDraft) return void res.status(503).json({ error: 'meeting scheduling unavailable' });
+    try {
+      const customer = await deps.cockpit.customerDetail(body.customerId);
+      if (!customer || typeof customer.display_name !== 'string') return void res.status(404).json({ error: 'customer not found' });
+      const session = await deps.repo.getOrCreateChatSession(body.customerId);
+      const view = await deps.meetingDraft.proposeOrRefine({
+        chatSessionId: session.id,
+        customerId: body.customerId,
+        customerName: customer.display_name,
+        utterance: body.text.trim(),
+      });
+      res.json({ data: view });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Book a meeting draft (the ONE irreversible step) ──────────────────────────────────
+  // Books the active draft NOW: re-checks the time is still future, then creates the calendar event
+  // with a Meet link and fires invites (sendUpdates:'all') — unrecallable, so it is NEVER done on a
+  // refine turn, only this explicit tap. Idempotent: the deterministic eventId is keyed on the draft
+  // id, so a double tap collides at Google (409) instead of a second event. 409 with the current view
+  // when the draft still `needs` a time/attendee or the time has lapsed; 503 when scheduling is off.
+  router.post('/api/meeting-draft/:id/book', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid draft id' });
+    if (!deps.meetingDraft) return void res.status(503).json({ error: 'meeting scheduling unavailable' });
+    try {
+      const result = await deps.meetingDraft.book({ draftId: req.params.id });
+      if (!result.ok) return void res.status(409).json({ error: result.reason, data: result.view });
+      res.json({ data: { status: 'booked', view: result.view } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Calendar day view ────────────────────────────────────────────────────────────────
+  // Every event across every one of the founder's calendars for ONE navigable day (any past/future
+  // day), plus the founder's business-hours window, so they can eyeball a free slot instead of
+  // guessing. `messageId` (optional) resolves a pending "📅 Pick a time" card to its meeting so the
+  // FE can highlight the slots already offered. The day is anchored in env.CALENDAR_TZ — never the
+  // phone's zone. calendar dep absent (CALENDAR_ENABLED off) → 503; the events list is useful even
+  // when the meeting doesn't resolve, so an unresolved messageId just omits `meeting`.
+  router.get('/api/calendar', async (req, res, next) => {
+    const day = req.query.day;
+    if (typeof day !== 'string' || !DAY_RE.test(day)) return void res.status(400).json({ error: 'invalid day' });
+    const messageIdRaw = req.query.messageId;
+    if (messageIdRaw !== undefined && (typeof messageIdRaw !== 'string' || !UUID_RE.test(messageIdRaw))) {
+      return void res.status(400).json({ error: 'invalid message id' });
+    }
+    if (!deps.calendar) return void res.status(503).json({ error: 'calendar unavailable' });
+    const dayStart = DateTime.fromISO(day, { zone: env.CALENDAR_TZ }).startOf('day');
+    if (!dayStart.isValid) return void res.status(400).json({ error: 'invalid day' });
+    const dayEnd = dayStart.plus({ days: 1 });
+    try {
+      const [events, businessHours] = await Promise.all([
+        deps.calendar.listRange({ timeMin: dayStart.toJSDate(), timeMax: dayEnd.toJSDate() }),
+        deps.calendar.businessHoursForDay(day),
+      ]);
+      const data: {
+        day: string;
+        tz: string;
+        businessHours: { startMinutes: number; endMinutes: number } | null;
+        events: Array<{ id: string; calendarLabel: string; title: string; startsAt: Date; endsAt: Date; allDay: boolean }>;
+        meeting?: { messageId: string; durationMinutes: number; proposedSlots: Array<{ startsAt: string; endsAt: string }> };
+      } = {
+        day,
+        tz: env.CALENDAR_TZ,
+        businessHours,
+        events: events.map((e) => ({ id: e.id, calendarLabel: e.calendarLabel, title: e.title, startsAt: e.startsAt, endsAt: e.endsAt, allDay: e.allDay })),
+      };
+      // Resolve the pending meeting the SAME way /api/meeting-time does: the card's notificationRef
+      // IS the meeting id, and only a "Pick a time" card (slot buttons) carries one.
+      if (typeof messageIdRaw === 'string') {
+        const row = await deps.repo.getMessage(messageIdRaw);
+        if (row?.notificationRef && row.buttons?.some((b) => SLOT_BUTTON_RE.test(b.id))) {
+          const meeting = await deps.calendar.meetingForCard(row.notificationRef);
+          if (meeting) data.meeting = { messageId: messageIdRaw, durationMinutes: meeting.durationMinutes, proposedSlots: meeting.proposedSlots };
+        }
+      }
+      res.json({ data });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Block time (standalone hold — no customer, no invitee) ────────────────────────────
+  // Tapping a free slot in the day view that isn't a pending customer meeting books a private hold
+  // on the founder host calendar. localTime is a bare wall-clock (datetime-local); the SERVER
+  // anchors it in env.CALENDAR_TZ. FAIL-CLOSED + past-refused in the builder. Status vocabulary
+  // matches /api/meeting-time ('booked'|'unavailable'|'invalid') so the FE reuses its handler.
+  router.post('/api/calendar/block', async (req, res, next) => {
+    const body = (req.body ?? {}) as { localTime?: unknown; durationMinutes?: unknown; title?: unknown };
+    if (typeof body.localTime !== 'string' || !LOCAL_TIME_RE.test(body.localTime)) {
+      return void res.status(400).json({ error: 'invalid time' });
+    }
+    if (typeof body.durationMinutes !== 'number' || !Number.isInteger(body.durationMinutes) || body.durationMinutes <= 0 || body.durationMinutes > MAX_BLOCK_MINUTES) {
+      return void res.status(400).json({ error: 'invalid duration' });
+    }
+    const title = optionalLabel(body.title); // null → default in the builder; undefined → wrong type/too long
+    if (title === undefined) return void res.status(400).json({ error: 'invalid title' });
+    if (!deps.calendar) return void res.status(503).json({ error: 'calendar unavailable' });
+    try {
+      const outcome = await deps.calendar.block({ localTime: body.localTime, durationMinutes: body.durationMinutes, title: title ?? undefined });
+      res.json({ data: { status: outcome.status } });
     } catch (err) {
       next(err);
     }
