@@ -105,6 +105,37 @@ export function CardActions({ card, className }: { card: CardLike; className?: s
   );
 }
 
+/**
+ * Dismiss for a meeting "wants to talk" / "pick a time" question — cards the shared `CardActions`
+ * dismiss deliberately skips (they're `question` kind, which the `/dismiss` route 409s). This one
+ * abandons the meeting with NO task through the meeting-specific route, wearing the same look as the
+ * notification dismiss so the gesture reads the same. Rendered only while the question stands; a
+ * card outside the data layer (no AppData) offers nothing, matching `CardActions`.
+ */
+export function MeetingDismissButton({ messageId }: { messageId: string }): ReactElement | null {
+  const app = useOptionalAppData();
+  const [acked, setAcked] = useState(false);
+  if (!app) return null;
+
+  const dismiss = () => {
+    setAcked(true);
+    // The queue rolls itself back on failure (AppData); this only un-sticks the button.
+    void app.dismissMeeting(messageId).catch(() => setAcked(false));
+  };
+
+  return (
+    <button
+      type="button"
+      disabled={acked}
+      onClick={dismiss}
+      className={cn(CHIP, acked ? 'bg-zinc-800 text-zinc-500' : 'bg-zinc-800 text-zinc-300 active:bg-zinc-700')}
+    >
+      <Check size={14} />
+      {acked ? 'Dismissed' : 'Dismiss'}
+    </button>
+  );
+}
+
 function ViewThread({ path }: { path: string }): ReactElement {
   const navigate = useNavigate();
   return (

@@ -1,6 +1,23 @@
 import 'dotenv/config';
 import { z } from 'zod';
 
+// 24h HH:MM, zero-padded — the wire form for the day-window bounds and the soft-block edges.
+// Zero-padding makes a string compare (start < end) equal a chronological one.
+const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// One founder "suggested hold" as CONFIGURED (env.CALENDAR_SOFT_BLOCKS): HH:MM edges + a label,
+// optionally scoped to weekdays (0=Sun..6=Sat; omitted → every day). start < end. The slot engine
+// and day view consume the minutes-from-midnight form (send-window.toSoftBlocks) — this is only the
+// input contract.
+const softBlockConfig = z
+  .object({
+    start: z.string().regex(HHMM_RE),
+    end: z.string().regex(HHMM_RE),
+    label: z.string().trim().min(1),
+    days: z.array(z.number().int().min(0).max(6)).optional(),
+  })
+  .refine((b) => b.start < b.end, { message: 'a soft block start must be before its end' });
+
 // Non-secret config only. SECRETS never live here — they resolve through
 // src/config/credentials.ts (`resolveCredential`), the M1.4 sealed-store seam.
 // Later milestones extend this schema (LLM provider base URLs, more channel
@@ -577,6 +594,29 @@ export const envSchema = z.object({
   // IANA timezone for rendering meeting date/time lines (the founder's local week). Also the
   // zone the WRITE path renders deadline events in, and whose local day decides all-day vs timed.
   CALENDAR_TZ: z.string().default('America/Panama'),
+
+  // ── Founder-app calendar day view (M6): the VISIBLE working-day extent, DISTINCT from business
+  // hours. Business HOURS (agent_business_hours, 06:30–17:30 today) drive the dim/shading; THIS is
+  // the grid's default vertical extent — 06:00–20:00 — a hint the FE still widens to include any
+  // out-of-range event. HH:MM, founder-local (env.CALENDAR_TZ).
+  CALENDAR_DAY_WINDOW_START: z.string().regex(HHMM_RE).default('06:00'),
+  CALENDAR_DAY_WINDOW_END: z.string().regex(HHMM_RE).default('20:00'),
+  // Founder "suggested hold" windows (walk / gym) as a JSON array. SOFT: the meeting AUTO-PROPOSAL
+  // avoids them (a slot overlapping one is never OFFERED), but a founder TYPED / manual booking is
+  // NOT vetoed — the founder can still book into their gym time on purpose. Surfaced on the day view
+  // (shaded) filtered per weekday. Each entry: {start,end,label,days?} — HH:MM, start<end, days
+  // 0=Sun..6=Sat (omitted → every day). Invalid JSON / a malformed entry fails boot validation.
+  CALENDAR_SOFT_BLOCKS: z
+    .preprocess((v) => {
+      if (v === undefined) return undefined; // let .default supply the array form
+      if (typeof v !== 'string') return v;
+      try {
+        return JSON.parse(v);
+      } catch {
+        return v; // non-JSON → the array schema reports the type error and boot fails
+      }
+    }, z.array(softBlockConfig))
+    .default([{ start: '11:30', end: '13:00', label: 'Walk / gym', days: [1, 2, 3, 4, 5] }]),
 
   // M5(d) WRITE path: a task created with a `dueAt` also gets a deadline event on the founder's
   // calendar (src/triage/due-event-sync.ts). SEPARATE kill-switch from CALENDAR_ENABLED (which

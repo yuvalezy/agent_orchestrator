@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { CalendarDays, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from './lib/utils';
 import { relativeTime } from './lib/time';
-import { CardActions, ThreadTap, threadPath } from './CardActions';
+import { CardActions, MeetingDismissButton, ThreadTap, threadPath } from './CardActions';
 import { DecisionChips, type DecideHandler } from './DecisionChips';
 import { DraftControls, isDraftCard } from './DraftControls';
 import { MeetingDraftCard, isMeetingDraftCard } from './MeetingDraftCard';
@@ -13,6 +13,11 @@ import type { AttentionCard as AttentionCardData, Severity } from './types';
 /** A "📅 Pick a time" card is known by its slot buttons (`ms0…`); only there does typing a time
  *  make sense (a duration card is a step too early). Mirrors the server's SLOT_BUTTON_RE. */
 const isSlotCard = (card: AttentionCardData): boolean => (card.buttons ?? []).some((b) => /^ms\d+$/.test(b.id));
+
+/** A meeting question — either the "Wants to talk" duration card (`md\d+`) or the "Pick a time" slot
+ *  card (`ms\d+`). Both can be abandoned with no task via the meeting-specific Dismiss; the booked
+ *  meeting-draft card (`mkbook`) has its own Cancel and is not one of these. */
+const isMeetingCard = (card: AttentionCardData): boolean => (card.buttons ?? []).some((b) => /^m[sd]\d+$/.test(b.id));
 
 const accent: Record<Severity, string> = {
   info: 'bg-sky-400',
@@ -90,6 +95,13 @@ export function AttentionCard({
               <div className="flex flex-wrap items-center gap-x-2">
                 <MeetingTimeReply messageId={card.id} />
                 <ViewCalendarChip messageId={card.id} />
+              </div>
+            )}
+            {/* Abandon the meeting entirely — no task, no reply. Offered on both the duration and the
+                slot card while the question stands, distinct from "Just make a task" (mtask). */}
+            {decidedOptionId === null && isMeetingCard(card) && (
+              <div className="mt-2">
+                <MeetingDismissButton messageId={card.id} />
               </div>
             )}
           </div>

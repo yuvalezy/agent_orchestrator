@@ -13,6 +13,10 @@ interface AppDataValue {
   /** Acknowledge a card ("I've seen this") — it leaves the queue here and stays gone.
    *  Rejects on a 409 (a `question` must be answered, not dismissed) with the queue restored. */
   dismiss: (messageId: string) => Promise<void>;
+  /** Abandon a meeting "wants to talk" / "pick a time" question with NO task — the meeting-specific
+   *  dismiss the plain `/dismiss` route refuses (it's a `question`). Same optimistic-drop-then-settle
+   *  behaviour as `dismiss`, against POST /meeting/:messageId/dismiss. */
+  dismissMeeting: (messageId: string) => Promise<void>;
 }
 
 /** The server dismisses by `notification_ref`, because several rows legitimately mirror ONE
@@ -52,17 +56,17 @@ export function AppDataProvider({
   // Refetch the queue on first mount and whenever the world changes (any live row).
   useEffect(() => { void loadAttention(); }, [loadAttention, feed.eventToken]);
 
-  const dismiss = useCallback(async (messageId: string) => {
+  // Drop the card from the queue the instant the founder taps, fire the given request, and settle
+  // from the server (which also re-publishes the affected rows over SSE); on failure, roll the queue
+  // back. Shared by the plain dismiss and the meeting-specific dismiss so both behave identically.
+  const removeFromQueue = useCallback(async (messageId: string, send: () => Promise<unknown>) => {
     const snapshot = attention;
     const target = attention?.decisions.find((card) => card.id === messageId) ?? null;
-    // Drop it now — the founder's tap is the answer, the round-trip is just bookkeeping.
     if (target) {
       setAttention((current) => current && { ...current, decisions: current.decisions.filter((card) => !sameThing(card, target)) });
     }
     try {
-      await api<{ data: Message[] }>('/dismiss', { method: 'POST', body: JSON.stringify({ messageId }) });
-      // The server also re-publishes the dismissed rows over SSE; this settles the queue for
-      // the (common) case where this client's own tap is the only thing that changed.
+      await send();
       void loadAttention();
     } catch (err) {
       if (target) setAttention(snapshot);
@@ -70,8 +74,18 @@ export function AppDataProvider({
     }
   }, [attention, loadAttention]);
 
+  const dismiss = useCallback(
+    (messageId: string) => removeFromQueue(messageId, () => api<{ data: Message[] }>('/dismiss', { method: 'POST', body: JSON.stringify({ messageId }) })),
+    [removeFromQueue],
+  );
+
+  const dismissMeeting = useCallback(
+    (messageId: string) => removeFromQueue(messageId, () => api<{ data: { status: string } }>(`/meeting/${encodeURIComponent(messageId)}/dismiss`, { method: 'POST' })),
+    [removeFromQueue],
+  );
+
   return (
-    <Ctx.Provider value={{ config, deviceLabel, feed, attention, attentionLoading, refetchAttention: () => void loadAttention(), dismiss }}>
+    <Ctx.Provider value={{ config, deviceLabel, feed, attention, attentionLoading, refetchAttention: () => void loadAttention(), dismiss, dismissMeeting }}>
       {children}
     </Ctx.Provider>
   );

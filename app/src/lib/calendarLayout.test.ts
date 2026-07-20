@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockLabel, freeGaps, localTimeAt, minuteInDay, packColumns, shiftDay } from './calendarLayout';
+import { clockLabel, freeGaps, localTimeAt, minuteInDay, packColumns, shiftDay, tapMinuteInGap } from './calendarLayout';
 
 describe('calendarLayout', () => {
   it('reads an instant as a minute-of-day in the given tz, clamping other days', () => {
@@ -39,6 +39,17 @@ describe('calendarLayout', () => {
     expect(a.lane).not.toBe(b.lane);
     expect(c.lanes).toBe(1);
     expect(c.lane).toBe(0);
+  });
+
+  it('books the TAPPED position inside a gap, not the gap start', () => {
+    // Gap 9:00–20:00 (540–1200) at 1.1 px/min. A tap 150 min down (≈165px) lands on 11:30 — the
+    // start the sheet must show and post, NOT the gap's 9:00 start (which on today would be `now`).
+    expect(tapMinuteInGap(540, 1200, 150 * 1.1, 1.1)).toBe(690); // 11:30
+    // Snaps to 5-min granularity: an offset landing on 11:32 rounds to 11:30.
+    expect(tapMinuteInGap(540, 1200, 152 * 1.1, 1.1)).toBe(690);
+    // A tap at the very top stays at the gap start; a tap past the end clamps inside the gap.
+    expect(tapMinuteInGap(540, 1200, 0, 1.1)).toBe(540);
+    expect(tapMinuteInGap(540, 1200, 5000, 1.1)).toBe(1195);
   });
 
   it('subtracts busy spans from the business band, dropping slivers below the minimum', () => {

@@ -3,7 +3,7 @@ import { env } from '../../config/env';
 import { logger } from '../../logger';
 import type { BusyInterval, RangeEvent } from '../../ports/calendar.port';
 import { loadBusinessHours, loadHolidays } from '../../outbound/outbound-repo';
-import { businessHoursByDow, openWindowForDay } from '../../outbound/send-window';
+import { businessHoursByDow, openWindowForDay, toSoftBlocks } from '../../outbound/send-window';
 import { slotConflicts } from '../../triage/meeting-slots';
 import { getMeetingRequest } from '../../triage/meeting-repo';
 import { buildCalendarRangeAdapter } from '../calendar';
@@ -33,6 +33,19 @@ export interface FounderAppCalendar {
    */
   businessHoursForDay: (dayIso: string) => Promise<{ startMinutes: number; endMinutes: number } | null>;
   /**
+   * The founder's VISIBLE working-day extent (env.CALENDAR_DAY_WINDOW_*), as minutes from local
+   * midnight — a hint for the grid's default vertical extent, DISTINCT from businessHours (which
+   * drives the dim/shading). Static: it does not vary by day, and the FE still widens to include any
+   * out-of-range event.
+   */
+  dayWindow: { startMinutes: number; endMinutes: number };
+  /**
+   * The founder's soft "suggested hold" windows (walk / gym) that apply to a founder-tz day
+   * (weekday-filtered), as minutes-from-midnight + label — a hint the FE shades. SOFT and distinct
+   * from business hours: the auto-proposal avoids them, a manual booking does not.
+   */
+  softBlocksForDay: (dayIso: string) => Array<{ startMinutes: number; endMinutes: number; label: string }>;
+  /**
    * A "📅 Pick a time" card's meeting: its duration + the slots already proposed, or null when the
    * meeting isn't awaiting a slot (resolved, abandoned, or gone). `meetingId` is the card's
    * `notificationRef` — the same mapping /api/meeting-time uses.
@@ -50,8 +63,21 @@ export interface FounderAppCalendar {
 /** Default title for a standalone block-time event. */
 const DEFAULT_BLOCK_TITLE = 'Blocked';
 
+/** 'HH:MM' → minutes from midnight (env day-window bounds). */
+function hhmmToMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(':');
+  return Number(h) * 60 + Number(m);
+}
+
 export function buildFounderAppCalendar(): FounderAppCalendar {
   const range = buildCalendarRangeAdapter();
+  // Both are pure env reads (no tz/DB) — resolved once at build. The soft holds are weekday-filtered
+  // per requested day in softBlocksForDay below; the day window is the same every day.
+  const dayWindow = {
+    startMinutes: hhmmToMinutes(env.CALENDAR_DAY_WINDOW_START),
+    endMinutes: hhmmToMinutes(env.CALENDAR_DAY_WINDOW_END),
+  };
+  const softBlocks = toSoftBlocks(env.CALENDAR_SOFT_BLOCKS);
 
   // Same free/busy fan-out the meeting scheduler uses (FAIL-CLOSED across every enabled calendar),
   // built here rather than shared so the day-view feature carries no dependency on meeting
@@ -81,6 +107,17 @@ export function buildFounderAppCalendar(): FounderAppCalendar {
       const w = openWindowForDay(day, businessHoursByDow(businessHours), holidays, null);
       if (!w) return null;
       return { startMinutes: w.open.hour * 60 + w.open.minute, endMinutes: w.close.hour * 60 + w.close.minute };
+    },
+
+    dayWindow,
+
+    softBlocksForDay: (dayIso) => {
+      const day = DateTime.fromISO(dayIso, { zone: env.CALENDAR_TZ });
+      if (!day.isValid) return [];
+      const dow = day.weekday % 7; // luxon 1=Mon..7=Sun → 0=Sun..6=Sat
+      return softBlocks
+        .filter((b) => !b.days || b.days.length === 0 || b.days.includes(dow))
+        .map((b) => ({ startMinutes: b.startMinutes, endMinutes: b.endMinutes, label: b.label }));
     },
 
     meetingForCard: async (meetingId) => {

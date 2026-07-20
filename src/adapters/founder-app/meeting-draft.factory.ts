@@ -32,6 +32,7 @@ export interface AppMeetingDraftGateway {
   book(input: { draftId: string }): Promise<
     { ok: true; view: MeetingDraftView } | { ok: false; reason: string; view: MeetingDraftView }
   >;
+  resolveAttendee(input: { draftId: string; name: string; email: string }): Promise<MeetingDraftView>;
   cancel(input: { draftId: string }): Promise<MeetingDraftView>;
 }
 
@@ -122,6 +123,19 @@ export function buildAppMeetingDraftGated(deps: {
         if (row) deps.feed.publish(row);
       }
       return res;
+    },
+    resolveAttendee: async (input) => {
+      const view = await core.resolveAttendee(input);
+      // The card already exists (a draft was proposed first) — refresh it in place so the picked
+      // contact replaces the unresolved chip and the block clears.
+      if (view.messageId) {
+        const row = await deps.updateMessageCard(view.messageId, {
+          body: summarize(view),
+          context: { meetingDraft: view },
+        });
+        if (row) deps.feed.publish(row);
+      }
+      return view;
     },
     cancel: async (input) => {
       const view = await core.cancel(input);

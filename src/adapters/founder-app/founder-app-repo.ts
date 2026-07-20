@@ -503,19 +503,69 @@ export async function getMessage(id: string): Promise<FeedMessage | null> {
 }
 
 /**
- * Record the founder's choice on EVERY mirrored row sharing a decision's notification_ref,
- * but ONLY the first time (WHERE decided_option_id IS NULL) — first-writer-wins, so a
- * decision made on one surface (Telegram) and a later stale tap on another (the app) can
- * never overwrite the recorded option. Keyed by ref, not messageId, because a Telegram
- * callback carries no app messageId: the ref is the single identifier both surfaces share
- * (see decision-handler.ts). Returns the rows this call actually decided (for the SSE
- * re-emit); an empty ref matches nothing (a buttoned notification always carries a ref).
+ * Record the founder's choice on every mirrored row sharing a decision's notification_ref that
+ * ACTUALLY OFFERED this option, but ONLY the first time (WHERE decided_option_id IS NULL) —
+ * first-writer-wins, so a decision made on one surface (Telegram) and a later stale tap on
+ * another (the app) can never overwrite the recorded option. Keyed by ref, not messageId,
+ * because a Telegram callback carries no app messageId: the ref is the single identifier both
+ * surfaces share (see decision-handler.ts).
+ *
+ * The `buttons @> [{id:optionId}]` containment guard is load-bearing: a multi-step flow reuses
+ * ONE ref across successive cards (a duration card → a "Pick a time" slot card, both on the
+ * meeting id). onDuration inserts the NEXT card BEFORE this mirror-mark runs, so without the
+ * guard this would stamp the just-born slot card decided too and it would never reach the
+ * attention queue — the founder taps a duration and nothing appears. Scoping to cards that
+ * carried this exact option marks the resolved card (and any duplicate mirror of it) while
+ * leaving a follow-up card that offers DIFFERENT options untouched. A synthetic resolution
+ * option that is not a real button (a typed-time booking → 'mtyped') matches nothing here by
+ * design — those clear the specific card via markDecidedById.
+ *
+ * Returns the rows this call actually decided (for the SSE re-emit); an empty ref matches nothing
+ * (a buttoned notification always carries a ref).
  */
 export async function markDecidedByRef(notificationRef: string, optionId: string): Promise<FeedMessage[]> {
   if (!notificationRef) return [];
   const { rows } = await query<MessageRow>(
     `UPDATE founder_app_messages SET decided_option_id = $2
-      WHERE notification_ref = $1 AND buttons IS NOT NULL AND decided_option_id IS NULL
+      WHERE notification_ref = $1 AND decided_option_id IS NULL
+        AND buttons @> $3::jsonb
+      RETURNING ${MESSAGE_COLUMNS}`,
+    [notificationRef, optionId, JSON.stringify([{ id: optionId }])],
+  );
+  return rows.map(mapMessage);
+}
+
+/**
+ * Mark ONE card decided by its own id (undecided-only, returning it for the SSE re-emit).
+ * For the case markDecidedByRef deliberately can't serve: a resolution whose option is
+ * SYNTHETIC (a typed-time booking records 'mtyped', which is not a button on the slot card),
+ * so the ref+containment path would match nothing. The caller has the exact messageId, so it
+ * clears precisely that card. Returns null when the id is gone or already decided.
+ */
+export async function markDecidedById(id: string, optionId: string): Promise<FeedMessage | null> {
+  const { rows } = await query<MessageRow>(
+    `UPDATE founder_app_messages SET decided_option_id = $2
+      WHERE id = $1 AND decided_option_id IS NULL
+      RETURNING ${MESSAGE_COLUMNS}`,
+    [id, optionId],
+  );
+  return rows[0] ? mapMessage(rows[0]) : null;
+}
+
+/**
+ * Clear EVERY still-open card on a meeting ref — the dismiss-a-meeting gesture. Unlike
+ * markDecidedByRef there is NO `buttons @>` containment guard: a meeting dismiss records a SYNTHETIC
+ * option ('mdismiss', not a real button) and must clear both the card the founder saw AND any sibling
+ * open card on the same meeting (a duration + a slot card can coexist on one ref), so the containment
+ * guard would match none. Ref-scoped and first-writer-wins (decided_option_id IS NULL), so it touches
+ * only THAT meeting's cards (the ref is the agent_meeting_requests id, carried by no other card) and a
+ * re-dismiss re-decides nothing. Returns exactly the rows this call changed, for the SSE re-emit.
+ */
+export async function dismissMeetingCards(notificationRef: string, optionId: string): Promise<FeedMessage[]> {
+  if (!notificationRef) return [];
+  const { rows } = await query<MessageRow>(
+    `UPDATE founder_app_messages SET decided_option_id = $2
+      WHERE notification_ref = $1 AND decided_option_id IS NULL
       RETURNING ${MESSAGE_COLUMNS}`,
     [notificationRef, optionId],
   );

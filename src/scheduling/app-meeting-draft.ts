@@ -1,5 +1,5 @@
 import { validatedExecution, stillFuture, type MeetingCommandDeps } from './schedule-handler';
-import { meansEveryone, resolveInvitees } from './meeting-invitees';
+import { meansEveryone, resolveInvitees, type ContactCandidate } from './meeting-invitees';
 import type { ScheduleInterpreterPort } from '../ports/llm.port';
 import type { MeetingDraftAttendee, MeetingDraftRepo, MeetingDraftRow } from '../adapters/founder-app/meeting-draft-repo';
 
@@ -20,6 +20,14 @@ import type { MeetingDraftAttendee, MeetingDraftRepo, MeetingDraftRow } from '..
 
 export type { MeetingDraftAttendee } from '../adapters/founder-app/meeting-draft-repo';
 
+/** One of the customer's email contacts, offered on the card so the founder can PICK who an
+ *  unresolved name ("Shlomo") really is (the stored contact is "Salomon Kortovich") — the exact
+ *  matcher can't bridge a familiar name, but a tap can. */
+export interface MeetingContact {
+  name: string;
+  email: string;
+}
+
 /** The JSON a card renders + the endpoints return (frozen shared contract). */
 export interface MeetingDraftView {
   id: string;
@@ -31,6 +39,9 @@ export interface MeetingDraftView {
   attendees: MeetingDraftAttendee[];
   conflicts: string[]; // best-effort busy warnings; [] if none/unknown
   needs: string[]; // what still blocks booking; empty ⇒ ready to book
+  /** The customer's email contacts to PICK from — populated only while an attendee is unresolved,
+   *  so the card can offer "did you mean …?" one-tap resolution. Empty otherwise. */
+  candidates: MeetingContact[];
   messageId: string | null; // the founder_app_messages card row (router manages)
   meetLink: string | null; // set once booked
   htmlLink: string | null; // set once booked
@@ -55,6 +66,10 @@ export interface AppMeetingDraftService {
   book(
     input: { draftId: string },
   ): Promise<{ ok: true; view: MeetingDraftView } | { ok: false; reason: string; view: MeetingDraftView }>;
+  /** Resolve an unresolved attendee by PICKING one of the customer's email contacts — the founder
+   *  taps "Salomon Kortovich" for the "Shlomo" they typed. `email` MUST be one of the customer's
+   *  contacts (never an arbitrary address); the guess named `name` is replaced by the real contact. */
+  resolveAttendee(input: { draftId: string; name: string; email: string }): Promise<MeetingDraftView>;
   /** Abandon the active draft (the card's Cancel). Idempotent — a non-drafting/absent row just
    *  returns a cancelled view. Frees the session's active-draft slot so a new meeting can start. */
   cancel(input: { draftId: string }): Promise<MeetingDraftView>;
@@ -82,7 +97,7 @@ function computeNeeds(row: MeetingDraftRow): string[] {
 }
 
 export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraftService {
-  const buildView = (row: MeetingDraftRow, conflicts: string[], needs: string[]): MeetingDraftView => ({
+  const buildView = (row: MeetingDraftRow, conflicts: string[], needs: string[], candidates: MeetingContact[] = []): MeetingDraftView => ({
     id: row.id,
     status: row.status,
     title: row.title,
@@ -92,6 +107,8 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     attendees: row.attendees,
     conflicts,
     needs,
+    // Only offer pick-candidates while a name is still in question — a fully-resolved card needs none.
+    candidates: row.attendees.some((a) => a.unresolved) ? candidates : [],
     messageId: row.message_id,
     meetLink: row.meet_link,
     htmlLink: row.html_link,
@@ -108,10 +125,26 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     attendees: [],
     conflicts: [],
     needs: ['time', 'attendee'],
+    candidates: [],
     messageId: null,
     meetLink: null,
     htmlLink: null,
   });
+
+  /** The customer's email contacts, deduped — the pool the card offers when a name is unresolved. */
+  const emailCandidates = (contacts: ContactCandidate[]): MeetingContact[] => {
+    const seen = new Set<string>();
+    const out: MeetingContact[] = [];
+    for (const c of contacts) {
+      const email = c.email?.trim();
+      if (!email) continue;
+      const key = email.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name: c.name, email });
+    }
+    return out;
+  };
 
   /** MERGE the names an utterance introduced INTO the draft's existing attendees — a refine ADDS
    *  ("add Dana" keeps Salomon), it does not replace. A silent turn (no names) keeps the set as-is;
@@ -119,16 +152,14 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
    *  for the whole room). Each name is resolved one at a time so placed chips can sit next to the
    *  ones still in question, and a newly-resolved contact supersedes an earlier unresolved guess of
    *  the same name (so "Dana" going from a question to a real invitee clears the block). */
-  const mergeAttendees = async (
-    customerId: string,
+  const mergeAttendees = (
     prior: MeetingDraftAttendee[],
     requestedNames: string[],
-  ): Promise<MeetingDraftAttendee[]> => {
+    contacts: ContactCandidate[],
+    founderEmails: string[],
+  ): MeetingDraftAttendee[] => {
     const requested = requestedNames.map((a) => a.trim()).filter(Boolean);
     if (requested.length === 0) return prior; // the utterance named nobody → attendees unchanged
-
-    const contacts = await deps.meetings.listContacts(customerId);
-    const founderEmails = await deps.meetings.founderEmails();
 
     if (requested.some(meansEveryone)) {
       // "everyone" is every known email contact of the customer, minus the founder's own addresses.
@@ -187,9 +218,11 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     const newStartsAt = validatedExecution(interp.execute_at, deps.timezone, now, interp.explicit_date);
     const startsAt = newStartsAt ?? prior?.starts_at ?? null;
 
-    // ATTENDEES: additively merged onto the prior set (see mergeAttendees). TITLE/DURATION: updated
-    // only when this utterance supplies one, else the prior value (or the default) stands.
-    const attendees = await mergeAttendees(customerId, prior?.attendees ?? [], interp.attendees ?? []);
+    // ATTENDEES: additively merged onto the prior set (see mergeAttendees). Fetch the customer's
+    // contacts ONCE — the merge needs them, and so do the pick-candidates when a name won't resolve.
+    const contacts = await deps.meetings.listContacts(customerId);
+    const founderEmails = await deps.meetings.founderEmails();
+    const attendees = mergeAttendees(prior?.attendees ?? [], interp.attendees ?? [], contacts, founderEmails);
 
     const title = interp.body?.trim() || prior?.title || `Call — ${customerName}`;
     const durationMinutes =
@@ -219,7 +252,7 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     });
     const needs = computeNeeds(row);
     deps.log.info({ draftId: row.id, customerId, blocked: needs.length }, 'meeting draft: proposed/refined');
-    return buildView(row, conflicts, needs);
+    return buildView(row, conflicts, needs, emailCandidates(contacts));
   };
 
   const book: AppMeetingDraftService['book'] = async ({ draftId }) => {
@@ -263,6 +296,45 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     };
   };
 
+  const resolveAttendee: AppMeetingDraftService['resolveAttendee'] = async ({ draftId, name, email }) => {
+    const row = await deps.repo.getById(draftId);
+    if (!row || row.status !== 'drafting') {
+      return row ? buildView(row, [], computeNeeds(row)) : stubView(draftId);
+    }
+    const contacts = await deps.meetings.listContacts(row.customer_ref);
+    const contact = contacts.find((c) => c.email.trim().toLowerCase() === email.trim().toLowerCase());
+    // Never invent an invitee: the picked email MUST be one of THIS customer's contacts. An unknown
+    // email is a no-op that just re-offers the candidates (a raced/forged pick can't add a stranger).
+    if (!contact) return buildView(row, [], computeNeeds(row), emailCandidates(contacts));
+
+    const picked: MeetingDraftAttendee = { name: contact.name, email: contact.email, unresolved: false };
+    const attendees: MeetingDraftAttendee[] = [];
+    for (const a of row.attendees) {
+      if (a.unresolved && a.name.toLowerCase() === name.trim().toLowerCase()) continue; // drop the guess being resolved
+      if (a.email?.toLowerCase() === contact.email.toLowerCase()) continue; // and any existing copy of the pick
+      attendees.push(a);
+    }
+    attendees.push(picked);
+
+    const updated = await deps.repo.upsertActive({
+      chatSessionId: row.chat_session_id,
+      customerRef: row.customer_ref,
+      title: row.title,
+      startsAt: row.starts_at,
+      durationMinutes: row.duration_minutes,
+      timezone: row.timezone,
+      attendees,
+      commandText: row.command_text,
+    });
+    let conflicts: string[] = [];
+    if (updated.starts_at) {
+      const endsAt = new Date(updated.starts_at.getTime() + updated.duration_minutes * 60_000);
+      conflicts = await deps.meetings.conflictsAt(updated.starts_at, endsAt).catch(() => [] as string[]);
+    }
+    deps.log.info({ draftId, blocked: computeNeeds(updated).length }, 'meeting draft: attendee resolved by pick');
+    return buildView(updated, conflicts, computeNeeds(updated), emailCandidates(contacts));
+  };
+
   const cancel: AppMeetingDraftService['cancel'] = async ({ draftId }) => {
     const row = await deps.repo.getById(draftId);
     if (!row) return stubView(draftId);
@@ -271,5 +343,5 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     return { ...buildView(row, [], []), status: 'cancelled', needs: [] };
   };
 
-  return { proposeOrRefine, book, cancel };
+  return { proposeOrRefine, book, resolveAttendee, cancel };
 }

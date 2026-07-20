@@ -10,6 +10,7 @@ import type { Button } from './types';
  *  express/vite boundary carries no shared TS type (each card defines its own view type), so this
  *  mirrors `founder_app_meeting_drafts` → `founder_app_messages.context.meetingDraft`. */
 export interface MeetingDraftAttendee { name: string; email: string | null; unresolved: boolean }
+export interface MeetingContact { name: string; email: string }
 export interface MeetingDraftView {
   id: string;
   status: 'drafting' | 'booked' | 'cancelled';
@@ -20,6 +21,9 @@ export interface MeetingDraftView {
   attendees: MeetingDraftAttendee[];
   conflicts: string[];
   needs: string[];
+  /** The customer's email contacts to pick from, present only while a name is unresolved. Optional
+   *  so a card row minted before this field shipped still renders (falls back to no pick UI). */
+  candidates?: MeetingContact[];
   messageId: string | null;
   meetLink: string | null;
   htmlLink: string | null;
@@ -81,7 +85,7 @@ export function MeetingDraftCard({
 }): ReactElement {
   const app = useOptionalAppData();
   const [refine, setRefine] = useState('');
-  const [busy, setBusy] = useState<null | 'refine' | 'book'>(null);
+  const [busy, setBusy] = useState<null | 'refine' | 'book' | 'resolve'>(null);
   const [note, setNote] = useState<Note>(null);
 
   const view = card.context?.meetingDraft ?? null;
@@ -143,6 +147,24 @@ export function MeetingDraftCard({
       });
   };
 
+  // Pick who an unresolved name really is: tapping a candidate posts {name, email} — the guess is
+  // replaced by the real contact and the block clears. The email is one of the customer's own
+  // contacts (the server rejects anything else), so this can never invite a stranger.
+  const doResolve = (name: string, email: string): void => {
+    if (busy) return;
+    setBusy('resolve');
+    setNote(null);
+    api<{ data: MeetingDraftView }>(`/meeting-draft/${view.id}/resolve`, { method: 'POST', body: JSON.stringify({ name, email }) })
+      .then(() => {
+        setBusy(null);
+        app?.refetchAttention();
+      })
+      .catch((err: ApiError) => {
+        setBusy(null);
+        setNote({ tone: 'error', message: err.status === 503 ? "Scheduling isn't available right now." : 'Something went wrong — try again.' });
+      });
+  };
+
   // Booked / cancelled render as terminal states — no live controls, mirroring DraftControls.
   if (view.status === 'booked') {
     return (
@@ -173,6 +195,8 @@ export function MeetingDraftCard({
   const locked = decidedOptionId !== null;
   const bookDisabled = locked || busy !== null || view.needs.length > 0;
   const refineEmpty = !refine.trim();
+  const unresolvedNames = view.attendees.filter((a) => a.unresolved).map((a) => a.name);
+  const candidates = view.candidates ?? [];
 
   return (
     <div className="space-y-3 rounded-2xl border border-zinc-700 bg-zinc-900/40 p-3">
@@ -213,6 +237,33 @@ export function MeetingDraftCard({
 
       {view.needs.length > 0 && (
         <p className="text-xs text-zinc-500">Still needs: {view.needs.join(', ')}</p>
+      )}
+
+      {!locked && unresolvedNames.length > 0 && candidates.length > 0 && (
+        <div className="space-y-2 rounded-xl border border-amber-500/20 bg-amber-500/5 p-2.5">
+          {unresolvedNames.map((name) => (
+            <div key={name} className="space-y-1.5">
+              <p className="text-xs text-amber-300">Who is “{name}”?</p>
+              <div className="flex flex-wrap gap-1.5">
+                {candidates.map((c) => (
+                  <button
+                    key={c.email}
+                    type="button"
+                    onClick={() => doResolve(name, c.email)}
+                    disabled={busy !== null}
+                    title={c.email}
+                    className={cn(
+                      'inline-flex min-h-9 items-center rounded-full border border-zinc-600 px-2.5 text-xs font-medium text-zinc-200 transition',
+                      busy !== null ? 'opacity-50' : 'hover:bg-zinc-700 active:scale-[0.97]',
+                    )}
+                  >
+                    {busy === 'resolve' ? <Loader2 size={13} className="animate-spin" /> : c.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
 
       {!locked && (

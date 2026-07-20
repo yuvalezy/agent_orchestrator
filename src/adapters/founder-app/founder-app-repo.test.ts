@@ -10,6 +10,8 @@ import {
   insertMessage,
   listChatMessages,
   listRecentChatTurns,
+  markDecidedByRef,
+  markDecidedById,
   planDismiss,
   resetChatSession,
   type FeedMessage,
@@ -180,4 +182,38 @@ test('chat sessions persist scoped context, stop at a new-topic boundary, and re
   assert.notEqual(reset.id, session.id);
   assert.deepEqual((await listChatMessages(reset.id, { limit: 10 })).data, []);
   assert.equal((await listChatMessages(session.id, { limit: 10 })).data.length, 6, 'reset retains the ended session as audit');
+});
+
+test('markDecidedByRef clears only cards that offered the option — the follow-up slot card survives', async (t) => {
+  if (!(await migrated())) return t.skip('migration 043 not applied to this database');
+  const notificationRef = `mtg-${crypto.randomUUID()}`;
+  // The duration card and the "Pick a time" slot card its tap spawns share ONE ref (the meeting id).
+  // Regression: the mirror-mark of the duration decision used to clobber the just-born slot card, so
+  // the founder tapped a duration and no slot card ever reached the queue.
+  const duration = await seed({
+    kind: 'question', notificationRef, title: '📅 Wants to talk',
+    buttons: [{ id: 'md30', label: '30 min' }, { id: 'mtask', label: 'Just make a task' }],
+  });
+  const slot = await seed({
+    kind: 'question', notificationRef, title: '📅 Pick a time',
+    buttons: [{ id: 'ms0', label: 'Mon 10:00' }, { id: 'mtask', label: 'Just make a task' }],
+  });
+
+  const decided = await markDecidedByRef(notificationRef, 'md30');
+  assert.deepEqual(decided.map((r) => r.id), [duration.id]);
+  assert.equal((await getMessage(duration.id))?.decidedOptionId, 'md30');
+  assert.equal((await getMessage(slot.id))?.decidedOptionId, null); // survives — this is the fix
+});
+
+test('markDecidedById clears exactly one card (a typed-time booking whose option is synthetic)', async (t) => {
+  if (!(await migrated())) return t.skip('migration 043 not applied to this database');
+  const notificationRef = `mtg-${crypto.randomUUID()}`;
+  const slot = await seed({ kind: 'question', notificationRef, title: '📅 Pick a time', buttons: [{ id: 'ms0', label: 'Mon 10:00' }] });
+  const sibling = await seed({ kind: 'question', notificationRef, title: 'sibling', buttons: [{ id: 'ms0', label: 'x' }] });
+
+  const cleared = await markDecidedById(slot.id, 'mtyped');
+  assert.equal(cleared?.id, slot.id);
+  assert.equal((await getMessage(slot.id))?.decidedOptionId, 'mtyped');
+  assert.equal((await getMessage(sibling.id))?.decidedOptionId, null); // by-id never touches neighbours
+  assert.equal(await markDecidedById(slot.id, 'mtyped'), null); // first-writer-wins
 });

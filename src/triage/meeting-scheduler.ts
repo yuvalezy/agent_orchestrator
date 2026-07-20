@@ -1,6 +1,6 @@
 import { DateTime } from 'luxon';
 import { logger } from '../logger';
-import type { BusinessHour, Holiday } from '../outbound/send-window';
+import type { BusinessHour, Holiday, SoftBlock } from '../outbound/send-window';
 import type { BusyInterval, CalendarFreeBusyPort, CreatedEvent, CreateEventInput } from '../ports/calendar.port';
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import { generateSlots, isSlotFree, slotConflicts, type Slot } from './meeting-slots';
@@ -69,7 +69,9 @@ export interface MeetingSchedulerDeps {
   /** The email of the human to invite, or null (group chat / no directory ref) → book without
    *  an attendee rather than guessing at an address. */
   resolveAttendeeEmail: (channelType: string, address: string) => Promise<string | null>;
-  loadSchedule: () => Promise<{ businessHours: BusinessHour[]; holidays: Holiday[] }>;
+  /** The founder's working schedule. `softBlocks` (walk / gym) are OPTIONAL — the auto-proposal
+   *  avoids them; a founder-typed / manual booking is never vetoed by them. */
+  loadSchedule: () => Promise<{ businessHours: BusinessHour[]; holidays: Holiday[]; softBlocks?: SoftBlock[] }>;
   /**
    * Mint the project task this request would have become, and return its deep link.
    *
@@ -241,6 +243,7 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
       busy,
       businessHours: schedule.businessHours,
       holidays: schedule.holidays,
+      softBlocks: schedule.softBlocks,
       count: deps.slotOptions?.count ?? 4,
       leadMinutes: deps.slotOptions?.leadMinutes ?? 60,
       horizonDays,
@@ -490,6 +493,7 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
           busy,
           businessHours: schedule.businessHours,
           holidays: schedule.holidays,
+          softBlocks: schedule.softBlocks,
         });
 
       if (!stillFree) {

@@ -211,6 +211,24 @@ export async function abandonMeeting(id: string): Promise<void> {
 }
 
 /**
+ * Founder-driven DISMISS from the app: abandon an OPEN meeting request WITHOUT booking and WITHOUT
+ * minting a task (the "I don't need this meeting" gesture on a Wants-to-talk / Pick-a-time card).
+ * Guarded to the three open states — like claimMeetingGiveUp — so a dismiss cannot clobber an
+ * already-booked meeting (which owns a real event + invitation) or re-abandon a settled one: rowCount
+ * is 1 iff THIS call abandoned it. Distinct from claimMeetingGiveUp, which mints a fallback task; a
+ * dismiss makes none. Returns true when it abandoned an open request, false otherwise (gone, booked,
+ * already abandoned) — the app maps false to 'not_pending'.
+ */
+export async function abandonOpenMeeting(id: string): Promise<boolean> {
+  const { rowCount } = await query(
+    `UPDATE agent_meeting_requests SET status = 'abandoned'
+      WHERE id = $1 AND status IN ('awaiting_duration','awaiting_slot','creating')`,
+    [id],
+  );
+  return rowCount === 1;
+}
+
+/**
  * TRANSIENT write failure → hand the slot back so the founder's next tap can retry. Mirrors
  * releaseDueEvent: the claim is taken BEFORE the write, so without this a blip would wedge the
  * request in `creating` forever.

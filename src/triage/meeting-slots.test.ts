@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { BusinessHour, Holiday } from '../outbound/send-window';
+import type { BusinessHour, Holiday, SoftBlock } from '../outbound/send-window';
 import { generateSlots, isSlotFree, mergeBusy, slotConflicts } from './meeting-slots';
 
 // Pure unit tests — frozen clock, no db, no network (mirrors schedule-handler.test.ts's NOW).
@@ -241,4 +241,46 @@ test('slotConflicts treats touching intervals as free, not busy', () => {
     slotConflicts({ startsAt: new Date('2026-07-16T15:00:00Z'), endsAt: new Date('2026-07-16T15:30:00Z') }, busy),
     null,
   );
+});
+
+// ── soft holds (walk / gym): SOFT — vetoes an OFFERED slot, never a typed/manual booking ──────
+// 11:30–13:00 Panama on weekdays. 11:30 local = 16:30Z, 13:00 local = 18:00Z, 12:00 local = 17:00Z.
+
+const SOFT: SoftBlock[] = [{ startMinutes: 690, endMinutes: 780, label: 'Walk / gym', days: [1, 2, 3, 4, 5] }];
+
+test('an OFFERED slot avoids a soft hold, jumping past it', () => {
+  const slots = generateSlots({
+    ...base,
+    busy: [iv('2026-07-14T14:00:00Z', '2026-07-14T16:30:00Z')], // Tue 09:00–11:30 busy
+    softBlocks: SOFT,
+    count: 1,
+  });
+  // Without the hold the first free slot would be Tue 11:30; the hold pushes the offer to 13:00.
+  assert.equal(slots[0].startsAt.toISOString(), '2026-07-14T18:00:00.000Z'); // Tue 13:00 -05
+});
+
+test('slotConflicts ignores soft holds — a founder may TYPE a time inside their gym block', () => {
+  // Tue 12:00 sits inside the 11:30–13:00 hold, but there is no BUSY interval there. slotConflicts
+  // takes no soft blocks at all, so the manual/typed path is structurally never vetoed by one.
+  const noon = { startsAt: new Date('2026-07-14T17:00:00Z'), endsAt: new Date('2026-07-14T17:30:00Z') };
+  assert.equal(slotConflicts(noon, []), null, 'a soft hold is not a busy interval');
+});
+
+test('isSlotFree (the PROPOSAL predicate) rejects a slot inside a soft hold, accepts it without one', () => {
+  const noon = { startsAt: new Date('2026-07-14T17:00:00Z'), endsAt: new Date('2026-07-14T17:30:00Z') }; // Tue 12:00
+  assert.ok(isSlotFree(noon, base), 'free when no soft holds are configured');
+  assert.equal(isSlotFree(noon, { ...base, softBlocks: SOFT }), false, 'refused when it falls inside a soft hold');
+});
+
+test('a soft hold applies only on its configured weekdays', () => {
+  const wedOnly: SoftBlock[] = [{ startMinutes: 690, endMinutes: 780, label: 'gym', days: [3] }];
+  const noonTue = { startsAt: new Date('2026-07-14T17:00:00Z'), endsAt: new Date('2026-07-14T17:30:00Z') }; // Tue 12:00
+  assert.ok(isSlotFree(noonTue, { ...base, softBlocks: wedOnly }), 'a Wednesday-only hold does not touch Tuesday');
+});
+
+test('with soft holds, every OFFERED slot still passes isSlotFree (proposal ↔ re-validation agree)', () => {
+  const ctx = { ...base, softBlocks: SOFT, count: 4, maxPerDay: 5 };
+  const offered = generateSlots(ctx);
+  assert.ok(offered.length > 0);
+  for (const s of offered) assert.ok(isSlotFree(s, ctx), `offered ${s.startsAt.toISOString()} but isSlotFree rejects it`);
 });

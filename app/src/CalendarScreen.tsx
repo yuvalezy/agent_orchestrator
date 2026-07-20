@@ -8,7 +8,7 @@ import { ScreenHeader } from './ScreenHeader';
 import { Screen, ScrollArea } from './Layout';
 import { cn } from './lib/utils';
 import {
-  clockLabel, freeGaps, localTimeAt, minuteInDay, packColumns, shiftDay, todayInTz,
+  clockLabel, freeGaps, localTimeAt, minuteInDay, packColumns, shiftDay, tapMinuteInGap, todayInTz,
   type Span,
 } from './lib/calendarLayout';
 import type { CalendarDay, CalendarMeeting } from './types';
@@ -150,8 +150,11 @@ function DayGrid({
   today: string;
   onPick: (minutes: number) => void;
 }): ReactElement {
-  const { day, tz, businessHours, events, meeting } = data;
+  const { day, tz, businessHours, dayWindow, softBlocks, events, meeting } = data;
   const bh = businessHours ?? DEFAULT_HOURS;
+  // The grid's base visible extent is the server's dayWindow (e.g. 06:00–20:00); before the server
+  // supplies one, fall back to the business band so an older response still renders.
+  const base = dayWindow ?? bh;
 
   const allDay = events.filter((e) => e.allDay);
   const timed = useMemo(
@@ -164,14 +167,15 @@ function DayGrid({
     [events, day, tz],
   );
 
-  // Window = business hours widened to cover any event that falls outside them, snapped to whole
-  // hours so the rules land cleanly. Never narrower than the business band.
+  // Window = the base extent widened to cover any event that falls outside it, snapped to whole
+  // hours so the rules land cleanly. Never narrower than the base window (an event before 6am or
+  // after 8pm still pulls the grid open to stay visible).
   const { winStart, winEnd } = useMemo(() => {
-    let lo = bh.startMinutes;
-    let hi = bh.endMinutes;
+    let lo = base.startMinutes;
+    let hi = base.endMinutes;
     for (const t of timed) { lo = Math.min(lo, t.s); hi = Math.max(hi, t.e); }
     return { winStart: Math.max(0, Math.floor(lo / 60) * 60), winEnd: Math.min(1440, Math.ceil(hi / 60) * 60) };
-  }, [bh.startMinutes, bh.endMinutes, timed]);
+  }, [base.startMinutes, base.endMinutes, timed]);
 
   const nowMin = today === day ? minuteAtNow(tz) : -1;
   const top = (min: number): number => (min - winStart) * PX_PER_MIN;
@@ -189,6 +193,12 @@ function DayGrid({
   const slots = (meeting?.proposedSlots ?? [])
     .map((s) => ({ s: minuteInDay(s.startsAt, day, tz), e: minuteInDay(s.endsAt, day, tz) }))
     .filter((s) => s.e > winStart && s.s < winEnd);
+
+  // Suggested holds (walk/gym), clamped to the visible window. Drawn as soft bands under events and
+  // kept non-interactive, so the founder can still tap the free-gap target underneath to book over one.
+  const softs = (softBlocks ?? [])
+    .map((b) => ({ s: Math.max(winStart, b.startMinutes), e: Math.min(winEnd, b.endMinutes), label: b.label }))
+    .filter((b) => b.e > b.s);
 
   const hours: number[] = [];
   for (let m = winStart; m <= winEnd; m += 60) hours.push(m);
@@ -216,10 +226,34 @@ function DayGrid({
         </p>
       )}
 
+      {softs.length > 0 && (
+        <p className="flex items-center gap-1.5 px-1 text-[0.7rem] text-amber-300/80">
+          <span aria-hidden>▨</span> Suggested hold — tap through to book over it.
+        </p>
+      )}
+
       <div className="relative ml-12" style={{ height }}>
         {/* Out-of-hours dimming: before the business band and after it. */}
         {bh.startMinutes > winStart && <div className="absolute inset-x-0 bg-zinc-950/50" style={{ top: 0, height: top(bh.startMinutes) }} aria-hidden />}
         {bh.endMinutes < winEnd && <div className="absolute inset-x-0 bg-zinc-950/50" style={{ top: top(bh.endMinutes), height: height - top(bh.endMinutes) }} aria-hidden />}
+
+        {/* Suggested-hold bands: hatched amber, over the dim but UNDER events (z-0), and
+            pointer-events-none so the bookable gap underneath still takes the tap. */}
+        {softs.map((sb, i) => (
+          <div
+            key={`soft-${i}`}
+            aria-hidden
+            className="pointer-events-none absolute left-0 right-1 z-0 overflow-hidden rounded-lg border border-amber-400/30"
+            style={{
+              top: top(sb.s) + 1,
+              height: Math.max((sb.e - sb.s) * PX_PER_MIN - 2, 18),
+              backgroundImage:
+                'repeating-linear-gradient(45deg, rgba(251,191,36,0.18) 0, rgba(251,191,36,0.18) 6px, transparent 6px, transparent 12px)',
+            }}
+          >
+            <span className="absolute left-1.5 top-1 truncate text-[0.6rem] font-medium uppercase tracking-wide text-amber-300/90">{sb.label}</span>
+          </div>
+        ))}
 
         {/* Hour rules + gutter labels (the gutter lives in the ml-12 margin). */}
         {hours.map((m) => (
@@ -235,11 +269,13 @@ function DayGrid({
           </div>
         )}
 
-        {/* Bookable gaps (below events so an event block always wins the tap). */}
+        {/* Bookable gaps (below events so an event block always wins the tap). A gap is one tall
+            button, so book where the finger fell — the tapped Y offset mapped back to a minute —
+            not the gap's start (which on today is `now`). */}
         {gaps.map((g) => (
           <button
             key={`gap-${g.s}`}
-            onClick={() => onPick(g.s)}
+            onClick={(e) => onPick(tapMinuteInGap(g.s, g.e, e.clientY - e.currentTarget.getBoundingClientRect().top, PX_PER_MIN))}
             className="absolute left-0 right-1 z-0 flex items-start justify-center rounded-lg border border-dashed border-zinc-700/70 text-zinc-500 active:bg-ember-400/10 active:text-ember-200"
             style={{ top: top(g.s) + 1, height: Math.max((g.e - g.s) * PX_PER_MIN - 2, 18) }}
           >

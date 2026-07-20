@@ -350,6 +350,59 @@ test('book an unknown / non-drafting draft → ok:false reason "not_pending", bo
   assert.equal(h.booked.length, 0);
 });
 
+test('unresolved attendee → the customer email contacts are offered as pick candidates', async () => {
+  const h = harness({
+    kind: 'meeting',
+    execute_at: '2026-07-14T15:00:00-05:00',
+    explicit_date: true,
+    body: null,
+    delivery_channel: 'none',
+    clarification: null,
+    attendees: ['Yossi'], // a familiar name matching none of the stored contacts (Shlomo Katz / Dana Levi)
+  });
+
+  const view = await h.svc.proposeOrRefine({ chatSessionId: 's1', customerId: 'c1', customerName: 'Acme', utterance: 'meeting with Yossi at 3pm' });
+  assert.ok(attendee(view, 'Yossi')?.unresolved, 'Yossi stays unresolved');
+  // The card can offer the customer's email contacts so the founder picks who "Shlomo" is.
+  assert.deepEqual(view.candidates.map((c) => c.email).sort(), ['dana@acme.com', 'shlomo@acme.com']);
+});
+
+test('a fully-resolved draft offers NO candidates (nothing to pick)', async () => {
+  const h = harness({
+    kind: 'meeting', execute_at: '2026-07-14T15:00:00-05:00', explicit_date: true, body: null, delivery_channel: 'none', clarification: null, attendees: ['Dana'],
+  });
+  const view = await h.svc.proposeOrRefine({ chatSessionId: 's1', customerId: 'c1', customerName: 'Acme', utterance: 'meeting with Dana at 3pm' });
+  assert.equal(attendee(view, 'Dana Levi')?.unresolved, false);
+  assert.deepEqual(view.candidates, []);
+});
+
+test('resolveAttendee: picking a contact replaces the unresolved guess and clears the block', async () => {
+  // Seed a draft where "Shlomo" is an unresolved guess, at a set time.
+  const h = harness({ kind: 'none', execute_at: null, explicit_date: false, body: null, delivery_channel: 'none', clarification: null }, {
+    active: {
+      starts_at: new Date('2026-07-14T20:00:00.000Z'),
+      attendees: [{ name: 'Shlomo', email: null, unresolved: true }],
+    },
+  });
+
+  const view = await h.svc.resolveAttendee({ draftId: 'draft-1', name: 'Shlomo', email: 'shlomo@acme.com' });
+  assert.equal(view.attendees.length, 1);
+  assert.equal(view.attendees[0].email, 'shlomo@acme.com');
+  assert.equal(view.attendees[0].unresolved, false);
+  assert.ok(!view.attendees.some((a) => a.unresolved && a.name === 'Shlomo'), 'the unresolved guess is gone');
+  assert.deepEqual(view.needs, []); // has a time and a real invitee → bookable
+});
+
+test('resolveAttendee: an email NOT among the customer contacts is a no-op (never invents an invitee)', async () => {
+  const h = harness({ kind: 'none', execute_at: null, explicit_date: false, body: null, delivery_channel: 'none', clarification: null }, {
+    active: { attendees: [{ name: 'Shlomo', email: null, unresolved: true }] },
+  });
+
+  const view = await h.svc.resolveAttendee({ draftId: 'draft-1', name: 'Shlomo', email: 'stranger@evil.com' });
+  assert.ok(attendee(view, 'Shlomo')?.unresolved, 'the stranger email did not resolve anyone');
+  assert.ok(view.attendees.every((a) => a.email !== 'stranger@evil.com'), 'no stranger was added');
+});
+
 test('cancel: a drafting draft is marked cancelled and returns a terminal view', async () => {
   const h = harness({ kind: 'none', execute_at: null, explicit_date: false, body: null, delivery_channel: 'none', clarification: null }, {
     active: { title: 'Call — Acme' },

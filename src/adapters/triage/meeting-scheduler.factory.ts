@@ -3,6 +3,7 @@ import { env } from '../../config/env';
 import { logger } from '../../logger';
 import { findTriageIntent, recordTaskBridge, recordTriageDecision, resolveTriageDecision } from '../../decisions/decisions';
 import { loadBusinessHours, loadHolidays } from '../../outbound/outbound-repo';
+import { toSoftBlocks } from '../../outbound/send-window';
 import type { FounderNotifierPort } from '../../ports/founder-notifier.port';
 import type { TaskTargetPort } from '../../ports/task-target.port';
 import type { Intent, ScheduleInterpreterPort } from '../../ports/llm.port';
@@ -180,6 +181,9 @@ export function buildMeetingSchedulerGated(
           today.toISODate() ?? '',
           today.plus({ days: HORIZON_DAYS + 1 }).toISODate() ?? '',
         ),
+        // Soft holds (walk / gym) come from env, not the DB — the AUTO-PROPOSAL avoids them; a
+        // founder-typed / manual booking is never vetoed by them (onTypedTime uses slotConflicts).
+        softBlocks: toSoftBlocks(env.CALENDAR_SOFT_BLOCKS),
       };
     },
     fallbackToTask: buildTaskFallback(taskTarget, deepLink),

@@ -123,11 +123,29 @@ function makeRepo(): FounderAppRepo & {
       insert({ direction: 'in', kind: 'chat', body: question, customerRef, chatSessionId: sessionId, conversationRelation: relation }),
       insert({ direction: 'out', kind: 'chat', body: answer, customerRef, chatSessionId: sessionId }),
     ],
-    // Mirror of the real markDecidedByRef: first-writer-wins over every buttoned row
-    // sharing the ref; returns the rows it actually decided.
+    // Mirror of the real markDecidedByRef: first-writer-wins over every undecided row sharing the
+    // ref THAT OFFERED this option (containment guard) — a follow-up card with different buttons
+    // survives.
     markDecidedByRef: async (notificationRef, optionId) => {
       if (!notificationRef) return [];
-      const decided = messages.filter((m) => m.notificationRef === notificationRef && m.buttons && !m.decidedOptionId);
+      const decided = messages.filter(
+        (m) => m.notificationRef === notificationRef && !m.decidedOptionId && (m.buttons ?? []).some((b) => b.id === optionId),
+      );
+      for (const m of decided) m.decidedOptionId = optionId;
+      return decided;
+    },
+    // Mirror of the real markDecidedById: clear exactly one undecided card.
+    markDecidedById: async (id, optionId) => {
+      const m = messages.find((x) => x.id === id && !x.decidedOptionId);
+      if (!m) return null;
+      m.decidedOptionId = optionId;
+      return m;
+    },
+    // Mirror of the real dismissMeetingCards: clear EVERY undecided card on the ref (no containment
+    // guard — the synthetic 'mdismiss' is not a button), so target + sibling meeting cards clear.
+    dismissMeetingCards: async (notificationRef, optionId) => {
+      if (!notificationRef) return [];
+      const decided = messages.filter((m) => m.notificationRef === notificationRef && !m.decidedOptionId);
       for (const m of decided) m.decidedOptionId = optionId;
       return decided;
     },
@@ -454,6 +472,91 @@ test('a typed time on an already-decided card is refused (409)', async () => {
     if (row) row.decidedOptionId = 'ms0';
     assert.equal((await fetch(`${baseUrl}/app/api/meeting-time`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ messageId, localTime: '2026-08-01T15:00' }) })).status, 409);
   }, { deps: { meetingReply: () => async () => ({ status: 'booked' }) } });
+});
+
+// ── Dismiss a "Wants to talk" / "Pick a time" meeting card (abandon — no booking, no task) ──
+
+/** Post a "📅 Wants to talk" duration card (md buttons + meeting ref) and return its message id. */
+async function durationCard(baseUrl: string, notifier: AppFounderNotifier, cookie: string, ref = 'mtg-9'): Promise<string> {
+  await notifier.askFounder('cust-1', { title: '📅 Wants to talk', body: 'how long?' }, [
+    { id: `md30:${ref}`, label: '30 min' },
+    { id: `mtask:${ref}`, label: 'Just make a task' },
+  ]);
+  const rows = await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] };
+  return rows.data[0].id;
+}
+
+test('dismissing a meeting card abandons the meeting and clears the card', async () => {
+  const abandoned: string[] = [];
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+    const res = await fetch(`${baseUrl}/app/api/meeting/${messageId}/dismiss`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'dismissed' } });
+    // Abandoned by the card's meeting ref (its notification_ref), and the card left the queue.
+    assert.deepEqual(abandoned, ['mtg-9']);
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, 'mdismiss');
+  }, { deps: { dismissMeeting: async (id) => { abandoned.push(id); return true; } } });
+});
+
+test('dismissing a meeting card also clears a SIBLING open card on the same meeting', async () => {
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    // A duration card and a slot card can coexist on ONE meeting ref (mid-flow). Dismissing either
+    // must clear BOTH so neither lingers in the queue on any client.
+    const durId = await durationCard(baseUrl, notifier, cookie, 'mtg-sib');
+    const slotId = await pickTimeCard(baseUrl, notifier, cookie, 'mtg-sib');
+    const res = await fetch(`${baseUrl}/app/api/meeting/${slotId}/dismiss`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'dismissed' } });
+    assert.equal(repo.messages.find((m) => m.id === slotId)?.decidedOptionId, 'mdismiss');
+    assert.equal(repo.messages.find((m) => m.id === durId)?.decidedOptionId, 'mdismiss', 'the sibling duration card clears too');
+  }, { deps: { dismissMeeting: async () => true } });
+});
+
+test('dismissing a meeting whose request is no longer open reports not_pending and leaves the card', async () => {
+  await withApp(async ({ baseUrl, notifier, repo }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+    const res = await fetch(`${baseUrl}/app/api/meeting/${messageId}/dismiss`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'not_pending' } });
+    // A booked/settled meeting is left untouched — the card is NOT cleared.
+    assert.equal(repo.messages.find((m) => m.id === messageId)?.decidedOptionId, null);
+  }, { deps: { dismissMeeting: async () => false } });
+});
+
+test('dismissing a NON-meeting card reports not_a_meeting_card and does not abandon anything', async () => {
+  let called = false;
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    await notifier.notifyCustomerEvent('cust-1', { title: 'New task', body: 'b' }, [{ id: 'x:task-1', label: 'Cancel' }]);
+    const taskId = (await (await fetch(`${baseUrl}/app/api/messages?limit=1`, { headers: { cookie } })).json() as { data: FeedMessage[] }).data[0].id;
+    const res = await fetch(`${baseUrl}/app/api/meeting/${taskId}/dismiss`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'not_a_meeting_card' } });
+    assert.equal(called, false, 'a non-meeting card never reaches abandonOpenMeeting');
+  }, { deps: { dismissMeeting: async () => { called = true; return true; } } });
+});
+
+test('dismissing a meeting card validates input and 503s when the dep is absent', async () => {
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    // Bad id → 400; unknown id → 404.
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting/not-a-uuid/dismiss`, { method: 'POST', headers: { cookie } })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting/${crypto.randomUUID()}/dismiss`, { method: 'POST', headers: { cookie } })).status, 404);
+    // With the dep wired but a real card, it resolves normally (sanity that the above are input paths).
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting/${messageId}/dismiss`, { method: 'POST', headers: { cookie } })).status, 200);
+  }, { deps: { dismissMeeting: async () => true } });
+
+  // No dismissMeeting dep → 503.
+  await withApp(async ({ baseUrl, notifier }) => {
+    const cookie = await login(baseUrl);
+    const messageId = await pickTimeCard(baseUrl, notifier, cookie);
+    assert.equal((await fetch(`${baseUrl}/app/api/meeting/${messageId}/dismiss`, { method: 'POST', headers: { cookie } })).status, 503);
+  });
 });
 
 // ── Dismiss ──────────────────────────────────────────────────────────────────────────
@@ -1277,6 +1380,8 @@ function fakeCalendar(overrides: Partial<NonNullable<FounderAppDeps['calendar']>
       { id: 'e1', calendarLabel: 'Work', title: 'Standup', startsAt: new Date('2026-07-20T13:00:00Z'), endsAt: new Date('2026-07-20T13:15:00Z'), allDay: false },
     ],
     businessHoursForDay: async () => ({ startMinutes: 540, endMinutes: 1080 }), // 09:00–18:00
+    dayWindow: { startMinutes: 360, endMinutes: 1200 }, // 06:00–20:00
+    softBlocksForDay: () => [{ startMinutes: 690, endMinutes: 780, label: 'Walk / gym' }], // 11:30–13:00
     meetingForCard: async () => null,
     block: async () => ({ status: 'booked' }),
     ...overrides,
@@ -1288,10 +1393,13 @@ test('GET /calendar returns the day, tz, business hours and per-calendar tagged 
     const cookie = await login(baseUrl);
     const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
     assert.equal(res.status, 200);
-    const body = await res.json() as { data: { day: string; tz: string; businessHours: unknown; events: Array<Record<string, unknown>>; meeting?: unknown } };
+    const body = await res.json() as { data: { day: string; tz: string; businessHours: unknown; dayWindow: unknown; softBlocks: unknown; events: Array<Record<string, unknown>>; meeting?: unknown } };
     assert.equal(body.data.day, '2026-07-20');
     assert.equal(typeof body.data.tz, 'string');
     assert.deepEqual(body.data.businessHours, { startMinutes: 540, endMinutes: 1080 });
+    // The VISIBLE grid extent + soft holds ride alongside business hours (distinct from it).
+    assert.deepEqual(body.data.dayWindow, { startMinutes: 360, endMinutes: 1200 });
+    assert.deepEqual(body.data.softBlocks, [{ startMinutes: 690, endMinutes: 780, label: 'Walk / gym' }]);
     assert.equal(body.data.events.length, 1);
     assert.deepEqual(body.data.events[0], { id: 'e1', calendarLabel: 'Work', title: 'Standup', startsAt: '2026-07-20T13:00:00.000Z', endsAt: '2026-07-20T13:15:00.000Z', allDay: false });
     assert.equal(body.data.meeting, undefined); // no messageId → no meeting block

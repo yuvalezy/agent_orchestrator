@@ -53,6 +53,8 @@ import {
   getMessage,
   dismissMessage,
   markDecidedByRef,
+  markDecidedById,
+  dismissMeetingCards,
   listPushDevices,
   getOrCreateChatSession,
   resetChatSession,
@@ -64,6 +66,7 @@ import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker, buildDraftReviserService } from './adapters/triage/callback-poller.factory';
 import { buildMeetingSchedulerGated, type MeetingWiring } from './adapters/triage/meeting-scheduler.factory';
+import { abandonOpenMeeting } from './triage/meeting-repo';
 import { buildScheduleDueWorker } from './adapters/scheduling/schedule.worker';
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
 import { seedHolidays } from './adapters/outbound/holiday-seeder';
@@ -262,7 +265,8 @@ async function main(): Promise<void> {
       {
         repo: {
           createDevice, touchDeviceByTokenHash, revokeDeviceByTokenHash, setDeviceFcmToken,
-          unregisterDevicePush, insertMessage, listMessages, getMessage, dismissMessage,
+          unregisterDevicePush, insertMessage, listMessages, getMessage, dismissMessage, markDecidedById,
+          dismissMeetingCards,
           getOrCreateChatSession, resetChatSession, listChatMessages, listRecentChatTurns,
           insertChatExchange,
         },
@@ -292,6 +296,9 @@ async function main(): Promise<void> {
         // hours + a standalone "block time" write. Gated on CALENDAR_ENABLED (→ undefined → 503),
         // the SAME flag the meeting-context/dueAt calendar reads gate on.
         calendar: env.CALENDAR_ENABLED ? buildFounderAppCalendar() : undefined,
+        // Dismiss a "Wants to talk" / "Pick a time" card: abandon the OPEN meeting (guarded — a booked
+        // one is left untouched), no task. A plain meeting-repo fn, wired unconditionally like reminders.
+        dismissMeeting: abandonOpenMeeting,
         transcribe: (input) => appTranscription.transcribe(input),
         // v2 cockpit: reuse the console read models (DRY — no forked SQL) + app-specific augmentation.
         cockpit: {

@@ -26,6 +26,41 @@ export interface Holiday {
   faith: string; // 'global' | 'jewish' | ... ('global' sentinel, never null)
 }
 
+/**
+ * A founder "suggested hold" — a soft, weekday-scoped window (walk / gym) the meeting AUTO-PROPOSAL
+ * avoids. SOFT: it vetoes an OFFERED slot but NEVER a founder-typed / manual booking. Expressed in
+ * minutes from local midnight (weekday 0=Sun..6=Sat); `days` empty/undefined → every day. The env
+ * carries HH:MM strings (env.CALENDAR_SOFT_BLOCKS); `toSoftBlocks` maps them to this minutes form so
+ * the pure slot engine + the day view read ONE shape.
+ */
+export interface SoftBlock {
+  startMinutes: number;
+  endMinutes: number;
+  days?: number[];
+  label: string;
+}
+
+/** 'HH:MM' → minutes from midnight. */
+function hhmmToMinutes(hhmm: string): number {
+  const { hour, minute } = parseTime(hhmm);
+  return hour * 60 + minute;
+}
+
+/**
+ * Convert the HH:MM-configured soft blocks (env.CALENDAR_SOFT_BLOCKS) to the minutes-from-midnight
+ * form the slot engine and day view consume. Pure — the HH:MM→minutes mapping lives in ONE place.
+ */
+export function toSoftBlocks(
+  config: ReadonlyArray<{ start: string; end: string; label: string; days?: number[] }>,
+): SoftBlock[] {
+  return config.map((b) => ({
+    startMinutes: hhmmToMinutes(b.start),
+    endMinutes: hhmmToMinutes(b.end),
+    days: b.days,
+    label: b.label,
+  }));
+}
+
 export interface SendWindowInput {
   nowUtc: Date;
   tz: string;

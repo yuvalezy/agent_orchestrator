@@ -166,12 +166,23 @@ export interface CalendarMeeting {
   proposedSlots: { startsAt: string; endsAt: string }[];
 }
 
+/** A suggested, "soft" hold on the day (a walk, a gym block): a hint the founder can still book
+ *  over, drawn as a distinct band under the real events. Minutes are from local midnight in `tz`. */
+export interface CalendarSoftBlock {
+  startMinutes: number;
+  endMinutes: number;
+  label: string;
+}
+
 /** GET /app/api/calendar?day=…[&messageId=…] → `{ data: CalendarDay }`. `businessHours` minutes are
- *  from local midnight in `tz`; null when no business hours are configured. */
+ *  from local midnight in `tz`; null when no business hours are configured. `dayWindow` is the grid's
+ *  base visible extent (e.g. 06:00–20:00); the view still widens it to fit any out-of-range event. */
 export interface CalendarDay {
   day: string;
   tz: string;
   businessHours: { startMinutes: number; endMinutes: number } | null;
+  dayWindow?: { startMinutes: number; endMinutes: number };
+  softBlocks?: CalendarSoftBlock[];
   events: CalendarEvent[];
   meeting?: CalendarMeeting;
 }

@@ -39,6 +39,14 @@ const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** A "📅 Pick a time" card's signature: its slot buttons are `ms0…`. Only that card takes a
  *  typed time — a duration card (`md30`) is a step too early (no slot to override yet). */
 const SLOT_BUTTON_RE = /^ms\d+$/;
+/** Any meeting-scheduling card carries a duration (`md30`) OR a slot (`ms0`) button — the signature
+ *  the dismiss route matches to abandon a "Wants to talk" / "Pick a time" card (both are questions,
+ *  which planDismiss refuses, so the dedicated route uses this instead of /api/dismiss). */
+const MEETING_BUTTON_RE = /^m[ds]\d+$/;
+/** Synthetic option recorded when a meeting card is DISMISSED (abandoned, no booking, no task). Not
+ *  a real button — markDecidedByRef's containment guard would match none, so the route clears the
+ *  card + siblings by ref via dismissMeetingCards. */
+const MEETING_DISMISS_OPTION = 'mdismiss';
 /** Marks a "Pick a time" card resolved when the founder booked by TYPING rather than tapping a
  *  slot — no slot button was chosen, so a sentinel clears it from the queue (first-writer-wins,
  *  exactly the markDecidedByRef path a tap uses). Never a real, tappable option. */
@@ -87,6 +95,11 @@ export interface FounderAppRepo {
   listMessages: (opts: { before?: string | null; beforeId?: string | null; limit: number }) => Promise<MessagePage>;
   getMessage: (id: string) => Promise<FeedMessage | null>;
   dismissMessage: (id: string) => Promise<DismissResult>;
+  /** Clear ONE card by id (for a synthetic resolution not in the card's buttons — a typed time). */
+  markDecidedById: (id: string, optionId: string) => Promise<FeedMessage | null>;
+  /** Clear EVERY still-open card on a meeting ref (target + sibling duration/slot cards) with a
+   *  synthetic option — the meeting-dismiss gesture. Returns the changed rows for the SSE re-emit. */
+  dismissMeetingCards: (notificationRef: string, optionId: string) => Promise<FeedMessage[]>;
   getOrCreateChatSession: (customerRef: string | null) => Promise<ChatSession>;
   resetChatSession: (customerRef: string | null) => Promise<ChatSession>;
   listChatMessages: (sessionId: string, opts: { before?: string | null; beforeId?: string | null; limit: number }) => Promise<MessagePage>;
@@ -137,6 +150,7 @@ export interface FounderAppDeps {
   meetingDraft?: {
     proposeOrRefine: (input: { chatSessionId: string; customerId: string; customerName: string; utterance: string }) => Promise<MeetingDraftView>;
     book: (input: { draftId: string }) => Promise<{ ok: true; view: MeetingDraftView } | { ok: false; reason: string; view: MeetingDraftView }>;
+    resolveAttendee: (input: { draftId: string; name: string; email: string }) => Promise<MeetingDraftView>;
     cancel: (input: { draftId: string }) => Promise<MeetingDraftView>;
   };
   /**
@@ -158,6 +172,14 @@ export interface FounderAppDeps {
    * buildFounderAppCalendar at the composition edge (all tz anchoring + send-window reuse there).
    */
   calendar?: FounderAppCalendar;
+  /**
+   * Abandon the OPEN meeting request behind a "Wants to talk" / "Pick a time" card — the dismiss
+   * gesture for a meeting card (planDismiss refuses questions, and a meeting card IS a question).
+   * Guarded to the open states: a booked / settled meeting owns a real event + invite and is left
+   * untouched (returns false → the route answers 'not_pending'). Makes NO task. A plain meeting-repo
+   * fn (no scheduler needed) → wired unconditionally like reminders; absent → the route answers 503.
+   */
+  dismissMeeting?: (meetingId: string) => Promise<boolean>;
   /**
    * Transcribe a founder voice note recorded in the PWA chat composer — the SAME OpenAI adapter
    * the Telegram voice path uses (buildOpenAiTranscriptionClient). OPTIONAL so main.ts still
@@ -530,11 +552,45 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
 
       const outcome = await book({ meetingId: row.notificationRef, localTime: body.localTime, by: 'founder-app' });
       if (outcome.status === 'booked') {
-        // Mark + re-emit every app row on this meeting, so the card leaves the attention queue on
-        // every open client — the ONE mirror-marking path a tapped decision also uses.
-        await deps.notifier.recordDecision({ notificationRef: row.notificationRef, optionId: MEETING_TYPED_TIME_OPTION, by: 'founder-app' });
+        // Clear THIS slot card so it leaves the attention queue on every open client. 'mtyped' is
+        // synthetic (not a button on the card), so markDecidedByRef's containment guard would match
+        // nothing — mark the exact card by id and re-emit it over the feed (broadcasts to all
+        // clients). The booking confirmation card itself arrives separately via the fanout mirror.
+        const cleared = await deps.repo.markDecidedById(row.id, MEETING_TYPED_TIME_OPTION);
+        if (cleared) deps.feed.publish(cleared);
       }
       res.json({ data: { status: outcome.status } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Dismiss a "Wants to talk" / "Pick a time" meeting card (abandon — no booking, no task) ──
+  // planDismiss refuses 'question' cards (an askFounder fork must be ANSWERED) and a meeting card IS
+  // a question, so this dedicated route handles the ONE specific meeting-abandon action WITHOUT
+  // relaxing that global rule. Resolve the card → its meeting (notificationRef IS the
+  // agent_meeting_requests id, the SAME mapping /api/meeting-time uses), guardedly abandon the OPEN
+  // request (a booked meeting owns a real event + invite and is left untouched → 'not_pending'), then
+  // clear the card AND any sibling open card on the same meeting (a duration + a slot card can coexist)
+  // so it leaves the queue on every client. Returns 'dismissed' | 'not_pending' | 'not_a_meeting_card'.
+  router.post('/api/meeting/:messageId/dismiss', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.messageId)) return void res.status(400).json({ error: 'invalid message id' });
+    if (!deps.dismissMeeting) return void res.status(503).json({ error: 'meeting scheduling unavailable' });
+    try {
+      const row = await deps.repo.getMessage(req.params.messageId);
+      if (!row) return void res.status(404).json({ error: 'not found' });
+      // A meeting card carries a meeting ref AND md*/ms* buttons; anything else is not one, and the
+      // meeting-abandon gesture does not apply (a plain notification uses /api/dismiss).
+      if (!row.notificationRef || !row.buttons?.some((b) => MEETING_BUTTON_RE.test(b.id))) {
+        return void res.json({ data: { status: 'not_a_meeting_card' } });
+      }
+      const abandoned = await deps.dismissMeeting(row.notificationRef);
+      if (!abandoned) return void res.json({ data: { status: 'not_pending' } });
+      // Clear the card + any sibling open meeting card on the same ref (all synthetic 'mdismiss', no
+      // real button), and re-emit each over the feed so every open client drops it.
+      const cleared = await deps.repo.dismissMeetingCards(row.notificationRef, MEETING_DISMISS_OPTION);
+      for (const r of cleared) deps.feed.publish(r);
+      res.json({ data: { status: 'dismissed' } });
     } catch (err) {
       next(err);
     }
@@ -681,6 +737,29 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
     }
   });
 
+  // ── Resolve an unresolved attendee by PICKING a contact ───────────────────────────────
+  // When the founder's word for someone ("Shlomo") doesn't match the stored contact ("Salomon
+  // Kortovich"), the card offers the customer's email contacts as candidates. Tapping one posts
+  // {name, email} here: `name` is the guess to replace, `email` MUST be one of the customer's
+  // contacts (the core rejects anything else — never invents an invitee). Returns the refreshed view.
+  router.post('/api/meeting-draft/:id/resolve', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid draft id' });
+    const body = (req.body ?? {}) as { name?: unknown; email?: unknown };
+    if (typeof body.name !== 'string' || !body.name.trim() || body.name.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'name is required' });
+    }
+    if (typeof body.email !== 'string' || !body.email.trim() || body.email.length > MAX_TEXT) {
+      return void res.status(400).json({ error: 'email is required' });
+    }
+    if (!deps.meetingDraft) return void res.status(503).json({ error: 'meeting scheduling unavailable' });
+    try {
+      const view = await deps.meetingDraft.resolveAttendee({ draftId: req.params.id, name: body.name.trim(), email: body.email.trim() });
+      res.json({ data: view });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // ── Calendar day view ────────────────────────────────────────────────────────────────
   // Every event across every one of the founder's calendars for ONE navigable day (any past/future
   // day), plus the founder's business-hours window, so they can eyeball a free slot instead of
@@ -708,12 +787,18 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
         day: string;
         tz: string;
         businessHours: { startMinutes: number; endMinutes: number } | null;
+        // The VISIBLE grid extent (env-configured), DISTINCT from businessHours — a hint the FE still
+        // widens to fit any out-of-range event. Soft holds (walk / gym) are shaded, weekday-filtered.
+        dayWindow: { startMinutes: number; endMinutes: number };
+        softBlocks: Array<{ startMinutes: number; endMinutes: number; label: string }>;
         events: Array<{ id: string; calendarLabel: string; title: string; startsAt: Date; endsAt: Date; allDay: boolean }>;
         meeting?: { messageId: string; durationMinutes: number; proposedSlots: Array<{ startsAt: string; endsAt: string }> };
       } = {
         day,
         tz: env.CALENDAR_TZ,
         businessHours,
+        dayWindow: deps.calendar.dayWindow,
+        softBlocks: deps.calendar.softBlocksForDay(day),
         events: events.map((e) => ({ id: e.id, calendarLabel: e.calendarLabel, title: e.title, startsAt: e.startsAt, endsAt: e.endsAt, allDay: e.allDay })),
       };
       // Resolve the pending meeting the SAME way /api/meeting-time does: the card's notificationRef

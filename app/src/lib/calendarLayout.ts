@@ -102,6 +102,20 @@ export function packColumns<T extends Span>(items: T[]): Array<Placed<T>> {
   return out;
 }
 
+/**
+ * The minute-of-day a tap lands on inside a free-gap button. A gap renders as ONE tall button
+ * spanning [gapStart,gapEnd]; tapping it must book where the finger fell, not the gap's start —
+ * so the pixel offset from the button's top is converted back to minutes (at the grid's px/min),
+ * snapped to `snap`-minute granularity, and clamped inside the gap so the start never precedes the
+ * gap or lands past its final slot. This is what makes "tap 11:30" book 11:30 rather than the gap's
+ * start (which on today is `now`).
+ */
+export function tapMinuteInGap(gapStart: number, gapEnd: number, offsetPx: number, pxPerMin: number, snap = 5): number {
+  const raw = gapStart + offsetPx / pxPerMin;
+  const snapped = Math.round(raw / snap) * snap;
+  return Math.max(gapStart, Math.min(snapped, Math.max(gapStart, gapEnd - snap)));
+}
+
 /** The open intervals inside [start,end] once the busy spans are removed — the founder's bookable
  *  gaps. Only gaps at least `minLen` minutes long are returned (a 5-minute sliver isn't a slot). */
 export function freeGaps(start: number, end: number, busy: Span[], minLen = 15): Span[] {

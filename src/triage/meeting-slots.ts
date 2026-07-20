@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon';
-import type { BusinessHour, Holiday } from '../outbound/send-window';
+import type { BusinessHour, Holiday, SoftBlock } from '../outbound/send-window';
 import { businessHoursByDow, openWindowForDay, safeZone } from '../outbound/send-window';
 import type { BusyInterval } from '../ports/calendar.port';
 
@@ -34,6 +34,10 @@ export interface GenerateSlotsInput {
   holidays: Holiday[];
   /** Founder faith for holiday relevance; null → only global holidays close a day. */
   faith?: string | null;
+  /** Founder "suggested hold" windows (walk / gym) the PROPOSAL path avoids — SOFT: they veto an
+   *  auto-OFFERED slot but NEVER a founder-typed / manual booking (that path is slotConflicts, which
+   *  ignores these). Absent/empty → no soft veto (byte-identical to before). */
+  softBlocks?: SoftBlock[];
   /** How many slots to offer. The Telegram keyboard stays readable at ~4. */
   count?: number;
   /** Don't offer a slot starting sooner than this — the founder needs warning, and so does
@@ -91,6 +95,21 @@ function overlaps(aStart: number, aEnd: number, bStart: number, bEnd: number): b
 }
 
 /**
+ * The soft-hold intervals that apply to ONE local day, anchored to `day` in its own zone. Soft
+ * blocks are weekday-scoped minutes-from-midnight, so this resolves them to real instants for that
+ * day. Shared by generateSlots (offered slots skip them) and isSlotFree (tap re-validation), so the
+ * weekday%7 + minutes anchoring lives in ONE place. A block with no `days` applies every day.
+ */
+function softBlocksForDay(day: DateTime, softBlocks: SoftBlock[]): Array<{ start: DateTime; end: DateTime }> {
+  if (softBlocks.length === 0) return [];
+  const dow = day.weekday % 7; // luxon 1=Mon..7=Sun → 0=Sun..6=Sat
+  const midnight = day.startOf('day');
+  return softBlocks
+    .filter((b) => !b.days || b.days.length === 0 || b.days.includes(dow))
+    .map((b) => ({ start: midnight.plus({ minutes: b.startMinutes }), end: midnight.plus({ minutes: b.endMinutes }) }));
+}
+
+/**
  * Is `slot` entirely free — inside an open business window and clear of every busy interval?
  * Exported because the SAME predicate must answer both "which slots do we offer" and "is the
  * tapped slot still free" (re-validated at tap time against fresh free/busy). Two implementations
@@ -98,7 +117,7 @@ function overlaps(aStart: number, aEnd: number, bStart: number, bEnd: number): b
  */
 export function isSlotFree(
   slot: Slot,
-  input: Pick<GenerateSlotsInput, 'tz' | 'busy' | 'businessHours' | 'holidays' | 'faith'>,
+  input: Pick<GenerateSlotsInput, 'tz' | 'busy' | 'businessHours' | 'holidays' | 'faith' | 'softBlocks'>,
 ): boolean {
   const zone = safeZone(input.tz);
   const start = DateTime.fromJSDate(slot.startsAt, { zone });
@@ -107,6 +126,15 @@ export function isSlotFree(
   if (start < w.open) return false;
   // The whole slot must fit before close — a 30-min slot at 17:45 does not.
   if (DateTime.fromJSDate(slot.endsAt, { zone }) > w.close) return false;
+  // A PROPOSED slot must also avoid the founder's soft holds (walk / gym). This is the offer/
+  // re-validate predicate ONLY — slotConflicts (the founder-typed / manual path) never consults them.
+  if (input.softBlocks && input.softBlocks.length > 0) {
+    const s = slot.startsAt.getTime();
+    const e = slot.endsAt.getTime();
+    if (softBlocksForDay(start, input.softBlocks).some((b) => overlaps(s, e, b.start.toMillis(), b.end.toMillis()))) {
+      return false;
+    }
+  }
 
   return !slotConflicts(slot, input.busy);
 }
@@ -149,6 +177,7 @@ export function generateSlots(input: GenerateSlotsInput): Slot[] {
   const zone = safeZone(input.tz);
   const byDow = businessHoursByDow(input.businessHours);
   const busy = mergeBusy(input.busy);
+  const softBlocks = input.softBlocks ?? [];
   const now = DateTime.fromJSDate(input.now, { zone });
   const earliest = now.plus({ minutes: leadMinutes });
 
@@ -157,6 +186,11 @@ export function generateSlots(input: GenerateSlotsInput): Slot[] {
     const day = now.plus({ days: d }).startOf('day');
     const w = openWindowForDay(day, byDow, input.holidays, input.faith ?? null);
     if (!w) continue;
+
+    // The day's soft holds, resolved once (weekday+minutes are constant within a day). An offered
+    // slot skips them, though the founder can still book into one by TYPING a time (slotConflicts
+    // ignores soft blocks) — soft, not a hard veto.
+    const softToday = softBlocksForDay(day, softBlocks);
 
     // First candidate: the later of the window open and the lead-time floor, rounded UP to the
     // next granularity boundary so offers land on clean times.
@@ -174,6 +208,14 @@ export function generateSlots(input: GenerateSlotsInput): Slot[] {
         // Jump to the end of the blocking interval rather than crawling by `granularity` —
         // same result, no long scan across an all-day event.
         cursor = ceilToGranularity(DateTime.fromMillis(hit.end.getTime(), { zone }), granularity);
+        continue;
+      }
+
+      const soft = softToday.find((b) => overlaps(cursor.toMillis(), endsAt.toMillis(), b.start.toMillis(), b.end.toMillis()));
+      if (soft) {
+        // Jump past the soft hold, same as a busy interval — the slot is not offered, but the block
+        // is reversible: the founder may still type a time inside it.
+        cursor = ceilToGranularity(soft.end, granularity);
         continue;
       }
 
