@@ -1,24 +1,31 @@
 # Dropping Telegram: audit & migration plan
 
-**Status:** Phases 1–4 DELIVERED (2026-07-17) · Phase 5 (decommission) pending a Telegram-free soak · **Owner:** founder
+**Status:** Phases 1–4 DELIVERED (2026-07-17) · all flagged residual gaps CLOSED (2026-07-20) · Phase 5 (decommission) pending a Telegram-free soak · **Owner:** founder
 
 ## Delivered
 
 | Phase | What | Commits |
 |---|---|---|
-| 1 | Money loop boots without Telegram (`HeadlessPrimaryNotifier`; callback poller nullable-notifier; app decision sinks always wired) | 4a5d370, 34c411e |
+| 1 | Money loop boots without Telegram (`HeadlessPrimaryNotifier`; callback poller nullable-notifier; app decision sinks always wired; console onboarding unhooked from Telegram at boot) | 4a5d370, 34c411e, 69eefda |
 | 2 | PWA draft **Edit / Revise** + **Compose** a new draft | a97c597, 0dab55d, d84e8dc |
+| 2+ | **Voice input** lands on the PWA — record → transcribe → composer (the last Telegram-only input) | a337252 |
 | 3a | Reminders **delivered** to the PWA (not just the Telegram thread) | 1cf3b0b |
 | 3b | Reminders **created** from the PWA (migration 045 + `/api/reminders` + ReminderSheet) | aa673cf |
 | — | Cancel/commitment **and** backfill acks mirrored to the app | 015c08c, 92c3a45 |
+| — | **Iterative meeting composer** (propose → refine → book) + calendar day view + meeting scheduling, entirely from the PWA | e403999 |
+| — | **Calendar soft holds** (walk/gym) + **meeting-card dismiss** + **attendee-pick** resolution on the PWA | af18e37 |
 | 4 | Actionable assistant | already covered by the WP8 agentic toolset (`list_open_tasks`, `open_commitments`, `pending_approvals`, `customer_brief`, `search_memory`, …) — no new work |
+| — | Housekeeping: the deferred residual gaps below are closed (nullable `ScheduledAction` typed; outbound-drainer boot line reworded; agentic-tools cross-customer fan-out now surfaces a Coverage note when truncated) | 3fe54d3 |
 
 **Telegram is still configured and running.** Everything above is a *capability*; the flip happens when you unset `TELEGRAM_*` and the loop comes up app-only.
 
-### Known residual gaps (deliberately not closed)
-- **Voice-note input** — Telegram-specific; drop it, or add audio upload to the PWA later.
-- `ScheduledAction` TS type still declares the four now-nullable columns as non-null (latent, untriggered — reminders don't read the Telegram anchor after Phase 3a).
-- The outbound-drainer's "Telegram unconfigured" log line is now slightly misleading (it already reaches the app via the fanout).
+### Residual gaps (now closed)
+
+All three gaps flagged when Phase 4 delivered have since been closed:
+
+- **Voice-note input** — closed by `a337252` (PWA `/api/transcribe` reuses the Telegram path's OpenAI transcription adapter).
+- `ScheduledAction` TS type — closed by `3fe54d3` (the four migration-045 nullable columns are now `string | null`; surfaced + fixed a latent `notifyCustomerEvent` null-customer bug in `schedule.worker`).
+- The outbound-drainer's misleading "Telegram unconfigured" log line — closed by `3fe54d3` (reworded to "no founder surface"; with the app configured, drainer alerts already reach it via the fanout).
 
 ## Phase 5 — decommission checklist (run only after a Telegram-free soak)
 

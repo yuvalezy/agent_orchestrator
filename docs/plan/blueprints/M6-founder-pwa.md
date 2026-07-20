@@ -250,3 +250,146 @@ across two screens.
 
 `ci.sh` now runs the app's typecheck/test/build — it covered the server and console but never
 `app/`, which is how a broken-ordering timeline shipped green.
+
+## v4 — PWA parity + calendar & meeting composer (the post-Telegram PWA)
+
+v3 made the cockpit actionable; v4 makes it **stand on its own**. The money loop no
+longer needs Telegram to boot, every founder-only flow that lived in the Telegram poll
+loop has a PWA-native entry point, and the founder can compose + schedule meetings
+entirely from the phone. See [`docs/telegram-decommission-plan.md`](../../telegram-decommission-plan.md)
+for the full seam-by-seam audit; Phases 1–4 are delivered, Phase 5 (remove the adapter)
+is pending a Telegram-free soak.
+
+```mermaid
+flowchart LR
+  subgraph pwa[PWA intake — own endpoints, no Telegram poll]
+    direction TB
+    chat["/api/messages<br/>/api/chat (durable, follow-ups)"]
+    decide["/api/decisions<br/>(shared routeDecision)"]
+    drafts["/api/drafts/:id/{edit,revise}<br/>/api/drafts/compose"]
+    meet["/api/meeting-draft<br/>/api/meeting-draft/:id/{book,resolve,cancel}<br/>/api/meeting-time · /api/meeting/:id/dismiss"]
+    cal["/api/calendar · /api/calendar/block"]
+    rem["/api/reminders"]
+    voice["/api/transcribe"]
+  end
+  chat & decide & drafts & meet & cal & rem & voice --> core["shared core handlers<br/>(same fns Telegram used)"]
+  core --> fanout["FanoutFounderNotifier<br/>primary: Telegram OR headless"]
+  fanout --> app["AppFounderNotifier<br/>feed card + FCM push"]
+```
+
+### Boot without Telegram (decommission Phase 1)
+
+`FanoutFounderNotifier` now accepts a **headless / no-op primary** (`HeadlessPrimaryNotifier`) — when `TELEGRAM_*` is
+absent the money loop (inbox processor + callback poller + decision sinks) still boots,
+and the PWA's `/api/decisions` is wired unconditionally (it was already the second
+surface; now it's the *first-class* one). The callback poller's Telegram `poll()` branch
+is conditional on the notifier. `main.ts` no longer wraps the money loop in a Telegram
+guard — feature flags and the headless shim do the gating. The console onboarding
+service was also unhooked from Telegram at boot (`69eefda`), so customer onboarding
+runs app-only too.
+
+### Draft Edit / Revise / Compose (decommission Phase 2)
+
+The PWA matches the console's `console-approvals.router.ts` exactly — same core fns,
+no thread markers (the message UUID *is* the identity):
+
+- `POST /api/drafts/:messageId/edit` (new body) → `replaceDraftBodyAndApprove`
+- `POST /api/drafts/:messageId/revise` (instruction) → `reviser.reviseFromInstruction`
+- `POST /api/drafts/compose` → `draftEmail` presenter → new draft card (the `/draft email`
+  parity; before this the PWA could only approve/reject, never originate)
+
+First-writer-wins + 409 on conflict are inherited from the shared core, so two surfaces
+editing the same draft can't clobber each other.
+
+### Cancel / commitment / backfill acks mirrored to the app
+
+`askFounder` decisions and task cancel/commitment confirmations used to be
+Telegram-only *ack* paths. They now fan out to the app too (`80fdd07`, `015c08c`):
+each surfaces as a feed card scoped to its customer (`/customer/:id?focus=…`), and the
+founder's tap re-uses the existing decision handler. Backfill approve/reject cards are
+mirrored the same way (`92c3a45`) so a historical-thread proposal is decidable from the
+phone.
+
+### Reminders — created AND delivered on the PWA (decommission Phase 3)
+
+Before this, reminders were both *created* and *delivered* through a Telegram thread.
+Migration 045 + three endpoints + the ReminderSheet close both legs:
+
+- `POST /api/reminders` — create (the Phase 3b NL entry point)
+- `GET /api/reminders` — list the founder's pending reminders
+- `DELETE /api/reminders/:id` — cancel
+
+`schedule.worker.ts` now fires the `⏰ Reminder` through the fanout (a feed card + FCM
+push) instead of `replyInThread`, and `scheduled_actions.source_thread_id` is nullable
+for an app-origin reminder. `TELEGRAM_SCHEDULING_ENABLED` (Settings-managed) is the
+restart flag that registers the due-action worker regardless of which surface fires it.
+
+### Voice input — the last Telegram-only input
+
+`POST /api/transcribe` (multipart/RAW audio body) → the **same** OpenAI transcription
+adapter the Telegram voice path uses (`buildOpenAiTranscriptionClient`), on the accurate
+tier. The composer records → uploads → the returned text lands in the input box for
+editing before send (`a337252`). This was the last input leg that still required
+Telegram; after it, every founder input surface is reachable from the phone.
+
+### Iterative meeting composer (propose → refine → book)
+
+Free-text meeting composition from the chat composer, replacing the old fixed
+"duration card → slot card → booking" ladder with a back-and-forth draft the founder
+can refine in words before booking (`e403999`).
+
+- `POST /api/meeting-draft` → `appMeetingDraft.proposeOrRefine({chatSessionId, customerId, customerName, utterance})`
+- `POST /api/meeting-draft/:id/book` → `book`
+- `POST /api/meeting-draft/:id/cancel` → `cancel`
+
+`src/scheduling/app-meeting-draft.ts` carries the state machine. A refine is
+**additive**: an utterance that names a new attendee ("add Dana") *adds* to the prior
+set rather than replacing it, and an "everyone" utterance expands to the customer's
+full email-contact list. Each turn re-runs the LLM interpreter (role `schedule`) and
+re-fetches the customer's contacts, so unresolved guesses sit next to real invitees
+on the same card. The view's `needs` array is what the card renders as "what still
+blocks booking" — `time`, `attendee`, or empty ⇒ ready.
+
+### Calendar day view + meeting scheduling
+
+`GET /api/calendar?day=YYYY-MM-DD` returns one navigable day across every one of the
+founder's calendars: events, business hours (for the dim band), the server-configured
+`dayWindow`, weekday-filtered `softBlocks`, and — when a meeting request is pending on
+that day — the proposed slots as `meeting.proposedSlots`. The FE (`CalendarScreen`)
+renders gaps as tappable bands; a tap books via `/api/meeting-time`. `POST /api/calendar/block`
+manually blocks a slot.
+
+`POST /api/meeting/:messageId/dismiss` is the meeting-card abandon gesture. `planDismiss`
+**refuses** question cards (an `askFounder` fork must be answered), and a meeting card
+*is* a question — so this dedicated route handles it: it resolves the card → its meeting
+ref, guardedly abandons the OPEN request (a booked meeting owns a real event + invite
+and is left untouched → `'not_pending'`), then clears the card **and** any sibling open
+card on the same ref via `dismissMeetingCards` / `markDecidedById` and re-emits each
+over the feed so every open client drops them. The synthetic `'mdismiss'` option is not
+a real button; it's the sentinel that satisfies the resolution guard.
+
+### Soft holds + tap-to-book-where-the-finger-fell + attendee-pick
+
+The latest round (`af18e37`) refines the calendar + composer UX:
+
+- **Soft holds (walk / gym)** — `env.CALENDAR_SOFT_BLOCKS` (JSON array of
+  `{start,end,label,days?}`, weekday-scoped) and the distinct day-window bounds
+  `CALENDAR_DAY_WINDOW_START` / `_END` (the *visible* grid extent — 06:00–20:00 by
+  default — separate from business hours, which drive only the dim band). The slot
+  proposal (`generateSlots` / `isSlotFree` in `src/triage/meeting-slots.ts`) **avoids**
+  them: an offered slot never overlaps one. **SOFT, not hard**: a founder *typed* time
+  or manual booking goes through `slotConflicts`, which ignores soft blocks — the
+  founder can still book into gym on purpose. `SoftBlock` + `toSoftBlocks` in
+  `src/outbound/send-window.ts` is the single HH:MM→minutes mapping both the slot engine
+  and the day view read. On the FE they render as hatched amber bands, `pointer-events-none`,
+  *under* events so the gap underneath still takes the tap.
+- **Tap-to-book on a gap maps the finger's Y back to a minute** — `tapMinuteInGap` in
+  `app/src/lib/calendarLayout.ts`. A gap is one tall button, so on *today* (where a gap
+  starts at `now`) the book lands where the finger fell, not at the gap's start.
+- **Attendee-pick resolution** — `POST /api/meeting-draft/:id/resolve {name, email}` →
+  `appMeetingDraft.resolveAttendee`. When the founder's word for someone ("Shlomo")
+  doesn't match the stored contact ("Salomon Kortovich"), the card offers the customer's
+  email contacts as candidates; a tap posts one back. The picked `email` MUST be one of
+  THIS customer's contacts — the core rejects anything else (a raced/forged pick can't
+  add a stranger); the guess named `name` is replaced by the real contact and the
+  refreshed view keeps offering candidates until every attendee resolves.

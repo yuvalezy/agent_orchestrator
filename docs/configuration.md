@@ -367,7 +367,10 @@ foundation.
 | `CALENDAR_LOOKAHEAD_DAYS` | `7` | Forward window for the customer's meetings. |
 | `CALENDAR_MAX_EVENTS` | `5` | Max meeting lines injected per draft. |
 | `CALENDAR_ID` | `primary` | Legacy single-account calendar id (back-compat `GOOGLE_CALENDAR_OAUTH` fallback only; dynamic accounts carry their own `calendar_id`). |
-| `CALENDAR_TZ` | `America/Panama` | IANA timezone for rendering meeting date/time lines. |
+| `CALENDAR_TZ` | `America/Panama` | IANA timezone for rendering meeting date/time lines, for task-deadline events on the WRITE path, and for the day window / soft blocks below. |
+| `CALENDAR_DAY_WINDOW_START` | `06:00` | Founder-app calendar **day view**: the default VISIBLE grid extent (`HH:MM`, founder-local). DISTINCT from business hours (which drive the dim/shading) — the FE still widens the grid to include any out-of-range event. |
+| `CALENDAR_DAY_WINDOW_END` | `20:00` | Upper bound of the day-view window (`HH:MM`). |
+| `CALENDAR_SOFT_BLOCKS` | `[{start:'11:30',end:'13:00',label:'Walk / gym',days:[1,2,3,4,5]}]` | Founder "suggested hold" windows (walk / gym) as a JSON array. **SOFT**: the meeting AUTO-PROPOSAL avoids them, but a founder TYPED / manual booking is NOT vetoed. Surfaced on the day view (shaded) filtered per weekday. Each entry `{start,end,label,days?}` — `HH:MM`, `start<end`, `days` is 0=Sun..6=Sat (omitted → every day). Invalid JSON / a malformed entry fails boot validation. |
 | `TRIAGE_FAILURE_ALERT_THRESHOLD` | `3` | Early-warning: after this many consecutive row failures, one admin Telegram notice (re-armed on recovery). |
 
 #### Proactive
