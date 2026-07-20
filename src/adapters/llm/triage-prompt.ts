@@ -138,6 +138,17 @@ export function triageUserMessage(ctx: TriageContext): string {
   if (ctx.message.subject) parts.push(`Subject: ${ctx.message.subject}`);
   parts.push(`CURRENT customer message: ${ctx.message.body ?? '(no text)'}`);
 
+  // M-vision: the image blocks themselves are attached by the caller (LlmMessage.images); this
+  // only tells the model they exist and are AUTHORITATIVE — the visible error/text in them is
+  // ground truth, so read them rather than guessing from the caption.
+  if (ctx.screenshots?.length) {
+    const n = ctx.screenshots.length;
+    const it = n === 1 ? 'it' : 'them';
+    parts.push(
+      `The customer attached ${n} screenshot${n === 1 ? '' : 's'} to this message — read ${it}. The visible error, dialog, or text in ${it} is authoritative; do not guess from the caption.`,
+    );
+  }
+
   // Cited RAG knowledge (change 02 §2.2). Always render the header — an explicit
   // "(none)" tells the model the corpus had nothing relevant (vs. a forgotten field).
   parts.push('', 'Relevant knowledge (may be empty):');

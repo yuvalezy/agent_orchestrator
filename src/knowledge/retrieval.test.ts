@@ -180,6 +180,51 @@ test('flag ON: an empty/whitespace query never embeds or hybrid-searches', async
   assert.equal(hybrid.calls.length, 0, 'no hybrid search for empty query');
 });
 
+// ── Grounding hygiene: rejected-draft feedback is never citable; revise deny-list ───
+// (A) A rejected draft's body is embedded as memory_type='feedback' outcome='rejected'; it must
+// never be returned as a citable source (that is how a turned-down answer resurfaces as if it were
+// documentation). Modified-feedback + corrections are kept. (B) opts.excludeRoutes drops the routes
+// a revise is correcting so re-retrieval can surface the next-nearest (correct) docs.
+
+test('(A) a REJECTED feedback row is dropped from grounding; a guide + modified feedback survive', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([
+    { content: 'WRONG maintenance answer', metadata: { source: 'draft_feedback', outcome: 'rejected' }, memoryType: 'feedback', distance: 0.11 },
+    { content: 'Real doc about invoices.', metadata: { title: 'Invoices', section: 'RUC', route: '/finance' }, memoryType: 'guide', distance: 0.2 },
+    { content: 'We drafted X, sent Y instead.', metadata: { source: 'draft_feedback', outcome: 'modified' }, memoryType: 'feedback', distance: 0.25 },
+  ]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, options: OPTS });
+
+  const chunks = await r.retrieve('factura con ubicación', 'CUST-1');
+
+  assert.equal(chunks.length, 2, 'the rejected feedback row is excluded; guide + modified feedback remain');
+  assert.deepEqual(chunks.map((c) => c.content), ['Real doc about invoices.', 'We drafted X, sent Y instead.']);
+});
+
+test('(B) opts.excludeRoutes drops the just-rejected routes so the next-nearest doc surfaces', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([
+    { content: 'Maintenance locations guide', metadata: { title: 'Maintenance', section: 'Locations', route: '/maintenance/locations' }, memoryType: 'guide', distance: 0.12 },
+    { content: 'Business partner address fields', metadata: { title: 'BP', section: 'Address', route: '/bp' }, memoryType: 'guide', distance: 0.3 },
+  ]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, options: OPTS });
+
+  const chunks = await r.retrieve('ubicación', 'CUST-1', { excludeRoutes: ['/maintenance/locations'] });
+
+  assert.deepEqual(chunks.map((c) => c.route), ['/bp'], 'the rejected maintenance route is gone; BP surfaces');
+});
+
+test('excludeRoutes undefined/empty leaves results untouched (default path)', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([
+    { content: 'a', metadata: { route: '/x' }, memoryType: 'guide', distance: 0.1 },
+    { content: 'b', metadata: { route: '/y' }, memoryType: 'guide', distance: 0.2 },
+  ]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, options: OPTS });
+  assert.equal((await r.retrieve('q', 'CUST-1')).length, 2, 'no opts → nothing filtered');
+  assert.equal((await r.retrieve('q', 'CUST-1', { excludeRoutes: [] })).length, 2, 'empty deny-list → nothing filtered');
+});
+
 test('missing/blank citation metadata maps to null fields (no throw)', async () => {
   const emb = makeEmbedding([[1, 2, 3]]);
   const search = makeSearch([
@@ -190,4 +235,51 @@ test('missing/blank citation metadata maps to null fields (no throw)', async () 
   const chunks = await r.retrieve('q', 'CUST-1');
   assert.deepEqual(chunks[0], { content: 'body with no metadata', title: null, route: null, section: null, distance: 0.2 });
   assert.deepEqual(chunks[1], { content: 'blank title', title: null, route: '/r', section: 'S', distance: 0.3 });
+});
+
+// ── change 047: per-customer module scoping is threaded into the search leg ─────────
+// retrieve() forwards opts.moduleList into the SHARED retrieval leg (via the search/hybrid opts
+// object). An absent/empty list is NOT merged, so the options handed down are byte-identical to
+// pre-047 (memory-repo then applies the predicate to the shared leg only).
+
+type OptsWithModules = KnowledgeRetrievalOptions & { moduleList?: readonly string[] };
+
+test('047: retrieve() forwards a non-empty moduleList into the vector search options', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([{ content: 'x', metadata: { module: 'financeApp' }, memoryType: 'guide', distance: 0.1 }]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, options: OPTS });
+
+  await r.retrieve('ubicación', 'CUST-1', { moduleList: ['financeApp', 'settings'] });
+
+  const opts = search.calls[0].opts as OptsWithModules;
+  assert.deepEqual(opts.moduleList, ['financeApp', 'settings'], 'the module allow-list reaches the repo search');
+  assert.equal(opts.kCustomer, OPTS.kCustomer, 'the per-run knobs are preserved alongside it');
+  assert.equal(opts.maxDistance, OPTS.maxDistance);
+});
+
+test('047: retrieve() forwards moduleList into the hybrid search options (flag on)', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([]);
+  const hybrid = makeHybrid([{ content: 'x', metadata: {}, memoryType: 'guide', distance: 0.1 }]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, hybridSearch: hybrid.fn, options: OPTS });
+
+  await r.retrieve('q', 'CUST-1', { moduleList: ['itemsApp'] });
+
+  const opts = hybrid.calls[0].opts as OptsWithModules;
+  assert.deepEqual(opts.moduleList, ['itemsApp'], 'the allow-list reaches the hybrid search too');
+});
+
+test('047: an ABSENT or EMPTY moduleList leaves the search options UNTOUCHED (allow-all, no regression)', async () => {
+  const emb = makeEmbedding([[1, 2, 3]]);
+  const search = makeSearch([]);
+  const r = buildKnowledgeRetriever({ embedding: emb.port, search: search.fn, options: OPTS });
+
+  await r.retrieve('q', 'CUST-1'); // no opts at all
+  await r.retrieve('q', 'CUST-1', { moduleList: [] }); // an explicitly empty list
+
+  const noOpts = search.calls[0].opts as OptsWithModules;
+  const emptyOpts = search.calls[1].opts as OptsWithModules;
+  assert.equal(noOpts.moduleList, undefined, 'no moduleList key added when none is supplied');
+  assert.equal(emptyOpts.moduleList, undefined, 'an empty list is treated as allow-all — not forwarded');
+  assert.deepEqual(noOpts, OPTS, 'the options object handed down is exactly deps.options');
 });

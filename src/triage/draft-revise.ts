@@ -1,6 +1,7 @@
 import type { DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, ReviseRequest, VerifyDraftRequest } from '../ports/llm.port';
 import type { FounderNotifierPort, Notification } from '../ports/founder-notifier.port';
 import type { KnowledgeRetriever } from '../knowledge/retrieval';
+import { buildModuleFilter, type ModuleScoping } from '../customers/customer-modules';
 import type { StyleLane } from '../knowledge/style-lane';
 import type { getDraftForRevise, reviseDraft, DraftForRevise } from '../outbound/outbound-repo';
 import type { getInboxSubjectBody } from '../inbox/inbox-repo';
@@ -42,6 +43,10 @@ export interface DraftReviserDeps {
   getInboxSubjectBody: typeof getInboxSubjectBody;
   /** Phase 2: learn the correction into the right scope (throw-isolated here). */
   learnCorrection?: LearnCorrection;
+  /** C (module scoping): best-effort read of the customer's active modules, so a revise re-retrieves
+   *  within the customer's modules AND the regeneration prompt stays in-module. Injected + optional;
+   *  absent (or a null customer) = unscoped (allow-all), byte-identical to the pre-scoping revise. */
+  moduleScoping?: (customerId: string) => Promise<ModuleScoping>;
   /** Style-Correction Always-On lane: the customer's persistent voice/tone directives, re-fetched
    *  on every regeneration so a revise keeps the learned voice (gated; undefined when off). The lane
    *  is itself best-effort (a miss yields []), and we further isolate its call below — a style-lane
@@ -103,8 +108,19 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
         question = await resolveQuestion(deps, draft, meta.summary);
 
         // (3) Best-effort scoped re-retrieval (customer + shared). [] on any error — the
-        // founder directive still governs the regeneration.
-        const knowledge = await deps.retriever.retrieve(question, draft.customerId);
+        // founder directive still governs the regeneration. Deny-list the routes the PRIOR draft
+        // cited: the founder is correcting a draft grounded in those docs, so re-pulling them
+        // (retrieval is stateless on the same original text) is exactly what let the wrong source
+        // survive 3 revises. Excluding them lets the next-nearest (correct-module) docs surface.
+        const excludeRoutes = priorCitedRoutes(draft.agentOutput);
+        // C: scope the re-retrieval to the customer's modules (best-effort → allow-all) so a revise
+        // can never re-surface an out-of-module doc, and carry the module list into the regeneration
+        // prompt below so the model stays in-module even when grounding is sparse.
+        const scoping = draft.customerId && deps.moduleScoping
+          ? await deps.moduleScoping(draft.customerId).catch(() => ({ enabled: false, modules: [] as string[] }))
+          : { enabled: false, modules: [] as string[] };
+        const moduleFilter = buildModuleFilter(scoping);
+        const knowledge = await deps.retriever.retrieve(question, draft.customerId, { excludeRoutes, moduleList: moduleFilter ?? undefined });
 
         // (3b) Always-on style lane: re-fetch the customer's persistent voice/tone directives so
         // the regenerated draft keeps the learned voice. Best-effort → [] (the lane swallows its own
@@ -121,6 +137,7 @@ export function buildDraftReviser(deps: DraftReviserDeps): DraftReviserService {
           priorDraft: draft.priorBody,
           instruction,
           voiceGuidance,
+          activeModules: scoping.enabled && scoping.modules.length > 0 ? scoping.modules : undefined,
         };
         result = await deps.reviser.reviseReply(req);
         citations = renderCitations(knowledge, result.usedSourceIndexes);
@@ -258,6 +275,23 @@ async function resolveQuestion(
     if (assembled) return assembled;
   }
   return fallbackSummary;
+}
+
+/** The routes the PRIOR draft cited, parsed from the stored citation labels
+ *  (`title › section (route)`, rendered by renderCitations). Used as the revise deny-list so
+ *  re-retrieval cannot re-surface the exact docs the founder is correcting. Best-effort + total:
+ *  a malformed/citation-less agent_output yields [] (retrieval then behaves as before). */
+export function priorCitedRoutes(agentOutput: unknown): string[] {
+  const o = agentOutput && typeof agentOutput === 'object' ? (agentOutput as Record<string, unknown>) : {};
+  const citations = Array.isArray(o.citations) ? o.citations : [];
+  const routes = new Set<string>();
+  for (const c of citations) {
+    if (typeof c !== 'string') continue;
+    const m = c.match(/\(([^()]+)\)\s*$/); // the trailing "(route)" of "title › section (route)"
+    const route = m?.[1]?.trim();
+    if (route) routes.add(route);
+  }
+  return [...routes];
 }
 
 interface DraftMeta {

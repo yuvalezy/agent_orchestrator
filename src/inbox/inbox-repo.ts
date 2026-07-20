@@ -39,6 +39,18 @@ export interface ClaimedInbox {
   is_group: boolean | null;
   chat_muted: boolean | null;
   mentions_me: boolean | null;
+  // M-vision: inbound media descriptor from raw_metadata->'media' (the whatsapp_manager
+  // RoutableMessage carries it as a nested object when the message has an attachment). null
+  // when the key is absent (text-only messages, non-WA channels, history-backfill rows) — no
+  // screenshot. The triage vision loader fetches the bytes TRANSIENTLY by ref (channel_message_id)
+  // and gates on these fields; they are never stored/logged here. filesize is cast to double
+  // precision so node-pg yields a real number (an int8 cast would arrive as a string).
+  // Optional on the type (not every ClaimedInbox constructor in tests supplies them; the
+  // claimBatch SELECT always projects them, null when the media key is absent).
+  media_type?: string | null;
+  media_mimetype?: string | null;
+  media_status?: string | null;
+  media_filesize?: number | null;
 }
 
 /** Claim a batch of triageable inbound rows. A voice note lands body=NULL and the
@@ -69,7 +81,11 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
             c.raw_metadata->>'ticketNumber' AS ticket_number,
             (c.raw_metadata->'metadata'->>'isGroup')::boolean   AS is_group,
             (c.raw_metadata->'metadata'->>'chatMuted')::boolean AS chat_muted,
-            (c.raw_metadata->'metadata'->>'mentionsMe')::boolean AS mentions_me
+            (c.raw_metadata->'metadata'->>'mentionsMe')::boolean AS mentions_me,
+            c.raw_metadata->'media'->>'mediaType' AS media_type,
+            c.raw_metadata->'media'->>'mimetype'  AS media_mimetype,
+            c.raw_metadata->'media'->>'status'    AS media_status,
+            (c.raw_metadata->'media'->>'filesize')::double precision AS media_filesize
        FROM claimed c JOIN channel_instances ci ON ci.id = c.channel_instance_id
       ORDER BY c.id ASC`,
     [limit, MAX_ATTEMPTS],

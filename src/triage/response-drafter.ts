@@ -69,6 +69,9 @@ export interface DraftAndPresentInput {
   /** Non-empty — the caller gates on knowledge.length > 0. */
   knowledge: KnowledgeChunk[];
   intent: Intent;
+  /** Module scoping (C): the portal modules this customer uses. Draft CONTEXT — the reply must
+   *  never attribute behavior to a module NOT listed. Empty/absent = unscoped (uses everything). */
+  activeModules?: string[];
 }
 
 export interface ResponseDrafter {
@@ -117,7 +120,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
 
   return {
     async draftAndPresent(input: DraftAndPresentInput): Promise<void> {
-      const { row, customerId, config, threadKey, knowledge, intent } = input;
+      const { row, customerId, config, threadKey, knowledge, intent, activeModules } = input;
 
       // (1) Reclaim guard: a prior attempt that failed AT/AFTER the notify left an OPEN
       // draft for this inbox message — re-present it instead of minting a second draft.
@@ -175,6 +178,7 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
         voiceGuidance,
         upcomingMeetings,
         customerBrief,
+        activeModules,
       };
       const result = await deps.llm.draftReply(req);
 

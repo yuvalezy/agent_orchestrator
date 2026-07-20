@@ -26,6 +26,7 @@ import {
   reviseDraft,
 } from '../../outbound/outbound-repo';
 import { getInboxSubjectBody } from '../../inbox/inbox-repo';
+import { getModuleScoping } from '../../customers/customer-modules';
 import { buildBackfillApproveHandler } from './backfill-approve.factory';
 import { buildMeetingSchedulerGated } from './meeting-scheduler.factory';
 import { buildCommitmentDecisionHandler } from '../../commitments/commitment-decision-handler';
@@ -134,6 +135,9 @@ export function buildDraftReviserService(
     reviseDraft,
     getInboxSubjectBody,
     learnCorrection,
+    // C (module scoping): scope the revise re-retrieval to the customer's modules AND keep the
+    // regeneration prompt in-module. A plain DB read; the reviser swallows a read failure → allow-all.
+    moduleScoping: getModuleScoping,
     // Style-Correction Always-On lane: re-inject the customer's persistent voice/tone directives on
     // every regeneration so a revise keeps the learned voice (gated; undefined when off). REUSES the
     // SAME buildStyleLaneGated the inbox drafter uses (STYLE_LANE_ENABLED) — one gated builder, no

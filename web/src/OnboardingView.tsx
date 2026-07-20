@@ -1,6 +1,6 @@
-import { type ReactElement, type ReactNode, useEffect, useState } from 'react';
+import { type ReactElement, type ReactNode, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { Building2, CheckCircle2, CircleAlert, FolderKanban, MessageCircle, Sparkles, UserPlus } from 'lucide-react';
+import { Boxes, Building2, CheckCircle2, CircleAlert, FolderKanban, Globe, MessageCircle, Search, Sparkles, UserPlus } from 'lucide-react';
 import { api, type ApiError } from './lib/api';
 import { Select } from './lib/select';
 
@@ -14,11 +14,13 @@ import { Select } from './lib/select';
 interface CustomerHit { ref: string; name: string; code: string; alreadyOnboarded: boolean }
 interface ProjectHit { ref: string; code: string; name: string; status: string }
 interface Contact { name: string; email: string | null; phone: string | null; whatsapp: string | null; telegram: string | null; isPrimary: boolean }
-interface Preview { ref: string; name: string; website: string | null; email: string | null; contacts: Contact[]; alreadyOnboarded: boolean }
+interface Preview { ref: string; name: string; website: string | null; email: string | null; contacts: Contact[]; alreadyOnboarded: boolean; customerId: string | null }
 interface WorkItemType { ref: string; name: string }
 interface DrySummary { at: string; threads: number; linkedOpen: number; linkedResolved: number; memories: number; proposed: number; proposalsConsidered: number; skipped: number; retryable: number; skippedReason?: string }
 interface BackfillState { enabled: boolean; reason: string | null; status: string | null; running: boolean; dry: DrySummary | null }
 interface OnboardResponse { data: { customerId: string; created: boolean; waBlocked: boolean; workItemTypeRef: string } }
+interface ModuleRow { moduleKey: string; source: 'auto' | 'operator' | 'portal'; active: boolean }
+interface ModulesState { modules: ModuleRow[]; moduleScopingEnabled: boolean }
 
 function useDebounced(value: string, ms = 300): string {
   const [debounced, setDebounced] = useState(value);
@@ -90,6 +92,10 @@ export function OnboardingView(): ReactElement {
   const resetCustomer = (): void => { setSelected(null); setProject(null); setProjectInput(''); setWitRef(''); setOnboardedId(null); onboard.reset(); };
 
   const canOnboard = Boolean(selected && project && witRef) && !preview.data?.data.alreadyOnboarded;
+  // The customer whose modules the editor targets: a freshly-onboarded one, OR an already-onboarded
+  // one selected to edit (the preview carries its customerId). Lets you revisit modules any time,
+  // not only during first onboarding.
+  const editCustomerId = onboardedId ?? (preview.data?.data.alreadyOnboarded ? preview.data.data.customerId : null);
 
   return (
     <section className="space-y-6">
@@ -105,10 +111,11 @@ export function OnboardingView(): ReactElement {
       <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-5 text-sm leading-6 text-zinc-400">
         <p className="font-medium text-zinc-300">How it works</p>
         <ol className="mt-2 list-decimal space-y-1 pl-5">
-          <li>Search the portal for the customer. Already-onboarded ones are marked and can't be picked again.</li>
+          <li>Search the portal for the customer. New ones onboard here; an already-onboarded one is marked <span className="text-zinc-300">“edit modules”</span> — pick it to update which portal modules it uses.</li>
           <li>Review the contacts we'll import — especially the WhatsApp numbers.</li>
           <li>Pick the project its tasks land in. Its work item type is chosen automatically when there's only one.</li>
-          <li>Onboard. Then run the <span className="text-zinc-300">dry</span> backfill preview to see what history would seed — nothing is written until you run the <span className="text-zinc-300">live</span> sweep, which posts Telegram approval cards.</li>
+          <li>Onboard. Then declare which <span className="text-zinc-300">portal modules</span> this customer actually uses — the agent then never references a module they don't have. Leave it untouched and they stay unscoped (they see everything).</li>
+          <li>Optionally run the <span className="text-zinc-300">dry</span> backfill preview to see what history would seed — nothing is written until you run the <span className="text-zinc-300">live</span> sweep, which posts Telegram approval cards.</li>
         </ol>
       </div>
 
@@ -140,16 +147,15 @@ export function OnboardingView(): ReactElement {
                 {customers.data?.data.map((hit) => (
                   <button
                     key={hit.ref}
-                    disabled={hit.alreadyOnboarded}
                     onClick={() => setSelected(hit)}
-                    className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left hover:bg-zinc-900/60 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
+                    className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left hover:bg-zinc-900/60"
                   >
                     <span className="min-w-0">
                       <span className="block truncate text-sm text-zinc-100">{hit.name}</span>
                       <span className="block font-mono text-[11px] text-zinc-600">{hit.code}</span>
                     </span>
                     {hit.alreadyOnboarded
-                      ? <span className="shrink-0 rounded-full bg-zinc-800 px-2 py-1 text-xs text-zinc-400">already onboarded</span>
+                      ? <span className="shrink-0 rounded-full bg-zinc-800 px-2 py-1 text-xs text-zinc-300">onboarded · edit modules</span>
                       : <span className="shrink-0 rounded-full bg-emerald-400/15 px-2 py-1 text-xs font-medium text-emerald-300">Select</span>}
                   </button>
                 ))}
@@ -166,7 +172,11 @@ export function OnboardingView(): ReactElement {
           {preview.isError && <ErrorText message={(preview.error as Error).message} />}
           {preview.data && (
             <>
-              {preview.data.data.alreadyOnboarded && <ErrorText message="This customer is already onboarded — pick another." />}
+              {preview.data.data.alreadyOnboarded && (
+                <p className="mb-3 flex items-center gap-2 rounded-lg bg-zinc-800/60 px-3 py-2 text-xs text-zinc-300">
+                  <CheckCircle2 size={14} className="text-emerald-300" />Already onboarded — jump to <span className="font-medium">Modules</span> below to update which portal modules it uses.
+                </p>
+              )}
               {preview.data.data.website && <p className="mb-3 text-xs text-zinc-500">Website: {preview.data.data.website}</p>}
               {preview.data.data.contacts.length === 0 ? (
                 <p className="text-sm text-zinc-500">No contacts on this business partner. WhatsApp groups from whatsapp_manager are imported at onboarding regardless.</p>
@@ -264,13 +274,142 @@ export function OnboardingView(): ReactElement {
         </Panel>
       )}
 
-      {/* Step 5: backfill */}
-      {onboardedId && <BackfillPanel customerId={onboardedId} confirmLive={confirmLive} setConfirmLive={setConfirmLive} />}
+      {/* Module scoping — reachable for a freshly-onboarded (step 5) OR an already-onboarded customer
+          (step 3: they skip project/onboard). */}
+      {editCustomerId && <ModulesPanel step={onboardedId ? 5 : 3} customerId={editCustomerId} />}
+
+      {/* Step 6: backfill */}
+      {onboardedId && <BackfillPanel step={6} customerId={onboardedId} confirmLive={confirmLive} setConfirmLive={setConfirmLive} />}
     </section>
   );
 }
 
-function BackfillPanel({ customerId, confirmLive, setConfirmLive }: { customerId: string; confirmLive: boolean; setConfirmLive: (v: boolean) => void }): ReactElement {
+// Module scoping (C): declare which portal modules this customer actually uses. A multi-select over
+// the corpus vocabulary, pre-checked from the customer's current ACTIVE modules (auto-seeded rows
+// look pre-checked). Saving turns scoping ON; leaving it untouched keeps the customer unscoped
+// (sees all modules). Every option is keyed by its non-empty module_key.
+function ModulesPanel({ step, customerId }: { step: number; customerId: string }): ReactElement {
+  const vocabulary = useQuery({
+    queryKey: ['onboarding-modules-vocab'],
+    queryFn: () => api<{ data: string[] }>('/onboarding/modules/vocabulary'),
+  });
+  const current = useQuery({
+    queryKey: ['onboarding-modules', customerId],
+    queryFn: () => api<{ data: ModulesState }>(`/onboarding/${customerId}/modules`),
+  });
+
+  // `null` = not yet seeded from the server. Seed once from the customer's current ACTIVE modules,
+  // then the operator's edits are authoritative (a refetch after save never clobbers them).
+  const [selected, setSelected] = useState<Set<string> | null>(null);
+  const [filter, setFilter] = useState('');
+  useEffect(() => {
+    if (current.data && selected === null) {
+      setSelected(new Set(current.data.data.modules.filter((m) => m.active).map((m) => m.moduleKey)));
+    }
+  }, [current.data, selected]);
+
+  const save = useMutation({
+    mutationFn: (keys: string[]) => api(`/onboarding/${customerId}/modules`, { method: 'PUT', body: JSON.stringify({ moduleKeys: keys }) }),
+    onSuccess: () => void current.refetch(),
+  });
+
+  const rows = current.data?.data.modules ?? [];
+  const sourceOf = useMemo(() => new Map(rows.map((r) => [r.moduleKey, r.source])), [rows]);
+  const scopingEnabled = current.data?.data.moduleScopingEnabled ?? false;
+
+  // Options = the corpus vocabulary ∪ the customer's own rows (so a custom/auto-seeded key not in the
+  // shared corpus — e.g. 'pilates-gal' — still shows). Empty keys are never offered.
+  const options = useMemo(() => {
+    const union = new Set<string>([...(vocabulary.data?.data ?? []), ...rows.map((r) => r.moduleKey)]);
+    return [...union].map((k) => k.trim()).filter((k) => k.length > 0).sort((a, b) => a.localeCompare(b));
+  }, [vocabulary.data, rows]);
+
+  const shown = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return q ? options.filter((k) => k.toLowerCase().includes(q)) : options;
+  }, [options, filter]);
+
+  const toggle = (key: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev ?? []);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
+  const loading = vocabulary.isLoading || current.isLoading || selected === null;
+  const count = selected?.size ?? 0;
+
+  return (
+    <Panel step={step} title="Which modules does this customer use?">
+      <p className="mb-4 text-sm leading-6 text-zinc-400">
+        Check only the portal modules this customer actually uses. The agent then never references, explains, or attributes behavior to a module they don't have. Auto-detected modules are pre-checked — deselect any that don't apply.
+      </p>
+
+      {!scopingEnabled && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-sky-800/60 bg-sky-950/30 p-4 text-sm text-sky-100">
+          <Globe size={16} className="mt-0.5 shrink-0" />
+          <span>Currently <span className="font-medium">unscoped</span> — this customer sees all modules. Save a selection below to narrow them.</span>
+        </div>
+      )}
+
+      {vocabulary.isError && <ErrorText message={(vocabulary.error as ApiError).message} />}
+      {current.isError && <ErrorText message={(current.error as ApiError).message} />}
+
+      {loading && !vocabulary.isError && !current.isError ? (
+        <p className="text-sm text-zinc-500">Loading modules…</p>
+      ) : (
+        <>
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2">
+            <Search size={14} className="shrink-0 text-zinc-500" />
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              maxLength={60}
+              placeholder="Filter modules…"
+              className="w-full bg-transparent text-sm text-zinc-200 outline-none placeholder:text-zinc-600"
+            />
+          </div>
+
+          <div className="grid max-h-72 grid-cols-1 gap-1 overflow-y-auto rounded-lg border border-zinc-800 p-1 sm:grid-cols-2">
+            {shown.length === 0 && <p className="px-3 py-4 text-sm text-zinc-500">No modules match “{filter}”.</p>}
+            {shown.map((key) => {
+              const src = sourceOf.get(key);
+              const checked = selected?.has(key) ?? false;
+              return (
+                <label key={key} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-900/60">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(key)}
+                    className="size-4 shrink-0 accent-emerald-400"
+                  />
+                  <span className="min-w-0 truncate font-mono text-[13px] text-zinc-200">{key}</span>
+                  {src && <span className="ml-auto shrink-0 rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400">{src}</span>}
+                </label>
+              );
+            })}
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <button
+              disabled={selected === null || save.isPending}
+              onClick={() => save.mutate([...(selected ?? [])])}
+              className="inline-flex items-center gap-2 rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-semibold text-zinc-950 enabled:hover:bg-emerald-300 disabled:opacity-50"
+            >
+              <Boxes size={16} />{save.isPending ? 'Saving…' : 'Save modules'}
+            </button>
+            <span className="text-xs text-zinc-500">{count} selected</span>
+            {save.isSuccess && !save.isPending && <span className="inline-flex items-center gap-1 text-xs text-emerald-300"><CheckCircle2 size={14} />Saved — scoping is on.</span>}
+          </div>
+          {save.isError && <ErrorText message={(save.error as ApiError).message} />}
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function BackfillPanel({ step, customerId, confirmLive, setConfirmLive }: { step: number; customerId: string; confirmLive: boolean; setConfirmLive: (v: boolean) => void }): ReactElement {
   const status = useQuery({
     queryKey: ['onboarding-backfill', customerId],
     queryFn: () => api<{ data: BackfillState }>(`/onboarding/${customerId}/backfill`),
@@ -284,7 +423,7 @@ function BackfillPanel({ customerId, confirmLive, setConfirmLive }: { customerId
   const dry = state?.dry ?? null;
 
   return (
-    <Panel step={5} title="Backfill customer history (optional)">
+    <Panel step={step} title="Backfill customer history (optional)">
       <p className="mb-4 text-sm leading-6 text-zinc-400">
         Seed the customer's memory from their existing history. Run the <span className="text-zinc-300">dry preview</span> first — it reads every history leg and reports what would be linked or proposed, writing nothing. When it looks right, run the <span className="text-zinc-300">live sweep</span>: it seeds memory and posts a Telegram approval card for each starred unmatched request. Tasks are created only when you tap ✅.
       </p>

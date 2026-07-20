@@ -56,6 +56,11 @@ export interface SearchOptions {
   kShared: number;
   /** ⚠︎ cosine-distance ceiling; rows beyond it are dropped (citation gating). */
   maxDistance: number;
+  /** Per-customer module scoping (migration 047). When present + NON-EMPTY, the SHARED leg is
+   *  narrowed to `metadata->>'module' = ANY(moduleList) OR metadata->>'module' IS NULL` — the
+   *  customer leg is NEVER filtered (own + custom docs always retrieve). Absent/empty → NO filter
+   *  (allow-all), byte-identical to the pre-047 SQL. Bound as a parameter, never interpolated. */
+  moduleList?: readonly string[];
 }
 
 /** One append-only Layer-A memory (document_id NULL, chunk_index 0). Used by the
@@ -257,6 +262,10 @@ export interface BuildSearchSqlInput {
   kCustomer: number;
   kShared: number;
   maxDistance: number;
+  /** ⚠︎ per-customer module scoping (migration 047) applied to the SHARED leg ONLY. Present +
+   *  non-empty → the shared leg gains `AND (metadata->>'module' = ANY($n) OR ...IS NULL)`; the
+   *  customer leg is untouched. Absent/empty → SQL is byte-identical to the pre-047 builder. */
+  moduleList?: readonly string[];
 }
 
 /** Serialize a JS embedding to pgvector's textual literal `[a,b,c]` (bound as a
@@ -265,26 +274,47 @@ function toVectorLiteral(embedding: number[]): string {
   return `[${embedding.join(',')}]`;
 }
 
+/**
+ * ⚠︎ Per-customer module scoping (migration 047) — the predicate spliced into a SHARED leg's
+ * WHERE. When `moduleList` is present + NON-EMPTY it is BOUND as the next parameter (pushed onto
+ * `values`, so this MUST be called after the leg's other params are in place) and the returned
+ * ` AND (...)` fragment references it; the customer leg NEVER calls this (own + custom docs always
+ * retrieve). Absent/empty → returns '' and pushes nothing, so the SQL + values are byte-identical
+ * to the pre-047 builders (the flag-off path). The array is a param, never interpolated.
+ */
+function sharedModuleClause(moduleList: readonly string[] | undefined, values: unknown[]): string {
+  if (!moduleList || moduleList.length === 0) return '';
+  values.push(moduleList as string[]);
+  const n = values.length; // 1-based index of the just-pushed array param
+  return ` AND (metadata->>'module' = ANY($${n}::text[]) OR metadata->>'module' IS NULL)`;
+}
+
 export function buildSearchSql(input: BuildSearchSqlInput): { text: string; values: unknown[] } {
   const { embedding, customerId, kCustomer, kShared, maxDistance } = input;
   const vec = toVectorLiteral(embedding);
   const projection = 'content, metadata, memory_type, (embedding <=> $1::vector) AS distance';
 
-  // Shared-only when there is no customer context: a single customer_id IS NULL query.
+  // Shared-only when there is no customer context: a single customer_id IS NULL query. This whole
+  // query IS the shared leg, so module scoping (when enabled) narrows it.
   if (customerId === null) {
+    const values: unknown[] = [vec, maxDistance, kShared];
+    const moduleClause = sharedModuleClause(input.moduleList, values);
     const text = `SELECT ${projection}
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
-         AND (embedding <=> $1::vector) <= $2
+         AND (embedding <=> $1::vector) <= $2${moduleClause}
        ORDER BY embedding <=> $1::vector
        LIMIT $3`;
-    return { text, values: [vec, maxDistance, kShared] };
+    return { text, values };
   }
 
   // Two STRICTLY-isolated legs unioned: the customer leg matches customer_id = $2 ONLY
   // (never another tenant's rows), the shared leg matches customer_id IS NULL ONLY.
   // Both are gated by maxDistance and return the cosine distance for citation gating.
+  // Module scoping (when enabled) narrows the SHARED leg ONLY; the customer leg is untouched.
+  const values: unknown[] = [vec, customerId, maxDistance, kCustomer, kShared];
+  const moduleClause = sharedModuleClause(input.moduleList, values);
   const text = `(
       SELECT ${projection}
        FROM agent_memory
@@ -300,12 +330,12 @@ export function buildSearchSql(input: BuildSearchSqlInput): { text: string; valu
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
-         AND (embedding <=> $1::vector) <= $3
+         AND (embedding <=> $1::vector) <= $3${moduleClause}
        ORDER BY embedding <=> $1::vector
        LIMIT $5
     )
     ORDER BY distance ASC`;
-  return { text, values: [vec, customerId, maxDistance, kCustomer, kShared] };
+  return { text, values };
 }
 
 // ── WP4: HYBRID retrieval (vector + Postgres FTS, RRF fusion) over agent_memory ──────
@@ -329,16 +359,21 @@ export function buildHybridVectorSql(input: BuildSearchSqlInput): { text: string
   const projection = 'id, content, metadata, memory_type, (embedding <=> $1::vector) AS distance';
 
   if (customerId === null) {
+    const values: unknown[] = [vec, maxDistance, kShared];
+    const moduleClause = sharedModuleClause(input.moduleList, values);
     const text = `SELECT ${projection}
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
-         AND (embedding <=> $1::vector) <= $2
+         AND (embedding <=> $1::vector) <= $2${moduleClause}
        ORDER BY embedding <=> $1::vector
        LIMIT $3`;
-    return { text, values: [vec, maxDistance, kShared] };
+    return { text, values };
   }
 
+  // Module scoping (when enabled) narrows the SHARED leg ONLY; the customer leg is untouched.
+  const values: unknown[] = [vec, customerId, maxDistance, kCustomer, kShared];
+  const moduleClause = sharedModuleClause(input.moduleList, values);
   const text = `(
       SELECT ${projection}
        FROM agent_memory
@@ -354,12 +389,12 @@ export function buildHybridVectorSql(input: BuildSearchSqlInput): { text: string
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
-         AND (embedding <=> $1::vector) <= $3
+         AND (embedding <=> $1::vector) <= $3${moduleClause}
        ORDER BY embedding <=> $1::vector
        LIMIT $5
     )
     ORDER BY distance ASC`;
-  return { text, values: [vec, customerId, maxDistance, kCustomer, kShared] };
+  return { text, values };
 }
 
 /** ⚠︎ PURE SQL builder for the HYBRID keyword (FTS) leg. websearch_to_tsquery('simple', $2) —
@@ -376,6 +411,10 @@ export function buildKeywordSearchSql(input: {
   queryText: string;
   customerId: string | null;
   maxCandidates: number;
+  /** ⚠︎ per-customer module scoping (migration 047), SHARED leg ONLY — same semantics as
+   *  buildSearchSql. Present + non-empty → the shared FTS leg gains the module predicate; the
+   *  customer leg is untouched. Absent/empty → byte-identical to the pre-047 keyword builder. */
+  moduleList?: readonly string[];
 }): { text: string; values: unknown[] } {
   const { embedding, queryText, customerId, maxCandidates } = input;
   const vec = toVectorLiteral(embedding);
@@ -383,20 +422,25 @@ export function buildKeywordSearchSql(input: {
   const tsquery = `websearch_to_tsquery('simple', $2)`;
 
   if (customerId === null) {
+    const values: unknown[] = [vec, queryText, maxCandidates];
+    const moduleClause = sharedModuleClause(input.moduleList, values);
     const text = `SELECT ${projection}
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
-         AND content_tsv @@ ${tsquery}
+         AND content_tsv @@ ${tsquery}${moduleClause}
        ORDER BY ts_rank(content_tsv, ${tsquery}) DESC
        LIMIT $3`;
-    return { text, values: [vec, queryText, maxCandidates] };
+    return { text, values };
   }
 
   // Each leg projects its LEXICAL rank (kw_rank) so the UNION can be re-ordered by relevance, NOT
   // by cosine distance: fuseByRrf ranks candidates by ARRAY POSITION, so the keyword leg it consumes
   // must arrive in ts_rank order (mirrors the shared-only branch above). The `distance` column stays
-  // (consumers read the real cosine distance); it just no longer drives the ordering.
+  // (consumers read the real cosine distance); it just no longer drives the ordering. Module scoping
+  // (when enabled) narrows the SHARED leg ONLY; the customer leg is untouched.
+  const values: unknown[] = [vec, queryText, customerId, maxCandidates];
+  const moduleClause = sharedModuleClause(input.moduleList, values);
   const text = `(
       SELECT ${projection}, ts_rank(content_tsv, ${tsquery}) AS kw_rank
        FROM agent_memory
@@ -412,12 +456,12 @@ export function buildKeywordSearchSql(input: {
        FROM agent_memory
        WHERE customer_id IS NULL
          AND lifecycle_status = 'active'
-         AND content_tsv @@ ${tsquery}
+         AND content_tsv @@ ${tsquery}${moduleClause}
        ORDER BY ts_rank(content_tsv, ${tsquery}) DESC
        LIMIT $4
     )
     ORDER BY kw_rank DESC`;
-  return { text, values: [vec, queryText, customerId, maxCandidates] };
+  return { text, values };
 }
 
 /** One fusion candidate — a row from either leg, keyed by its agent_memory `id` (the RRF dedup
@@ -897,6 +941,7 @@ export const memoryRepo: KnowledgeRepo &
       kCustomer: opts.kCustomer,
       kShared: opts.kShared,
       maxDistance: opts.maxDistance,
+      moduleList: opts.moduleList,
     });
     const { rows } = await query<SearchDbRow>(text, values);
     return rows.map((r) => ({
@@ -930,6 +975,7 @@ export const memoryRepo: KnowledgeRepo &
       kCustomer: opts.kCustomer,
       kShared: opts.kShared,
       maxDistance: opts.maxDistance,
+      moduleList: opts.moduleList,
     });
     const vectorRows = (await query<HybridDbRow>(vec.text, vec.values)).rows.map(toCand);
 
@@ -944,6 +990,7 @@ export const memoryRepo: KnowledgeRepo &
         queryText: trimmed,
         customerId,
         maxCandidates: KEYWORD_CANDIDATE_CAP,
+        moduleList: opts.moduleList,
       });
       keywordRows = (await query<HybridDbRow>(kw.text, kw.values)).rows.map(toCand);
     }

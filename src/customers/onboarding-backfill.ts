@@ -1,4 +1,6 @@
 import { query } from '../db';
+import { logger } from '../logger';
+import { seedActiveModulesFromMemory } from './customer-modules';
 
 // Onboarding's BACKFILL-SEEDING step (plan Part 6). Core: DB upserts + pure decisions,
 // ports injected — no adapter imports (D1 boundary). The composition root is
@@ -55,14 +57,36 @@ export async function stampBackfillCutoff(customerId: string): Promise<BackfillC
       RETURNING backfill_cutoff`,
     [customerId],
   );
-  if ((claim.rowCount ?? 0) > 0) return { stamped: true, cutoff: claim.rows[0].backfill_cutoff };
+  let result: BackfillCutoffResult | null;
+  if ((claim.rowCount ?? 0) > 0) {
+    result = { stamped: true, cutoff: claim.rows[0].backfill_cutoff };
+  } else {
+    const existing = await query<{ backfill_cutoff: Date | null }>(
+      'SELECT backfill_cutoff FROM agent_customers WHERE id = $1',
+      [customerId],
+    );
+    const cutoff = existing.rows[0]?.backfill_cutoff;
+    result = cutoff ? { stamped: false, cutoff } : null; // null = unknown customer
+  }
 
-  const existing = await query<{ backfill_cutoff: Date | null }>(
-    'SELECT backfill_cutoff FROM agent_customers WHERE id = $1',
-    [customerId],
-  );
-  const cutoff = existing.rows[0]?.backfill_cutoff;
-  return cutoff ? { stamped: false, cutoff } : null; // null = unknown customer
+  // Seed the customer's ACTIVE-MODULE set from their own memory (migration 047) — the onboarding
+  // composition root's per-customer stamp fires here, alongside the cutoff (and, in seedBackfillDry,
+  // registerCustomerDocsRoot). seedActiveModulesFromMemory is insert-only (source='auto', ON CONFLICT
+  // DO NOTHING), so a re-run is a no-op that only picks up newly-observable modules. BEST-EFFORT: it
+  // must NEVER break onboarding — a failure (e.g. migration 047 not yet applied) is logged and
+  // swallowed; the opt-in flag stays false (allow-all) and the operator can set modules by hand.
+  // Skipped for an unknown customer (result === null): there is nothing to seed.
+  if (result) {
+    try {
+      await seedActiveModulesFromMemory(customerId);
+    } catch (err) {
+      logger.warn(
+        { customerId, reason: (err as Error)?.message },
+        'active-module auto-seed skipped — onboarding continues (modules can be set by hand later)',
+      );
+    }
+  }
+  return result;
 }
 
 /** Mark the seed complete — the LIVE sweep's terminal transition ('in_progress' → 'done'). */

@@ -41,6 +41,9 @@ export class AnthropicClient implements LlmProviderClient {
   readonly provider = 'anthropic';
   // WP8: Anthropic supports the read-only tool loop via tool_use content blocks.
   readonly supportsTools = true;
+  // M-vision: claude-sonnet-5 is vision-capable — a turn's LlmMessage.images become image
+  // content blocks (toMessages). The router only sends images to a supportsVision=true provider.
+  readonly supportsVision = true;
   private readonly baseUrl: string;
   private readonly resolveKey: () => string | undefined;
   private readonly fetchImpl: typeof fetch;
@@ -86,9 +89,26 @@ export class AnthropicClient implements LlmProviderClient {
     );
   }
 
-  private toMessages(messages: LlmMessage[]): Array<{ role: string; content: string }> {
+  private toMessages(messages: LlmMessage[]): Array<{ role: string; content: unknown }> {
     // Anthropic takes system separately; only user/assistant turns go here.
-    return messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role, content: m.content }));
+    return messages.filter((m) => m.role !== 'system').map((m) => {
+      // M-vision: a turn carrying image blocks is emitted as a content-block array
+      // [{text}, {image}...] instead of a plain string, so a vision-capable model reads
+      // the screenshots. The text-only path stays a bare string — byte-identical to before.
+      if (m.images?.length) {
+        return {
+          role: m.role,
+          content: [
+            { type: 'text', text: m.content },
+            ...m.images.map((img) => ({
+              type: 'image',
+              source: { type: 'base64', media_type: img.mediaType, data: img.dataBase64 },
+            })),
+          ],
+        };
+      }
+      return { role: m.role, content: m.content };
+    });
   }
 
   private usageOf(res: MessagesResponse): TokenUsage {

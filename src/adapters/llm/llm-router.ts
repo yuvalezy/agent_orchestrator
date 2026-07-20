@@ -122,17 +122,25 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
     customerId: string | null;
   }): Promise<T> {
     await this.enforceCap();
-    const chain = this.chainFor(opts.role);
+    // M-vision: when this call carries image blocks, PREFER a vision-capable provider (a
+    // text-only fallback would silently drop the customer's screenshots) and, before sending
+    // to any provider that is NOT vision-capable, STRIP the images so a fallback never
+    // receives an image block it would reject. Text-only calls skip all of this (byte-identical).
+    const hasImages = opts.messages.some((m) => m.images?.length);
+    const baseChain = this.chainFor(opts.role);
+    const chain = hasImages ? preferVision(baseChain, this.deps.providers) : baseChain;
     const attempts: Array<{ provider: string; kind: LlmErrorKind }> = [];
 
     for (const provider of chain) {
       const client = this.deps.providers[provider];
       const model = this.deps.modelFor(provider, opts.role);
+      // Non-vision provider → drop the images (send a text-only turn); vision provider → pass through.
+      const messages = hasImages && client.supportsVision !== true ? stripImages(opts.messages) : opts.messages;
       try {
         const { value, usage } = await client.completeStructured<unknown>({
           model,
           system: opts.system,
-          messages: opts.messages,
+          messages,
           maxTokens: opts.maxTokens,
           schema: opts.schema,
           effort: this.deps.effortFor?.(provider, opts.role),
@@ -164,11 +172,16 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
   }
 
   async extractIntents(input: TriageContext, customerId: string | null = null): Promise<Intent[]> {
+    // M-vision: attach the customer's screenshots as image blocks on the extractor turn (the
+    // triageUserMessage prompt adds the "read these, they're authoritative" note). Absent →
+    // a plain text-only turn (byte-identical). callStructured prefers/strips per provider.
+    const userMessage: LlmMessage = { role: 'user', content: triageUserMessage(input) };
+    if (input.screenshots?.length) userMessage.images = input.screenshots;
     return this.callStructured<Intent[]>({
       role: 'triage',
       schema: INTENTS_SCHEMA,
       system: TRIAGE_SYSTEM,
-      messages: [{ role: 'user', content: triageUserMessage(input) }],
+      messages: [userMessage],
       // R44: Anthropic sonnet-5 runs adaptive thinking ON, and max_tokens caps
       // thinking + output COMBINED — a tight budget could let thinking truncate the
       // JSON (→ parse fail → failover masking a dark primary). Give ample headroom;
@@ -499,4 +512,20 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       log: logger,
     });
   }
+}
+
+// ── M-vision helpers (kept local + minimal — the router isn't refactored) ────────────────────
+
+/** Reorder a provider chain so vision-capable providers come FIRST (stable otherwise), so a
+ *  call carrying image blocks prefers a provider that can actually read them. */
+function preferVision(chain: string[], providers: Record<string, LlmProviderClient>): string[] {
+  const vision = chain.filter((p) => providers[p]?.supportsVision === true);
+  const rest = chain.filter((p) => providers[p]?.supportsVision !== true);
+  return [...vision, ...rest];
+}
+
+/** Drop the `images` field from every message (a text-only turn) — sent to any provider that
+ *  is not vision-capable so it never receives an image block it would reject. */
+function stripImages(messages: LlmMessage[]): LlmMessage[] {
+  return messages.map(({ images: _images, ...rest }) => rest);
 }

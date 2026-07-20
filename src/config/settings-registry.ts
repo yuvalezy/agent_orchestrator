@@ -120,6 +120,29 @@ export const SETTINGS_REGISTRY: readonly SettingDef[] = [
     dependsOn: 'KNOWLEDGE_RETRIEVAL_ENABLED',
   },
   {
+    key: 'AGENT_VISION_ENABLED',
+    type: 'boolean',
+    category: KNOWLEDGE,
+    label: 'Read screenshots (vision)',
+    description:
+      'Feed a customer’s attached screenshots to the vision model during triage, so the agent reads the actual error/dialog instead of guessing from the caption. Best-effort — a fetch miss degrades to text-only, never a triage failure.',
+    applyMode: 'restart',
+    default: false,
+  },
+  {
+    key: 'AGENT_VISION_MAX_BYTES',
+    type: 'number',
+    category: KNOWLEDGE,
+    label: 'Vision max image size (bytes)',
+    description:
+      'Skip attached screenshots larger than this many bytes (they are not sent to the vision model). Guards latency/cost on pathological uploads.',
+    applyMode: 'restart',
+    default: 5_000_000,
+    min: 100_000,
+    max: 20_000_000,
+    integer: true,
+  },
+  {
     key: 'KNOWLEDGE_SYNC_ENABLED',
     type: 'boolean',
     category: KNOWLEDGE,

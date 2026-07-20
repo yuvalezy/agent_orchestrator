@@ -51,6 +51,20 @@ export interface TriageContext {
    * src/knowledge/customer-brief.ts.
    */
   customerBrief?: string;
+  /**
+   * Vision (M-vision): screenshots the customer attached to the CURRENT message, decoded to base64.
+   * Fed to the extractor as image blocks so it reads the actual error/dialog instead of guessing
+   * from the caption. Optional (absent when AGENT_VISION_ENABLED is off, no image, or the media
+   * fetch failed → triage proceeds text-only). See src/inbox/inbound-media.ts + triage.service.
+   */
+  screenshots?: LlmImage[];
+  /**
+   * Module scoping (C): the portal modules/services this customer actually uses (e.g.
+   * ['financeApp','commerceApp','pilates-gal']). CONTEXT-ONLY — the extractor must never attribute
+   * behavior to a module NOT listed. Optional/absent = unscoped (the customer uses everything, the
+   * default). See src/customers/customer-modules.ts.
+   */
+  activeModules?: string[];
 }
 
 /**
@@ -81,10 +95,22 @@ export interface Intent {
   related_open_task_ref: string | null;
 }
 
+/** An image attached to a chat turn (customer screenshot fed to a vision-capable model).
+ *  `dataBase64` is the raw base64 (no data: prefix); `mediaType` is the IANA type
+ *  (image/jpeg|png|webp|gif). Only honoured by providers with supportsVision=true — a
+ *  non-vision provider MUST drop images (never send them) and fall back to text. */
+export interface LlmImage {
+  mediaType: string;
+  dataBase64: string;
+}
+
 /** A single chat turn passed to a provider. Placeholder shape (decision #4). */
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  /** Optional image blocks for a multimodal (vision) turn. Absent for the text-only path
+   *  (byte-identical to before). A provider without supportsVision ignores/strips these. */
+  images?: LlmImage[];
 }
 
 /** Token accounting returned by a provider call. Placeholder shape (decision #4). */
@@ -139,6 +165,13 @@ export interface DraftRequest {
    * exists yet, or the best-effort load failed). See src/knowledge/customer-brief.ts.
    */
   customerBrief?: string;
+  /**
+   * Module scoping (C): the portal modules/services this customer uses. Draft CONTEXT — the reply
+   * must never explain or attribute behavior to a module NOT listed (e.g. never describe a
+   * "maintenance module" to a customer who does not have it). NOT a citation source. Optional/absent
+   * = unscoped (the customer uses everything). See src/customers/customer-modules.ts.
+   */
+  activeModules?: string[];
 }
 
 /**
@@ -484,6 +517,11 @@ export interface ReviseRequest {
    * See src/knowledge/style-lane.ts.
    */
   voiceGuidance?: string[];
+  /**
+   * Module scoping (C), mirrored from DraftRequest so a regeneration also stays in-module. Draft
+   * CONTEXT — never attribute behavior to a module NOT listed. Optional/absent = unscoped.
+   */
+  activeModules?: string[];
 }
 
 /** Structured revise result — identical shape to DraftResult (the reviser reuses the
@@ -851,6 +889,10 @@ export interface LlmProviderClient {
   /** WP8: does this provider support the read-only tool loop (completeWithTools)? Absent/false =
    *  the agentic loop skips it (a non-supporting provider like DeepSeek cleanly reports unavailable). */
   readonly supportsTools?: boolean;
+  /** Vision (M-vision): does this provider accept image blocks on LlmMessage.images? Absent/false =
+   *  the router MUST strip images before calling it (and should prefer a vision provider when a call
+   *  carries images) so a text-only fallback never sends an image the provider will reject. */
+  readonly supportsVision?: boolean;
   complete(req: {
     model: string;
     system: string;

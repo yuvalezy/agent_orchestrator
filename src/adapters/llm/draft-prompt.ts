@@ -72,6 +72,14 @@ export const DRAFT_SYSTEM = [
   'number in used_sources, and never assert a capability, commitment, or fact that appears only there',
   '— grounding for anything the customer will read still comes ONLY from the numbered sources.',
   '',
+  'MODULES THIS CUSTOMER USES (when a "Modules this customer uses" section is present): those are the',
+  'ONLY portal modules/services this customer has. Never explain, reference, or attribute behavior to a',
+  'portal module that is NOT listed — e.g. never describe a "maintenance module" to a customer who does',
+  'not have it. If a question seems to need an unlisted module, do NOT assume the customer has it: say',
+  'you will check with the team rather than guess. This is SCOPE context, NOT a knowledge source —',
+  'never cite it and never list a number for it in used_sources (it has none). When the section is',
+  'ABSENT the customer is unscoped (they use everything) and this restriction does not apply.',
+  '',
   'In a gendered language, use the supplied recipient gender for adjectives/participles about them.',
   'When no gender is supplied you do NOT know it: use phrasing that works for anyone — never guess from',
   'the name, and never hedge with a slash ("Bienvenido/a"), which no native speaker writes.',
@@ -108,6 +116,14 @@ export function draftUserMessage(req: DraftRequest): string {
   const brief = req.customerBrief?.trim();
   if (brief) {
     parts.push('', 'Customer relationship brief (context — NOT a source, do NOT cite):', brief);
+  }
+  // Module scoping (C): the portal modules/services this customer uses. A DISTINCT, UN-numbered SCOPE
+  // line (not a source) so the model can never cite it or fold it into used_sources; it constrains
+  // which modules the reply may reference. Absent/empty ⇒ omitted entirely (unscoped = uses everything,
+  // and the output stays byte-identical to the pre-scoping prompt).
+  const modules = (req.activeModules ?? []).map((m) => m.trim()).filter((m) => m.length > 0);
+  if (modules.length > 0) {
+    parts.push('', `Modules this customer uses (SCOPE — NOT a source, do NOT cite): ${modules.join(', ')}`);
   }
   parts.push('', 'Knowledge sources (answer ONLY from these):');
   req.knowledge.forEach((k, i) => {

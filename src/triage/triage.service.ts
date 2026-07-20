@@ -1,5 +1,5 @@
 import { logger } from '../logger';
-import type { AgentLlmPort, Intent, KnowledgeChunk } from '../ports/llm.port';
+import type { AgentLlmPort, Intent, KnowledgeChunk, LlmImage } from '../ports/llm.port';
 import type { TargetTask, TaskTargetPort } from '../ports/task-target.port';
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import type { GroupSummaryPort, GroupSummary, GroupImageRef } from '../ports/group-summary.port';
@@ -11,6 +11,7 @@ import type { MeetingScheduler } from './meeting-scheduler';
 import type { CustomerBriefLoader } from '../knowledge/customer-brief';
 import { resolveContact, proposeAddContact, type ContactResolutionQueries } from '../customers/contact-resolution';
 import { loadCustomerConfig, buildTriageContext, type CustomerConfig } from './context-loader';
+import { getModuleScoping, buildModuleFilter, type ModuleScoping } from '../customers/customer-modules';
 import { decideDedup } from './dedup';
 import {
   recordTaskBridge,
@@ -210,6 +211,11 @@ export interface TriageDeps {
    *  Best-effort by contract (load returns null on a miss/error), so a brief read NEVER blocks triage;
    *  absent = no brief section (byte-for-byte the pre-feature context). */
   customerBrief?: CustomerBriefLoader;
+  /** Vision (M-vision, gated AGENT_VISION_ENABLED): loads the customer's attached screenshots for the
+   *  CURRENT message as decoded image blocks, so the extractor reads the actual error instead of the
+   *  caption. Best-effort by contract (→ [] on gate miss / fetch error); absent = text-only triage
+   *  (byte-identical to the pre-vision path). Wired in inbox-processor.factory. */
+  inboundScreenshots?: (row: ClaimedInbox) => Promise<LlmImage[]>;
 }
 
 /** How far back (minutes) the group-mention path pulls images for attach/reference
@@ -353,9 +359,14 @@ export class TriageService {
     const address = row.sender_address ?? '';
     const threadKey = row.channel_thread_id ?? address;
     const openTasks = await this.deps.taskTarget.findOpenTasks({ projectRef: config.projectRef });
+    // C (module scoping, mig 047): load this customer's module scoping ONCE — reused for retrieval
+    // (narrow the shared corpus) AND the extractor/draft prompt (tell the model which modules the
+    // customer uses). Best-effort → allow-all on any error, so a bad read never blocks or over-scopes.
+    const moduleScoping = await this.loadModuleScoping(customerId);
+    const moduleFilter = buildModuleFilter(moduleScoping); // string[] | null (null = allow-all)
     // M2a(b): scope RAG retrieval to THIS customer (customerId is the resolved,
     // known customer — never null here). Additive: [] when disabled or on error.
-    const knowledge = await this.retrieveKnowledge(row, customerId);
+    const knowledge = await this.retrieveKnowledge(row, customerId, moduleFilter);
     const priorTurns = row.channel_thread_id
       ? await loadPriorThreadConversation({
           instanceId: row.channel_instance_id,
@@ -369,6 +380,15 @@ export class TriageService {
     // blocks triage); absent loader (feature off) → no brief section.
     const customerBrief = await this.loadCustomerBrief(customerId);
     const context = buildTriageContext({ subject: row.subject, body: row.body }, config, openTasks, knowledge, priorTurns, customerBrief);
+    // C: tell the extractor which modules this customer uses (CONTEXT-ONLY) so it never reads an
+    // out-of-module doc as relevant. Only when actually scoped — absent = unscoped (allow-all).
+    if (moduleScoping.enabled && moduleScoping.modules.length > 0) context.activeModules = moduleScoping.modules;
+    // Vision: attach the customer's screenshots so the extractor reads the real error, not the caption.
+    // Best-effort — the loader swallows its own errors (→ []); absent dep = text-only (unchanged).
+    if (this.deps.inboundScreenshots) {
+      const shots = await this.deps.inboundScreenshots(row);
+      if (shots.length > 0) context.screenshots = shots;
+    }
     const intents = await this.deps.llm.extractIntents(context);
 
     if (intents.length === 0) {
@@ -382,7 +402,7 @@ export class TriageService {
     const createdThisRun = new Set<string>();
     const ccOnly = isCcOnly(row);
     for (const intent of intents) {
-      await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly, knowledge }, createdThisRun);
+      await this.act(intent, { row, config, customerId, threadKey, openTasks, ccOnly, knowledge, activeModules: context.activeModules }, createdThisRun);
     }
     await markProcessed(inboxId);
   }
@@ -394,12 +414,28 @@ export class TriageService {
    * wired (feature off) or the message has no text. The retriever swallows its own
    * errors (returns []), so triage is never blocked by a retrieval miss.
    */
-  private async retrieveKnowledge(row: ClaimedInbox, customerId: string): Promise<KnowledgeChunk[]> {
+  private async retrieveKnowledge(row: ClaimedInbox, customerId: string, moduleFilter: string[] | null): Promise<KnowledgeChunk[]> {
     const retriever = this.deps.knowledgeRetriever;
     if (!retriever) return [];
     const queryText = [row.subject, row.body].filter((s): s is string => !!s && s.trim().length > 0).join('\n');
     if (!queryText) return [];
-    return retriever.retrieve(queryText, customerId);
+    // C: narrow the SHARED corpus to the customer's modules (moduleFilter non-null) — null = allow-all.
+    return retriever.retrieve(queryText, customerId, { moduleList: moduleFilter ?? undefined });
+  }
+
+  /**
+   * C (module scoping): best-effort read of this customer's module scoping. Returns
+   * {enabled:false, modules:[]} (→ allow-all) on ANY error, so a module-read failure can never
+   * block the money loop or accidentally over-scope retrieval. Absent for a customer with no
+   * scoping row (the default: unscoped, uses everything).
+   */
+  private async loadModuleScoping(customerId: string): Promise<ModuleScoping> {
+    try {
+      return await getModuleScoping(customerId);
+    } catch (err) {
+      logger.warn({ customerId, reason: (err as Error)?.message }, 'triage: module scoping read failed — allow-all');
+      return { enabled: false, modules: [] };
+    }
   }
 
   /**
@@ -556,7 +592,7 @@ export class TriageService {
 
   private async act(
     intent: Intent,
-    ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[]; ccOnly: boolean; knowledge: KnowledgeChunk[] },
+    ctx: { row: ClaimedInbox; config: CustomerConfig; customerId: string; threadKey: string; openTasks: TargetTask[]; ccOnly: boolean; knowledge: KnowledgeChunk[]; activeModules?: string[] },
     createdThisRun: Set<string>,
   ): Promise<void> {
     const { row, config, customerId, threadKey } = ctx;
@@ -680,6 +716,7 @@ export class TriageService {
         threadKey,
         knowledge: ctx.knowledge,
         intent,
+        activeModules: ctx.activeModules,
       });
       return; // answerable question → cited draft, NOT a task (the drafter records its own draft_reply decision)
     }

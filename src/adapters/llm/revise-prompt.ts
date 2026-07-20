@@ -60,6 +60,14 @@ export const REVISE_SYSTEM = [
   '(it has no source number). Grounding still comes ONLY from the numbered knowledge sources',
   "and the founder's instruction; voice guidance shapes phrasing, never content.",
   '',
+  'MODULES THIS CUSTOMER USES (when a "Modules this customer uses" section is present): those are the',
+  'ONLY portal modules/services this customer has. Never explain, reference, or attribute behavior to a',
+  'portal module that is NOT listed — e.g. never describe a "maintenance module" to a customer who does',
+  'not have it. If a correction or question seems to need an unlisted module, do NOT assume the customer',
+  'has it: say you will check with the team rather than guess. This is SCOPE context, NOT a knowledge',
+  'source — never cite it and never list a number for it in used_sources (it has none). When the section',
+  'is ABSENT the customer is unscoped (they use everything) and this restriction does not apply.',
+  '',
   'Write the reply in the requested language. Return ONLY the structured object',
   '{"reply": "...", "used_sources": [n, ...]} where used_sources lists the 0-based indexes',
   'of the sources you actually relied on (empty if none applied). Do NOT put citation',
@@ -82,6 +90,13 @@ export function reviseUserMessage(req: ReviseRequest): string {
   if (voice.length > 0) {
     parts.push('', 'Persistent voice & tone guidance (HOW to write — directive, NOT a source, do NOT cite):');
     voice.forEach((g) => parts.push(`- ${g}`));
+  }
+  // Module scoping (C), mirrored from the draft prompt so a regeneration stays in-module. A DISTINCT,
+  // UN-numbered SCOPE line (not a source). Absent/empty ⇒ omitted (unscoped = uses everything; the
+  // output stays byte-identical to the pre-scoping prompt).
+  const modules = (req.activeModules ?? []).map((m) => m.trim()).filter((m) => m.length > 0);
+  if (modules.length > 0) {
+    parts.push('', `Modules this customer uses (SCOPE — NOT a source, do NOT cite): ${modules.join(', ')}`);
   }
   parts.push('', 'Knowledge sources (use ONLY these for customer facts):');
   req.knowledge.forEach((k, i) => {

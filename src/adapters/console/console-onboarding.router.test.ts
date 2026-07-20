@@ -23,7 +23,7 @@ function fakeService(overrides: Partial<OnboardingService> = {}): OnboardingServ
     async searchCustomers(): Promise<CustomerSearchResult[]> { return []; },
     async searchProjects(): Promise<ProjectSearchResult[]> { return []; },
     async listWorkItemTypes(): Promise<Array<{ ref: string; name: string }>> { return []; },
-    async previewCustomer(): Promise<CustomerPreview> { return { ref: BP, name: 'Acme', website: null, email: null, contacts: [], alreadyOnboarded: false }; },
+    async previewCustomer(): Promise<CustomerPreview> { return { ref: BP, name: 'Acme', website: null, email: null, contacts: [], alreadyOnboarded: false, customerId: null }; },
     async onboard(_input: OnboardCoreInput): Promise<OnboardResult> { return { ok: true, customerId: CUSTOMER, created: true, waBlocked: false, workItemTypeRef: WIT }; },
     async startBackfill(_id: string, _mode: BackfillMode): Promise<{ started: boolean; reason?: string }> { return { started: true }; },
     async backfillStatus(): Promise<BackfillState> { return { enabled: true, reason: null, status: null, running: false, dry: null }; },

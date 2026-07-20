@@ -367,3 +367,107 @@ test('fuseByRrf: keyword-only cap is overridable; distance breaks score ties det
   // A(vector rank1)=1/61; B(vector rank2)=1/62 → A first regardless; assert stable order.
   assert.deepEqual(tie.map((c) => c.id), ['Z', 'Y']);
 });
+
+// ── change 047: per-customer module scoping (SHARED leg ONLY) ────────────────────────
+// The shared retrieval leg is narrowed to (active modules ∪ globals) when a moduleList is supplied;
+// the CUSTOMER leg is NEVER filtered (own + custom docs always retrieve). The module list is a BOUND
+// array param, never interpolated. An absent/empty moduleList adds NO predicate — the SQL + values
+// are byte-identical to the pre-047 builders (the flag-off / allow-all path).
+
+const MODULE_PREDICATE = /metadata->>'module' = ANY\(\$\d+::text\[\]\) OR metadata->>'module' IS NULL/;
+
+test('047 buildSearchSql (customer) + moduleList: predicate on the SHARED leg ONLY, bound as a param', () => {
+  const modules = ['financeApp', 'commerceApp', 'settings'];
+  const { text, values } = buildSearchSql({
+    embedding: [0.1, 0.2],
+    customerId: 'cust-uuid-1',
+    kCustomer: 5,
+    kShared: 3,
+    maxDistance: 0.35,
+    moduleList: modules,
+  });
+  const sql = collapse(text);
+  const [customerLeg, sharedLeg] = sql.split('UNION ALL');
+
+  assert.doesNotMatch(customerLeg, MODULE_PREDICATE, 'the customer leg is NEVER module-filtered');
+  assert.match(sharedLeg, MODULE_PREDICATE, 'the shared leg gains the module predicate');
+  assert.equal((sql.match(MODULE_PREDICATE) ?? []).length, 1, 'exactly one module predicate (shared leg only)');
+
+  // The module list is the NEXT bound param ($6, after the 5 existing ones), never spliced in.
+  assert.match(sql, /= ANY\(\$6::text\[\]\)/, 'module list bound as $6');
+  assert.deepEqual(values, ['[0.1,0.2]', 'cust-uuid-1', 0.35, 5, 3, modules]);
+  assert.ok(!text.includes('financeApp'), 'module keys are parameterized, not interpolated');
+});
+
+test('047 buildSearchSql (shared-only) + moduleList: the single shared query gains the predicate as $4', () => {
+  const { text, values } = buildSearchSql({
+    embedding: [1, 2],
+    customerId: null,
+    kCustomer: 5,
+    kShared: 4,
+    maxDistance: 0.5,
+    moduleList: ['itemsApp'],
+  });
+  const sql = collapse(text);
+  assert.match(sql, MODULE_PREDICATE, 'the shared-only query is module-scoped');
+  assert.match(sql, /= ANY\(\$4::text\[\]\)/, 'bound after [vec, maxDistance, kShared] → $4');
+  assert.deepEqual(values, ['[1,2]', 0.5, 4, ['itemsApp']]);
+});
+
+test('047 buildSearchSql: an ABSENT or EMPTY moduleList adds NO predicate (allow-all, byte-identical)', () => {
+  const base = buildSearchSql({ embedding: [0.1, 0.2], customerId: 'cust-X', kCustomer: 5, kShared: 3, maxDistance: 0.5 });
+  const empty = buildSearchSql({ embedding: [0.1, 0.2], customerId: 'cust-X', kCustomer: 5, kShared: 3, maxDistance: 0.5, moduleList: [] });
+  assert.doesNotMatch(collapse(base.text), MODULE_PREDICATE, 'no moduleList → no predicate');
+  assert.equal(base.text, empty.text, 'an empty list yields the IDENTICAL SQL as no list');
+  assert.deepEqual(base.values, ['[0.1,0.2]', 'cust-X', 0.5, 5, 3], 'no extra param bound');
+  assert.deepEqual(empty.values, ['[0.1,0.2]', 'cust-X', 0.5, 5, 3], 'an empty list binds no extra param');
+});
+
+test('047 buildHybridVectorSql (customer) + moduleList: predicate on the SHARED leg ONLY, id still projected', () => {
+  const { text, values } = buildHybridVectorSql({
+    embedding: [0.1, 0.2],
+    customerId: 'cust-uuid-1',
+    kCustomer: 5,
+    kShared: 3,
+    maxDistance: 0.35,
+    moduleList: ['financeApp'],
+  });
+  const sql = collapse(text);
+  const [customerLeg, sharedLeg] = sql.split('UNION ALL');
+  assert.doesNotMatch(customerLeg, MODULE_PREDICATE, 'customer leg unfiltered');
+  assert.match(sharedLeg, MODULE_PREDICATE, 'shared leg filtered');
+  assert.match(sql, /id, content, metadata, memory_type/, 'the hybrid id projection is preserved');
+  assert.match(sql, /= ANY\(\$6::text\[\]\)/, 'module list bound as $6');
+  assert.deepEqual(values, ['[0.1,0.2]', 'cust-uuid-1', 0.35, 5, 3, ['financeApp']]);
+});
+
+test('047 buildKeywordSearchSql (customer) + moduleList: predicate on the SHARED FTS leg ONLY, bound as $5', () => {
+  const { text, values } = buildKeywordSearchSql({
+    embedding: [0.1, 0.2],
+    queryText: 'ubicación',
+    customerId: 'cust-uuid-1',
+    maxCandidates: KEYWORD_CANDIDATE_CAP,
+    moduleList: ['financeApp', 'commerceApp'],
+  });
+  const sql = collapse(text);
+  const [customerLeg, sharedLeg] = sql.split('UNION ALL');
+  assert.doesNotMatch(customerLeg, MODULE_PREDICATE, 'customer FTS leg unfiltered');
+  assert.match(sharedLeg, MODULE_PREDICATE, 'shared FTS leg filtered');
+  assert.match(sql, /= ANY\(\$5::text\[\]\)/, 'bound after [vec, queryText, customerId, maxCandidates] → $5');
+  assert.deepEqual(values, ['[0.1,0.2]', 'ubicación', 'cust-uuid-1', KEYWORD_CANDIDATE_CAP, ['financeApp', 'commerceApp']]);
+  assert.ok(!text.includes('financeApp'), 'module keys parameterized, not interpolated');
+});
+
+test('047 buildKeywordSearchSql (shared-only) + moduleList: single FTS query gains the predicate as $4', () => {
+  const { text, values } = buildKeywordSearchSql({
+    embedding: [1, 2],
+    queryText: 'invoices',
+    customerId: null,
+    maxCandidates: 2000,
+    moduleList: ['financeApp'],
+  });
+  const sql = collapse(text);
+  assert.match(sql, MODULE_PREDICATE, 'the shared-only FTS query is module-scoped');
+  assert.match(sql, /= ANY\(\$4::text\[\]\)/, 'bound after [vec, queryText, maxCandidates] → $4');
+  assert.deepEqual(values, ['[1,2]', 'invoices', 2000, ['financeApp']]);
+});

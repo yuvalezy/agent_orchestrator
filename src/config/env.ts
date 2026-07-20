@@ -99,6 +99,23 @@ export const envSchema = z.object({
   OPENAI_TRANSCRIBE_MODEL: z.string().default('gpt-4o-transcribe'),
   DEEPSEEK_BASE_URL: z.string().url().default('https://api.deepseek.com'),
 
+  // ── M-vision: 1:1 image attachments (customer error screenshots) fed to the vision-capable
+  // triage/draft model (Anthropic claude-sonnet-5) as image blocks, so the extractor reads the
+  // actual error/dialog instead of guessing from the caption. Kill-switch (mirrors the other
+  // strict-bool flags): the inbound-media loader is wired into triage ONLY when the literal
+  // "true"; unset/"false"/anything else → false. DORMANT by default so nothing fetches or
+  // forwards image bytes by surprise. ADDITIVE + best-effort everywhere — a fetch/gate miss
+  // degrades to text-only triage, never a failure. Bytes are fetched TRANSIENTLY (never
+  // persisted, never logged).
+  AGENT_VISION_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Hard ceiling on a single screenshot's declared filesize (bytes); a larger image is dropped
+  // by the gate (never fetched) so a huge attachment can't blow the request/token budget.
+  // 5 MB — above a typical phone screenshot, below the WhatsApp media cap.
+  AGENT_VISION_MAX_BYTES: z.coerce.number().int().positive().default(5_000_000),
+
   // ── M1.8: outbound delivery (NON-secret; the WRITE key WHATSAPP_MANAGER_WRITE_KEY
   // is a credential, resolved via resolveCredential — NEVER here). OUTBOUND_ENABLED
   // is the kill-switch: the drainer is registered ONLY when true. It is parsed as a

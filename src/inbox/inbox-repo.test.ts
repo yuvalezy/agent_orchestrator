@@ -77,3 +77,31 @@ test('the skip case: group + muted, mention absent → true/true/null', async (t
   const id = await seedRaw(`${TAG}mixed`, { metadata: { isGroup: true, chatMuted: true } });
   assert.deepEqual(await extractFlags(id), { is_group: true, chat_muted: true, mentions_me: null });
 });
+
+// ── M-vision: mirror claimBatch's raw_metadata->'media' extraction (inbox-repo.ts) verbatim ──────
+/** Mirrors claimBatch's media SELECT extraction (inbox-repo.ts) verbatim. */
+async function extractMedia(id: string): Promise<{ media_type: string | null; media_mimetype: string | null; media_status: string | null; media_filesize: number | null }> {
+  const { rows } = await query<{ media_type: string | null; media_mimetype: string | null; media_status: string | null; media_filesize: number | null }>(
+    `SELECT c.raw_metadata->'media'->>'mediaType' AS media_type,
+            c.raw_metadata->'media'->>'mimetype'  AS media_mimetype,
+            c.raw_metadata->'media'->>'status'    AS media_status,
+            (c.raw_metadata->'media'->>'filesize')::double precision AS media_filesize
+       FROM agent_inbox c WHERE c.id = $1`,
+    [id],
+  );
+  return rows[0];
+}
+
+test('media fields parse from raw_metadata->media (filesize is a real number, not a string)', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const id = await seedRaw(`${TAG}media`, { media: { mediaType: 'image', mimetype: 'image/png', status: 'downloaded', filesize: 48213 } });
+  const m = await extractMedia(id);
+  assert.deepEqual(m, { media_type: 'image', media_mimetype: 'image/png', media_status: 'downloaded', media_filesize: 48213 });
+  assert.equal(typeof m.media_filesize, 'number'); // ::double precision → JS number (an int8 cast would be a string)
+});
+
+test('media absent (text-only / backfill row) → all media fields null', async (t) => {
+  if (!(await dbReady())) return t.skip('no db');
+  const id = await seedRaw(`${TAG}nomedia`, { metadata: { isGroup: false } }); // no media key
+  assert.deepEqual(await extractMedia(id), { media_type: null, media_mimetype: null, media_status: null, media_filesize: null });
+});

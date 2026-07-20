@@ -54,6 +54,9 @@ export interface CustomerPreview {
   email: string | null;
   contacts: ContactPreview[];
   alreadyOnboarded: boolean;
+  /** The orchestrator customer id (agent_customers.id) when alreadyOnboarded — else null. Lets the
+   *  console open an already-onboarded customer straight into the module-scoping editor. */
+  customerId: string | null;
 }
 
 export type OnboardResult =
@@ -218,6 +221,7 @@ export function buildOnboardingService(deps: OnboardingServiceDeps = {}): Onboar
           isPrimary: c.isPrimary,
         })),
         alreadyOnboarded: Boolean(existing),
+        customerId: existing?.customerId ?? null,
       };
     },
 

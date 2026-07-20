@@ -21,7 +21,10 @@ import { buildNeedsInfoDrafter, type NeedsInfoDrafter } from '../../triage/needs
 import { buildCrossChannelDedup, type CrossChannelDedup } from '../../triage/cross-channel-dedup';
 import { searchConversationLinks, insertConversationLink } from '../../triage/conversation-link-repo';
 import { memoryRepo } from '../../knowledge/memory-repo';
-import { claimBatch, failStuck } from '../../inbox/inbox-repo';
+import { claimBatch, failStuck, type ClaimedInbox } from '../../inbox/inbox-repo';
+import { loadInboundScreenshots, type InboundMediaFetch } from '../../inbox/inbound-media';
+import type { LlmImage } from '../../ports/llm.port';
+import type { GroupSummaryPort } from '../../ports/group-summary.port';
 import { enqueueDraft, findOpenDraftByInbox } from '../../outbound/outbound-repo';
 import { recordDraftDecision } from '../../decisions/decisions';
 import { buildEzyPortalGateway } from '../ezy-portal';
@@ -102,6 +105,37 @@ function buildCustomerBriefLoaderGated(): CustomerBriefLoader | undefined {
   }
   logger.info('customer relationship brief wired (CUSTOMER_BRIEF_ENABLED=true) — injected as context-only into triage + drafting');
   return buildCustomerBriefLoader({ get: getCustomerBrief, log: logger });
+}
+
+/**
+ * Vision (M-vision): build the inbound-screenshot loader wired into triage — the composition root
+ * where the core loader (src/inbox/inbound-media.ts, ports-only) meets the whatsapp_manager media
+ * fetch (GroupSummaryPort.fetchMedia over the read key; D1: core never imports adapters). Gated by
+ * AGENT_VISION_ENABLED so it stays dormant → triage is text-only (byte-identical). Returns undefined
+ * when off. Reuses the SAME group-summary adapter instance already built for the group path — no new
+ * HTTP plumbing. Best-effort: a fetch error → null → the loader yields [] → text-only triage.
+ */
+function buildInboundScreenshotsGated(gs: GroupSummaryPort): ((row: ClaimedInbox) => Promise<LlmImage[]>) | undefined {
+  if (!env.AGENT_VISION_ENABLED) {
+    logger.info('inbound vision NOT wired (AGENT_VISION_ENABLED=false) — triage is text-only');
+    return undefined;
+  }
+  logger.info({ maxBytes: env.AGENT_VISION_MAX_BYTES }, 'inbound vision wired (AGENT_VISION_ENABLED=true) — screenshots fed to the extractor');
+  const fetch: InboundMediaFetch = async (ref) => {
+    try {
+      const { bytes, contentType } = await gs.fetchMedia(ref);
+      return { bytes, contentType };
+    } catch {
+      return null; // best-effort: a media miss/outage → text-only triage
+    }
+  };
+  const gate = { maxBytes: env.AGENT_VISION_MAX_BYTES };
+  return (row) =>
+    loadInboundScreenshots(
+      { ref: row.channel_message_id, mediaType: row.media_type, mimetype: row.media_mimetype, status: row.media_status, filesize: row.media_filesize },
+      fetch,
+      gate,
+    );
 }
 
 function buildResponseDrafterGated(
@@ -268,6 +302,9 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
   // WP6: one relationship-brief loader, shared by the triage context + the drafter (gated).
   const customerBrief = buildCustomerBriefLoaderGated();
 
+  // M2 group-mention path + vision share ONE group-summary adapter (media fetch over the read key).
+  const groupSummary = buildGroupSummaryAdapter();
+
   const triage = new TriageService({
     // A customer asking to talk books a call instead of minting a task (gated; dormant by
     // default). Given the UNDECORATED task target on purpose: its fallback creates the task a
@@ -285,7 +322,10 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
     bumpSkipped: () => incrementCounter(SKIPPED_COUNTER_KEY),
     // M2: the muted-group @-mention path (summarize over write key + media over
     // read key). Lazily-keyed adapter — no secret resolved at build.
-    groupSummary: buildGroupSummaryAdapter(),
+    groupSummary,
+    // Vision (gated AGENT_VISION_ENABLED): feed the customer's attached screenshots to the extractor
+    // so it reads the real error instead of the caption. Reuses the same group-summary media fetch.
+    inboundScreenshots: buildInboundScreenshotsGated(groupSummary),
     // M2a(b): scoped RAG retrieval into the triage context (gated; see below).
     knowledgeRetriever: buildTriageKnowledgeRetriever(),
     // M2a(c): cited-draft responder for answerable questions (gated; dormant by default).

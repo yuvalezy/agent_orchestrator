@@ -165,7 +165,13 @@ test('LOOP PROOF: a correction written for a customer is retrieved for a later s
   assert.equal(forB.length, 0, 'another customer never sees CUST-A feedback (scope isolation)');
 });
 
-test('LOOP PROOF (rejected): a REJECTED draft yields a customer-scoped lesson retrieved for a later similar question — and isolated', async () => {
+test('LOOP PROOF (rejected): a REJECTED draft persists a lesson but is NEVER returned as citable grounding (no poison-as-source)', async () => {
+  // A rejected draft's body is the WRONG answer; embedding it and then serving it back as a
+  // numbered grounding source is how a turned-down reply resurfaced as if it were documentation
+  // (the Pilates Gal "maintenance module" incident). New contract: the lesson is still WRITTEN
+  // (scope-checked below, and it still reaches the model via the customer-brief lane), but the
+  // grounding retriever EXCLUDES memory_type='feedback' outcome='rejected' — so it is never cited.
+  // (The modified LOOP PROOF above still surfaces, because a modified row carries the ACCEPTED answer.)
   // Parity with the modified LOOP PROOF, for the REJECT branch: a rejected draft must
   // (1) persist a customer-scoped feedback memory embedded on the rejected answer text,
   // and (2) surface for the SAME customer on a topically-similar later question, while
@@ -209,10 +215,10 @@ test('LOOP PROOF (rejected): a REJECTED draft yields a customer-scoped lesson re
 
   const retriever = buildKnowledgeRetriever({ embedding, search, options: { kCustomer: 5, kShared: 3, maxDistance: 100_000 } });
 
+  // The rejected lesson was WRITTEN (asserted above) — but the grounding retriever must NOT
+  // hand it back as a citable source, or the wrong answer resurfaces as documentation.
   const forA = await retriever.retrieve('Do you ship internationally to every country?', 'CUST-A');
-  assert.equal(forA.length, 1, 'CUST-A retrieves its own rejection lesson on a similar question');
-  assert.match(forA[0].content, /rejected and NOT sent/);
-  assert.match(forA[0].content, /We ship internationally to every country\./);
+  assert.equal(forA.length, 0, 'a rejected draft is never surfaced as grounding (it reaches the model via the brief lane, not as a cited source)');
 
   const forB = await retriever.retrieve('Do you ship internationally to every country?', 'CUST-B');
   assert.equal(forB.length, 0, 'another customer never sees CUST-A rejection lesson (scope isolation)');

@@ -1,25 +1,43 @@
 import { Router } from 'express';
 import type { OnboardingService } from '../onboarding';
+import {
+  listCustomerModules,
+  listModuleVocabulary,
+  getModuleScoping,
+  setOperatorModules,
+} from '../../customers/customer-modules';
 import { auditConsoleAction, type ConsoleAuditContext } from './console-repo';
 
 // Console Onboarding surface. Mounted under /console/api/onboarding (inherits the parent router's
 // session + CSRF + audit-context, like console-approvals/console-connectors). Search + preview are
-// GET reads (no CSRF); onboarding and the backfill triggers are CSRF-guarded mutations. All portal
-// I/O and persistence live in the injected OnboardingService — this router only validates input,
-// maps outcomes to status codes, and audits the writes.
+// GET reads (no CSRF); onboarding, the backfill triggers, and the module-scoping PUT are CSRF-guarded
+// mutations. All portal I/O and persistence live in the injected OnboardingService / customer-modules
+// core — this router only validates input, maps outcomes to status codes, and audits the writes.
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The customer-module (scoping, C) core queries the router reads — db-only, mirrors the customer-
+ *  modules module's exports. Injectable (like `audit`) so the router can be tested without a DB. */
+export interface CustomerModuleQueries {
+  listModuleVocabulary: typeof listModuleVocabulary;
+  listCustomerModules: typeof listCustomerModules;
+  getModuleScoping: typeof getModuleScoping;
+  setOperatorModules: typeof setOperatorModules;
+}
 
 export interface OnboardingRouterDeps {
   onboarding: OnboardingService;
   /** Best-effort audit sink (defaults to the console audit table). Injected as a no-op in tests. */
   audit?: typeof auditConsoleAction;
+  /** Module-scoping core queries (defaults to the real customer-modules db functions). */
+  modules?: CustomerModuleQueries;
 }
 
 export function buildConsoleOnboardingRouter(deps: OnboardingRouterDeps): Router {
   const router = Router();
   const { onboarding } = deps;
   const audit = deps.audit ?? auditConsoleAction;
+  const modules = deps.modules ?? { listModuleVocabulary, listCustomerModules, getModuleScoping, setOperatorModules };
 
   // ── Portal customer search (annotated with alreadyOnboarded) ────────────────
   router.get('/customers', async (req, res, next) => {
@@ -105,6 +123,48 @@ export function buildConsoleOnboardingRouter(deps: OnboardingRouterDeps): Router
       if (!started.started) return void res.status(409).json({ error: started.reason ?? 'could not start backfill' });
       await audit(res.locals.consoleAuditContext as ConsoleAuditContext, `onboarding.backfill.${mode}`, 'agent_customers', req.params.customerId, {});
       res.status(202).json({ data: { customerId: req.params.customerId, mode, started: true } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Module-scoping vocabulary (picker options: the distinct module keys across the corpus) ──
+  // Two literal segments, so it never collides with the `/:customerId/modules` param route below.
+  router.get('/modules/vocabulary', async (_req, res, next) => {
+    try {
+      res.json({ data: await modules.listModuleVocabulary() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── A customer's module set + the module_scoping_enabled flag (each row carries its source) ──
+  router.get('/:customerId/modules', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.customerId)) return void res.status(400).json({ error: 'invalid customer id' });
+    try {
+      const [rows, scoping] = await Promise.all([
+        modules.listCustomerModules(req.params.customerId),
+        modules.getModuleScoping(req.params.customerId),
+      ]);
+      res.json({ data: { modules: rows, moduleScopingEnabled: scoping.enabled } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Declare a customer's modules (CSRF-guarded, audited). Operator picks → source='operator',
+  //    deselected rows soft-removed, module_scoping_enabled turned on (all behind setOperatorModules) ─
+  router.put('/:customerId/modules', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.customerId)) return void res.status(400).json({ error: 'invalid customer id' });
+    const body = req.body as { moduleKeys?: unknown } | undefined;
+    if (!Array.isArray(body?.moduleKeys) || !body.moduleKeys.every((k) => typeof k === 'string')) {
+      return void res.status(400).json({ error: 'moduleKeys must be an array of strings' });
+    }
+    const moduleKeys = (body.moduleKeys as string[]).map((k) => k.trim()).filter((k) => k.length > 0);
+    try {
+      await modules.setOperatorModules(req.params.customerId, moduleKeys);
+      await audit(res.locals.consoleAuditContext as ConsoleAuditContext, 'onboarding.customer.modules', 'agent_customers', req.params.customerId, { moduleKeys });
+      res.json({ data: { customerId: req.params.customerId, moduleKeys } });
     } catch (err) {
       next(err);
     }

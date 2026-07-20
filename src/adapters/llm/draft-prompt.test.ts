@@ -85,3 +85,33 @@ test('DRAFT_SYSTEM: the relationship brief is context-only — apply for tone, n
   assert.ok(s.includes('never cite it'), 'the brief is never cited');
   assert.ok(s.includes('used_sources'), 'excludes the brief from used_sources');
 });
+
+// ── Module scoping (C): the customer uses only the listed modules; never attribute behavior to an
+//    unlisted portal module (the Pilates Gal "maintenance module" incident). ──
+
+test('draftUserMessage: active modules render as a distinct un-numbered SCOPE line, not a source', () => {
+  const msg = draftUserMessage(req({ activeModules: ['financeApp', 'commerceApp', 'pilates-gal'] }));
+  assert.match(msg, /Modules this customer uses \(SCOPE — NOT a source, do NOT cite\): financeApp, commerceApp, pilates-gal/);
+  // The knowledge source is still numbered [0]; the module scope line is NEVER numbered like a source.
+  assert.match(msg, /\[0\] Exports › Scheduling/);
+  assert.equal(/\[\d+\][^\n]*financeApp/.test(msg), false, 'the module scope is never emitted as a numbered [i] source');
+  // The scope line appears BEFORE the knowledge sources (it constrains what the answer may reference).
+  assert.ok(msg.indexOf('Modules this customer uses') < msg.indexOf('Knowledge sources'));
+});
+
+test('draftUserMessage: absent/empty/blank active modules ⇒ no scope line, and output is byte-identical (additive)', () => {
+  const baseline = draftUserMessage(req());
+  assert.equal(/Modules this customer uses/.test(baseline), false, 'absent → omitted');
+  // Additive guarantee: absent, empty, and blank-only all produce the SAME string as today's prompt.
+  assert.equal(draftUserMessage(req({ activeModules: undefined })), baseline, 'undefined → byte-identical');
+  assert.equal(draftUserMessage(req({ activeModules: [] })), baseline, 'empty → byte-identical');
+  assert.equal(draftUserMessage(req({ activeModules: ['   ', ''] })), baseline, 'blank-only → byte-identical');
+});
+
+test('DRAFT_SYSTEM: instructs the customer uses ONLY the listed modules and to defer, not invent, an unlisted one', () => {
+  const s = DRAFT_SYSTEM.toLowerCase();
+  assert.ok(s.includes('modules this customer uses'), 'names the module scope section');
+  assert.ok(s.includes('maintenance module'), 'gives the concrete never-invent example');
+  assert.ok(s.includes('not listed') || s.includes('unlisted'), 'forbids attributing behavior to an unlisted module');
+  assert.ok(s.includes('check with the team'), 'defers to the team rather than assuming an unlisted module');
+});

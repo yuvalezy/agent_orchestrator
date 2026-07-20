@@ -39,6 +39,10 @@ export class OpenAiCompatibleClient implements LlmProviderClient {
   // and DeepSeek report supportsTools=false and the loop cleanly falls back to the single-shot
   // engine when the tool-capable provider (Anthropic) is unavailable. completeWithTools is absent.
   readonly supportsTools = false;
+  // M-vision: OpenAI vision is NOT implemented here — declare it unsupported so the router
+  // STRIPS image blocks before falling back to this provider (a text-only fallback), rather
+  // than sending an image block it would reject. (DeepSeek is also OpenAI-compatible here.)
+  readonly supportsVision = false;
   private readonly baseUrl: string;
   private readonly resolveKey: () => string | undefined;
   private readonly structuredMode: StructuredMode;

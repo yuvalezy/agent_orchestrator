@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildDraftReviser,
   buildDraftReviseMessageHandler,
+  priorCitedRoutes,
   type DraftReviserDeps,
 } from './draft-revise';
 import type { DraftVerdict, KnowledgeChunk, ReviseRequest, ReviseResult, VerifyDraftRequest } from '../ports/llm.port';
@@ -44,7 +45,7 @@ const draft = (over: Partial<DraftForRevise> = {}): DraftForRevise => ({
 
 interface Cap {
   reviseReqs: ReviseRequest[];
-  retrieveCalls: Array<{ q: string; customerId: string | null }>;
+  retrieveCalls: Array<{ q: string; customerId: string | null; excludeRoutes?: readonly string[] }>;
   inboxReads: string[];
   reviseDraftCalls: Array<{ queueId: string; body: string; agentOutput: unknown; revision: { instruction: string; by: string }; verifierVerdict?: unknown }>;
   notifies: Array<{ customerId: string; n: Notification; buttons?: Array<{ id: string; label: string }> }>;
@@ -89,8 +90,8 @@ function makeDeps(over?: {
           },
     },
     retriever: {
-      retrieve: async (q: string, customerId: string | null) => {
-        cap.retrieveCalls.push({ q, customerId });
+      retrieve: async (q: string, customerId: string | null, opts?: { excludeRoutes?: readonly string[] }) => {
+        cap.retrieveCalls.push({ q, customerId, excludeRoutes: opts?.excludeRoutes });
         return over?.knowledge ?? [];
       },
     },
@@ -387,4 +388,46 @@ test('revise capture: empty/whitespace instruction → NOT consumed, marker stay
   await handler({ threadId: '42', text: '   \n ', by: 'u' });
   assert.equal(calls.length, 0, 'never regenerate on a blank instruction');
   assert.equal(map.get('42'), 'q7', 'marker stays armed for the next non-empty message');
+});
+
+// ── Revise deny-list (fix B) ─────────────────────────────────────────────────────────
+// The founder is correcting a draft grounded in specific docs; re-retrieval must exclude those
+// routes so it can't re-pull the same rejected sources (what let the maintenance answer survive
+// 3 revises). Routes are parsed from the prior draft's citation labels.
+
+test('priorCitedRoutes: parses the trailing (route) from citation labels, dedupes, tolerates junk', () => {
+  assert.deepEqual(
+    priorCitedRoutes({
+      citations: [
+        'Maintenance › Locations (/maintenance/locations)',
+        'Business Partner › Address (/bp)',
+        'Maintenance › Sites (/maintenance/locations)', // dup route
+        'no parens here',
+        42,
+      ],
+    }),
+    ['/maintenance/locations', '/bp'],
+  );
+  assert.deepEqual(priorCitedRoutes({}), [], 'no citations → []');
+  assert.deepEqual(priorCitedRoutes(null), [], 'non-object → []');
+});
+
+test('reviseFromInstruction: passes the prior draft’s cited routes to retrieval as the deny-list', async () => {
+  const { deps, cap } = makeDeps({
+    getDraft: draft({
+      agentOutput: {
+        intent: { category: 'question_existing', summary: 'Asked about ubicación', suggested_title: 't', priority: 'low', confidence: 0.9, explicit_action_request: true, related_open_task_ref: null },
+        draft_body: 'about the maintenance module…',
+        citations: ['Maintenance › Locations (/maintenance/locations)'],
+        language: 'es',
+        customer_name: 'Mary',
+      },
+    }),
+  });
+  const svc = buildDraftReviser(deps);
+
+  await svc.reviseFromInstruction({ queueId: 'q1', instruction: 'no es mantenimiento, es el socio de negocio', by: 'founder' });
+
+  assert.equal(cap.retrieveCalls.length, 1);
+  assert.deepEqual(cap.retrieveCalls[0].excludeRoutes, ['/maintenance/locations'], 'the just-rejected route is denied on re-retrieval');
 });

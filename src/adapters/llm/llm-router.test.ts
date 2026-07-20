@@ -1,7 +1,7 @@
 import { test, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { query, closePool } from '../../db';
-import type { LlmProviderClient, TokenUsage } from '../../ports/llm.port';
+import type { LlmMessage, LlmProviderClient, TokenUsage } from '../../ports/llm.port';
 import { LlmRouter, type LlmRole } from './llm-router';
 import { LlmProviderError, LlmAllProvidersFailed, CostCapExceeded } from './errors';
 
@@ -211,4 +211,87 @@ test('answerAgentically: tool-capable provider runs the loop and records cost pe
   );
   // 2 completeWithTools turns + 1 closing completeStructured = 3 cost rows.
   assert.ok(Number(rows[0].n) >= 3, 'cost recorded per provider call (2 loop turns + closing)');
+});
+
+// ── M-vision: router prefer + strip on an image-carrying triage call ──────────────────────────────
+// The extractor turn carries LlmMessage.images when TriageContext.screenshots is set. The router
+// must (a) PREFER a vision-capable provider and (b) STRIP images before any non-vision provider.
+// These fakes capture the exact messages they received. DB-guarded like the rest (extractIntents
+// records cost, customerId null → no agent_customers FK); each test clears its recent cost rows.
+
+type Capturing = LlmProviderClient & { called: boolean; lastMessages?: LlmMessage[] };
+
+function capturingClient(provider: string, opts: { vision: boolean; behavior?: 'auth-fail' }): Capturing {
+  const client: Capturing = {
+    provider,
+    supportsVision: opts.vision,
+    called: false,
+    complete: async () => ({ text: '', usage: { inputTokens: 1, outputTokens: 1 } }),
+    completeStructured: async <T>(req: { messages: LlmMessage[] }) => {
+      client.called = true;
+      client.lastMessages = req.messages;
+      if (opts.behavior === 'auth-fail') throw new LlmProviderError(provider, 'auth', 'bad key', 401);
+      return { value: VALID_INTENTS as unknown as T, usage: { inputTokens: 100, outputTokens: 20 } };
+    },
+  };
+  return client;
+}
+
+function visionRouter(providers: Record<string, LlmProviderClient>, defaultProvider: string, fallbackChain: string[]) {
+  return new LlmRouter({
+    providers,
+    defaultProvider,
+    fallbackChain,
+    modelFor: (p, role) => models[p]?.[role] ?? 'm',
+    dailyCapUsd: 10,
+    notifyAdmin: async () => {},
+  });
+}
+
+const SCREENSHOT = { mediaType: 'image/png', dataBase64: 'AAAA' };
+
+test('vision: a screenshot call PREFERS the vision-capable provider (even when it is only the fallback)', async (t) => {
+  if (!(await ensureDb())) return t.skip('no db');
+  await query(`DELETE FROM llm_costs WHERE created_at > now() - interval '1 min'`).catch(() => {});
+  const vision = capturingClient('anthropic', { vision: true });
+  const nonVision = capturingClient('openai', { vision: false });
+  // Non-vision is the DEFAULT/preferred; the vision provider is only in the fallback chain.
+  const router = visionRouter({ openai: nonVision, anthropic: vision }, 'openai', ['anthropic']);
+  const intents = await router.extractIntents({ ...CANNED, screenshots: [SCREENSHOT] });
+  assert.equal(intents[0].category, 'bug_report');
+  assert.equal(vision.called, true, 'vision provider was preferred');
+  assert.equal(nonVision.called, false, 'non-vision provider was skipped');
+  assert.equal(vision.lastMessages?.[0].images?.length, 1, 'images reached the vision provider intact');
+});
+
+test('vision: a non-vision FALLBACK receives the images STRIPPED (never an image block it would reject)', async (t) => {
+  if (!(await ensureDb())) return t.skip('no db');
+  await query(`DELETE FROM llm_costs WHERE created_at > now() - interval '1 min'`).catch(() => {});
+  const vision = capturingClient('anthropic', { vision: true, behavior: 'auth-fail' });
+  const nonVision = capturingClient('openai', { vision: false });
+  const router = visionRouter({ anthropic: vision, openai: nonVision }, 'anthropic', ['openai']);
+  const intents = await router.extractIntents({ ...CANNED, screenshots: [SCREENSHOT] });
+  assert.equal(intents[0].category, 'bug_report'); // fallback rescued
+  assert.equal(vision.lastMessages?.[0].images?.length, 1, 'the vision primary got the images');
+  assert.equal(nonVision.called, true);
+  assert.equal(nonVision.lastMessages?.[0].images, undefined, 'the non-vision fallback got a text-only turn');
+});
+
+test('vision: with only a non-vision provider, images are stripped before the call', async (t) => {
+  if (!(await ensureDb())) return t.skip('no db');
+  await query(`DELETE FROM llm_costs WHERE created_at > now() - interval '1 min'`).catch(() => {});
+  const nonVision = capturingClient('openai', { vision: false });
+  const router = visionRouter({ openai: nonVision }, 'openai', []);
+  const intents = await router.extractIntents({ ...CANNED, screenshots: [SCREENSHOT] });
+  assert.equal(intents[0].category, 'bug_report');
+  assert.equal(nonVision.lastMessages?.[0].images, undefined, 'no image block sent to a non-vision provider');
+});
+
+test('vision: a text-only triage call attaches NO images (byte-identical to before)', async (t) => {
+  if (!(await ensureDb())) return t.skip('no db');
+  await query(`DELETE FROM llm_costs WHERE created_at > now() - interval '1 min'`).catch(() => {});
+  const vision = capturingClient('anthropic', { vision: true });
+  const router = visionRouter({ anthropic: vision }, 'anthropic', []);
+  await router.extractIntents(CANNED); // no screenshots on the context
+  assert.equal(vision.lastMessages?.[0].images, undefined, 'no images field when the context carries no screenshots');
 });
