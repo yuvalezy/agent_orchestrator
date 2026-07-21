@@ -12,6 +12,7 @@ import { CustomerScreen } from './CustomerScreen';
 import { ActivityScreen } from './ActivityScreen';
 import { AssistantScreen } from './AssistantScreen';
 import { CalendarScreen } from './CalendarScreen';
+import { ReminderSheet } from './ReminderSheet';
 import { SettingsSheet, type InstallPrompt } from './SettingsSheet';
 import type { AppConfig } from './types';
 
@@ -54,6 +55,7 @@ function AppShell({ onLoggedOut }: { onLoggedOut: () => void }): ReactElement {
   const navigate = useNavigate();
   const { config, deviceLabel, feed } = useAppData();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [remindersOpen, setRemindersOpen] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPrompt | null>(null);
 
   useEffect(() => {
@@ -82,7 +84,7 @@ function AppShell({ onLoggedOut }: { onLoggedOut: () => void }): ReactElement {
   };
 
   return (
-    <UiProvider openSettings={() => setSettingsOpen(true)}>
+    <UiProvider openSettings={() => setSettingsOpen(true)} openReminders={() => setRemindersOpen(true)}>
       <div className="flex h-[100dvh] flex-col">
         <main className="min-h-0 flex-1 overflow-hidden">
           <Routes>
@@ -107,6 +109,7 @@ function AppShell({ onLoggedOut }: { onLoggedOut: () => void }): ReactElement {
         installPrompt={installPrompt}
         onLogout={() => void logout()}
       />
+      <ReminderSheet open={remindersOpen} onClose={() => setRemindersOpen(false)} />
     </UiProvider>
   );
 }

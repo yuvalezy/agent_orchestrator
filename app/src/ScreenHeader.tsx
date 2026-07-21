@@ -1,8 +1,7 @@
 import { type ReactElement, type ReactNode } from 'react';
-import { CalendarDays, ChevronLeft, Settings } from 'lucide-react';
+import { BellPlus, CalendarDays, ChevronLeft, Settings } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { useOpenSettings } from './Ui';
-import { ReminderSheet } from './ReminderSheet';
+import { useOpenReminders, useOpenSettings } from './Ui';
 
 /** The sticky top bar every cockpit screen shares: optional back button, title +
  *  subtitle, and either a custom trailing slot or (on top-level screens) a settings gear. */
@@ -20,6 +19,7 @@ export function ScreenHeader({
   trailing?: ReactNode;
 }): ReactElement {
   const openSettings = useOpenSettings();
+  const openReminders = useOpenReminders();
   const navigate = useNavigate();
   return (
     <header className="safe-top safe-x z-10 flex shrink-0 items-center gap-2 border-b border-zinc-800/80 bg-zinc-950/85 px-3 py-3 backdrop-blur-xl">
@@ -38,7 +38,9 @@ export function ScreenHeader({
           <button aria-label="Calendar" onClick={() => navigate('/calendar')} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
             <CalendarDays size={20} />
           </button>
-          <ReminderSheet />
+          <button aria-label="Reminders" onClick={openReminders} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
+            <BellPlus size={20} />
+          </button>
           <button aria-label="Settings" onClick={openSettings} className="grid size-10 shrink-0 place-items-center rounded-full text-zinc-400 active:bg-zinc-800">
             <Settings size={20} />
           </button>

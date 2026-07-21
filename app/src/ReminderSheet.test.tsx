@@ -29,8 +29,7 @@ function route(overrides: { list?: unknown[]; del?: string } = {}) {
 }
 
 function openSheet(): void {
-  render(<ReminderSheet />);
-  fireEvent.click(screen.getByRole('button', { name: 'Reminders' }));
+  render(<ReminderSheet open onClose={() => {}} />);
 }
 
 describe('ReminderSheet', () => {
