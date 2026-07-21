@@ -8,12 +8,14 @@ import {
   getMessage,
   insertChatExchange,
   insertMessage,
+  listAllFounderAppDevices,
   listChatMessages,
   listRecentChatTurns,
   markDecidedByRef,
   markDecidedById,
   planDismiss,
   resetChatSession,
+  revokeDeviceById,
   type FeedMessage,
   type InsertMessageInput,
 } from './founder-app-repo';
@@ -63,6 +65,7 @@ test('an unknown message is a refusal the router can turn into a 404', () => {
 
 const created: string[] = [];
 const chatScopes: string[] = [];
+const createdDevices: string[] = [];
 
 async function migrated(): Promise<boolean> {
   const res = await query(
@@ -90,6 +93,9 @@ after(async () => {
   }
   if (chatScopes.length > 0) {
     await query('DELETE FROM founder_app_chat_sessions WHERE scope_key = ANY($1::text[])', [chatScopes]).catch(() => {});
+  }
+  if (createdDevices.length > 0) {
+    await query('DELETE FROM founder_app_devices WHERE id = ANY($1::uuid[])', [createdDevices]).catch(() => {});
   }
   await closePool();
 });
@@ -216,4 +222,70 @@ test('markDecidedById clears exactly one card (a typed-time booking whose option
   assert.equal((await getMessage(slot.id))?.decidedOptionId, 'mtyped');
   assert.equal((await getMessage(sibling.id))?.decidedOptionId, null); // by-id never touches neighbours
   assert.equal(await markDecidedById(slot.id, 'mtyped'), null); // first-writer-wins
+});
+
+// ── Console subscribers admin repo (founder_app_devices) ─────────────────────────────────
+
+async function devicesMigrated(): Promise<boolean> {
+  const res = await query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'founder_app_devices' AND column_name = 'revoked_at'`,
+  ).catch(() => null);
+  return Boolean(res?.rows[0]);
+}
+
+async function seedDevice(opts: { pushEnabled?: boolean; revoked?: boolean; label?: string | null } = {}): Promise<string> {
+  const hash = crypto.createHash('sha256').update(crypto.randomUUID()).digest('hex');
+  const { rows } = await query<{ id: string }>(
+    `INSERT INTO founder_app_devices (token_hash, label, push_enabled, revoked_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (token_hash) DO UPDATE SET token_hash = EXCLUDED.token_hash
+     RETURNING id::text`,
+    [hash, opts.label ?? null, opts.pushEnabled ?? false, opts.revoked ? new Date().toISOString() : null],
+  );
+  return rows[0].id;
+}
+
+test('listAllFounderAppDevices returns every row including revoked, never fcm_token or token_hash', async (t) => {
+  if (!(await devicesMigrated())) return t.skip('migration 037 not applied to this database');
+  const activeId = await seedDevice({ pushEnabled: true, label: 'iPhone' });
+  const offId = await seedDevice({ pushEnabled: false });
+  const revokedId = await seedDevice({ pushEnabled: true, revoked: true });
+  createdDevices.push(activeId, offId, revokedId);
+
+  const rows = await listAllFounderAppDevices();
+  const ids = new Set(rows.map((r) => r.id));
+  assert.ok(ids.has(activeId) && ids.has(offId) && ids.has(revokedId), 'all three states appear in the admin list');
+
+  const active = rows.find((r) => r.id === activeId)!;
+  assert.equal(active.label, 'iPhone');
+  assert.equal(active.pushEnabled, true);
+  assert.equal(active.revokedAt, null);
+  assert.equal(typeof active.failureCount, 'number');
+  assert.equal(typeof active.createdAt, 'string');
+  assert.equal(typeof active.lastSeenAt, 'string');
+
+  const revoked = rows.find((r) => r.id === revokedId)!;
+  assert.ok(revoked.revokedAt, 'revoked row carries a non-null revokedAt');
+
+  // Never expose the opaque device token digest or the FCM registration token.
+  const serialized = JSON.stringify(rows);
+  assert.equal(serialized.includes('fcmToken'), false);
+  assert.equal(serialized.includes('fcm_token'), false);
+  assert.equal(serialized.includes('token_hash'), false);
+  assert.equal(serialized.includes('tokenHash'), false);
+});
+
+test('revokeDeviceById is idempotent: first call stamps now, second call returns the same ts, unknown id → null', async (t) => {
+  if (!(await devicesMigrated())) return t.skip('migration 037 not applied to this database');
+  const id = await seedDevice({ pushEnabled: true });
+  createdDevices.push(id);
+
+  const first = await revokeDeviceById(id);
+  assert.ok(first, 'first revoke returns a timestamp');
+  const second = await revokeDeviceById(id);
+  assert.equal(second, first, 'a second revoke returns the SAME timestamp (idempotent)');
+
+  const unknown = crypto.randomUUID();
+  assert.equal(await revokeDeviceById(unknown), null, 'unknown id → null (router turns into 404)');
 });

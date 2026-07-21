@@ -20,6 +20,7 @@ import type { QueryService } from '../../query/query-service';
 import { listUrgencyInbox } from './console-urgency-repo';
 import { portalTaskUrl } from '../shared/portal-url';
 import { buildConsolePushRouter } from './console-push.router';
+import { buildConsoleSubscribersRouter } from './console-subscribers.router';
 import { buildConsoleOnboardingRouter } from './console-onboarding.router';
 import type { OnboardingService } from '../onboarding';
 import type { WebPushConfig } from '../../config/web-push';
@@ -434,6 +435,7 @@ export function buildConsoleRouter(config: ConsoleConfig, assetsDir?: string, de
 
   router.use('/api/approvals', buildConsoleApprovalsRouter());
   router.use('/api/push', buildConsolePushRouter(deps.webPush ?? null));
+  router.use('/api/subscribers', buildConsoleSubscribersRouter());
   router.use('/api/settings', buildConsoleSettingsRouter());
   router.use('/api/connectors', buildConsoleConnectorsRouter({ sessionSecret: config.sessionSecret }));
   if (deps.onboarding) router.use('/api/onboarding', buildConsoleOnboardingRouter({ onboarding: deps.onboarding }));

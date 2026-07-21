@@ -14,6 +14,7 @@ import { QueryView } from './QueryView';
 import { UrgencyInboxView } from './UrgencyInboxView';
 import { OnboardingView } from './OnboardingView';
 import { ModulesPanel } from './ModulesPanel';
+import { DevicesView } from './DevicesView';
 
 type Overview = {
   data: {
@@ -51,6 +52,7 @@ const nav = [
   ['memory', 'Memory', BookOpen],
   ['query', 'Ask the system', MessageSquareText],
   ['settings', 'Settings', SlidersHorizontal],
+  ['devices', 'Devices', Smartphone],
   ['connectors', 'Connectors', Plug],
 ] as const;
 type View = typeof nav[number][0];
@@ -161,7 +163,7 @@ function Console({ onLogout }: { onLogout: () => void }): ReactElement {
     {menuOpen && <button aria-label="Close navigation" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 bg-black/60 md:hidden" />}
     <main className="min-h-screen md:ml-64">
       <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-zinc-800 bg-zinc-950/85 px-5 backdrop-blur"><button onClick={() => setMenuOpen(true)} className="md:hidden"><Menu /></button><div className="text-sm text-zinc-400">Founder-only · Tailscale protected</div><button onClick={() => client.invalidateQueries()} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900 hover:text-white" title="Refresh"><RefreshCw size={17} /></button></header>
-      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'urgency' && <UrgencyInboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'onboarding' && <OnboardingView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'memory' && <MemoryView />}{view === 'query' && <QueryView />}{view === 'settings' && <SettingsView />}{view === 'connectors' && <ConnectorsView />}</div>
+      <div className="mx-auto max-w-7xl p-5 md:p-8">{view === 'overview' && <OverviewView onSelect={choose} />}{view === 'approvals' && <ApprovalsView />}{view === 'workers' && <WorkersView />}{view === 'inbox' && <InboxView />}{view === 'urgency' && <UrgencyInboxView />}{view === 'outbound' && <OutboundView />}{view === 'customers' && <CustomersView />}{view === 'onboarding' && <OnboardingView />}{view === 'decisions' && <DecisionsView />}{view === 'insights' && <InsightsView />}{view === 'memory' && <MemoryView />}{view === 'query' && <QueryView />}{view === 'settings' && <SettingsView />}{view === 'devices' && <DevicesView />}{view === 'connectors' && <ConnectorsView />}</div>
     </main>
   </div>;
 }

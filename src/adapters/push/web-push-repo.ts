@@ -108,6 +108,65 @@ export async function activePushSubscriptions(limit = 10): Promise<ActivePushSub
   return subscriptions;
 }
 
+// Admin console list shape (founder-console subscribers surface). Never decrypts —
+// exposes only a 12-char hex prefix of the endpoint_hash as a stable identifier.
+export interface PushSubscriptionAdminRow {
+  id: string;
+  endpointPrefix: string;
+  disabledAt: string | null;
+  failureCount: number;
+  lastFailureKind: string | null;
+  lastSeenAt: string;
+  createdAt: string;
+}
+
+function toIso(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+/** ALL browser subscriptions (active + disabled) for the founder-console list. Never decrypts. */
+export async function listAllPushSubscriptions(): Promise<PushSubscriptionAdminRow[]> {
+  const { rows } = await query<{
+    id: string;
+    endpoint_prefix: string;
+    disabled_at: Date | string | null;
+    failure_count: number;
+    last_failure_kind: string | null;
+    last_seen_at: Date | string;
+    created_at: Date | string;
+  }>(
+    `SELECT id::text                                  AS id,
+            encode(substring(endpoint_hash::bytea from 1 for 6), 'hex') AS endpoint_prefix,
+            disabled_at,
+            failure_count,
+            last_failure_kind,
+            last_seen_at,
+            created_at
+       FROM founder_push_subscriptions
+      ORDER BY last_seen_at DESC`,
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    endpointPrefix: row.endpoint_prefix,
+    disabledAt: row.disabled_at ? toIso(row.disabled_at) : null,
+    failureCount: row.failure_count,
+    lastFailureKind: row.last_failure_kind,
+    lastSeenAt: toIso(row.last_seen_at),
+    createdAt: toIso(row.created_at),
+  }));
+}
+
+/** Read one subscription's disabled_at for the console-remove 404 check and audit
+ *  before_status. Returns null when no such id exists. Never decrypts. */
+export async function getPushSubscriptionState(id: string): Promise<{ disabledAt: string | null } | null> {
+  const { rows } = await query<{ disabled_at: Date | string | null }>(
+    `SELECT disabled_at FROM founder_push_subscriptions WHERE id = $1`,
+    [id],
+  );
+  if (!rows[0]) return null;
+  return { disabledAt: rows[0].disabled_at ? toIso(rows[0].disabled_at) : null };
+}
+
 export async function disablePushSubscription(id: string, reason: 'invalid' | 'gone'): Promise<void> {
   await query(
     `UPDATE founder_push_subscriptions

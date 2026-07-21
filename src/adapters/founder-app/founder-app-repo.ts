@@ -180,6 +180,84 @@ export async function listPushDevices(): Promise<FounderAppDevice[]> {
   return rows.map(mapDevice);
 }
 
+// Admin console list shape (founder-console subscribers surface). Excludes the
+// sensitive fcm_token / token_hash text — only the push_enabled boolean is exposed.
+export interface FounderAppDeviceAdminRow {
+  id: string;
+  label: string | null;
+  pushEnabled: boolean;
+  failureCount: number;
+  createdAt: string;
+  lastSeenAt: string;
+  revokedAt: string | null;
+}
+
+/** ALL devices for the founder-console subscribers list (active, push-off, revoked). */
+export async function listAllFounderAppDevices(): Promise<FounderAppDeviceAdminRow[]> {
+  const { rows } = await query<{
+    id: string;
+    label: string | null;
+    push_enabled: boolean;
+    failure_count: number;
+    created_at: Date | string;
+    last_seen_at: Date | string;
+    revoked_at: Date | string | null;
+  }>(
+    `SELECT id, label, push_enabled, failure_count, created_at, last_seen_at, revoked_at
+       FROM founder_app_devices
+      ORDER BY last_seen_at DESC`,
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    label: row.label,
+    pushEnabled: row.push_enabled,
+    failureCount: row.failure_count,
+    createdAt: toIso(row.created_at),
+    lastSeenAt: toIso(row.last_seen_at),
+    revokedAt: row.revoked_at ? toIso(row.revoked_at) : null,
+  }));
+}
+
+/** The console-subscribers view of one device: just enough to gate a 404 and to record
+ *  the before_status audit field. Never selects fcm_token / token_hash text. */
+export interface FounderAppDeviceState {
+  pushEnabled: boolean;
+  revokedAt: string | null;
+}
+
+/** Read the console-relevant state of one device. Returns null when no such id exists. */
+export async function getFounderAppDeviceState(id: string): Promise<FounderAppDeviceState | null> {
+  const { rows } = await query<{ push_enabled: boolean; revoked_at: Date | string | null }>(
+    `SELECT push_enabled, revoked_at FROM founder_app_devices WHERE id = $1`,
+    [id],
+  );
+  if (!rows[0]) return null;
+  return {
+    pushEnabled: rows[0].push_enabled,
+    revokedAt: rows[0].revoked_at ? toIso(rows[0].revoked_at) : null,
+  };
+}
+
+/**
+ * Revoke a device by its id (founder-console). Returns the new revoked_at on first
+ * revoke, the existing revoked_at if already revoked, or null when no such id exists
+ * (so the router can distinguish the idempotent second-call case from a 404).
+ */
+export async function revokeDeviceById(id: string): Promise<string | null> {
+  const update = await query<{ revoked_at: Date | string }>(
+    `UPDATE founder_app_devices SET revoked_at = now()
+      WHERE id = $1 AND revoked_at IS NULL
+      RETURNING revoked_at`,
+    [id],
+  );
+  if (update.rows[0]) return toIso(update.rows[0].revoked_at);
+  const existing = await query<{ revoked_at: Date | string | null }>(
+    `SELECT revoked_at FROM founder_app_devices WHERE id = $1`,
+    [id],
+  );
+  return existing.rows[0]?.revoked_at ? toIso(existing.rows[0].revoked_at as Date | string) : null;
+}
+
 const MESSAGE_COLUMNS =
   'id, direction, kind, title, body, severity, customer_ref, notification_ref, buttons, decided_option_id, link_url, context, dismissed_at, chat_session_id, conversation_relation, created_at';
 
