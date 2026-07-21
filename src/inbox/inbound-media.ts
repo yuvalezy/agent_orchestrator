@@ -47,9 +47,13 @@ export async function loadInboundScreenshots(
   } catch {
     return []; // best-effort: a media-fetch failure NEVER blocks triage
   }
-  if (!fetched || fetched.bytes.length === 0) return [];
+  if (!fetched || fetched.bytes.length === 0 || fetched.bytes.length > gate.maxBytes) return [];
 
-  // Use the gated (validated) mimetype for the block, not the fetched content-type — it already
-  // cleared IMAGE_MIMETYPES, so it is a type the vision model accepts.
-  return [{ mediaType: mimetype, dataBase64: Buffer.from(fetched.bytes).toString('base64') }];
+  // Metadata is untrusted and can be stale. Validate the response type independently and use it
+  // for the model block so a server returning HTML/PDF under an image descriptor cannot smuggle
+  // unsupported content into the vision request. Parameters such as `; charset=binary` are legal.
+  const fetchedType = fetched.contentType.split(';', 1)[0]?.trim().toLowerCase() ?? '';
+  if (!IMAGE_MIMETYPES.has(fetchedType)) return [];
+
+  return [{ mediaType: fetchedType, dataBase64: Buffer.from(fetched.bytes).toString('base64') }];
 }

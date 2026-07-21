@@ -313,10 +313,9 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
   // contract test distinguish them (R45).
   //
   // ⚠ R47: the portal's projects/tasks module does NOT honor Idempotency-Key (only
-  // the bp module wired that middleware), so a transport-retry after a committed
-  // create would DOUBLE-create. `createTask` is therefore NOT exactly-once on its
-  // own — M1.5b's pre-create findOpenTasks(sourceEntity) reconcile is the
-  // compensating control (and a portal-side idempotency handler is the real fix).
+  // the bp module wired that middleware), so this endpoint is deliberately sent
+  // ONCE. A transport failure is ambiguous and propagates; the workflow's next
+  // attempt reconciles by the source triple before deciding whether to create.
 
   async createTask(input: {
     customerRef: string;
@@ -329,7 +328,7 @@ export class EzyPortalGateway implements CustomerDirectoryPort, TaskTargetPort, 
     tags: string[];
     dueAt?: Date;
   }): Promise<TaskRef> {
-    const created = await this.http.post<EzyTask>('/api/projects/tasks', {
+    const created = await this.http.postNonIdempotent<EzyTask>('/api/projects/tasks', {
       projectId: input.projectRef,
       workItemTypeId: input.workItemTypeRef,
       title: truncateRunes(input.title, TITLE_MAX),

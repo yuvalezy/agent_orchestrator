@@ -71,3 +71,27 @@ test('fetch returns null or empty bytes → [] (no image block)', async () => {
     [],
   );
 });
+
+test('reject: fetched bytes exceed the gate even when declared filesize is small', async () => {
+  const oversized = new Uint8Array(GATE.maxBytes + 1);
+  assert.deepEqual(
+    await loadInboundScreenshots(okInput({ filesize: 1 }), async () => ({ bytes: oversized, contentType: 'image/png' }), GATE),
+    [],
+  );
+});
+
+test('reject: fetched content type is not a supported image even when metadata says image/png', async () => {
+  assert.deepEqual(
+    await loadInboundScreenshots(okInput(), async () => ({ bytes: new Uint8Array([1]), contentType: 'text/html' }), GATE),
+    [],
+  );
+});
+
+test('uses normalized fetched content type after independently validating it', async () => {
+  const out = await loadInboundScreenshots(
+    okInput({ mimetype: 'image/png' }),
+    async () => ({ bytes: new Uint8Array([1]), contentType: 'IMAGE/JPEG; charset=binary' }),
+    GATE,
+  );
+  assert.equal(out[0]?.mediaType, 'image/jpeg');
+});

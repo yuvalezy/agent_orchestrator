@@ -1,93 +1,103 @@
 # agent-orchestrator
 
-Solo-founder chief-of-staff service: normalizes inbound customer messages
-(WhatsApp via whatsapp_manager, Gmail ×2, EZY Portal service desk) into an inbox,
-triages them into EZY Portal tasks/comments, and notifies the founder on
-Telegram. This repo is the **M1.1 service skeleton** — DB schema, ports, worker
-framework, `/health`, and the D1 import boundary. No channel adapters, LLM
-router, or credentials store yet (those are M1.2+).
+A production-oriented chief-of-staff service for a solo founder. It ingests customer
+conversations from Gmail, WhatsApp, and EZY Portal, enriches them with customer and
+project context, uses routed LLMs to triage and draft actions, and keeps delivery,
+scheduling, decisions, reminders, knowledge, and follow-up work durable in Postgres.
 
-See the plan in `docs/plan/` (project invariants in
-`project.md`, this milestone's contract in
-`blueprints/M1.1-orchestrator-scaffold.md`).
+The service includes two founder surfaces: an operations console in `web/` and the
+AO Founder PWA in `app/`. See `docs/plan/project.md` for the architecture invariants
+and `docs/plan/blueprints/` for feature-level decisions.
 
-## Architecture invariants (do not violate)
+## Architecture
 
-- **Ports & adapters (D1).** Core (`inbox`, `triage`, `customers`, `outbound`,
-  `decisions`, `ports`) depends only on port interfaces in `src/ports/`. Adapters
-  live in `src/adapters/` and are wired **only** in `src/main.ts`. Enforced by
-  ESLint `import/no-restricted-paths` + the fail-closed `lint:boundary` guard.
-- **Channels are pluggable instances, not enums.** No `CHECK (channel IN …)`
-  anywhere; everything references `channel_instances(id)`. Adding a channel = new
-  adapter + new row, zero schema change.
-- **Own database.** Separate `agent_orchestrator` DB on the shared Postgres. Never
-  reads/writes the whatsapp_manager DB — WhatsApp I/O is HTTP-only (D3).
-- **Inbox pattern.** All inbound lands in `agent_inbox`; all outbound goes through
-  `agent_outbound_queue`. Workers claim rows with `FOR UPDATE SKIP LOCKED`.
-- **No message content in logs** — IDs and metadata only.
-- **Opaque refs.** `bp_ref` / `project_ref` / `work_item_type_ref` / `task_ref`
-  stay `TEXT`; core never parses them.
+- Core domains (`inbox`, `triage`, `customers`, `outbound`, `decisions`,
+  `knowledge`, `scheduling`, `query`) depend on port interfaces, not adapters.
+- Adapters for Gmail, Google Calendar, WhatsApp Manager, EZY Portal, Telegram,
+  LLM providers, the console, and the founder app are composed at the application edge.
+- All inbound work lands in `agent_inbox`; all customer-facing delivery goes through
+  `agent_outbound_queue`. Workers claim durable rows with `FOR UPDATE SKIP LOCKED`.
+- Channel instances are data, not enums. Adding an account or provider does not
+  require a channel-type schema migration.
+- Message content and credentials must never be logged. Database references remain
+  opaque to the core domain.
+
+The import boundary is enforced by ESLint and the fail-closed `lint:boundary` check.
 
 ## Prerequisites
 
-- Node ≥ 20
-- The shared `ezy-postgres` running (via `/mnt/dev/tools/ops-dev`), host-published
-  on **localhost:42016**.
+- Node.js 20 or newer
+- Docker, for the dedicated development Postgres and mandatory database tests
+- Provider credentials for whichever connectors are enabled
 
-## Boot (host)
+The development database is a dedicated pgvector/Postgres instance defined in
+`docker-compose.db.yml` and published on `localhost:55432` by default.
+
+## Local setup
 
 ```bash
-cp .env.example .env          # defaults already target localhost:42016
+cp .env.example .env
+docker compose -f docker-compose.db.yml up -d
 npm install
-npm run db:create             # one-off: CREATE DATABASE agent_orchestrator (idempotent)
-npm run migrate               # apply migrations 001–008
-npm run dev                   # tsx watch → http://localhost:3100/health
+npm run db:create
+npm run migrate
+npm run dev
 ```
 
-## Boot (docker)
+The API listens on `http://localhost:3100` by default. Migrations also run during
+normal service startup. The migration runner serializes concurrent replicas, records
+SHA-256 checksums, rejects edited history, and requires unique versions for new files.
+
+For a containerized application process:
 
 ```bash
-npm run db:create             # DB bootstrap still runs from the host (localhost:42016)
-docker compose up --build     # network_mode: host, binds :3100 directly
-curl localhost:3100/health
+docker compose -f docker-compose.db.yml up -d
+docker compose up --build
 ```
 
-`db:create` connects to the `postgres` maintenance DB to `CREATE DATABASE`; it is
-idempotent. Migrations run automatically on every boot (`src/db/migrate.ts`,
-tracked in `schema_migrations`).
+## Operational endpoints
 
-## Scripts
+- `GET /health` — public liveness/readiness report with database, queue-age, and
+  worker-runtime state; returns 503 when a critical dependency or worker is unhealthy.
+- `/console` — password/session-protected founder operations console.
+- `/app` — device-authenticated AO Founder PWA.
+- `/admin` — API-key-protected administration API when `ADMIN_API_KEY` is configured.
+- `/webhooks/whatsapp` — raw-body, signature-verified WhatsApp webhook receiver.
 
-| Script | Purpose |
+Only configured surfaces are mounted. Review `.env.example` for connector flags,
+credentials, limits, and safe defaults.
+
+## Development commands
+
+| Command | Purpose |
 |---|---|
-| `npm run build` | `tsc` → `dist/`, then copy `*.sql` migrations into `dist/` |
-| `npm run dev` | `tsx watch src/main.ts` |
-| `npm run migrate` | apply pending migrations |
-| `npm run db:create` | one-off `CREATE DATABASE agent_orchestrator` (idempotent) |
-| `npm run typecheck` | `tsc --noEmit` |
-| `npm run lint` | ESLint (includes the D1 import-boundary rule over `src/`) |
-| `npm run lint:boundary` | fidelity guard: lints `src/inbox/__illegal_import_fixture__.ts` (a real core dir) with the MAIN config via `--no-ignore`; **exit 0** when the `src/inbox→src/adapters` rule rejects it, **non-zero** if the rule ever stops firing (fail-closed). `lint`/`typecheck`/`build` exclude the fixture and stay green |
+| `npm run dev` | Run the server with `tsx` watch mode |
+| `npm run migrate` | Apply immutable forward-only migrations |
+| `npm run typecheck` | Type-check the backend |
+| `npm run lint` | Run ESLint and architecture rules |
+| `npm run lint:boundary` | Prove the core-to-adapter import guard fails closed |
+| `npm test` | Run backend unit and local integration tests |
+| `npm run test:containers` | Run mandatory disposable-Postgres concurrency tests |
+| `npm run build` | Build the backend and copy SQL migrations |
+| `npm run build:console` | Build the founder operations console |
+| `npm run build:app` | Build the AO Founder PWA |
+| `npm run ci` | Run all typechecks, lints, tests, database tests, and builds |
 
-## `/health`
+Additional operational and reconciliation commands are listed in `package.json`.
 
-`GET /health` → 200 (`status:"ok"`) when the DB probe passes, 503
-(`status:"degraded"`) when it fails (independently of backlog). Payload exposes
-`backlog` (inbox + outbound queue `pending`/`failed`/`oldestPendingAgeSeconds` —
-makes the R22 5-min SLA measurable) and `workers[]` (each worker's last run,
-duration, error message, consecutive failures).
+## Repository layout
 
-## Layout
-
-```
-src/
-  main.ts            composition root (env → migrate → listen → workers → shutdown)
-  app.ts             pure Express factory (/health)
-  config/env.ts      zod-validated env (M1.1-scoped)
-  db/                pool + forward-only SQL migration runner + migrations 001–008
-  ports/             D1 port interfaces (channel, task-target, customer-directory,
-                     ticketing, founder-notifier, llm, embedding) — no runtime code
-  workers/           generic interval/backoff runner + registry + heartbeat + CLAIM_TEMPLATE.md
-  health/            backlog queries + worker registry read
-  inbox|triage|customers|outbound|decisions/   core domain placeholders (M1.2+)
-  adapters/          outbound edge — empty until M1.2/M1.3/M1.4 (README documents the boundary)
+```text
+src/main.ts          composition root
+src/app.ts           Express application factory
+src/config/          validated environment and runtime settings
+src/db/              pool, migration runner, and migrations
+src/ports/           external-system interfaces
+src/adapters/        provider and UI adapters
+src/workers/         bounded worker execution and health registry
+src/health/          readiness, backlog, and operational state
+src/{domain}/        core domain services and repositories
+web/                 founder operations console
+app/                 AO Founder PWA
+scripts/             onboarding, reconciliation, backfill, and smoke tools
 ```

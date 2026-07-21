@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EzyPortalHttpClient, EzyHttpError } from './http-client';
+import { getProviderMetrics, resetProviderMetrics } from '../../observability/provider-metrics';
 
 // Builds a minimal Response-like object; the client only touches .ok/.status/
 // .headers/.json/.text.
@@ -60,6 +61,42 @@ test('does NOT retry a 422 — it surfaces immediately', async () => {
     (err: unknown) => err instanceof EzyHttpError && err.status === 422,
   );
   assert.equal(call, 1, '422 is not retried');
+});
+
+test('postNonIdempotent never replays an ambiguous transport failure', async () => {
+  let call = 0;
+  const client = new EzyPortalHttpClient({
+    baseUrl: 'http://portal.test',
+    resolveApiKey: () => 'k',
+    fetchImpl: (async () => {
+      call += 1;
+      throw new Error('ECONNRESET after commit');
+    }) as typeof fetch,
+    retry: { sleep: async () => {} },
+  });
+
+  await assert.rejects(
+    client.postNonIdempotent('/api/projects/tasks', { title: 'x' }),
+    /ECONNRESET after commit/,
+  );
+  assert.equal(call, 1, 'an endpoint without server idempotency must never be replayed');
+});
+
+test('records Ezy provider timeout metadata without request content', async () => {
+  resetProviderMetrics();
+  const client = new EzyPortalHttpClient({
+    baseUrl: 'http://portal.test',
+    resolveApiKey: () => 'k',
+    fetchImpl: (async () => {
+      throw Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+    }) as typeof fetch,
+  });
+
+  await assert.rejects(client.postNonIdempotent('/api/projects/tasks', { secret: 'not-a-label' }));
+  const metric = getProviderMetrics().find((m) => m.provider === 'ezy-portal');
+  assert.equal(metric?.requests, 1);
+  assert.equal(metric?.timeouts, 1);
+  assert.equal(metric?.failures, 0);
 });
 
 test('uploadFile POSTs multipart (field `file`, no JSON Content-Type, no Idempotency-Key, correct query)', async () => {

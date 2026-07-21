@@ -4,8 +4,17 @@ import { recordRun, recordRunStart, registerWorker, getWorkerStatuses } from './
 export interface WorkerDefinition {
   name: string;
   intervalMs: number;
-  run: () => Promise<void>;
+  /**
+   * A cooperative cancellation signal. Existing no-argument callbacks remain
+   * assignable, while network-aware workers can stop promptly during shutdown
+   * or after maxRuntimeMs.
+   */
+  run: (signal?: AbortSignal) => Promise<void>;
   maxBackoffMs?: number; // default 10 × intervalMs
+  /** Maximum wall-clock duration for one tick before it is classified as hung. */
+  maxRuntimeMs?: number; // default max(2 × intervalMs, 60 seconds)
+  /** A failed/stale/hung critical worker degrades the service health report. */
+  critical?: boolean;
   /** Run the first tick immediately (delay 0) instead of after intervalMs. Used
    *  for startup catch-up pollers (M1.3 reconcile) so downtime is covered at boot
    *  rather than one interval later. Backward-compatible: defaults to false. */
@@ -51,9 +60,19 @@ export function projectWorkerError(err: unknown): string {
  * only { worker, durationMs, ok } metadata. Concrete workers claim rows with the
  * FOR UPDATE SKIP LOCKED shape in CLAIM_TEMPLATE.md and must uphold the same.
  */
-export function startWorker(def: WorkerDefinition): { stop(): void } {
+export interface WorkerHandle {
+  /** Prevent future ticks and request cancellation of the active tick. */
+  stop(): void;
+  /** Resolves when the active tick settles. It is intentionally not self-timed. */
+  waitForIdle(): Promise<void>;
+}
+
+export function startWorker(def: WorkerDefinition): WorkerHandle {
   const maxBackoffMs = def.maxBackoffMs ?? def.intervalMs * 10;
+  const maxRuntimeMs = def.maxRuntimeMs ?? Math.max(def.intervalMs * 2, 60_000);
   let timer: NodeJS.Timeout | null = null;
+  let activeTick: Promise<void> | null = null;
+  let activeController: AbortController | null = null;
   let stopped = false;
 
   registerWorker(def);
@@ -61,21 +80,34 @@ export function startWorker(def: WorkerDefinition): { stop(): void } {
   const scheduleNext = (delayMs: number): void => {
     if (stopped) return;
     timer = setTimeout(() => {
-      void tick();
+      const running = tick();
+      activeTick = running;
+      void running.finally(() => {
+        if (activeTick === running) activeTick = null;
+      });
     }, delayMs);
     timer.unref();
   };
 
   const tick = async (): Promise<void> => {
     const startedAt = Date.now();
+    const controller = new AbortController();
+    activeController = controller;
+    const runtimeTimer = setTimeout(() => {
+      controller.abort(new DOMException('worker max runtime exceeded', 'TimeoutError'));
+    }, maxRuntimeMs);
+    runtimeTimer.unref();
     recordRunStart(def.name);
     let ok = false;
     let errMessage: string | null = null;
     try {
-      await def.run();
+      await def.run(controller.signal);
       ok = true;
     } catch (err) {
       errMessage = projectWorkerError(err);
+    } finally {
+      clearTimeout(runtimeTimer);
+      if (activeController === controller) activeController = null;
     }
     const durationMs = Date.now() - startedAt;
     const consecutiveFailures = recordRun(def.name, { ok, durationMs, errMessage });
@@ -105,6 +137,10 @@ export function startWorker(def: WorkerDefinition): { stop(): void } {
     stop(): void {
       stopped = true;
       if (timer) clearTimeout(timer);
+      activeController?.abort(new DOMException('worker stopped', 'AbortError'));
+    },
+    async waitForIdle(): Promise<void> {
+      await activeTick;
     },
   };
 }

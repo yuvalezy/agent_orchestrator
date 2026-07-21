@@ -233,6 +233,35 @@ export async function failuresSince(instanceId: string, recipient: string, since
   return rows[0]?.n ?? 0;
 }
 
+/**
+ * Run a recipient's final rate checks and dispatch under a PostgreSQL session advisory lock.
+ * The lock is shared by every orchestrator replica, and remains held across the provider call
+ * and terminal queue update. A contender returns false immediately so it can park its already-
+ * claimed row instead of blocking a database connection behind a slow network send.
+ */
+export async function withRecipientLease(
+  instanceId: string,
+  recipient: string,
+  run: () => Promise<void>,
+): Promise<boolean> {
+  return withClient(async (client) => {
+    // PostgreSQL text rejects NUL bytes. JSON's length-delimited structure also
+    // prevents boundary collisions such as ("ab","c") vs ("a","bc").
+    const key = JSON.stringify([instanceId, recipient]);
+    const { rows } = await client.query<{ acquired: boolean }>(
+      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired',
+      [key],
+    );
+    if (rows[0]?.acquired !== true) return false;
+    try {
+      await run();
+      return true;
+    } finally {
+      await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key]);
+    }
+  });
+}
+
 export interface EnqueueOutboundInput {
   channelInstanceId: string;
   channelType: string; // to pick the address normalizer (R37 join must hit — F2)

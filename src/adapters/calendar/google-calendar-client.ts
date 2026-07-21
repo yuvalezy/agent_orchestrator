@@ -12,6 +12,7 @@ import type {
   ListUpcomingEventsInput,
   RangeEvent,
 } from '../../ports/calendar.port';
+import { recordProviderRequest } from '../../observability/provider-metrics';
 
 // GoogleCalendarClient (M5(d)) — raw fetch, no SDK (HTTP-only, invariant #5). OAuth2
 // refresh-token → access token (mirrors GmailClient), then:
@@ -25,6 +26,7 @@ import type {
 
 const CAL = 'https://www.googleapis.com/calendar/v3';
 const OAUTH = 'https://oauth2.googleapis.com/token';
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 /** Retryable transport statuses: rate-limit + server-side. Everything else is a caller error
  *  (403 scope, 404 calendar, 409 duplicate id) that a retry cannot fix. */
@@ -83,6 +85,7 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
     private readonly resolveCred: () => string, // JSON {client_id,client_secret,refresh_token}
     private readonly nowMs: () => number = () => Date.now(),
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
   ) {}
 
   private cred(): OAuthCred {
@@ -91,13 +94,31 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
     return c;
   }
 
+  private async request(input: string, init?: RequestInit): Promise<Response> {
+    const startedAt = Date.now();
+    try {
+      const response = await this.fetchImpl(input, init);
+      recordProviderRequest('google:calendar', Date.now() - startedAt, response.ok ? 'success' : 'failure');
+      return response;
+    } catch (err) {
+      const name = err instanceof Error ? err.name : '';
+      recordProviderRequest(
+        'google:calendar',
+        Date.now() - startedAt,
+        name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'failure',
+      );
+      throw err;
+    }
+  }
+
   private async token(): Promise<string> {
     if (this.accessToken && this.nowMs() < this.tokenExpiresMs) return this.accessToken;
     const c = this.cred();
-    const res = await this.fetchImpl(OAUTH, {
+    const res = await this.request(OAUTH, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ client_id: c.client_id, client_secret: c.client_secret, refresh_token: c.refresh_token, grant_type: 'refresh_token' }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) throw new Error(`calendar token refresh failed (${res.status})`);
     const j = (await res.json()) as { access_token: string; expires_in: number };
@@ -109,7 +130,10 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
   /** GET a Calendar API path. 401 → refresh once + retry; 429/5xx → retry. */
   private async get<T>(path: string): Promise<T> {
     return withRetry(async () => {
-      const res = await this.fetchImpl(`${CAL}${path}`, { headers: { Authorization: `Bearer ${await this.token()}` } });
+      const res = await this.request(`${CAL}${path}`, {
+        headers: { Authorization: `Bearer ${await this.token()}` },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
       if (res.status === 401) {
         this.accessToken = null; // force refresh + retry
         throw new Error('calendar 401 (token) — retrying');
@@ -125,10 +149,11 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
   private async post<T>(path: string, body: unknown): Promise<T> {
     return withRetry(
       async () => {
-        const res = await this.fetchImpl(`${CAL}${path}`, {
+        const res = await this.request(`${CAL}${path}`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.timeoutMs),
         });
         if (res.status === 401) {
           this.accessToken = null; // force refresh + retry
@@ -140,7 +165,7 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
       {
         ...DEFAULT_RETRY,
         isRetryable: (err) =>
-          err instanceof CalendarHttpError && (err.status === 401 || RETRYABLE_STATUS.has(err.status)),
+          !(err instanceof CalendarHttpError) || err.status === 401 || RETRYABLE_STATUS.has(err.status),
       },
     );
   }

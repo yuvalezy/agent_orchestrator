@@ -668,6 +668,9 @@ export const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+  // Durable meeting→task fallback retry cadence. This remains active in app-only
+  // deployments and is independent of Telegram's callback polling interval.
+  MEETING_FALLBACK_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
 
   // ── M3(e): weekly pattern detection — a weekly digest that clusters the week's Layer-A
   // signal memories (founder corrections + customer conversation/task themes) by their

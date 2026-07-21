@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { query } from '../../db';
 import { logger } from '../../logger';
+import { recordProviderRequest } from '../../observability/provider-metrics';
 import type { AgentLlmPort, AgenticAnswerInput, AgenticAnswerPort, AgenticAnswerResult, AnswerRequest, AnswerResult, AnswerSynthesizerPort, BriefingSynthesisRequest, BriefingSynthesisResult, BriefingSynthesizerPort, CommitmentExtractionResult, CommitmentExtractorPort, ComposeMessageRequest, ConversationContextPort, ConversationContextRequest, ConversationContextResult, CorrectionClass, CorrectionClassifierPort, CustomerBriefRequest, CustomerBriefResult, CustomerBriefSynthesizerPort, DraftRequest, DraftResult, DraftReviserPort, DraftVerdict, DraftVerifierPort, Intent, LlmMessage, LlmProviderClient, MeetingPrepRequest, MeetingPrepResult, MeetingPrepSynthesizerPort, ReviseRequest, ReviseResult, ScheduleInterpretRequest, ScheduleInterpretation, ScheduleInterpreterPort, TokenUsage, TriageContext, VerifyDraftRequest, WeeklyReviewRequest, WeeklyReviewResult, WeeklyReviewSynthesizerPort } from '../../ports/llm.port';
-import { costUsd } from './pricing';
+import { costUsd, maximumCostUsd, UnknownLlmPricingError } from './pricing';
+import { postgresLlmBudget, type LlmBudgetPort } from './llm-budget';
 import { runAgenticLoop } from './agentic-loop';
 import { CostCapExceeded, LlmAllProvidersFailed, LlmProviderError, type LlmErrorKind } from './errors';
 import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
@@ -38,6 +39,8 @@ export interface LlmRouterDeps {
   dailyCapUsd: number;
   /** Admin-topic notifier (injected — the router never imports the Telegram adapter). */
   notifyAdmin: (msg: string) => Promise<void>;
+  /** Atomic daily-cap ledger. Defaults to PostgreSQL; injectable for deterministic tests. */
+  budget?: LlmBudgetPort;
   /** WP8 agentic loop tuning (defaults applied when absent). */
   agentic?: {
     /** Max provider tool-gathering turns before a forced closing synthesis. */
@@ -66,45 +69,72 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
     return [preferred, ...this.deps.fallbackChain].filter((p) => this.deps.providers[p] && !seen.has(p) && seen.add(p));
   }
 
-  /** Today's spend, day boundary pinned to the founder timezone (DA R42). */
-  private async spentTodayUsd(): Promise<number> {
-    const { rows } = await query<{ total: string }>(
-      `SELECT coalesce(sum(cost_usd), 0) AS total FROM llm_costs
-        WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'America/Panama') AT TIME ZONE 'America/Panama'`,
-    );
-    return Number(rows[0]?.total ?? 0);
-  }
-
   private capNotifiedFor: string | null = null;
-  // SOFT cap (DA §6-Q1 / code-review Finding 1): this is a check-then-act — under
-  // concurrency N overlapping calls can each read "under cap" and then each bill,
-  // overshooting by ≤ (in-flight × per-call cost). Harmless in M1.4 (the only
-  // caller is the single-shot triage:sample CLI). M1.5b wires this into concurrent
-  // inbound processing → HARDEN there (atomic reserve-then-spend / advisory lock).
-  private async enforceCap(): Promise<void> {
-    const spent = await this.spentTodayUsd();
-    if (spent >= this.deps.dailyCapUsd) {
-      const day = new Date().toISOString().slice(0, 10);
-      if (this.capNotifiedFor !== day) {
-        this.capNotifiedFor = day;
-        await this.deps.notifyAdmin(`⛔ LLM daily cost cap hit: $${spent.toFixed(4)} ≥ $${this.deps.dailyCapUsd}. Calls paused.`);
-      }
-      throw new CostCapExceeded(spent, this.deps.dailyCapUsd);
-    }
+  private async notifyCap(err: CostCapExceeded): Promise<void> {
+    const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Panama' }).format(new Date());
+    if (this.capNotifiedFor === day) return;
+    this.capNotifiedFor = day;
+    await this.deps.notifyAdmin(
+      `⛔ LLM daily cost cap has no room for this call: $${err.spentUsd.toFixed(4)} committed/reserved of $${err.capUsd}. Calls paused.`,
+    );
   }
 
-  private async recordCost(
-    provider: string,
-    model: string,
-    role: LlmRole,
-    usage: TokenUsage,
-    customerId: string | null,
-  ): Promise<void> {
-    await query(
-      `INSERT INTO llm_costs (provider, model, role, customer_id, input_tokens, output_tokens, cost_usd)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [provider, model, role, customerId, usage.inputTokens, usage.outputTokens, costUsd(provider, model, usage)],
+  private async budgetedCall<T extends { usage: TokenUsage }>(opts: {
+    provider: string;
+    model: string;
+    role: LlmRole;
+    customerId: string | null;
+    maxTokens: number;
+    request: unknown;
+    call: () => Promise<T>;
+  }): Promise<T> {
+    const maximum = maximumCostUsd(
+      opts.provider,
+      opts.model,
+      Buffer.byteLength(JSON.stringify(opts.request), 'utf8'),
+      opts.maxTokens,
     );
+    const budget = this.deps.budget ?? postgresLlmBudget;
+    let reservation;
+    try {
+      reservation = await budget.reserve(opts.provider, opts.model, opts.role, maximum, this.deps.dailyCapUsd);
+    } catch (err) {
+      if (err instanceof CostCapExceeded) await this.notifyCap(err);
+      throw err;
+    }
+
+    const started = Date.now();
+    let result: T;
+    try {
+      result = await opts.call();
+      recordProviderRequest(`llm:${opts.provider}`, Date.now() - started, 'success');
+    } catch (err) {
+      const timeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+      recordProviderRequest(`llm:${opts.provider}`, Date.now() - started, timeout ? 'timeout' : 'failure');
+      // The provider may have consumed tokens before a transport error. Charge the conservative
+      // reservation instead of releasing it and permitting a real cap overrun.
+      try {
+        await budget.forfeit(reservation);
+      } catch (accountingErr) {
+        throw new LlmBudgetAccountingError((accountingErr as Error)?.message ?? 'unknown forfeit error');
+      }
+      throw err;
+    }
+
+    const actualUsd = costUsd(opts.provider, opts.model, result.usage);
+    try {
+      await budget.settle(reservation, {
+        provider: opts.provider,
+        model: opts.model,
+        role: opts.role,
+        customerId: opts.customerId,
+        usage: result.usage,
+        actualUsd,
+      });
+    } catch (err) {
+      throw new LlmBudgetAccountingError((err as Error)?.message ?? 'unknown accounting error');
+    }
+    return result;
   }
 
   /**
@@ -121,7 +151,6 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
     validate: (v: unknown) => T;
     customerId: string | null;
   }): Promise<T> {
-    await this.enforceCap();
     // M-vision: when this call carries image blocks, PREFER a vision-capable provider (a
     // text-only fallback would silently drop the customer's screenshots) and, before sending
     // to any provider that is NOT vision-capable, STRIP the images so a fallback never
@@ -137,15 +166,23 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       // Non-vision provider → drop the images (send a text-only turn); vision provider → pass through.
       const messages = hasImages && client.supportsVision !== true ? stripImages(opts.messages) : opts.messages;
       try {
-        const { value, usage } = await client.completeStructured<unknown>({
+        const request = {
           model,
           system: opts.system,
           messages,
           maxTokens: opts.maxTokens,
           schema: opts.schema,
           effort: this.deps.effortFor?.(provider, opts.role),
+        };
+        const { value } = await this.budgetedCall({
+          provider,
+          model,
+          role: opts.role,
+          customerId: opts.customerId,
+          maxTokens: opts.maxTokens,
+          request,
+          call: () => client.completeStructured<unknown>(request),
         });
-        await this.recordCost(provider, model, opts.role, usage, opts.customerId); // tokens spent → bill
         try {
           const parsed = opts.validate(value);
           if (attempts.length) {
@@ -159,6 +196,7 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
           logger.warn({ provider, model, role: opts.role }, 'llm structured output failed schema validation');
         }
       } catch (err) {
+        if (err instanceof CostCapExceeded || err instanceof UnknownLlmPricingError || err instanceof LlmBudgetAccountingError) throw err;
         const kind = err instanceof LlmProviderError ? err.kind : 'transport';
         attempts.push({ provider, kind });
         logger.warn({ provider, model, role: opts.role, kind }, 'llm provider call failed');
@@ -493,11 +531,22 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
     const cfg = this.deps.agentic ?? AGENTIC_DEFAULTS;
     const client = picked.client;
 
+    const budgeted = <T extends { usage: TokenUsage }>(request: unknown, maxTokens: number, call: () => Promise<T>) =>
+      this.budgetedCall({
+        provider: picked.provider,
+        model,
+        role: 'answer',
+        customerId,
+        maxTokens,
+        request,
+        call,
+      });
+
     return runAgenticLoop({
       // completeWithTools is present (guarded above); completeStructured is on every client.
       client: {
-        completeWithTools: (req) => client.completeWithTools!(req),
-        completeStructured: (req) => client.completeStructured(req),
+        completeWithTools: (req) => budgeted(req, req.maxTokens, () => client.completeWithTools!(req)),
+        completeStructured: (req) => budgeted(req, req.maxTokens, () => client.completeStructured(req)),
       },
       model,
       question: input.question,
@@ -506,11 +555,20 @@ export class LlmRouter implements AgentLlmPort, AnswerSynthesizerPort, BriefingS
       maxIterations: cfg.maxIterations,
       maxCostUsd: cfg.maxCostUsd,
       maxTokens: cfg.maxTokens,
-      enforceCap: () => this.enforceCap(),
-      recordCost: (usage) => this.recordCost(picked.provider, model, 'answer', usage, customerId),
+      // Calls are already reserved + settled by the wrapped client above. Keep the pure loop's
+      // hooks as no-ops so its isolated tests and cost-ceiling control flow remain unchanged.
+      enforceCap: async () => {},
+      recordCost: async () => {},
       costOf: (usage) => costUsd(picked.provider, model, usage),
       log: logger,
     });
+  }
+}
+
+class LlmBudgetAccountingError extends Error {
+  constructor(reason: string) {
+    super(`LLM budget accounting failed: ${reason}`);
+    this.name = 'LlmBudgetAccountingError';
   }
 }
 

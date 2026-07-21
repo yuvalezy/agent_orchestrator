@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CalendarHttpError, GoogleCalendarClient, dateInTz, normalizeEvent, normalizeRangeEvent } from './google-calendar-client';
+import { getProviderMetrics, resetProviderMetrics } from '../../observability/provider-metrics';
 
 // Unit tests for the Google Calendar READ adapter (no network — fake fetchImpl). Verifies the
 // event normalization (title/time/all-day, attendee dedup+lowercasing, customer match) and the
@@ -8,6 +9,24 @@ import { CalendarHttpError, GoogleCalendarClient, dateInTz, normalizeEvent, norm
 
 const CRED = JSON.stringify({ client_id: 'ci', client_secret: 'cs', refresh_token: 'rt' });
 const NOW = 1_700_000_000_000;
+
+test('OAuth refresh has a bounded deadline and records the timeout', async () => {
+  resetProviderMetrics();
+  const fetchImpl = (async (_url: string, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    })) as unknown as typeof fetch;
+  const client = new GoogleCalendarClient(() => CRED, () => NOW, fetchImpl, 5);
+
+  await assert.rejects(
+    () => client.listUpcomingEvents({ lookaheadDays: 1, matchEmails: [] }),
+    (err: unknown) => (err as Error).name === 'TimeoutError',
+  );
+  assert.deepEqual(
+    getProviderMetrics().map(({ provider, requests, timeouts }) => ({ provider, requests, timeouts })),
+    [{ provider: 'google:calendar', requests: 3, timeouts: 3 }],
+  );
+});
 
 function res(status: number, body: unknown): Response {
   return { ok: status >= 200 && status < 300, status, json: async () => body, text: async () => JSON.stringify(body) } as Response;

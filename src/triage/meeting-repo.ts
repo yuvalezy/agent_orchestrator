@@ -14,6 +14,8 @@ export type MeetingStatus =
   | 'awaiting_slot'
   | 'creating'
   | 'scheduled'
+  | 'fallback_pending'
+  | 'fallback_creating'
   | 'failed'
   | 'abandoned';
 
@@ -197,16 +199,61 @@ export async function markScheduled(
  * task is just as un-undoable as booking the event. An unguarded `SET status='failed'` would
  * happily run twice and leave the founder with two identical tasks.
  *
- * The allow-list is the three OPEN states — notably including 'creating', because the permanent
- * -failure path gives up AFTER claimForCreating has already moved the row there.
+ * `fallback_pending` is also claimable: a previous portal attempt failed and deliberately
+ * released the durable job for this or another process to retry. `fallback_creating` is not
+ * claimable until the reclaimer expires it, so concurrent workers cannot both create.
  */
 export async function claimMeetingGiveUp(id: string): Promise<boolean> {
   const { rowCount } = await query(
-    `UPDATE agent_meeting_requests SET status = 'failed'
-      WHERE id = $1 AND status IN ('awaiting_duration','awaiting_slot','creating')`,
+    `UPDATE agent_meeting_requests SET status = 'fallback_creating'
+      WHERE id = $1 AND status IN ('awaiting_duration','awaiting_slot','creating','fallback_pending')`,
     [id],
   );
   return rowCount === 1;
+}
+
+/** A transient fallback failure remains durable and visible to the retry worker. */
+export async function releaseMeetingGiveUp(id: string): Promise<void> {
+  await query(
+    `UPDATE agent_meeting_requests SET status = 'fallback_pending'
+      WHERE id = $1 AND status = 'fallback_creating'`,
+    [id],
+  );
+}
+
+/** Settle only the worker that currently owns the fallback claim. */
+export async function completeMeetingGiveUp(id: string): Promise<void> {
+  await query(
+    `UPDATE agent_meeting_requests SET status = 'failed'
+      WHERE id = $1 AND status = 'fallback_creating'`,
+    [id],
+  );
+}
+
+/** Bounded retry scan; oldest work first prevents a hot row from starving older asks. */
+export async function listPendingMeetingFallbacks(limit = 25): Promise<string[]> {
+  const { rows } = await query<{ id: string }>(
+    `SELECT id
+       FROM agent_meeting_requests
+      WHERE status = 'fallback_pending'
+      ORDER BY updated_at ASC
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => r.id);
+}
+
+/** Recover a process crash after claim but before release/complete. */
+export async function reclaimStuckMeetingFallbacks(minutes: number): Promise<string[]> {
+  const { rows } = await query<{ id: string }>(
+    `UPDATE agent_meeting_requests
+        SET status = 'fallback_pending'
+      WHERE status = 'fallback_creating'
+        AND updated_at < now() - ($1 || ' minutes')::interval
+      RETURNING id`,
+    [String(minutes)],
+  );
+  return rows.map((r) => r.id);
 }
 
 export async function abandonMeeting(id: string): Promise<void> {
@@ -216,7 +263,7 @@ export async function abandonMeeting(id: string): Promise<void> {
 /**
  * Founder-driven DISMISS from the app: abandon an OPEN meeting request WITHOUT booking and WITHOUT
  * minting a task (the "I don't need this meeting" gesture on a Wants-to-talk / Pick-a-time card).
- * Guarded to the three open states — like claimMeetingGiveUp — so a dismiss cannot clobber an
+ * Guarded to the three open states — like the initial claimMeetingGiveUp path — so a dismiss cannot clobber an
  * already-booked meeting (which owns a real event + invitation) or re-abandon a settled one: rowCount
  * is 1 iff THIS call abandoned it. Distinct from claimMeetingGiveUp, which mints a fallback task; a
  * dismiss makes none. Returns true when it abandoned an open request, false otherwise (gone, booked,

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildGoogleAuthUrl, clientFromGmailCred, exchangeGoogleCode, resolveConsoleGoogleClient, type FetchLike } from './google-oauth';
+import { getProviderMetrics, resetProviderMetrics } from '../../observability/provider-metrics';
 import { signOAuthState, verifyOAuthState } from './oauth-state';
 import { CONNECTORS, connectorById } from './registry';
 
@@ -34,6 +35,27 @@ test('exchangeGoogleCode: posts to the token endpoint and returns parsed JSON', 
   assert.equal(seenUrl, 'https://oauth2.googleapis.com/token');
   assert.match(seenBody, /grant_type=authorization_code/);
   assert.match(seenBody, /code=code123/);
+});
+
+test('exchangeGoogleCode bounds a black-holed token request', async () => {
+  resetProviderMetrics();
+  const fakeFetch = (async (_input: unknown, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    })) as FetchLike;
+
+  await assert.rejects(
+    () => exchangeGoogleCode(
+      { client: { clientId: 'cid', clientSecret: 'sec' }, code: 'code123', redirectUri: 'https://box/cb' },
+      fakeFetch,
+      5,
+    ),
+    (err: unknown) => (err as Error).name === 'TimeoutError',
+  );
+  assert.deepEqual(
+    getProviderMetrics().map(({ provider, requests, timeouts }) => ({ provider, requests, timeouts })),
+    [{ provider: 'google:oauth', requests: 1, timeouts: 1 }],
+  );
 });
 
 test('oauth-state: round-trips the account payload, rejects tamper / expiry / wrong secret', () => {

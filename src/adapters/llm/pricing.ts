@@ -1,4 +1,3 @@
-import { logger } from '../../logger';
 import type { TokenUsage } from '../../ports/llm.port';
 
 // Best-effort per-model pricing (USD per 1M tokens) for llm_costs accounting
@@ -28,13 +27,31 @@ const PRICING: Record<string, Record<string, Rate>> = {
   },
 };
 
-/** Cost in USD for a call. Unknown (provider,model) → 0 + a warn (never crashes). */
-export function costUsd(provider: string, model: string, usage: TokenUsage): number {
-  const rate = PRICING[provider]?.[model];
-  if (!rate) {
-    logger.warn({ provider, model }, 'llm pricing: unknown model, recording 0 cost');
-    return 0;
+export class UnknownLlmPricingError extends Error {
+  constructor(provider: string, model: string) {
+    super(`No LLM pricing configured for ${provider}/${model}`);
+    this.name = 'UnknownLlmPricingError';
   }
+}
+
+function rateFor(provider: string, model: string): Rate {
+  const rate = PRICING[provider]?.[model];
+  if (!rate) throw new UnknownLlmPricingError(provider, model);
+  return rate;
+}
+
+/** Cost in USD for a call. Unknown models fail closed so they cannot bypass the cap. */
+export function costUsd(provider: string, model: string, usage: TokenUsage): number {
+  const rate = rateFor(provider, model);
   const cost = (usage.inputTokens / 1e6) * rate.inUsdPer1M + (usage.outputTokens / 1e6) * rate.outUsdPer1M;
   return Number(cost.toFixed(6));
+}
+
+/** Conservative pre-call reservation. UTF-8 bytes upper-bound ordinary tokenizer input tokens;
+ *  a fixed cushion covers provider-added structured-output markers. Output is capped by maxTokens. */
+export function maximumCostUsd(provider: string, model: string, inputBytes: number, maxTokens: number): number {
+  const rate = rateFor(provider, model);
+  const inputTokenCeiling = Math.max(0, inputBytes) + 1_024;
+  const raw = (inputTokenCeiling / 1e6) * rate.inUsdPer1M + (Math.max(0, maxTokens) / 1e6) * rate.outUsdPer1M;
+  return Math.max(0.000001, Math.ceil(raw * 1e6) / 1e6);
 }

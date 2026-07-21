@@ -1,11 +1,13 @@
 import type { WorkerDefinition } from './worker-runner';
 
-export type WorkerState = 'registered_idle' | 'working' | 'healthy' | 'stale' | 'failing_backoff' | 'not_registered';
+export type WorkerState = 'registered_idle' | 'working' | 'healthy' | 'stale' | 'hung' | 'failing_backoff' | 'not_registered';
 export type WorkerRegistration = 'registered' | 'flag_off' | 'not_registered';
 
 export interface WorkerStatus {
   name: string;
   intervalMs: number;
+  maxRuntimeMs: number;
+  critical: boolean;
   /** When the current or most recent tick started. */
   lastRunAt: Date | null;
   lastSuccessAt: Date | null;
@@ -32,6 +34,8 @@ export function registerWorker(def: WorkerDefinition): void {
   registry.set(def.name, {
     name: def.name,
     intervalMs: def.intervalMs,
+    maxRuntimeMs: def.maxRuntimeMs ?? Math.max(def.intervalMs * 2, 60_000),
+    critical: def.critical ?? false,
     lastRunAt: null,
     lastSuccessAt: null,
     lastDurationMs: null,
@@ -47,6 +51,8 @@ export function recordRunStart(name: string): void {
   registry.set(name, {
     name,
     intervalMs: prev?.intervalMs ?? 0,
+    maxRuntimeMs: prev?.maxRuntimeMs ?? 60_000,
+    critical: prev?.critical ?? false,
     lastRunAt: new Date(),
     lastSuccessAt: prev?.lastSuccessAt ?? null,
     lastDurationMs: prev?.lastDurationMs ?? null,
@@ -67,6 +73,8 @@ export function recordRun(
   registry.set(name, {
     name,
     intervalMs: prev?.intervalMs ?? 0,
+    maxRuntimeMs: prev?.maxRuntimeMs ?? 60_000,
+    critical: prev?.critical ?? false,
     lastRunAt: now,
     lastSuccessAt: r.ok ? now : (prev?.lastSuccessAt ?? null),
     lastDurationMs: r.durationMs,
@@ -83,7 +91,10 @@ export function recordRun(
  * jitter while still surfacing a stopped event loop or failed reschedule.
  */
 export function classifyWorkerState(worker: WorkerRegistryEntry, nowMs = Date.now()): Exclude<WorkerState, 'not_registered'> {
-  if (worker.isRunning) return 'working';
+  if (worker.isRunning) {
+    if (worker.lastRunAt && nowMs - worker.lastRunAt.getTime() > worker.maxRuntimeMs) return 'hung';
+    return 'working';
+  }
   if (worker.lastRunAt === null) return 'registered_idle';
   if (worker.lastError !== null) return 'failing_backoff';
   const staleAfterMs = Math.max(worker.intervalMs * 2, 30_000);

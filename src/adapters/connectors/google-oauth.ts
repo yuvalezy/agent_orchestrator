@@ -1,4 +1,5 @@
 import { tryResolveCredential } from '../../config/credentials';
+import { recordProviderRequest } from '../../observability/provider-metrics';
 
 // Google OAuth 2.0 client (ADAPTER, HTTP-only — raw fetch, no SDK). The shared home for the
 // consent-URL + code-exchange + account-email logic used by BOTH the console redirect flow
@@ -9,6 +10,7 @@ const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const GMAIL_PROFILE = 'https://gmail.googleapis.com/gmail/v1/users/me/profile';
 const CALENDAR_PRIMARY = 'https://www.googleapis.com/calendar/v3/calendars/primary';
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface GoogleClient {
   clientId: string;
@@ -21,6 +23,23 @@ export interface GoogleTokenResponse {
   error_description?: string;
 }
 export type FetchLike = typeof fetch;
+
+async function requestGoogle(fetchImpl: FetchLike, input: string, init: RequestInit): Promise<Response> {
+  const startedAt = Date.now();
+  try {
+    const response = await fetchImpl(input, init);
+    recordProviderRequest('google:oauth', Date.now() - startedAt, response.ok ? 'success' : 'failure');
+    return response;
+  } catch (err) {
+    const name = err instanceof Error ? err.name : '';
+    recordProviderRequest(
+      'google:oauth',
+      Date.now() - startedAt,
+      name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'failure',
+    );
+    throw err;
+  }
+}
 
 /** Build a Google OAuth 2.0 consent URL. Shared by the console redirect flow and the loopback scripts. */
 export function buildGoogleAuthUrl(input: {
@@ -47,8 +66,9 @@ export function buildGoogleAuthUrl(input: {
 export async function exchangeGoogleCode(
   input: { client: GoogleClient; code: string; redirectUri: string },
   fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<GoogleTokenResponse> {
-  const res = await fetchImpl(TOKEN_ENDPOINT, {
+  const res = await requestGoogle(fetchImpl, TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -58,6 +78,7 @@ export async function exchangeGoogleCode(
       redirect_uri: input.redirectUri,
       grant_type: 'authorization_code',
     }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   return (await res.json()) as GoogleTokenResponse;
 }
@@ -110,10 +131,14 @@ export async function fetchGoogleAccountEmail(
   accessToken: string,
   kind: 'gmail' | 'calendar',
   fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<string | null> {
   try {
     const url = kind === 'gmail' ? GMAIL_PROFILE : CALENDAR_PRIMARY;
-    const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    const res = await requestGoogle(fetchImpl, url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (!res.ok) return null;
     const j = (await res.json()) as { emailAddress?: string; id?: string };
     return j.emailAddress ?? j.id ?? null;

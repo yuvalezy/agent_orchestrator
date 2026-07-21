@@ -346,6 +346,7 @@ export function buildInboxProcessorWorker(notifier: FounderNotifierPort): Worker
   return {
     name: 'inbox:processor',
     intervalMs: 10_000,
+    critical: true,
     run: async () => {
       // Poison-pill first: rows that exhausted their attempts → failed + one alert.
       const failedIds = await failStuck();

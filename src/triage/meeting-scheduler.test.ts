@@ -89,6 +89,7 @@ function harness(
     claim?: string | null;
     claimForCreating?: boolean;
     taskFails?: boolean;
+    taskFailures?: number;
   } = {},
 ): Harness {
   const asks: Harness['asks'] = [];
@@ -98,6 +99,7 @@ function harness(
   const tasks: string[] = [];
   const decisions: string[] = [];
   const row: MeetingRequest = { ...ROW, ...opts.row };
+  let taskFailuresRemaining = opts.taskFailures ?? (opts.taskFails ? Number.POSITIVE_INFINITY : 0);
 
   const deps: MeetingSchedulerDeps = {
     freeBusy: {
@@ -133,7 +135,10 @@ function harness(
     resolveAttendeeEmail: async () => (opts.attendee === undefined ? 'iyelinek@holadocmed.com' : opts.attendee),
     loadSchedule: async () => ({ businessHours: HOURS, holidays: [] }),
     fallbackToTask: async (m) => {
-      if (opts.taskFails) throw new Error('portal down');
+      if (taskFailuresRemaining > 0) {
+        taskFailuresRemaining -= 1;
+        throw new Error('portal down');
+      }
       tasks.push(m.id);
       return { url: 'https://portal/t/TSK-1' };
     },
@@ -173,9 +178,15 @@ function harness(
       // Models the REAL guarded UPDATE (WHERE status IN <open states>), not a stub that always
       // succeeds — a permissive fake here would hide exactly the double-task bug this guards.
       claimGiveUp: async () => {
-        if (!['awaiting_duration', 'awaiting_slot', 'creating'].includes(row.status)) return false;
-        row.status = 'failed';
+        if (!['awaiting_duration', 'awaiting_slot', 'creating', 'fallback_pending'].includes(row.status)) return false;
+        row.status = 'fallback_creating';
         return true;
+      },
+      releaseGiveUp: async () => {
+        if (row.status === 'fallback_creating') row.status = 'fallback_pending';
+      },
+      completeGiveUp: async () => {
+        if (row.status === 'fallback_creating') row.status = 'failed';
       },
       releaseToAwaitingSlot: async () => {
         row.status = 'awaiting_slot';
@@ -415,10 +426,24 @@ test('a TRANSIENT create failure releases the slot for a retry (no task, no dead
   assert.deepEqual(h.enqueued, []);
 });
 
-test('when even the task fallback fails, the founder is told plainly rather than reassured', async () => {
+test('when the task fallback fails transiently, it stays durable instead of being marked complete', async () => {
   const h = harness({ freeBusyThrows: true, taskFails: true });
   await buildMeetingScheduler(h.deps).onDuration('m1', 30);
-  assert.match(h.notices[0].body, /could not create a task either/i);
+  assert.equal(h.row.status, 'fallback_pending');
+  assert.deepEqual(h.tasks, []);
+  assert.deepEqual(h.notices, [], 'do not claim the fallback is terminal while it is queued');
+});
+
+test('a later worker retry settles a transient task fallback exactly once', async () => {
+  const h = harness({ freeBusyThrows: true, taskFailures: 1 });
+  const scheduler = buildMeetingScheduler(h.deps);
+  await scheduler.onDuration('m1', 30);
+  assert.equal(h.row.status, 'fallback_pending');
+
+  await scheduler.retryFallback('m1');
+  await scheduler.retryFallback('m1');
+  assert.equal(h.row.status, 'failed');
+  assert.deepEqual(h.tasks, ['m1']);
 });
 
 test('"Just make a task" honours the founder and mints the task', async () => {

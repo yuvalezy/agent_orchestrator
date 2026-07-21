@@ -6,6 +6,8 @@ const now = Date.parse('2026-07-13T12:00:00.000Z');
 const base: Omit<WorkerStatus, 'state' | 'registration'> = {
   name: 'test:worker',
   intervalMs: 10_000,
+  maxRuntimeMs: 20_000,
+  critical: false,
   lastRunAt: new Date(now - 10_000),
   lastSuccessAt: new Date(now - 10_000),
   lastDurationMs: 15,
@@ -17,6 +19,10 @@ const base: Omit<WorkerStatus, 'state' | 'registration'> = {
 test('classifies registered workers without collapsing idle, working, stale, and failing states', () => {
   assert.equal(classifyWorkerState({ ...base, lastRunAt: null, lastSuccessAt: null }, now), 'registered_idle');
   assert.equal(classifyWorkerState({ ...base, isRunning: true }, now), 'working');
+  assert.equal(
+    classifyWorkerState({ ...base, isRunning: true, lastRunAt: new Date(now - 20_001) }, now),
+    'hung',
+  );
   assert.equal(classifyWorkerState(base, now), 'healthy');
   assert.equal(classifyWorkerState({ ...base, lastRunAt: new Date(now - 30_001) }, now), 'stale');
   assert.equal(classifyWorkerState({ ...base, lastError: 'timeout', consecutiveFailures: 2 }, now), 'failing_backoff');

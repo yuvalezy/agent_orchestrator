@@ -102,6 +102,10 @@ export interface MeetingSchedulerDeps {
     ) => Promise<void>;
     /** Guarded: TRUE only for the caller that wins the right to abandon + mint the task. */
     claimGiveUp: (id: string) => Promise<boolean>;
+    /** Transient portal failure: persist work for a later retry. */
+    releaseGiveUp: (id: string) => Promise<void>;
+    /** Task created (or a permanent local precondition is absent): settle the fallback. */
+    completeGiveUp: (id: string) => Promise<void>;
     releaseToAwaitingSlot: (id: string) => Promise<void>;
     enqueueConfirmation: (id: string, body: string, by: string) => Promise<boolean>;
   };
@@ -133,10 +137,23 @@ async function giveUpToTask(
     logger.info({ meetingId: m.id }, 'meeting: give-up already claimed — not creating a second task');
     return;
   }
-  const task = await deps.fallbackToTask(m).catch((err) => {
-    logger.error({ meetingId: m.id, reason: (err as Error)?.message }, 'meeting: task fallback FAILED — the ask may be dropped');
-    return null;
-  });
+  let task: { url?: string } | null;
+  try {
+    task = await deps.fallbackToTask(m);
+  } catch (err) {
+    await deps.repo.releaseGiveUp(m.id);
+    logger.error(
+      { meetingId: m.id, reason: (err as Error)?.message },
+      'meeting: task fallback failed transiently — queued for retry',
+    );
+    await deps.notifier.notifyAdmin({
+      title: 'Meeting fallback queued',
+      body: `Could not create the fallback task for meeting request ${m.id}; it remains queued for retry.`,
+      severity: 'warning',
+    });
+    return;
+  }
+  await deps.repo.completeGiveUp(m.id);
   await deps.notifier.notifyCustomerEvent(m.customer_id, {
     title,
     body: task ? `${body}\n\nI've created a task for it instead.` : `${body}\n\n⚠️ I could not create a task either — please handle this one manually.`,
@@ -182,6 +199,8 @@ export interface MeetingScheduler {
    *  task); FALSE = they must answer again, so the question stays armed and the buttons live. */
   onTypedTime(meetingId: string, startsAt: Date, by: string): Promise<boolean>;
   onDecline(meetingId: string): Promise<void>;
+  /** Retry a durable fallback job without requiring the original callback to be redelivered. */
+  retryFallback(meetingId: string): Promise<void>;
 }
 
 const toSlotRow = (s: Slot): MeetingSlot => ({ startsAt: s.startsAt.toISOString(), endsAt: s.endsAt.toISOString() });
@@ -586,6 +605,17 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
       const m = await deps.repo.get(meetingId);
       if (!m) return;
       await giveUpToTask(deps, m, '📋 Task instead', 'Skipped scheduling, as you asked.');
+    },
+
+    async retryFallback(meetingId): Promise<void> {
+      const m = await deps.repo.get(meetingId);
+      if (!m || m.status !== 'fallback_pending') return;
+      await giveUpToTask(
+        deps,
+        m,
+        '📋 Meeting request saved as a task',
+        'Scheduling could not be completed.',
+      );
     },
   };
 }

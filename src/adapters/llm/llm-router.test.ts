@@ -4,6 +4,8 @@ import { query, closePool } from '../../db';
 import type { LlmMessage, LlmProviderClient, TokenUsage } from '../../ports/llm.port';
 import { LlmRouter, type LlmRole } from './llm-router';
 import { LlmProviderError, LlmAllProvidersFailed, CostCapExceeded } from './errors';
+import type { BudgetCostRecord, BudgetReservation, LlmBudgetPort } from './llm-budget';
+import { UnknownLlmPricingError } from './pricing';
 
 // DB-guarded (real llm_costs table + cleanup; skips if no DB). Provider clients are
 // fakes — the point is the router's chain/failover/cost/cap logic, not real HTTP.
@@ -39,7 +41,12 @@ const models: Record<string, Record<LlmRole, string>> = {
   openai: { triage: 'gpt-4.1', classify: 'gpt-4.1-mini', draft: 'gpt-4.1', answer: 'gpt-4.1' },
 };
 
-function buildRouter(providers: Record<string, LlmProviderClient>, capUsd = 10, notify: (m: string) => Promise<void> = async () => {}) {
+function buildRouter(
+  providers: Record<string, LlmProviderClient>,
+  capUsd = 10,
+  notify: (m: string) => Promise<void> = async () => {},
+  budget?: LlmBudgetPort,
+) {
   return new LlmRouter({
     providers,
     defaultProvider: 'anthropic',
@@ -47,13 +54,32 @@ function buildRouter(providers: Record<string, LlmProviderClient>, capUsd = 10, 
     modelFor: (p, role) => models[p]?.[role] ?? 'unknown',
     dailyCapUsd: capUsd,
     notifyAdmin: notify,
+    budget,
   });
+}
+
+function fakeBudget() {
+  const reservations: Array<{ maximum: number; cap: number }> = [];
+  const settled: BudgetCostRecord[] = [];
+  const forfeited: BudgetReservation[] = [];
+  const budget: LlmBudgetPort = {
+    reserve: async (_provider, _model, _role, maximum, cap) => {
+      reservations.push({ maximum, cap });
+      return { id: String(reservations.length), reservedUsd: maximum };
+    },
+    settle: async (_reservation, cost) => { settled.push(cost); },
+    forfeit: async (reservation) => { forfeited.push(reservation); },
+  };
+  return { budget, reservations, settled, forfeited };
 }
 
 let dbOk = false;
 async function ensureDb(): Promise<boolean> {
   try {
-    await query('SELECT 1 FROM llm_costs LIMIT 1');
+    // Router DB assertions require the hard-cap ledger as well as the legacy cost
+    // table. A developer database awaiting migration 051 must skip cleanly instead
+    // of misclassifying a missing ledger as a provider transport failure.
+    await query('SELECT 1 FROM llm_costs, llm_daily_budgets LIMIT 1');
     return true;
   } catch {
     return false;
@@ -62,11 +88,29 @@ async function ensureDb(): Promise<boolean> {
 
 beforeEach(async () => {
   dbOk = await ensureDb();
-  if (dbOk) await query(`DELETE FROM llm_costs WHERE role = 'test'`).catch(() => {});
+  if (dbOk) {
+    await query(`DELETE FROM llm_costs WHERE role = 'test'`).catch(() => {});
+    await query(
+      `DELETE FROM llm_budget_reservations
+        WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date`,
+    ).catch(() => {});
+    await query(
+      `DELETE FROM llm_daily_budgets
+        WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date`,
+    ).catch(() => {});
+  }
 });
 
 after(async () => {
   await query(`DELETE FROM llm_costs WHERE role = 'test'`).catch(() => {});
+  await query(
+    `DELETE FROM llm_budget_reservations
+      WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date`,
+  ).catch(() => {});
+  await query(
+    `DELETE FROM llm_daily_budgets
+      WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date`,
+  ).catch(() => {});
   await closePool();
 });
 
@@ -161,6 +205,45 @@ test('daily cost cap kill-switch throws before any provider call', async (t) => 
   const router = buildRouter({ anthropic: client }, 10);
   await assert.rejects(router.extractIntents(CANNED), CostCapExceeded);
   assert.equal(called, false);
+});
+
+test('provider call reserves before dispatch and settles actual usage after success', async () => {
+  const ledger = fakeBudget();
+  const router = buildRouter({ anthropic: fakeClient('anthropic', 'ok') }, 10, async () => {}, ledger.budget);
+  await router.extractIntents(CANNED);
+  assert.equal(ledger.reservations.length, 1);
+  assert.equal(ledger.reservations[0].cap, 10);
+  assert.ok(ledger.reservations[0].maximum > 0);
+  assert.equal(ledger.settled.length, 1);
+  assert.equal(ledger.settled[0].provider, 'anthropic');
+  assert.deepEqual(ledger.settled[0].usage, { inputTokens: 100, outputTokens: 20 });
+  assert.equal(ledger.forfeited.length, 0);
+});
+
+test('provider failure forfeits its reservation before failover accounting', async () => {
+  const ledger = fakeBudget();
+  const router = buildRouter({ anthropic: fakeClient('anthropic', 'auth-fail') }, 10, async () => {}, ledger.budget);
+  await assert.rejects(router.extractIntents(CANNED), LlmAllProvidersFailed);
+  assert.equal(ledger.reservations.length, 1);
+  assert.equal(ledger.forfeited.length, 1);
+  assert.equal(ledger.settled.length, 0);
+});
+
+test('unpriced configured model fails closed before provider dispatch', async () => {
+  let called = false;
+  const ledger = fakeBudget();
+  const client = fakeClient('anthropic', 'ok');
+  const router = new LlmRouter({
+    providers: { anthropic: { ...client, completeStructured: async <T>(request: Parameters<LlmProviderClient['completeStructured']>[0]) => {
+      called = true;
+      return client.completeStructured<T>(request);
+    } } },
+    defaultProvider: 'anthropic', fallbackChain: [], modelFor: () => 'unpriced-model',
+    dailyCapUsd: 10, notifyAdmin: async () => {}, budget: ledger.budget,
+  });
+  await assert.rejects(router.extractIntents(CANNED), UnknownLlmPricingError);
+  assert.equal(called, false);
+  assert.equal(ledger.reservations.length, 0);
 });
 
 // ── WP8: answerAgentically (agentic loop) provider selection + cost ─────────────────────────────────

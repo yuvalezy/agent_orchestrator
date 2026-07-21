@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { logger } from '../../logger';
+import { recordProviderRequest } from '../../observability/provider-metrics';
 import { DEFAULT_RETRY, RetryOptions, withRetry } from '../shared/retry';
 
 // Thin HTTP client for the EZY Portal tenant API (blueprint §2). Mirrors the
@@ -95,6 +96,22 @@ export class EzyPortalHttpClient {
   }
 
   /**
+   * POST exactly once at the transport layer.
+   *
+   * Use this for endpoints that do not enforce Idempotency-Key. A timeout after
+   * the server commits has an unknowable outcome; replaying it here can duplicate
+   * the side effect. The caller must reconcile using a domain key before trying
+   * again in a later workflow attempt.
+   */
+  async postNonIdempotent<T>(path: string, body: unknown): Promise<T> {
+    return this.request<T>('POST', path, {
+      body,
+      idempotencyKey: crypto.randomUUID(),
+      retry: false,
+    });
+  }
+
+  /**
    * POST a multipart/form-data upload (M2 group-mention attach). Builds a FormData
    * with a single `file` part (the field name the portal's upload handler reads)
    * and lets fetch set the multipart boundary — so NO explicit Content-Type here.
@@ -149,7 +166,12 @@ export class EzyPortalHttpClient {
   private async request<T>(
     method: 'GET' | 'POST',
     path: string,
-    opts: { params?: Record<string, string | undefined>; body?: unknown; idempotencyKey?: string },
+    opts: {
+      params?: Record<string, string | undefined>;
+      body?: unknown;
+      idempotencyKey?: string;
+      retry?: boolean;
+    },
   ): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (opts.params) {
@@ -180,14 +202,22 @@ export class EzyPortalHttpClient {
           signal: AbortSignal.timeout(this.timeoutMs),
         });
       } catch (err) {
+        const durationMs = Date.now() - started;
+        const name = (err as { name?: unknown })?.name;
+        recordProviderRequest(
+          'ezy-portal',
+          durationMs,
+          name === 'AbortError' || name === 'TimeoutError' ? 'timeout' : 'failure',
+        );
         logger.warn(
-          { method, path, attempt, durationMs: Date.now() - started, err },
+          { method, path, attempt, durationMs, err },
           'EZY request transport error',
         );
         throw err; // network/timeout → retryable
       }
       const durationMs = Date.now() - started;
       if (!res.ok) {
+        recordProviderRequest('ezy-portal', durationMs, 'failure');
         const detail = await res.text().catch(() => '');
         logger.warn({ method, path, status: res.status, attempt, durationMs }, 'EZY request non-2xx');
         throw new EzyHttpError(
@@ -198,18 +228,21 @@ export class EzyPortalHttpClient {
           res.status === 429 ? parseRetryAfter(res.headers.get('retry-after')) : undefined,
         );
       }
+      recordProviderRequest('ezy-portal', durationMs, 'success');
       logger.info({ method, path, status: res.status, attempt, durationMs }, 'EZY request ok');
       return res;
     };
 
-    const res = await withRetry(doAttempt, {
-      ...DEFAULT_RETRY,
-      isRetryable,
-      retryAfterMs,
-      onRetry: ({ attempt: a, nextDelayMs }) =>
-        logger.warn({ method, path, attempt: a, nextDelayMs }, 'EZY retrying request'),
-      ...this.retry,
-    });
+    const res = opts.retry === false
+      ? await doAttempt()
+      : await withRetry(doAttempt, {
+          ...DEFAULT_RETRY,
+          isRetryable,
+          retryAfterMs,
+          onRetry: ({ attempt: a, nextDelayMs }) =>
+            logger.warn({ method, path, attempt: a, nextDelayMs }, 'EZY retrying request'),
+          ...this.retry,
+        });
 
     // Body parse is OUTSIDE the retry loop so a decode failure never re-POSTs.
     if (res.status === 204) return undefined as T;

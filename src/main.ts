@@ -3,9 +3,11 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { logger, startupLogger } from './logger';
 import { runMigrations } from './db/migrate';
-import { closePool, withClient } from './db';
+import { closePool } from './db';
 import { buildApp, type AppDeps } from './app';
 import { startWorker, type WorkerDefinition } from './workers/worker-runner';
+import { installGracefulShutdown } from './runtime/graceful-shutdown';
+import { withAdvisoryWorkerLock } from './runtime/advisory-worker';
 import { ChannelRegistry } from './adapters/channel-registry';
 import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
 import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
@@ -71,7 +73,11 @@ import {
 import { buildTelegramNotifier } from './adapters/telegram/factory';
 import { buildInboxProcessorWorker } from './adapters/triage/inbox-processor.factory';
 import { buildCallbackPollerWorker, buildDraftReviserService } from './adapters/triage/callback-poller.factory';
-import { buildMeetingSchedulerGated, type MeetingWiring } from './adapters/triage/meeting-scheduler.factory';
+import {
+  buildMeetingFallbackWorkerGated,
+  buildMeetingSchedulerGated,
+  type MeetingWiring,
+} from './adapters/triage/meeting-scheduler.factory';
 import { abandonOpenMeeting } from './triage/meeting-repo';
 import { buildScheduleDueWorker } from './adapters/scheduling/schedule.worker';
 import { buildOutboundDrainerWorker } from './adapters/outbound/outbound-drainer.factory';
@@ -426,7 +432,14 @@ async function main(): Promise<void> {
       onboardingNotifier = notifier; // late-bind the console onboarding service to the same fanout
       // The PWA "another time" picker books through this fanout notifier, so a booking made in the
       // app confirms on every surface. Null when scheduling is off → /api/meeting-time answers 503.
-      bookAppMeetingTime = buildMeetingSchedulerGated(buildEzyPortalGateway(), notifier)?.bookLocalTime ?? null;
+      const meetingTaskTarget = buildEzyPortalGateway();
+      bookAppMeetingTime = buildMeetingSchedulerGated(meetingTaskTarget, notifier)?.bookLocalTime ?? null;
+      const meetingFallbackWorker = buildMeetingFallbackWorkerGated(
+        meetingTaskTarget,
+        notifier,
+        env.MEETING_FALLBACK_INTERVAL_MS,
+      );
+      if (meetingFallbackWorker) triageWorkers.push(meetingFallbackWorker);
       // The app is a decision SINK (its own taps route to routeDecision) and the mirror hook
       // (onDecided marks + re-emits its rows). buildCallbackPollerWorker registers the shared
       // decision router on that sink as a BUILD-TIME side effect — so it is called even with no
@@ -526,26 +539,12 @@ async function main(): Promise<void> {
     });
     // Wrap the reconcile in a session advisory lock (try-lock → skip if not acquired,
     // release in finally; a process crash ends the session and frees it automatically).
-    knowledgeWorkers.push({
-      ...syncWorker,
-      run: async () => {
-        await withClient(async (client) => {
-          const { rows } = await client.query<{ locked: boolean }>(
-            'SELECT pg_try_advisory_lock($1) AS locked',
-            [KNOWLEDGE_SYNC_LOCK_KEY],
-          );
-          if (!rows[0]?.locked) {
-            logger.warn('knowledge sync: another instance holds the advisory lock — skipping this tick');
-            return;
-          }
-          try {
-            await syncWorker.run();
-          } finally {
-            await client.query('SELECT pg_advisory_unlock($1)', [KNOWLEDGE_SYNC_LOCK_KEY]);
-          }
-        });
-      },
-    });
+    knowledgeWorkers.push(withAdvisoryWorkerLock(
+      syncWorker,
+      KNOWLEDGE_SYNC_LOCK_KEY,
+      'knowledge sync: another instance holds the advisory lock — skipping this tick',
+      logger,
+    ));
     logger.info('knowledge-sync worker registered (KNOWLEDGE_SYNC_ENABLED=true)');
   } else {
     logger.info('knowledge-sync worker NOT registered (KNOWLEDGE_SYNC_ENABLED=false) — set it once corpus customers are onboarded, nothing ingests meanwhile');
@@ -593,43 +592,35 @@ async function main(): Promise<void> {
         ? 'live-dedup fingerprint seed wired into task-inventory tick (LIVE_DEDUP_FINGERPRINT_ENABLED=true)'
         : 'live-dedup fingerprint seed NOT wired (LIVE_DEDUP_FINGERPRINT_ENABLED=false)',
     );
-    knowledgeWorkers.push({
+    const taskInventoryAndSeed: WorkerDefinition = {
       ...taskInventoryWorker,
-      run: async () => {
-        await withClient(async (client) => {
-          const { rows } = await client.query<{ locked: boolean }>(
-            'SELECT pg_try_advisory_lock($1) AS locked',
-            [TASK_INVENTORY_LOCK_KEY],
-          );
-          if (!rows[0]?.locked) {
-            logger.warn('task-inventory sync: another instance holds the advisory lock — skipping this tick');
-            return;
-          }
-          try {
-            await taskInventoryWorker.run();
-            // Seed AFTER the reconcile so the memory + the fingerprint reflect the same scan.
-            // Best-effort + per-customer isolated inside seedTaskFingerprints → a seed error
-            // never fails the inventory tick.
-            if (seedFingerprints) {
-              await seedTaskFingerprints({
-                listCustomers: async () =>
-                  (await listTaskInventoryCustomers()).map((c) => ({ customerId: c.customerId, projectRef: c.projectRef })),
-                listAllTasks: (projectRef) => portal.listAllTasks(projectRef),
-                embedding: taskEmbedding,
-                listExistingRefs: listPortalFingerprintTaskRefs,
-                refresh: refreshPortalFingerprint,
-                insert: insertConversationLink,
-                deleteStale: deletePortalFingerprints,
-                channelType: PORTAL_FINGERPRINT_CHANNEL,
-                log: logger,
-              });
-            }
-          } finally {
-            await client.query('SELECT pg_advisory_unlock($1)', [TASK_INVENTORY_LOCK_KEY]);
-          }
-        });
+      run: async (signal) => {
+        await taskInventoryWorker.run(signal);
+        // Seed AFTER the reconcile so the memory + the fingerprint reflect the same scan.
+        // Best-effort + per-customer isolated inside seedTaskFingerprints → a seed error
+        // never fails the inventory tick.
+        if (seedFingerprints) {
+          await seedTaskFingerprints({
+            listCustomers: async () =>
+              (await listTaskInventoryCustomers()).map((c) => ({ customerId: c.customerId, projectRef: c.projectRef })),
+            listAllTasks: (projectRef) => portal.listAllTasks(projectRef),
+            embedding: taskEmbedding,
+            listExistingRefs: listPortalFingerprintTaskRefs,
+            refresh: refreshPortalFingerprint,
+            insert: insertConversationLink,
+            deleteStale: deletePortalFingerprints,
+            channelType: PORTAL_FINGERPRINT_CHANNEL,
+            log: logger,
+          });
+        }
       },
-    });
+    };
+    knowledgeWorkers.push(withAdvisoryWorkerLock(
+      taskInventoryAndSeed,
+      TASK_INVENTORY_LOCK_KEY,
+      'task-inventory sync: another instance holds the advisory lock — skipping this tick',
+      logger,
+    ));
     logger.info('task-inventory sync worker registered (TASK_INVENTORY_ENABLED=true)');
   } else {
     logger.info('task-inventory sync worker NOT registered (TASK_INVENTORY_ENABLED=false)');
@@ -862,26 +853,12 @@ async function main(): Promise<void> {
       intervalMs: env.KNOWLEDGE_INTERNAL_SYNC_INTERVAL_MS,
       tombstoneMaxRatio: env.KNOWLEDGE_TOMBSTONE_MAX_RATIO,
     });
-    knowledgeWorkers.push({
-      ...internalWorker,
-      run: async () => {
-        await withClient(async (client) => {
-          const { rows } = await client.query<{ locked: boolean }>(
-            'SELECT pg_try_advisory_lock($1) AS locked',
-            [INTERNAL_SYNC_LOCK_KEY],
-          );
-          if (!rows[0]?.locked) {
-            logger.warn('internal knowledge sync: another instance holds the advisory lock — skipping this tick');
-            return;
-          }
-          try {
-            await internalWorker.run();
-          } finally {
-            await client.query('SELECT pg_advisory_unlock($1)', [INTERNAL_SYNC_LOCK_KEY]);
-          }
-        });
-      },
-    });
+    knowledgeWorkers.push(withAdvisoryWorkerLock(
+      internalWorker,
+      INTERNAL_SYNC_LOCK_KEY,
+      'internal knowledge sync: another instance holds the advisory lock — skipping this tick',
+      logger,
+    ));
     logger.info('internal knowledge-sync worker registered (KNOWLEDGE_INTERNAL_ENABLED=true)');
   } else {
     logger.info('internal knowledge-sync worker NOT registered (KNOWLEDGE_INTERNAL_ENABLED=false) — Project Brain corpus not ingested; set the flag to enable');
@@ -930,26 +907,12 @@ async function main(): Promise<void> {
         log: logger,
         intervalMs: env.RELEASE_NOTE_SYNC_INTERVAL_MS,
       });
-      knowledgeWorkers.push({
-        ...rnWorker,
-        run: async () => {
-          await withClient(async (client) => {
-            const { rows } = await client.query<{ locked: boolean }>(
-              'SELECT pg_try_advisory_lock($1) AS locked',
-              [RELEASE_NOTE_LOCK_KEY],
-            );
-            if (!rows[0]?.locked) {
-              logger.warn('release-notes: another instance holds the advisory lock — skipping this tick');
-              return;
-            }
-            try {
-              await rnWorker.run();
-            } finally {
-              await client.query('SELECT pg_advisory_unlock($1)', [RELEASE_NOTE_LOCK_KEY]);
-            }
-          });
-        },
-      });
+      knowledgeWorkers.push(withAdvisoryWorkerLock(
+        rnWorker,
+        RELEASE_NOTE_LOCK_KEY,
+        'release-notes: another instance holds the advisory lock — skipping this tick',
+        logger,
+      ));
       logger.info('release-note drafts worker registered (RELEASE_NOTE_DRAFTS_ENABLED=true)');
     }
   } else {
@@ -1081,19 +1044,7 @@ async function main(): Promise<void> {
     ...proactiveWorkers,
   ].map(startWorker);
 
-  let shuttingDown = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    logger.info({ signal }, 'Shutting down…');
-    for (const w of workers) w.stop();
-    server.close();
-    await closePool();
-    process.exit(0);
-  };
-
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  installGracefulShutdown({ server, workers, closeResources: closePool, log: logger });
 }
 
 main().catch((err) => {

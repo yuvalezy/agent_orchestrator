@@ -130,6 +130,7 @@ function fakes(
           onTypedTime: async () => true,
           onSlot: async () => {},
           onDecline: async () => {},
+          retryFallback: async () => {},
         }
       : undefined,
     needsInfoDrafter: opts.needsInfo

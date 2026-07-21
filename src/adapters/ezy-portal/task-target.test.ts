@@ -50,6 +50,29 @@ test('createTask posts camelCase body + source* + Idempotency-Key; truncates a l
   assert.equal((c.body!.title as string).length, 240); // truncated
 });
 
+test('createTask does not blind-retry when the portal outcome is ambiguous', async () => {
+  let calls = 0;
+  const http = new EzyPortalHttpClient({
+    baseUrl: 'http://portal',
+    resolveApiKey: () => 'ten_key',
+    fetchImpl: (async () => {
+      calls += 1;
+      throw new Error('socket closed after commit');
+    }) as typeof fetch,
+    retry: { sleep: async () => {} },
+  });
+  const gw = new EzyPortalGateway(http);
+
+  await assert.rejects(
+    gw.createTask({
+      customerRef: 'b', projectRef: 'p', workItemTypeRef: 'w', title: 'x', description: 'd', priority: 'low',
+      source: { service: 'agent-orchestrator', entityType: 'whatsapp', entityId: 'e', display: 'd' }, tags: [],
+    }),
+    /socket closed after commit/,
+  );
+  assert.equal(calls, 1);
+});
+
 test('createTask sends a dueAt as an ISO string, and OMITS the field entirely when absent', async () => {
   const withDue = gatewayWith(201, { id: 'task-1', title: 'T' });
   await withDue.gw.createTask({

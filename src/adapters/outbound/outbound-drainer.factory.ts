@@ -35,6 +35,7 @@ export interface OutboundRepo {
   oldestSentSince(instanceId: string, recipient: string, sinceIso: string): Promise<Date | null>;
   lastSentAt(instanceId: string, recipient: string): Promise<Date | null>;
   failuresSince(instanceId: string, recipient: string, sinceIso: string): Promise<number>;
+  withRecipientLease(instanceId: string, recipient: string, run: () => Promise<void>): Promise<boolean>;
   loadBusinessHours(): Promise<BusinessHour[]>;
   loadHolidays(sinceIso: string, untilIso: string): Promise<Holiday[]>;
 }
@@ -177,47 +178,57 @@ export function buildOutboundDrainerWorker(cfg: OutboundDrainerConfig): WorkerDe
       }
     }
 
-    // (d) per-recipient rate limit (D-F) — internal pacing, NO notify.
-    const hourSince = new Date(now - HOUR_MS).toISOString();
-    const sentInHour = await repo.countSentSince(row.channel_instance_id, row.recipient_address, hourSince);
-    if (sentInHour >= cfg.ratePerHour) {
-      const oldest = await repo.oldestSentSince(row.channel_instance_id, row.recipient_address, hourSince);
-      const base = oldest ?? new Date(now);
-      await repo.deferUntil(row.id, new Date(base.getTime() + HOUR_MS));
-      logger.info({ worker: NAME, id: row.id, status: 'rate_deferred' }, 'outbound: hourly cap reached');
-      return;
-    }
-    const last = await repo.lastSentAt(row.channel_instance_id, row.recipient_address);
-    if (last && now - last.getTime() < cfg.minGapMs) {
-      await repo.deferUntil(row.id, new Date(last.getTime() + cfg.minGapMs));
-      logger.info({ worker: NAME, id: row.id, status: 'gap_deferred' }, 'outbound: min-gap not elapsed');
-      return;
-    }
+    // (d/e) Serialize the final rate checks + network dispatch + terminal update per recipient
+    // across every process. Without this lease two replicas can both observe an available slot
+    // and send concurrently. Checks stay INSIDE the lease so a waiter sees the preceding send.
+    const acquired = await repo.withRecipientLease(row.channel_instance_id, row.recipient_address, async () => {
+      const leaseNow = Date.now();
+      const hourSince = new Date(leaseNow - HOUR_MS).toISOString();
+      const sentInHour = await repo.countSentSince(row.channel_instance_id, row.recipient_address, hourSince);
+      if (sentInHour >= cfg.ratePerHour) {
+        const oldest = await repo.oldestSentSince(row.channel_instance_id, row.recipient_address, hourSince);
+        const base = oldest ?? new Date(leaseNow);
+        await repo.deferUntil(row.id, new Date(base.getTime() + HOUR_MS));
+        logger.info({ worker: NAME, id: row.id, status: 'rate_deferred' }, 'outbound: hourly cap reached');
+        return;
+      }
+      const last = await repo.lastSentAt(row.channel_instance_id, row.recipient_address);
+      if (last && leaseNow - last.getTime() < cfg.minGapMs) {
+        await repo.deferUntil(row.id, new Date(last.getTime() + cfg.minGapMs));
+        logger.info({ worker: NAME, id: row.id, status: 'gap_deferred' }, 'outbound: min-gap not elapsed');
+        return;
+      }
 
-    // (e) dispatch. isGroup from the joined contact row (R37); threadKey/subject/inReplyTo
-    // from the row; attachment_ref (JSONB) → media reference resolved by the adapter (M2 B).
-    const msg: OutboundMessage = {
-      instanceId: row.channel_instance_id,
-      recipientAddress: row.recipient_address,
-      threadKey: row.thread_key ?? undefined,
-      inReplyTo: row.in_reply_to ?? undefined,
-      subject: row.subject ?? undefined,
-      body: row.body,
-      attachment: row.attachment_ref ?? undefined,
-      isGroup: row.is_group ?? false,
-    };
-    try {
-      const { providerMessageId } = await adapter.send(msg);
-      await repo.markSent(row.id, providerMessageId);
-      logger.info({ worker: NAME, id: row.id, status: 'sent' }, 'outbound: sent');
-    } catch (err) {
-      await classify(row, err);
+      const msg: OutboundMessage = {
+        instanceId: row.channel_instance_id,
+        recipientAddress: row.recipient_address,
+        threadKey: row.thread_key ?? undefined,
+        inReplyTo: row.in_reply_to ?? undefined,
+        subject: row.subject ?? undefined,
+        body: row.body,
+        attachment: row.attachment_ref ?? undefined,
+        isGroup: row.is_group ?? false,
+      };
+      try {
+        const { providerMessageId } = await adapter.send(msg);
+        await repo.markSent(row.id, providerMessageId);
+        logger.info({ worker: NAME, id: row.id, status: 'sent' }, 'outbound: sent');
+      } catch (err) {
+        await classify(row, err);
+      }
+    });
+    if (!acquired) {
+      // The row is already `sending`; park it promptly and let the lease holder's markSent become
+      // visible before the next attempt. A positive delay also avoids a hot retry loop at gap=0.
+      await repo.deferUntil(row.id, new Date(Date.now() + Math.max(cfg.minGapMs, 1_000)));
+      logger.info({ worker: NAME, id: row.id, status: 'lease_deferred' }, 'outbound: recipient dispatch already in progress');
     }
   }
 
   return {
     name: NAME,
     intervalMs: cfg.intervalMs,
+    critical: true,
     run: async () => {
       // Reclaim stuck 'sending' rows first (possibly delivered → failReview + ONE alert).
       const stuck = await repo.reclaimStuck(cfg.stuckMinutes);

@@ -74,6 +74,7 @@ function fakeRepo(calls: Calls, over: Partial<OutboundRepo>, retryTipsToFailed =
     oldestSentSince: async () => null,
     lastSentAt: async () => null,
     failuresSince: async () => 0,
+    withRecipientLease: async (_instanceId, _recipient, run) => { await run(); return true; },
     loadBusinessHours: async () => OPEN_ALL,
     loadHolidays: async () => [],
     ...over,
@@ -298,6 +299,16 @@ test('min-gap not elapsed → deferUntil, NO note', async () => {
   assert.equal(calls.deferUntil.length, 1);
   assert.equal(calls.markSent.length, 0);
   assert.equal(admin.length + customer.length, 0);
+});
+
+test('recipient lease contention parks the claimed row without sending', async () => {
+  const { calls } = await runTick({
+    adapter: waAdapter(okFetch()),
+    repoOver: { withRecipientLease: async () => false },
+  });
+  assert.equal(calls.markSent.length, 0);
+  assert.equal(calls.deferUntil.length, 1);
+  assert.ok(calls.deferUntil[0].when.getTime() > Date.now());
 });
 
 test('failure circuit-breaker (>=3 recent) → deferUntil + one admin alert, no send', async () => {

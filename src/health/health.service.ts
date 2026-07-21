@@ -2,6 +2,7 @@ import { query } from '../db';
 import { env } from '../config/env';
 import { getWorkerStatuses } from '../workers/worker-runner';
 import type { WorkerStatus } from '../workers/worker-runner';
+import { getProviderMetrics, type ProviderMetric } from '../observability/provider-metrics';
 
 interface BacklogBucket {
   pending: number;
@@ -15,6 +16,21 @@ export interface HealthReport {
   db: 'ok' | 'down';
   backlog: { inbox: BacklogBucket; outboundQueue: BacklogBucket };
   workers: WorkerStatus[];
+  operations: OperationalMetrics;
+}
+
+export interface OperationalMetrics {
+  available: boolean;
+  providers: ProviderMetric[];
+  terminalManualReview: { inbox: number; outbound: number };
+  ambiguousOutbound: number;
+  meetingFallbackQueued: number;
+  llmBudget: {
+    budgetDate: string | null;
+    spentUsd: number;
+    reservedUsd: number;
+    activeReservations: number;
+  };
 }
 
 interface QueueStateCount {
@@ -49,10 +65,76 @@ export interface ConsoleOverview extends HealthReport {
 
 const EMPTY_BUCKET: BacklogBucket = { pending: 0, failed: 0, oldestPendingAgeSeconds: null };
 
+function emptyOperationalMetrics(): OperationalMetrics {
+  return {
+    available: false,
+    providers: getProviderMetrics(),
+    terminalManualReview: { inbox: 0, outbound: 0 },
+    ambiguousOutbound: 0,
+    meetingFallbackQueued: 0,
+    llmBudget: { budgetDate: null, spentUsd: 0, reservedUsd: 0, activeReservations: 0 },
+  };
+}
+
+async function operationalMetrics(): Promise<OperationalMetrics> {
+  const { rows } = await query<{
+    inbox_failed: string;
+    outbound_failed: string;
+    outbound_ambiguous: string;
+    meeting_fallback_queued: string;
+    budget_date: string;
+    spent_usd: string;
+    reserved_usd: string;
+    active_reservations: string;
+  }>(
+    `SELECT
+       (SELECT count(*) FROM agent_inbox WHERE status = 'failed')::text AS inbox_failed,
+       (SELECT count(*) FROM agent_outbound_queue WHERE status = 'failed')::text AS outbound_failed,
+       (SELECT count(*) FROM agent_outbound_queue
+         WHERE status = 'failed' AND last_error LIKE 'possibly-delivered: %')::text AS outbound_ambiguous,
+       (SELECT count(*) FROM agent_meeting_requests
+         WHERE status IN ('fallback_pending','fallback_creating'))::text AS meeting_fallback_queued,
+       (now() AT TIME ZONE 'America/Panama')::date::text AS budget_date,
+       coalesce((SELECT spent_usd FROM llm_daily_budgets
+                  WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date), 0)::text AS spent_usd,
+       coalesce((SELECT reserved_usd FROM llm_daily_budgets
+                  WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date), 0)::text AS reserved_usd,
+       (SELECT count(*) FROM llm_budget_reservations
+         WHERE budget_date = (now() AT TIME ZONE 'America/Panama')::date
+           AND status = 'reserved')::text AS active_reservations`,
+  );
+  const row = rows[0];
+  return {
+    available: true,
+    providers: getProviderMetrics(),
+    terminalManualReview: { inbox: Number(row.inbox_failed), outbound: Number(row.outbound_failed) },
+    ambiguousOutbound: Number(row.outbound_ambiguous),
+    meetingFallbackQueued: Number(row.meeting_fallback_queued),
+    llmBudget: {
+      budgetDate: row.budget_date,
+      spentUsd: Number(row.spent_usd),
+      reservedUsd: Number(row.reserved_usd),
+      activeReservations: Number(row.active_reservations),
+    },
+  };
+}
+
+/** Metrics must never turn a healthy application request into a 500 during a
+ * rolling deployment or partial database restore. The availability bit makes
+ * absence explicit while process-local provider telemetry remains visible. */
+async function safeOperationalMetrics(): Promise<OperationalMetrics> {
+  try {
+    return await operationalMetrics();
+  } catch {
+    return emptyOperationalMetrics();
+  }
+}
+
 interface ConfiguredWorker {
   name: string;
   intervalMs: number;
   enabled: boolean;
+  critical?: boolean;
 }
 
 /**
@@ -63,7 +145,8 @@ interface ConfiguredWorker {
  */
 function configuredWorkers(): ConfiguredWorker[] {
   return [
-    { name: 'outbound:drainer', intervalMs: env.OUTBOUND_DRAIN_INTERVAL_MS, enabled: env.OUTBOUND_ENABLED },
+    { name: 'outbound:drainer', intervalMs: env.OUTBOUND_DRAIN_INTERVAL_MS, enabled: env.OUTBOUND_ENABLED, critical: true },
+    { name: 'meeting:fallback', intervalMs: env.MEETING_FALLBACK_INTERVAL_MS, enabled: env.MEETING_SCHEDULING_ENABLED, critical: true },
     { name: 'knowledge:sync', intervalMs: env.KNOWLEDGE_SYNC_INTERVAL_MS, enabled: env.KNOWLEDGE_SYNC_ENABLED },
     { name: 'task-inventory:sync', intervalMs: env.TASK_INVENTORY_SYNC_INTERVAL_MS, enabled: env.TASK_INVENTORY_ENABLED },
     { name: 'feedback:learning', intervalMs: env.FEEDBACK_LEARNING_INTERVAL_MS, enabled: env.FEEDBACK_LEARNING_ENABLED },
@@ -80,6 +163,8 @@ export function includeUnregisteredConfiguredWorkers(workers: WorkerStatus[], co
     .map((worker): WorkerStatus => ({
       name: worker.name,
       intervalMs: worker.intervalMs,
+      maxRuntimeMs: Math.max(worker.intervalMs * 2, 60_000),
+      critical: worker.critical ?? false,
       lastRunAt: null,
       lastSuccessAt: null,
       lastDurationMs: null,
@@ -90,6 +175,21 @@ export function includeUnregisteredConfiguredWorkers(workers: WorkerStatus[], co
       registration: worker.enabled ? 'not_registered' : 'flag_off',
     }));
   return [...workers, ...missing].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+const UNHEALTHY_WORKER_STATES = new Set<WorkerStatus['state']>([
+  'failing_backoff',
+  'hung',
+  'stale',
+  'not_registered',
+]);
+
+/** Only explicitly critical workers affect the process-level readiness signal. */
+export function healthStatus(dbOk: boolean, workers: WorkerStatus[]): HealthReport['status'] {
+  if (!dbOk) return 'degraded';
+  return workers.some((worker) => worker.critical && UNHEALTHY_WORKER_STATES.has(worker.state))
+    ? 'degraded'
+    : 'ok';
 }
 
 /**
@@ -191,25 +291,28 @@ export async function getHealth(): Promise<HealthReport> {
   const dbOk = await probeDb();
   if (!dbOk) {
     return {
-      status: 'degraded',
+      status: healthStatus(false, workers),
       uptime: process.uptime(),
       db: 'down',
       backlog: { inbox: EMPTY_BUCKET, outboundQueue: EMPTY_BUCKET },
       workers,
+      operations: emptyOperationalMetrics(),
     };
   }
 
-  const [inbox, outboundQueue] = await Promise.all([
+  const [inbox, outboundQueue, operations] = await Promise.all([
     backlogFor('agent_inbox'),
     backlogFor('agent_outbound_queue'),
+    safeOperationalMetrics(),
   ]);
 
   return {
-    status: 'ok',
+    status: healthStatus(true, workers),
     uptime: process.uptime(),
     db: 'ok',
     backlog: { inbox, outboundQueue },
     workers,
+    operations,
   };
 }
 
@@ -225,11 +328,12 @@ export async function getConsoleOverview(): Promise<ConsoleOverview> {
   if (!dbOk) {
     const emptyChannels: ActiveChannel[] = [];
     return {
-      status: 'degraded',
+      status: healthStatus(false, workers),
       uptime: process.uptime(),
       db: 'down',
       backlog: { inbox: EMPTY_BUCKET, outboundQueue: EMPTY_BUCKET },
       workers,
+      operations: emptyOperationalMetrics(),
       queueStates: { inbox: [], outbound: [] },
       activeChannels: emptyChannels,
       featureFlags: flags,
@@ -237,19 +341,21 @@ export async function getConsoleOverview(): Promise<ConsoleOverview> {
     };
   }
 
-  const [inbox, outboundQueue, inboxStates, outboundStates, channels] = await Promise.all([
+  const [inbox, outboundQueue, inboxStates, outboundStates, channels, operations] = await Promise.all([
     backlogFor('agent_inbox'),
     backlogFor('agent_outbound_queue'),
     queueStatesFor('agent_inbox'),
     queueStatesFor('agent_outbound_queue'),
     activeChannels(),
+    safeOperationalMetrics(),
   ]);
   return {
-    status: 'ok',
+    status: healthStatus(true, workers),
     uptime: process.uptime(),
     db: 'ok',
     backlog: { inbox, outboundQueue },
     workers,
+    operations,
     queueStates: { inbox: inboxStates, outbound: outboundStates },
     activeChannels: channels,
     featureFlags: flags,

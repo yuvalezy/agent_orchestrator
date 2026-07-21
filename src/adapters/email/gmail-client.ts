@@ -2,6 +2,7 @@ import { logger } from '../../logger';
 import { DEFAULT_RETRY, withRetry } from '../shared/retry';
 import type { EmailProviderClient, ProviderEmail } from '../../ports/channel.port';
 import { extractText, header, parseAddresses, parseOneAddress, type GmailPayload } from './mime';
+import { recordProviderRequest } from '../../observability/provider-metrics';
 
 // GmailProviderClient (tasks.md 3.4) — raw fetch, no SDK. OAuth2 refresh-token →
 // access token; History-API incremental pull with FULL pagination + a dynamic
@@ -9,6 +10,7 @@ import { extractText, header, parseAddresses, parseOneAddress, type GmailPayload
 
 const GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const OAUTH = 'https://oauth2.googleapis.com/token';
+const DEFAULT_TIMEOUT_MS = 30_000;
 const BOOTSTRAP_CAP_MS = 30 * 24 * 3600_000; // never bootstrap further back than 30d
 const FIRST_RUN_MS = 2 * 24 * 3600_000; // first-ever bootstrap window
 
@@ -34,6 +36,7 @@ export class GmailClient implements EmailProviderClient {
     private readonly resolveCred: () => string, // JSON {client_id,client_secret,refresh_token}
     private readonly nowMs: () => number = () => Date.now(),
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
   ) {}
 
   private cred(): OAuthCred {
@@ -42,13 +45,31 @@ export class GmailClient implements EmailProviderClient {
     return c;
   }
 
+  private async request(input: string, init?: RequestInit): Promise<Response> {
+    const startedAt = Date.now();
+    try {
+      const response = await this.fetchImpl(input, init);
+      recordProviderRequest('google:gmail', Date.now() - startedAt, response.ok ? 'success' : 'failure');
+      return response;
+    } catch (err) {
+      const name = err instanceof Error ? err.name : '';
+      recordProviderRequest(
+        'google:gmail',
+        Date.now() - startedAt,
+        name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'failure',
+      );
+      throw err;
+    }
+  }
+
   private async token(): Promise<string> {
     if (this.accessToken && this.nowMs() < this.tokenExpiresMs) return this.accessToken;
     const c = this.cred();
-    const res = await this.fetchImpl(OAUTH, {
+    const res = await this.request(OAUTH, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ client_id: c.client_id, client_secret: c.client_secret, refresh_token: c.refresh_token, grant_type: 'refresh_token' }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) throw new Error(`gmail token refresh failed (${res.status})`);
     const j = (await res.json()) as { access_token: string; expires_in: number };
@@ -61,7 +82,10 @@ export class GmailClient implements EmailProviderClient {
   private async get<T>(path: string, allow404 = false): Promise<T | null> {
     return withRetry(
       async () => {
-        const res = await this.fetchImpl(`${GMAIL}${path}`, { headers: { Authorization: `Bearer ${await this.token()}` } });
+        const res = await this.request(`${GMAIL}${path}`, {
+          headers: { Authorization: `Bearer ${await this.token()}` },
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
         if (res.status === 401) {
           this.accessToken = null; // force refresh + retry
           throw new Error('gmail 401 (token) — retrying');
@@ -202,10 +226,11 @@ export class GmailClient implements EmailProviderClient {
     if (input.inReplyTo) lines.push(`In-Reply-To: ${input.inReplyTo}`);
     if (input.references?.length) lines.push(`References: ${input.references.join(' ')}`);
     const raw = Buffer.from(`${lines.join('\r\n')}\r\n\r\n${input.bodyText}`).toString('base64url');
-    const res = await this.fetchImpl(`${GMAIL}/messages/send`, {
+    const res = await this.request(`${GMAIL}/messages/send`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ raw, ...(input.threadId ? { threadId: input.threadId } : {}) }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) throw new Error(`gmail send → ${res.status}`);
     return { messageId: ((await res.json()) as { id: string }).id };

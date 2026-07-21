@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GmailClient } from './gmail-client';
+import { getProviderMetrics, resetProviderMetrics } from '../../observability/provider-metrics';
 
 const CRED = JSON.stringify({ client_id: 'ci', client_secret: 'cs', refresh_token: 'rt' });
 const NOW = 1_700_000_000_000;
@@ -92,4 +93,19 @@ test('send builds a base64url RFC-822 with reply headers', async () => {
   const raw = Buffer.from(sentBody!.raw!, 'base64url').toString('utf8');
   assert.match(raw, /In-Reply-To: <abc@x>/);
   assert.match(raw, /To: x@y\.com/);
+});
+
+test('OAuth refresh has a bounded deadline and records the timeout', async () => {
+  resetProviderMetrics();
+  const fetchImpl = (async (_url: string, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    })) as unknown as typeof fetch;
+  const client = new GmailClient(() => CRED, () => NOW, fetchImpl, 5);
+
+  await assert.rejects(() => client.listChanges(null), (err: unknown) => (err as Error).name === 'TimeoutError');
+  assert.deepEqual(
+    getProviderMetrics().map(({ provider, requests, timeouts }) => ({ provider, requests, timeouts })),
+    [{ provider: 'google:gmail', requests: 3, timeouts: 3 }],
+  );
 });

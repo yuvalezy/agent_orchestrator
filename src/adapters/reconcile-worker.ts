@@ -50,6 +50,7 @@ export function buildReconcileWorker(params: ReconcileWorkerParams): WorkerDefin
   return {
     name: `${namePrefix}:${instanceName}`,
     intervalMs,
+    critical: true,
     runImmediately: true, // startup catch-up (bootstrap on first run)
     run: async () => {
       const cursor = await store.read(instanceId);

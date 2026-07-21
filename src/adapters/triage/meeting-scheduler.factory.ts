@@ -13,6 +13,8 @@ import { buildMeetingDecisionHandler, type MeetingDecisionHandler } from '../../
 import { buildMeetingFreeTextHook } from '../../triage/meeting-free-text';
 import { buildMeetingScheduler, type MeetingScheduler } from '../../triage/meeting-scheduler';
 import type { MeetingRequest } from '../../triage/meeting-repo';
+import { buildMeetingFallbackWorker } from '../../triage/meeting-fallback.worker';
+import type { WorkerDefinition } from '../../workers/worker-runner';
 import {
   claimMeetingGiveUp,
   claimMeetingRequest,
@@ -20,6 +22,10 @@ import {
   enqueueMeetingConfirmation,
   getMeetingRequest,
   markScheduled,
+  completeMeetingGiveUp,
+  listPendingMeetingFallbacks,
+  reclaimStuckMeetingFallbacks,
+  releaseMeetingGiveUp,
   releaseToAwaitingSlot,
   replaceSlots,
   setDurationAndSlots,
@@ -64,19 +70,28 @@ function buildTaskFallback(taskTarget: TaskTargetPort, deepLink: (ref: string) =
     const config = await loadCustomerConfig(m.customer_id);
     if (!config?.projectRef || !config.workItemTypeRef) return null;
 
-    const task = await taskTarget.createTask({
+    // A fallback retry can follow an ambiguous timeout-after-commit. Reconcile
+    // before every create using a meeting-request-specific source key so a retry
+    // finds exactly this fallback, never another task from the same long-lived
+    // channel thread.
+    const source = {
+      service: 'agent-orchestrator',
+      entityType: 'meeting_request',
+      entityId: m.id,
+      display: `${config.displayName} · meeting fallback`,
+    };
+    const existing = await taskTarget.findTasksBySource({
+      projectRef: config.projectRef,
+      sourceEntity: { service: source.service, type: source.entityType, id: source.entityId },
+    });
+    const task = existing[0] ?? await taskTarget.createTask({
       customerRef: config.bpRef,
       projectRef: config.projectRef,
       workItemTypeRef: config.workItemTypeRef,
       title: intent.suggested_title,
       description: `${intent.summary}\n\n---\n(created by agent-orchestrator — a meeting could not be scheduled)`,
       priority: intent.priority,
-      source: {
-        service: 'agent-orchestrator',
-        entityType: m.channel_type ?? 'whatsapp',
-        entityId: m.thread_key ?? m.recipient_address ?? m.customer_id,
-        display: `${config.displayName} · ${m.thread_key ?? ''}`,
-      },
+      source,
       tags: [intent.category],
     });
     // Same bridge + audit bookkeeping the normal task path does, so the console's customer
@@ -205,6 +220,8 @@ export function buildMeetingSchedulerGated(
       claimForCreating,
       markScheduled,
       claimGiveUp: claimMeetingGiveUp,
+      releaseGiveUp: releaseMeetingGiveUp,
+      completeGiveUp: completeMeetingGiveUp,
       releaseToAwaitingSlot,
       enqueueConfirmation: enqueueMeetingConfirmation,
     },
@@ -280,4 +297,24 @@ export function buildMeetingSchedulerGated(
         }))(freeTextDeps.llm()))
       : undefined,
   };
+}
+
+/**
+ * Standalone durable fallback worker. It is intentionally separate from the
+ * Telegram callback poller so retries also run in app-only deployments.
+ */
+export function buildMeetingFallbackWorkerGated(
+  taskTarget: TaskTargetPort,
+  notifier: FounderNotifierPort,
+  intervalMs = 30_000,
+): WorkerDefinition | undefined {
+  const wiring = buildMeetingSchedulerGated(taskTarget, notifier);
+  if (!wiring) return undefined;
+  return buildMeetingFallbackWorker({
+    reclaimStuck: reclaimStuckMeetingFallbacks,
+    listPending: listPendingMeetingFallbacks,
+    retryFallback: (id) => wiring.scheduler.retryFallback(id),
+    intervalMs,
+    log: logger,
+  });
 }

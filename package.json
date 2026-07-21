@@ -36,7 +36,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:console": "npm --prefix web run typecheck",
     "typecheck:app": "npm --prefix app run typecheck",
-    "test:containers": "RUN_CONTAINERS=true node --import tsx --test src/adapters/console/console-mutations.container.test.ts",
+    "test:containers": "RUN_CONTAINERS=true node --import tsx --test \"src/**/*.container.test.ts\"",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "lint": "eslint .",
     "lint:boundary": "node scripts/check-boundary.mjs",

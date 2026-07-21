@@ -68,6 +68,7 @@ export function buildWhatsAppReconcileWorker(params: ReconcileWorkerParams): Wor
   return {
     name: 'whatsapp:reconcile',
     intervalMs,
+    critical: true,
     runImmediately: true, // startup catch-up (DM3-5)
     run: async () => {
       const cursor = await readCursor(instanceId);
