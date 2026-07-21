@@ -165,6 +165,10 @@ export class AppFounderNotifier implements NotifierMirror {
   private async pushToDevices(row: FeedMessage): Promise<void> {
     if (!this.deps.sendPush) return;
     if (row.kind !== 'notification' && row.kind !== 'question') return;
+    // The linked customer turn was already answered directly on WhatsApp. The row is
+    // retained in Activity for audit, but insertMessage pre-dismissed it; pushing it
+    // would resurrect handled work as a new interruption on the founder's phone.
+    if (row.dismissedAt) return;
     const devices = (await this.deps.listPushDevices()).filter((d): d is { id: string; fcmToken: string } => Boolean(d.fcmToken));
     if (devices.length === 0) return;
     // Deep-link scheme (v2 cockpit): a customer-scoped notification opens that customer's

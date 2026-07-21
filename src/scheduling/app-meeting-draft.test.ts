@@ -15,13 +15,14 @@ const CONTACTS = [
 
 /** An interpretation as a TEST writes one — the meeting/recurrence-only fields default to their
  *  not-a-meeting values so each literal only spells out what it is exercising. */
-type PartialInterpretation = Omit<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes'> &
-  Partial<Pick<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes'>>;
+type PartialInterpretation = Omit<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes' | 'meeting_topic'> &
+  Partial<Pick<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes' | 'meeting_topic'>>;
 
 const interpretation = (r: PartialInterpretation): ScheduleInterpretation => ({
   recurrence: null,
   attendees: null,
   duration_minutes: null,
+  meeting_topic: null,
   ...r,
 });
 
@@ -127,7 +128,8 @@ test('first utterance with a resolvable contact + explicit time → startsAt, 1 
     kind: 'meeting',
     execute_at: '2026-07-14T15:00:00-05:00', // 15:00 Panama, future vs 09:31
     explicit_date: true,
-    body: 'Sync with Acme',
+    body: null,
+    meeting_topic: 'Onboarding sync',
     delivery_channel: 'none',
     clarification: null,
     attendees: ['Shlomo'],
@@ -141,7 +143,7 @@ test('first utterance with a resolvable contact + explicit time → startsAt, 1 
   });
 
   assert.equal(view.status, 'drafting');
-  assert.equal(view.title, 'Sync with Acme');
+  assert.equal(view.title, 'Onboarding sync — Acme');
   assert.ok(view.startsAt, 'startsAt is set');
   assert.equal(new Date(view.startsAt!).toISOString(), '2026-07-14T20:00:00.000Z');
   assert.equal(view.attendees.length, 1);
@@ -194,6 +196,26 @@ test('refine "make it 4pm" → time updated, attendees untouched (a silent-on-na
   assert.equal(attendee(view, 'Shlomo Katz')?.email, 'shlomo@acme.com');
   assert.equal(view.startsAt, '2026-07-14T21:00:00.000Z'); // 16:00 Panama → 21:00 UTC
   assert.deepEqual(view.needs, []);
+});
+
+test('a later grounded topic upgrades the customer fallback; topic-silent refinements preserve it', async () => {
+  const h = harness(
+    [
+      { kind: 'meeting', execute_at: '2026-07-14T15:00:00-05:00', explicit_date: true, body: null, meeting_topic: null, delivery_channel: 'none', clarification: null, attendees: ['Shlomo'] },
+      { kind: 'meeting', execute_at: null, explicit_date: false, body: null, meeting_topic: 'Onboarding blockers', delivery_channel: 'none', clarification: null, attendees: [] },
+      { kind: 'meeting', execute_at: '2026-07-14T16:00:00-05:00', explicit_date: false, body: null, meeting_topic: null, delivery_channel: 'none', clarification: null, attendees: [] },
+      { kind: 'meeting', execute_at: null, explicit_date: false, body: null, meeting_topic: 'Call', delivery_channel: 'none', clarification: null, attendees: ['Dana'] },
+    ],
+  );
+
+  const first = await h.svc.proposeOrRefine({ chatSessionId: 's1', customerId: 'c1', customerName: 'Acme', utterance: 'meet Shlomo at 3pm' });
+  assert.equal(first.title, 'Call — Acme');
+  const titled = await h.svc.proposeOrRefine({ chatSessionId: 's1', customerId: 'c1', customerName: 'Acme', utterance: 'make it about onboarding blockers' });
+  assert.equal(titled.title, 'Onboarding blockers — Acme');
+  const timeOnly = await h.svc.proposeOrRefine({ chatSessionId: 's1', customerId: 'c1', customerName: 'Acme', utterance: 'make it 4pm' });
+  assert.equal(timeOnly.title, 'Onboarding blockers — Acme');
+  const generic = await h.svc.proposeOrRefine({ chatSessionId: 's1', customerId: 'c1', customerName: 'Acme', utterance: 'add Dana' });
+  assert.equal(generic.title, 'Onboarding blockers — Acme', 'a generic model placeholder cannot erase a real topic');
 });
 
 test('refine "add everyone, 3pm thursday" → whole contact list replaces the set + new time, in one turn', async () => {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { INTENTS_SCHEMA, parseIntents, triageUserMessage } from './triage-prompt';
+import { INTENTS_SCHEMA, TRIAGE_SYSTEM, parseIntents, triageUserMessage } from './triage-prompt';
 import type { TriageContext } from '../../ports/llm.port';
 
 // DA B3: the WIRE schema must be strict-output-clean or it 400s OpenAI/Anthropic
@@ -75,6 +75,12 @@ test('parseIntents rejects an unknown category', () => {
 
 test('parseIntents accepts an empty intents array', () => {
   assert.deepEqual(parseIntents({ intents: [] }), []);
+});
+
+test('meeting-request titles are attendee-visible grounded topics, with Call as the abstention sentinel', () => {
+  assert.match(TRIAGE_SYSTEM, /meeting_request.*attendee-visible NOUN PHRASE/s);
+  assert.match(TRIAGE_SYSTEM, /invoice export failure/i);
+  assert.match(TRIAGE_SYSTEM, /return exactly "Call"/i);
 });
 
 test('parseIntents requires the explicit-action safety signal', () => {

@@ -41,13 +41,14 @@ function action(input: Parameters<ScheduleHandlerDeps['createAction']>[0]): Sche
 /** An interpretation as a TEST writes one: the recurrence + meeting-only fields default to their
  *  not-recurring / not-a-meeting values, so the 30-odd existing literals stay about what they are
  *  testing; recurring/meeting tests pass theirs explicitly. */
-type PartialInterpretation = Omit<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes'> &
-  Partial<Pick<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes'>>;
+type PartialInterpretation = Omit<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes' | 'meeting_topic'> &
+  Partial<Pick<ScheduleInterpretation, 'recurrence' | 'attendees' | 'duration_minutes' | 'meeting_topic'>>;
 
 const fill = (r: PartialInterpretation): ScheduleInterpretation => ({
   recurrence: null,
   attendees: null,
   duration_minutes: null,
+  meeting_topic: null,
   ...r,
 });
 
@@ -603,6 +604,7 @@ const MEETING = {
   execute_at: '2026-07-16T15:00:00-05:00', // Thu 15:00 Panama
   explicit_date: true,
   body: null,
+  meeting_topic: null,
   delivery_channel: 'none' as const,
   clarification: null,
   attendees: ['Idan'],
@@ -638,16 +640,25 @@ test('tapping ✅ books it with the invitee, a Meet link, and sendUpdates', asyn
   assert.deepEqual(h.booked[0].attendeeEmails, ['iyelinek@holadocmed.com'], 'the NAME was resolved to a contact');
   assert.equal(h.booked[0].startsAt.toISOString(), '2026-07-16T20:00:00.000Z');
   assert.equal(h.booked[0].endsAt.toISOString(), '2026-07-16T20:30:00.000Z');
+  assert.equal(h.booked[0].title, 'Call — Acme');
   assert.match(h.posts.at(-1)!, /Booked/);
   assert.match(h.posts.at(-1)!, /meet\.google\.com/);
   assert.equal(h.peekPending(), null, 'the marker is cleared once it is on the calendar');
 });
 
-test('the founder\'s stated duration and title win over the defaults', async () => {
-  const h = harness({ ...MEETING, duration_minutes: 45, body: 'Pricing review' }, undefined, { meetings: 'on' });
+test('an opaque customer display name cannot leak into a founder-command meeting title', async () => {
+  const h = harness(MEETING, undefined, { meetings: 'on' });
+  h.deps.findCustomer = async () => ({ id: 'c1', displayName: '120363408075379002', language: 'es' });
+  await h.onMessage(message('set up a meeting with idan thursday 3pm'));
+  await h.onDecision(tap('scb'));
+  assert.equal(h.booked[0].title, 'Call');
+});
+
+test('the founder\'s stated duration and AI topic win over the defaults', async () => {
+  const h = harness({ ...MEETING, duration_minutes: 45, meeting_topic: 'Pricing review' }, undefined, { meetings: 'on' });
   await h.onMessage(message('45 min with idan thursday 3pm about pricing'));
   await h.onDecision(tap('scb'));
-  assert.equal(h.booked[0].title, 'Pricing review');
+  assert.equal(h.booked[0].title, 'Pricing review — Acme');
   assert.equal(h.booked[0].endsAt.getTime() - h.booked[0].startsAt.getTime(), 45 * 60_000);
 });
 

@@ -191,6 +191,19 @@ test('draftAndPresent: without a gender lookup the draft is simply gender-neutra
   assert.equal(cap.enqueues.length, 1, 'drafting is unaffected');
 });
 
+test('draftAndPresent: an inbound already answered directly on WhatsApp is suppressed before retrieval/drafting', async () => {
+  const { deps, cap } = makeDeps();
+  await buildResponseDrafter(deps).draftAndPresent({
+    row: row({ answered_by_inbox_id: 'outbound-99' }), customerId: 'cust-9', config: cfg,
+    threadKey: 't', knowledge: [chunk()], intent: { category: 'question_existing' } as never,
+  });
+  assert.equal(cap.findInboxIds.length, 0);
+  assert.equal(cap.draftReqs.length, 0);
+  assert.equal(cap.records.length, 0);
+  assert.equal(cap.enqueues.length, 0);
+  assert.equal(cap.notifies.length, 0);
+});
+
 // A gender lookup must never be able to break the hot inbound path.
 test('draftAndPresent: a failing gender lookup does not break the draft', async () => {
   const { deps, cap } = makeDeps({ resolveGender: async () => { throw new Error('whitelist down'); } });

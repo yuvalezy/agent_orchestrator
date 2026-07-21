@@ -232,8 +232,23 @@ type MessageRow = Parameters<typeof mapMessage>[0];
 export async function insertMessage(input: InsertMessageInput): Promise<FeedMessage> {
   const { rows } = await query<MessageRow>(
     `INSERT INTO founder_app_messages
-       (direction, kind, title, body, severity, customer_ref, notification_ref, buttons, link_url, context, chat_session_id, conversation_relation)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11, $12)
+       (direction, kind, title, body, severity, customer_ref, notification_ref, buttons,
+        link_url, context, chat_session_id, conversation_relation, dismissed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11, $12,
+       CASE
+         -- A direct founder WhatsApp reply can beat triage/card creation. When that
+         -- happens, preserve the later notification in Activity but never put it in
+         -- Pending or push it as fresh work. Questions remain live: answering a
+         -- customer is not authority to choose an orchestrator/meeting fork.
+         WHEN $2 = 'notification' AND EXISTS (
+           SELECT 1
+             FROM agent_inbox i
+            WHERE i.id::text = $10::jsonb->'contextRef'->>'ref'
+              AND $10::jsonb->'contextRef'->>'kind' = 'inbox'
+              AND i.answered_by_inbox_id IS NOT NULL
+         ) THEN now()
+         ELSE NULL
+       END)
      RETURNING ${MESSAGE_COLUMNS}`,
     [
       input.direction,

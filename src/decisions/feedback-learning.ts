@@ -3,20 +3,24 @@ import type { FeedbackMemoryInput } from '../knowledge/memory-repo';
 import type { SyncLogger } from '../knowledge/sync';
 
 // Feedback → memory (change 03, sub-milestone c — CORE, ports + injected repo fns).
-// When the founder MODIFIES or REJECTS a drafted reply the agent should learn the
-// correction: we write a customer-scoped feedback memory (memory_type='feedback',
+// When the founder MODIFIES/REJECTS a draft, or bypasses it with a substantive
+// direct WhatsApp answer, the agent should learn the correction: we write a
+// customer-scoped feedback memory (memory_type='feedback',
 // embedded) so a later similar question for THAT customer retrieves the lesson via
 // the same scoped RAG search the drafter already uses. Fully injected (fetch / embed
 // / write) so it's unit-testable with mocks. NEVER logs draft/edited bodies — only
 // counts + the decision id. Idempotency lives in the fetch (anti-join on decision_id).
 
-/** One resolved draft decision to learn from (from decisions.fetchUnprocessedFeedbackDecisions).
+/** One resolved reply decision to learn from (from decisions.fetchUnprocessedFeedbackDecisions).
  *  customerId is never null (the fetch filters it). agentOutput/humanOverride are the
  *  audit JSONB payloads — shape-checked defensively in buildFeedbackMemory. */
 export interface FeedbackDecisionRow {
   decisionId: string;
   customerId: string;
   outcome: 'modified' | 'rejected';
+  /** direct_reply means the founder bypassed the generated draft and answered in
+   * WhatsApp itself. Optional keeps legacy/injected rows source-compatible. */
+  decisionType?: 'draft_reply' | 'direct_reply';
   agentOutput: unknown;
   humanOverride: unknown;
 }
@@ -46,11 +50,24 @@ export function buildFeedbackMemory(row: FeedbackDecisionRow): BuiltFeedback | n
   const drafted = asStr(ao.draft_body).trim();
   const language = asStr(ao.language) || null;
   const metadata: Record<string, unknown> = {
-    source: 'draft_feedback',
+    source: row.decisionType === 'direct_reply' ? 'direct_whatsapp_reply' : 'draft_feedback',
     decision_id: row.decisionId,
     outcome: row.outcome,
     ...(language ? { language } : {}),
   };
+
+  if (row.decisionType === 'direct_reply') {
+    const sent = asStr(ho.edited_body).trim();
+    // Do not teach empty media placeholders or conversational acknowledgements as
+    // customer-answer policy. Substantive direct answers still become customer-
+    // scoped examples and are retrieved through the same feedback-memory lane.
+    if (!isSubstantiveDirectReply(sent)) return null;
+    return {
+      content: `Founder answer example — replied directly on WhatsApp.\nSent: ${sent}`,
+      embedText: sent,
+      metadata,
+    };
+  }
 
   if (row.outcome === 'modified') {
     const edited = asStr(ho.edited_body).trim();
@@ -71,6 +88,16 @@ export function buildFeedbackMemory(row: FeedbackDecisionRow): BuiltFeedback | n
   const content =
     'Founder correction — a drafted reply was rejected and NOT sent.\n' + `Drafted (rejected): ${drafted}`;
   return { content, embedText: drafted, metadata };
+}
+
+/** Conservative memory gate: short acknowledgements are evidence of handling, not
+ * reusable answer content. Unicode letters/numbers keep non-English replies valid. */
+export function isSubstantiveDirectReply(text: string): boolean {
+  const normalized = text.trim().toLocaleLowerCase();
+  if (!normalized) return false;
+  if (/^(ok(?:ay)?|dale|listo|gracias|perfecto|entendido|👍+|👌+)[.!\s]*$/iu.test(normalized)) return false;
+  const substantiveChars = [...normalized].filter((char) => /[\p{L}\p{N}]/u.test(char)).length;
+  return substantiveChars >= 8;
 }
 
 export interface FeedbackLearningDeps {

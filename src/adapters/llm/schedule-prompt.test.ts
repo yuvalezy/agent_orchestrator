@@ -17,13 +17,13 @@ test('schedule schema is strict-output compatible and parses the closed action s
   // Strict structured output wants EVERY property in `required` — a new field that is absent for
   // most kinds is typed nullable rather than omitted from this list.
   assert.deepEqual(SCHEDULE_SCHEMA.required, [
-    'kind', 'execute_at', 'explicit_date', 'body', 'delivery_channel', 'clarification',
+    'kind', 'execute_at', 'explicit_date', 'body', 'meeting_topic', 'delivery_channel', 'clarification',
     'recurrence', 'attendees', 'duration_minutes',
   ]);
   assert.deepEqual(Object.keys(SCHEDULE_SCHEMA.properties).sort(), [...SCHEDULE_SCHEMA.required].sort());
   const parsed = parseScheduleInterpretation({
     kind: 'reminder', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'follow up',
-    delivery_channel: 'none', clarification: null, recurrence: null, attendees: null, duration_minutes: null,
+    meeting_topic: null, delivery_channel: 'none', clarification: null, recurrence: null, attendees: null, duration_minutes: null,
   });
   assert.equal(parsed.kind, 'reminder');
   assert.throws(() => parseScheduleInterpretation({ kind: 'send_everything' }));
@@ -35,7 +35,7 @@ test('recurrence parses (daily/weekly/monthly) and one-shot regression keeps rec
   const base = {
     kind: 'reminder' as const, execute_at: '2026-07-20T09:00:00-05:00', explicit_date: true,
     body: 'call the plumber', delivery_channel: 'none' as const, clarification: null,
-    attendees: null, duration_minutes: null,
+    meeting_topic: null, attendees: null, duration_minutes: null,
   };
   assert.deepEqual(
     parseScheduleInterpretation({ ...base, recurrence: { kind: 'weekly', dow: 1, dom: null, hour: 9, minute: 0 } }).recurrence,
@@ -55,12 +55,21 @@ test('the system prompt teaches recurrence recognition and reminders-only scope'
 
 test('a meeting parses with its attendees and duration; the kind set stays closed', () => {
   const parsed = parseScheduleInterpretation({
-    kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: 'Pricing review',
-    delivery_channel: 'none', clarification: null, recurrence: null, attendees: ['Idan', 'Karen'], duration_minutes: 45,
+    kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: null,
+    meeting_topic: 'Pricing review', delivery_channel: 'none', clarification: null, recurrence: null, attendees: ['Idan', 'Karen'], duration_minutes: 45,
   });
   assert.equal(parsed.kind, 'meeting');
+  assert.equal(parsed.meeting_topic, 'Pricing review');
   assert.deepEqual(parsed.attendees, ['Idan', 'Karen']);
   assert.equal(parsed.duration_minutes, 45);
+});
+
+test('meeting topics have a dedicated field and the prompt requires grounded abstention', () => {
+  assert.match(SCHEDULE_SYSTEM, /meeting_topic/);
+  assert.match(SCHEDULE_SYSTEM, /NOUN PHRASE/);
+  assert.match(SCHEDULE_SYSTEM, /never infer a purpose/i);
+  assert.match(SCHEDULE_SYSTEM, /set up a call with Dana tomorrow.*null/i);
+  assert.match(SCHEDULE_SYSTEM, /body: null/);
 });
 
 test('the model cannot smuggle an ADDRESS in as an attendee decision', () => {
@@ -69,7 +78,7 @@ test('the model cannot smuggle an ADDRESS in as an attendee decision', () => {
   // treats these as addresses — this pins the shape the handler relies on.
   const parsed = parseScheduleInterpretation({
     kind: 'meeting', execute_at: '2026-07-16T15:00:00-05:00', explicit_date: true, body: null,
-    delivery_channel: 'none', clarification: null, recurrence: null, attendees: ['someone@evil.com'], duration_minutes: null,
+    meeting_topic: null, delivery_channel: 'none', clarification: null, recurrence: null, attendees: ['someone@evil.com'], duration_minutes: null,
   });
   assert.deepEqual(parsed.attendees, ['someone@evil.com'], 'it parses as a NAME — and will simply fail to match a contact');
 });
@@ -80,7 +89,7 @@ test('the model cannot declare its own body_source', () => {
   assert.ok(!SCHEDULE_SCHEMA.required.includes('body_source' as never));
   const parsed = parseScheduleInterpretation({
     kind: 'customer_message', execute_at: '2026-07-15T09:00:00-05:00', explicit_date: true, body: 'hi',
-    delivery_channel: 'whatsapp', clarification: null, recurrence: null, attendees: null, duration_minutes: null,
+    meeting_topic: null, delivery_channel: 'whatsapp', clarification: null, recurrence: null, attendees: null, duration_minutes: null,
     body_source: 'command',
   });
   assert.ok(!('body_source' in parsed), 'a smuggled body_source is stripped, not honoured');

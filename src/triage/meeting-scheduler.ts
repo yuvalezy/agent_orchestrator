@@ -5,6 +5,7 @@ import type { BusyInterval, CalendarFreeBusyPort, CreatedEvent, CreateEventInput
 import type { FounderNotifierPort } from '../ports/founder-notifier.port';
 import { generateSlots, isSlotFree, slotConflicts, type Slot } from './meeting-slots';
 import type { ClaimMeetingInput, MeetingRequest, MeetingSlot } from './meeting-repo';
+import { meetingCalendarTitle, safeMeetingCalendarTitle } from '../scheduling/meeting-title';
 
 // Meeting scheduling (CORE — ports + repo only; imports NO adapter, D1).
 //
@@ -155,6 +156,8 @@ export interface InitiateInput {
   /** The extracted intent, recorded as the audit row once the claim lands — and read back by
    *  the task fallback to rebuild the task this would otherwise have been. */
   intent: unknown;
+  /** Model-proposed discussion purpose. Generic "Call" means it correctly found no topic. */
+  meetingTopic: string | null;
   threadId: string;
   displayName: string;
   customerTz: string;
@@ -324,7 +327,7 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
     try {
       created = await host.writer.createEvent({
         calendarId: host.calendarId,
-        title: `Call — ${m.thread_key ?? 'customer'}`,
+        title: safeMeetingCalendarTitle(m.event_title),
         startsAt: slot.startsAt,
         endsAt: slot.endsAt,
         timeZone: m.founder_tz ?? deps.founderTz,
@@ -401,6 +404,7 @@ export function buildMeetingScheduler(deps: MeetingSchedulerDeps): MeetingSchedu
         inboxMessageId: input.inboxMessageId,
         decisionId: null, // linked below, once we know this arrival owns the conversation
         threadId: input.threadId,
+        eventTitle: meetingCalendarTitle({ topic: input.meetingTopic, customerName: input.displayName }),
         attendeeEmail,
         founderTz: deps.founderTz,
         customerTz: input.customerTz,

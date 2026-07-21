@@ -681,6 +681,7 @@ export class TriageService {
         customerId,
         inboxMessageId: inboxId,
         intent,
+        meetingTopic: intent.suggested_title,
         threadId: config.telegramTopicId ?? threadKey,
         displayName: config.displayName,
         customerTz: config.timezone,

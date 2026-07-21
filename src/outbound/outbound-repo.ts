@@ -311,24 +311,72 @@ export interface EnqueueDraftInput {
  */
 export async function enqueueDraft(input: EnqueueDraftInput): Promise<string> {
   const recipient = normalizeRecipient(input.channelType, input.recipientAddress);
-  const { rows } = await query<{ id: string }>(
-    `INSERT INTO agent_outbound_queue
-        (customer_id, channel_instance_id, recipient_address, thread_key, in_reply_to, subject, body,
-         status, is_draft, decision_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', true, $8)
-     RETURNING id`,
-    [
-      input.customerId ?? null,
-      input.channelInstanceId,
-      recipient,
-      input.threadKey ?? null,
-      input.inReplyTo ?? null,
-      input.subject ?? null,
-      input.body,
-      input.decisionId,
-    ],
-  );
-  return rows[0].id;
+  return withClient(async (client) => {
+    await client.query('BEGIN');
+    try {
+      // Close the narrow race where triage claimed the inbound immediately before
+      // its direct founder reply was ingested. The in-memory ClaimedInbox is stale,
+      // so re-check the durable link while creating the queue row. A superseded
+      // draft is kept as cancelled audit evidence and can never be drained.
+      const answered = await client.query<{
+        outbound_id: string;
+        outbound_body: string | null;
+        provider_message_id: string;
+      }>(
+        `SELECT o.id AS outbound_id, o.body AS outbound_body,
+                o.channel_message_id AS provider_message_id
+           FROM agent_decisions d
+           JOIN agent_inbox i ON i.id = d.inbox_message_id
+           JOIN agent_inbox o ON o.id = i.answered_by_inbox_id
+          WHERE d.id = $1 AND d.decision_type = 'draft_reply'
+          FOR UPDATE OF d`,
+        [input.decisionId],
+      );
+      const direct = answered.rows[0] ?? null;
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO agent_outbound_queue
+            (customer_id, channel_instance_id, recipient_address, thread_key, in_reply_to, subject, body,
+             status, is_draft, decision_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $9, true, $8)
+         RETURNING id`,
+        [
+          input.customerId ?? null,
+          input.channelInstanceId,
+          recipient,
+          input.threadKey ?? null,
+          input.inReplyTo ?? null,
+          input.subject ?? null,
+          input.body,
+          input.decisionId,
+          direct ? 'cancelled' : 'pending',
+        ],
+      );
+      if (direct) {
+        await client.query(
+          `UPDATE agent_decisions
+              SET outcome = 'modified', resolved_at = now(), source_outbound_inbox_id = $2,
+                  human_override = $3::jsonb
+            WHERE id = $1 AND outcome = 'pending'`,
+          [
+            input.decisionId,
+            direct.outbound_id,
+            JSON.stringify({
+              action: 'direct_reply',
+              by: 'founder:whatsapp',
+              edited_body: direct.outbound_body?.trim() ?? '',
+              outbound_inbox_id: direct.outbound_id,
+              provider_message_id: direct.provider_message_id,
+            }),
+          ],
+        );
+      }
+      await client.query('COMMIT');
+      return rows[0].id;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
+  });
 }
 
 /** A guarded-flip row shape: only these three columns are RETURNed by the draft

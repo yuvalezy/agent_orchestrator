@@ -414,8 +414,8 @@ export async function insertRevisedDraftDecisionTx(
 }
 
 // ── M3(c): feedback-learning source rows ──────────────────────────────────────
-// A draft_reply decision that the founder MODIFIED or REJECTED is a correction the
-// agent should learn (change 03, feedback-learning). The feedback worker reads the
+// A draft_reply decision the founder MODIFIED/REJECTED, or a substantive direct_reply
+// captured from WhatsApp, is a correction the agent should learn. The feedback worker reads the
 // unprocessed ones here and writes a customer-scoped feedback memory. Idempotency
 // is a NOT-EXISTS anti-join on agent_memory (metadata->>'decision_id') — no cursor,
 // no schema change: a decision that already produced a feedback row is never re-picked
@@ -423,7 +423,7 @@ export async function insertRevisedDraftDecisionTx(
 // selects/logs the raw inbound body (agent_output holds the structured draft only).
 
 /**
- * The oldest-first batch of resolved draft decisions (outcome modified/rejected) that
+ * The oldest-first batch of resolved draft/direct-reply decisions (outcome modified/rejected) that
  * have NOT yet produced a feedback memory. `agentOutput` = { intent, draft_body,
  * citations, language }; `humanOverride` = { action, by, edited_body? }. customer_id is
  * NEVER null here (filtered) — feedback is customer-scoped.
@@ -432,13 +432,14 @@ export async function fetchUnprocessedFeedbackDecisions(limit: number): Promise<
   const { rows } = await query<{
     id: string;
     customer_id: string;
+    decision_type: 'draft_reply' | 'direct_reply';
     outcome: 'modified' | 'rejected';
     agent_output: unknown;
     human_override: unknown;
   }>(
-    `SELECT d.id, d.customer_id, d.outcome, d.agent_output, d.human_override
+    `SELECT d.id, d.customer_id, d.decision_type, d.outcome, d.agent_output, d.human_override
        FROM agent_decisions d
-      WHERE d.decision_type = 'draft_reply'
+      WHERE d.decision_type IN ('draft_reply', 'direct_reply')
         AND d.outcome IN ('modified', 'rejected')
         AND d.resolved_at IS NOT NULL
         AND d.customer_id IS NOT NULL
@@ -454,6 +455,7 @@ export async function fetchUnprocessedFeedbackDecisions(limit: number): Promise<
   return rows.map((r) => ({
     decisionId: r.id,
     customerId: r.customer_id,
+    decisionType: r.decision_type,
     outcome: r.outcome,
     agentOutput: r.agent_output,
     humanOverride: r.human_override,

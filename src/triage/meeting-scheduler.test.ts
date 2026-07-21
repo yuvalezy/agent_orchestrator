@@ -29,6 +29,7 @@ const ROW: MeetingRequest = {
   decision_id: '2449',
   status: 'awaiting_duration',
   thread_id: 'topic-1',
+  event_title: 'Call — Holadoc',
   duration_minutes: null,
   slots: null,
   slots_computed_at: null,
@@ -51,6 +52,7 @@ const INITIATE: InitiateInput = {
   customerId: 'cust-1',
   inboxMessageId: '19499',
   intent: { category: 'meeting_request', summary: 'wants to talk', suggested_title: 'Call Idan', priority: 'medium' },
+  meetingTopic: 'Call',
   threadId: 'topic-1',
   displayName: 'Holadoc',
   customerTz: TZ,
@@ -140,7 +142,10 @@ function harness(
       return '2449';
     },
     repo: {
-      claim: async () => (opts.claim === undefined ? 'm1' : opts.claim),
+      claim: async (input) => {
+        row.event_title = input.eventTitle;
+        return opts.claim === undefined ? 'm1' : opts.claim;
+      },
       setDecisionId: async (_id, d) => {
         row.decision_id = d;
       },
@@ -215,6 +220,13 @@ test('tryInitiate claims the request and asks for a duration', async () => {
   assert.match(h.asks[0].title, /Wants to talk/);
   assert.deepEqual(h.asks[0].options, ['md15:m1', 'md30:m1', 'md45:m1', 'md60:m1', 'mtask:m1']);
   assert.deepEqual(h.tasks, [], 'a started conversation must NOT also mint a task');
+  assert.equal(h.row.event_title, 'Call — Holadoc');
+});
+
+test('tryInitiate snapshots the triage AI topic as Topic — Customer', async () => {
+  const h = harness();
+  await buildMeetingScheduler(h.deps).tryInitiate({ ...INITIATE, meetingTopic: 'Invoice export failure' });
+  assert.equal(h.row.event_title, 'Invoice export failure — Holadoc');
 });
 
 test('tryInitiate SHOWS the invite address so a stale directory ref is caught by a human', async () => {
@@ -307,6 +319,8 @@ test('onSlot books the event with a Meet link and the customer invited, then con
   assert.deepEqual(e.attendeeEmails, ['iyelinek@holadocmed.com']);
   assert.equal(e.sendUpdates, 'all', 'without this Google adds the attendee but never invites them');
   assert.equal(e.eventId, 'aom1', 'derived from the REQUEST id alone — never the slot index');
+  assert.equal(e.title, 'Call — Holadoc');
+  assert.ok(!e.title.includes(ROW.thread_key!), 'the raw WhatsApp thread id must never reach attendees');
   assert.equal(e.startsAt.toISOString(), slotRows(h)[0].startsAt);
 
   assert.equal(h.row.status, 'scheduled');

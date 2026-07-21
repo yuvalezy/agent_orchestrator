@@ -9,9 +9,15 @@ import { startWorker, type WorkerDefinition } from './workers/worker-runner';
 import { ChannelRegistry } from './adapters/channel-registry';
 import { buildWhatsAppWebhookRouter } from './adapters/whatsapp-manager/webhook.router';
 import { buildWhatsAppReconcileWorker } from './adapters/whatsapp-manager/reconcile.worker';
+import { buildFounderReplyWorker } from './adapters/whatsapp-manager/founder-reply.worker';
 import { buildEmailReconcileWorker } from './adapters/email/reconcile.worker';
 import { buildReconcileWorker } from './adapters/reconcile-worker';
 import { ingestInbound } from './inbox/ingestion';
+import {
+  listUnreconciledWhatsappReplies,
+  reconcileFounderWhatsappReply,
+  type FounderReplyReconciliation,
+} from './inbox/founder-whatsapp-reply';
 import { credentialsStore } from './config/credentials-store';
 import { settingsStore } from './config/settings-store';
 import { tryResolveCredential } from './config/credentials';
@@ -236,6 +242,7 @@ async function main(): Promise<void> {
   // the app feed + mirror notifier here; FCM is optional and self-disables (a logger.warn)
   // when FIREBASE_* is absent/incomplete, leaving the rest of the app router working.
   let founderAppNotifier: AppFounderNotifier | null = null;
+  let founderAppFeed: FounderAppFeed | null = null;
   // Late-bound: the PWA "another time" picker books through the fanout notifier, which is built
   // below in the money-loop. The router only reads this at request time, so a getter suffices.
   let bookAppMeetingTime: MeetingWiring['bookLocalTime'] | null = null;
@@ -249,6 +256,7 @@ async function main(): Promise<void> {
       logger.warn('founder-app FCM push disabled (FIREBASE_* config absent or incomplete)');
     }
     const feed = new FounderAppFeed();
+    founderAppFeed = feed;
     founderAppNotifier = new AppFounderNotifier({ insertMessage, feed, listPushDevices, disableDevicePush, sendPush: fcmSender, markDecidedByRef });
     // Voice input: the PWA composer's mic uploads audio to /api/transcribe, which reuses the SAME
     // OpenAI transcription client the Telegram voice path used. Self-reports 503 when OPENAI is unset.
@@ -318,15 +326,37 @@ async function main(): Promise<void> {
   }
   const ingestionWorkers: WorkerDefinition[] = [];
   if (wa) {
-    appDeps.whatsappWebhook = buildWhatsAppWebhookRouter(wa.adapter, ingestInbound);
+    const publishFounderReply = async (result: FounderReplyReconciliation): Promise<void> => {
+      if (!founderAppFeed) return;
+      const ids = [...result.dismissedMessageIds];
+      if (result.activityMessageId) ids.push(result.activityMessageId);
+      for (const id of ids) {
+        const row = await getMessage(id);
+        if (row) founderAppFeed.publish(row);
+      }
+    };
+    const ingestWhatsApp = async (message: Parameters<typeof ingestInbound>[0]) => {
+      const ingested = await ingestInbound(message);
+      if (message.direction === 'outbound') {
+        const result = await reconcileFounderWhatsappReply(ingested.id);
+        await publishFounderReply(result);
+      }
+      return ingested;
+    };
+    appDeps.whatsappWebhook = buildWhatsAppWebhookRouter(wa.adapter, ingestWhatsApp);
     ingestionWorkers.push(
       buildWhatsAppReconcileWorker({
         instanceId: wa.instance.id,
         adapter: wa.adapter,
-        sink: ingestInbound,
+        sink: ingestWhatsApp,
         intervalMs: env.WHATSAPP_RECONCILE_INTERVAL_MS,
         lookbackMs: env.WHATSAPP_RECONCILE_LOOKBACK_MS,
         maxPages: env.WHATSAPP_RECONCILE_MAX_PAGES,
+      }),
+      buildFounderReplyWorker({
+        list: listUnreconciledWhatsappReplies,
+        reconcile: reconcileFounderWhatsappReply,
+        onChanged: publishFounderReply,
       }),
     );
   } else {

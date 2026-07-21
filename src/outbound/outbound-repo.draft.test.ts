@@ -29,11 +29,17 @@ let poolResult: any = { rows: [] };
 let clientCalls: Captured[] = [];
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let updateResult: any = { rows: [] };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let draftInsertResult: any = { rows: [] };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let answeredResult: any = { rows: [] };
 
 const fakeClient = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   query: async (text: string, params?: unknown[]): Promise<any> => {
     clientCalls.push({ text, params: params ?? [] });
+    if (/SELECT o\.id AS outbound_id/.test(text)) return answeredResult;
+    if (/INSERT INTO agent_outbound_queue/.test(text)) return draftInsertResult;
     if (/UPDATE\s+agent_outbound_queue/.test(text)) return updateResult;
     return { rows: [] };
   },
@@ -45,6 +51,8 @@ beforeEach(() => {
   poolResult = { rows: [] };
   clientCalls = [];
   updateResult = { rows: [] };
+  draftInsertResult = { rows: [] };
+  answeredResult = { rows: [] };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (pool as any).query = async (text: string, params?: unknown[]) => {
     poolCalls.push({ text, params: params ?? [] });
@@ -67,7 +75,7 @@ const clientSql = (): string[] => clientCalls.map((c) => collapse(c.text));
 // ── enqueueDraft ──────────────────────────────────────────────────────────────
 
 test('enqueueDraft: parks (status=pending, is_draft=true) linked to the decision; recipient normalized', async () => {
-  poolResult = { rows: [{ id: 'q-1' }] };
+  draftInsertResult = { rows: [{ id: 'q-1' }] };
   const id = await repo.enqueueDraft({
     channelInstanceId: 'inst-1',
     channelType: 'whatsapp',
@@ -81,15 +89,15 @@ test('enqueueDraft: parks (status=pending, is_draft=true) linked to the decision
   });
 
   assert.equal(id, 'q-1');
-  assert.equal(poolCalls.length, 1);
-  const sql = collapse(poolCalls[0].text);
+  const insert = clientCalls.find((c) => /INSERT INTO agent_outbound_queue/.test(c.text))!;
+  const sql = collapse(insert.text);
   assert.match(sql, /INSERT INTO agent_outbound_queue/);
   // draft parks pending + is_draft=true (un-drainable) with the decision link.
-  assert.match(sql, /'pending', true, \$8/);
+  assert.match(sql, /\$9, true, \$8/);
   assert.match(sql, /decision_id/);
   assert.match(sql, /RETURNING id/);
 
-  const p = poolCalls[0].params;
+  const p = insert.params;
   assert.equal(p[0], 'cust-1'); // customer_id
   assert.equal(p[1], 'inst-1'); // channel_instance_id — same account as the inbound row
   // recipient is normalized per channel (R37 contact-join must hit) — proven by
@@ -100,10 +108,12 @@ test('enqueueDraft: parks (status=pending, is_draft=true) linked to the decision
   assert.equal(p[5], null); // subject
   assert.equal(p[6], 'draft body');
   assert.equal(p[7], 'dec-9'); // decision_id FK
+  assert.equal(p[8], 'pending');
+  assert.deepEqual([clientSql()[0], clientSql().at(-1)], ['BEGIN', 'COMMIT']);
 });
 
 test('enqueueDraft: nullable fields default to null', async () => {
-  poolResult = { rows: [{ id: 'q-2' }] };
+  draftInsertResult = { rows: [{ id: 'q-2' }] };
   await repo.enqueueDraft({
     channelInstanceId: 'inst-1',
     channelType: 'email',
@@ -111,11 +121,32 @@ test('enqueueDraft: nullable fields default to null', async () => {
     body: 'x',
     decisionId: 'dec-1',
   });
-  const p = poolCalls[0].params;
+  const p = clientCalls.find((c) => /INSERT INTO agent_outbound_queue/.test(c.text))!.params;
   assert.equal(p[0], null); // customerId
   assert.equal(p[3], null); // threadKey
   assert.equal(p[4], null); // inReplyTo
   assert.equal(p[5], null); // subject
+});
+
+test('enqueueDraft: a raced direct WhatsApp answer parks cancelled and resolves the draft as modified', async () => {
+  draftInsertResult = { rows: [{ id: 'q-raced' }] };
+  answeredResult = {
+    rows: [{ outbound_id: '900', outbound_body: 'Already answered', provider_message_id: 'wamid.OUT' }],
+  };
+  const id = await repo.enqueueDraft({
+    channelInstanceId: 'inst-1', channelType: 'whatsapp', recipientAddress: '50760000000',
+    body: 'stale suggestion', decisionId: 'dec-raced',
+  });
+  assert.equal(id, 'q-raced');
+  const insert = clientCalls.find((c) => /INSERT INTO agent_outbound_queue/.test(c.text))!;
+  assert.equal(insert.params[8], 'cancelled');
+  const resolved = clientCalls.find((c) => /UPDATE\s+agent_decisions/.test(c.text))!;
+  assert.equal(resolved.params[0], 'dec-raced');
+  assert.equal(resolved.params[1], '900');
+  assert.deepEqual(JSON.parse(resolved.params[2] as string), {
+    action: 'direct_reply', by: 'founder:whatsapp', edited_body: 'Already answered',
+    outbound_inbox_id: '900', provider_message_id: 'wamid.OUT',
+  });
 });
 
 // ── approveDraft ────────────────────────────────────────────────────────────────

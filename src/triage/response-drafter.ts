@@ -122,6 +122,17 @@ export function buildResponseDrafter(deps: ResponseDrafterDeps): ResponseDrafter
     async draftAndPresent(input: DraftAndPresentInput): Promise<void> {
       const { row, customerId, config, threadKey, knowledge, intent, activeModules } = input;
 
+      // whatsapp_manager also ingests messages the founder sends directly. The
+      // reply reconciler links this inbound to that outbound before (or while)
+      // triage runs. Never compose a second answer for an already-answered turn.
+      if (row.answered_by_inbox_id) {
+        logger.info(
+          { inboxId: row.id, outboundInboxId: row.answered_by_inbox_id },
+          'drafter: founder already answered directly on WhatsApp — suppressing draft',
+        );
+        return;
+      }
+
       // (1) Reclaim guard: a prior attempt that failed AT/AFTER the notify left an OPEN
       // draft for this inbox message — re-present it instead of minting a second draft.
       const existing = await deps.findOpenDraftByInbox(row.id);

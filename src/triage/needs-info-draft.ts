@@ -70,6 +70,14 @@ export function buildNeedsInfoDrafter(deps: NeedsInfoDrafterDeps): NeedsInfoDraf
     async draftClarification(input: DraftClarificationInput): Promise<void> {
       const { row, customerId, config, threadKey, intent } = input;
 
+      if (row.answered_by_inbox_id) {
+        logger.info(
+          { inboxId: row.id, outboundInboxId: row.answered_by_inbox_id },
+          'needs-info: founder already replied directly on WhatsApp — suppressing clarification draft',
+        );
+        return;
+      }
+
       // Reclaim guard: a prior attempt that failed AT/AFTER the notify left an OPEN draft for this
       // inbox message — re-present it rather than minting a second clarification.
       const existing = await deps.findOpenDraftByInbox(row.id);

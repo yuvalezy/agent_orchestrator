@@ -31,6 +31,7 @@ export interface MeetingRequest {
   decision_id: string | null;
   status: MeetingStatus;
   thread_id: string;
+  event_title: string;
   duration_minutes: number | null;
   slots: MeetingSlot[] | null;
   slots_computed_at: Date | null;
@@ -54,6 +55,7 @@ export interface ClaimMeetingInput {
   inboxMessageId: string;
   decisionId?: string | null;
   threadId: string;
+  eventTitle: string;
   attendeeEmail: string | null;
   founderTz: string;
   customerTz: string;
@@ -74,10 +76,10 @@ export interface ClaimMeetingInput {
 export async function claimMeetingRequest(input: ClaimMeetingInput): Promise<string | null> {
   const { rows } = await query<{ id: string }>(
     `INSERT INTO agent_meeting_requests
-       (customer_id, inbox_message_id, decision_id, status, thread_id, attendee_email,
+       (customer_id, inbox_message_id, decision_id, status, thread_id, event_title, attendee_email,
         founder_tz, customer_tz, preferred_language, channel_type, channel_instance_id,
         recipient_address, thread_key, in_reply_to)
-     VALUES ($1,$2,$3,'awaiting_duration',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     VALUES ($1,$2,$3,'awaiting_duration',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      ON CONFLICT (inbox_message_id) DO NOTHING
      RETURNING id`,
     [
@@ -85,6 +87,7 @@ export async function claimMeetingRequest(input: ClaimMeetingInput): Promise<str
       input.inboxMessageId,
       input.decisionId ?? null,
       input.threadId,
+      input.eventTitle,
       input.attendeeEmail,
       input.founderTz,
       input.customerTz,

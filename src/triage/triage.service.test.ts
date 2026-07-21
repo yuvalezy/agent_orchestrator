@@ -684,7 +684,7 @@ test('attach is best-effort: upload throws → the row is still processed', asyn
 
 const WANTS_TO_TALK: Intent = {
   category: 'meeting_request', summary: 'Customer asks to be notified when the founder is available to talk',
-  suggested_title: 'Notify customer when available for call', priority: 'medium',
+  suggested_title: 'Call', priority: 'medium',
   confidence: 0.7, explicit_action_request: true, related_open_task_ref: null,
 };
 
@@ -715,10 +715,11 @@ test('meeting_request passes the founder tz-independent customer zone + language
   const f = fakes([WANTS_TO_TALK], 'known', { meeting: 'ok' });
   await f.svc.process(await seedInbox(`${TAG}-meeting-tz`, 'avisame cuando puedes hablar'));
 
-  const i = f.initiated[0] as { customerTz: string; preferredLanguage: string; intent: Intent };
+  const i = f.initiated[0] as { customerTz: string; preferredLanguage: string; intent: Intent; meetingTopic: string };
   assert.equal(i.customerTz, 'America/Panama', 'the confirmation is rendered in the CUSTOMER zone');
   assert.equal(i.preferredLanguage, 'es');
   assert.equal(i.intent.category, 'meeting_request', 'the intent travels so the task fallback can rebuild it');
+  assert.equal(i.meetingTopic, 'Call', 'the triage topic is passed separately from the audit intent');
 });
 
 test('a scheduler that CANNOT start falls through to the task — the ask is never dropped', async (t) => {

@@ -4,6 +4,7 @@ import type { ScheduleInterpretation, ScheduleInterpreterPort } from '../ports/l
 import type { RecipientGender, RecipientProfilePort } from '../ports/recipient-profile.port';
 import { checkComposedBody, COMPOSE_MAX_CHARS } from './composed-body';
 import { meansEveryone, resolveInvitees, type ContactCandidate } from './meeting-invitees';
+import { meetingCalendarTitle } from './meeting-title';
 import {
   MAX_CLARIFY_TURNS,
   mergeCommandText,
@@ -503,7 +504,7 @@ export function buildScheduleHandlers(deps: ScheduleHandlerDeps): ScheduleHandle
     const meeting: PendingMeeting = {
       executeAt: executeAt.toISOString(),
       durationMinutes,
-      title: interpreted.body?.trim() || `Call — ${ctx.customer.displayName}`,
+      title: meetingCalendarTitle({ topic: interpreted.meeting_topic, customerName: ctx.customer.displayName }),
       attendees: resolved.invitees,
       conflicts,
     };

@@ -278,6 +278,9 @@ export interface ScheduleInterpretation {
    *  occurrence, and the handler — not the model — does that roll. */
   explicit_date: boolean;
   body: string | null;
+  /** kind='meeting' only: a concise attendee-visible subject grounded in a purpose the founder
+   *  explicitly stated. Null when no purpose was given; code supplies the customer-name fallback. */
+  meeting_topic: string | null;
   delivery_channel: 'whatsapp' | 'email' | 'none';
   clarification: string | null;
   /**

@@ -22,6 +22,7 @@ import { buildDynamicMultiFreeBusy, buildFreeBusyAccounts } from '../calendar/go
 import { listEnabledCalendarAccounts } from '../connectors/calendar-accounts-repo';
 import { dueEventId } from '../../triage/due-event-sync';
 import { mergeBusy } from '../../triage/meeting-slots';
+import { safeMeetingCalendarTitle } from '../../scheduling/meeting-title';
 
 export interface GatedScheduling extends ScheduleHandlers {
   isScheduleOption: (optionId: string) => boolean;
@@ -66,7 +67,7 @@ export function buildMeetingCommandDeps(): MeetingCommandDeps | null {
       if (!host) throw Object.assign(new Error('no meeting-host calendar'), { status: 404 });
       const created = await host.writer.createEvent({
         calendarId: host.calendarId,
-        title: input.title,
+        title: safeMeetingCalendarTitle(input.title),
         startsAt: input.startsAt,
         endsAt: input.endsAt,
         timeZone: env.CALENDAR_TZ,

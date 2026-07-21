@@ -102,6 +102,21 @@ test('confirm with no customer stores an unscoped ack (lands in the global feed)
   assert.equal(h.pushed.length, 0);
 });
 
+test('a notification pre-dismissed because the founder already answered is stored but never pushed', async () => {
+  const h = harness({
+    insertMessage: async (input) => ({
+      id: crypto.randomUUID(), direction: input.direction, kind: input.kind,
+      title: input.title ?? null, body: input.body, severity: input.severity ?? null,
+      customerRef: input.customerRef ?? null, notificationRef: input.notificationRef ?? null,
+      buttons: input.buttons ?? null, decidedOptionId: null, dismissedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    }),
+  });
+  await h.notifier.notifyCustomerEvent('cust-1', { title: 'Handled', body: 'stale' });
+  assert.equal(h.published.length, 1, 'the audit row still reaches Activity');
+  assert.equal(h.pushed.length, 0, 'handled work is not resurrected as a phone interruption');
+});
+
 test('FCM fans out for ALL severities, not just urgent (unlike web-push)', async () => {
   const h = harness();
   await h.notifier.notifyAdmin({ title: 'FYI', body: 'routine', severity: 'info' });

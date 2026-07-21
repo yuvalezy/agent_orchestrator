@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildFeedbackMemory,
+  isSubstantiveDirectReply,
   runFeedbackLearning,
   type FeedbackDecisionRow,
 } from './feedback-learning';
@@ -63,6 +64,28 @@ test('buildFeedbackMemory: degenerate rows (no substantive text) → null (skip)
   assert.equal(buildFeedbackMemory({ decisionId: 'd', customerId: 'C', outcome: 'rejected', agentOutput: {}, humanOverride: {} }), null);
   // modified with neither drafted nor edited body → nothing to learn.
   assert.equal(buildFeedbackMemory({ decisionId: 'd', customerId: 'C', outcome: 'modified', agentOutput: { draft_body: '' }, humanOverride: { edited_body: '  ' } }), null);
+});
+
+test('buildFeedbackMemory(direct_reply): learns the founder WhatsApp answer without pretending it was a draft edit', () => {
+  const built = buildFeedbackMemory({
+    decisionId: 'direct-1',
+    customerId: 'CUST-A',
+    decisionType: 'direct_reply',
+    outcome: 'modified',
+    agentOutput: { kind: 'direct_whatsapp_reply', draft_body: '' },
+    humanOverride: { action: 'direct_reply', edited_body: 'Sí, se necesita una cuenta de Facebook.' },
+  });
+  assert.ok(built);
+  assert.match(built.content, /replied directly on WhatsApp/);
+  assert.equal(built.embedText, 'Sí, se necesita una cuenta de Facebook.');
+  assert.equal(built.metadata.source, 'direct_whatsapp_reply');
+});
+
+test('direct reply memory gate excludes acknowledgements but keeps substantive answers', () => {
+  assert.equal(isSubstantiveDirectReply('ok'), false);
+  assert.equal(isSubstantiveDirectReply('Gracias!'), false);
+  assert.equal(isSubstantiveDirectReply('👍'), false);
+  assert.equal(isSubstantiveDirectReply('Sí, se necesita Facebook'), true);
 });
 
 function fakeEmbedding(): EmbeddingPort {

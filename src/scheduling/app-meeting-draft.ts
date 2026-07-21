@@ -2,6 +2,7 @@ import { validatedExecution, stillFuture, type MeetingCommandDeps } from './sche
 import { meansEveryone, resolveInvitees, type ContactCandidate } from './meeting-invitees';
 import type { ScheduleInterpreterPort } from '../ports/llm.port';
 import type { MeetingDraftAttendee, MeetingDraftRepo, MeetingDraftRow } from '../adapters/founder-app/meeting-draft-repo';
+import { meetingCalendarTitle, normalizedMeetingTopic } from './meeting-title';
 
 // Iterative meeting scheduling in the Founder PWA's per-customer chat (M6). The founder proposes a
 // meeting in natural language, REFINES it on a card ("add Dana", "make it 15:00 Thursday", "45 min"),
@@ -224,7 +225,10 @@ export function buildAppMeetingDraft(deps: AppMeetingDraftDeps): AppMeetingDraft
     const founderEmails = await deps.meetings.founderEmails();
     const attendees = mergeAttendees(prior?.attendees ?? [], interp.attendees ?? [], contacts, founderEmails);
 
-    const title = interp.body?.trim() || prior?.title || `Call — ${customerName}`;
+    // A topic named on THIS turn replaces the old title; a time/attendee-only refine preserves it.
+    // On the first turn, a correctly-abstaining model gets the deterministic customer fallback.
+    const topic = normalizedMeetingTopic(interp.meeting_topic);
+    const title = topic ? meetingCalendarTitle({ topic, customerName }) : prior?.title || meetingCalendarTitle({ customerName });
     const durationMinutes =
       interp.duration_minutes && interp.duration_minutes > 0
         ? Math.min(Math.round(interp.duration_minutes), 480)

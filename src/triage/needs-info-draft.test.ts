@@ -137,3 +137,13 @@ test('a senderless row is skipped (nothing drafted) — the founder already got 
   assert.equal(calls.enqueued.length, 0);
   assert.equal(calls.presented.length, 0);
 });
+
+test('an inbound already answered directly on WhatsApp never creates a stale clarification draft', async () => {
+  const calls = freshCalls();
+  const drafter = buildNeedsInfoDrafter(buildDeps(calls));
+  await drafter.draftClarification({
+    row: waRow({ answered_by_inbox_id: 'outbound-99' }), customerId: 'cust-A',
+    config: { displayName: 'Acme', preferredLanguage: 'es' }, threadKey: 'thread-A', intent: UNCLEAR,
+  });
+  assert.deepEqual(calls, freshCalls());
+});

@@ -51,6 +51,10 @@ export interface ClaimedInbox {
   media_mimetype?: string | null;
   media_status?: string | null;
   media_filesize?: number | null;
+  /** A later message the founder sent directly on WhatsApp covered this inbound
+   * turn. Triage may still create/maintain real work, but reply drafters must not
+   * suggest a second customer answer. Optional for legacy test fixtures. */
+  answered_by_inbox_id?: string | null;
 }
 
 /** Claim a batch of triageable inbound rows. A voice note lands body=NULL and the
@@ -72,7 +76,7 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
            FOR UPDATE SKIP LOCKED
            LIMIT $1
         )
-        RETURNING id, channel_instance_id, channel_message_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients, raw_metadata
+        RETURNING id, channel_instance_id, channel_message_id, channel_thread_id, sender_address, sender_name, subject, body, received_at, recipients, raw_metadata, answered_by_inbox_id
      )
      SELECT c.id, c.channel_instance_id, ci.channel_type, c.channel_message_id,
             c.raw_metadata->>'messageIdHeader' AS message_id_header, c.channel_thread_id,
@@ -85,7 +89,8 @@ export async function claimBatch(limit: number): Promise<ClaimedInbox[]> {
             c.raw_metadata->'media'->>'mediaType' AS media_type,
             c.raw_metadata->'media'->>'mimetype'  AS media_mimetype,
             c.raw_metadata->'media'->>'status'    AS media_status,
-            (c.raw_metadata->'media'->>'filesize')::double precision AS media_filesize
+            (c.raw_metadata->'media'->>'filesize')::double precision AS media_filesize,
+            c.answered_by_inbox_id
        FROM claimed c JOIN channel_instances ci ON ci.id = c.channel_instance_id
       ORDER BY c.id ASC`,
     [limit, MAX_ATTEMPTS],
