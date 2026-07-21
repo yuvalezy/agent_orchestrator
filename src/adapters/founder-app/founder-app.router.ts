@@ -9,7 +9,6 @@ import type { FirebaseConfig } from '../../config/firebase';
 import type { ConversationalQueryService } from '../../query/conversational-query-service';
 import { logger } from '../../logger';
 import { DeviceAuth } from './founder-app-auth';
-import type { FcmSender } from './fcm-sender';
 import type { FounderAppFeed } from './founder-app-feed';
 import type { AppFounderNotifier } from './app-founder-notifier';
 import { decodeCursor } from './founder-app-repo';
@@ -133,8 +132,6 @@ export interface FounderAppDeps {
   notifier: AppFounderNotifier;
   /** Public Firebase config echoed to the authed client; null disables push client-side. */
   firebase: FirebaseConfig | null;
-  /** The SAME sender the notifier fans out with, for `POST /api/push/test`. null → 503. */
-  sendPush?: FcmSender | null;
   /** v2 cockpit read models (reused console-repo SQL + app-specific augmentation). */
   cockpit: FounderAppCockpitReads;
   /**
@@ -1302,36 +1299,6 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
   router.delete('/api/push/register', async (_req, res, next) => {
     try {
       await deps.repo.unregisterDevicePush(device(res).id);
-      res.status(204).end();
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // A push the founder can fire at will. Without it the only way to test the notification path
-  // (delivery, icon, and — the reason this exists — whether a tap lands in the installed PWA or a
-  // browser tab) is to wait for a real customer event, which made every attempt a guessing game.
-  // It sends to THIS device only, and carries the same generic payload every other push does.
-  router.post('/api/push/test', async (_req, res, next) => {
-    const send = deps.sendPush ?? null;
-    if (!send) return void res.status(503).json({ error: 'push is not configured on the server' });
-    const target = device(res);
-    if (!target.fcmToken) return void res.status(409).json({ error: 'this device has no push token — turn push on first' });
-    try {
-      const [result] = await send([target.fcmToken], {
-        messageId: `test-${target.id}`,
-        kind: 'notification',
-        severity: null,
-        ref: null,
-        route: '/app/attention',
-        test: true,
-      });
-      if (result?.unregistered) {
-        // The token is dead (reinstalled app, cleared data). Drop it so the UI can re-enable.
-        await deps.repo.unregisterDevicePush(target.id);
-        return void res.status(409).json({ error: 'this device\'s push token expired — turn push off and on again' });
-      }
-      if (!result?.success) return void res.status(502).json({ error: 'the push relay rejected the notification' });
       res.status(204).end();
     } catch (err) {
       next(err);

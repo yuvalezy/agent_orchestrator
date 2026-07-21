@@ -5,7 +5,18 @@ export interface ApiError extends Error { status?: number }
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body) headers.set('content-type', 'application/json');
-  const response = await fetch(`/app/api${path}`, { ...init, headers, credentials: 'include' });
+  let response: Response;
+  try {
+    response = await fetch(`/app/api${path}`, { ...init, headers, credentials: 'include' });
+  } catch {
+    // A dead network rejects with a bare TypeError('Failed to fetch'), which surfaced verbatim
+    // in the UI. It is a state the app reaches easily and looks alive in: the worker serves the
+    // shell from cache, so the login screen renders perfectly on a phone that is off the tailnet,
+    // and only the first API call reveals there is no server on the other end.
+    const offline = new Error('Can\'t reach the server. Check that this device is on the tailnet (Tailscale connected), then try again.') as ApiError;
+    offline.status = 0;
+    throw offline;
+  }
   if (!response.ok) {
     if (response.status === 401) window.dispatchEvent(new Event('app:unauthorized'));
     const body = await response.json().catch(() => ({})) as { error?: string };

@@ -647,41 +647,6 @@ test('push register enables the device; config echoes the public Firebase settin
   }, { deps: { firebase: { serviceAccountFile: 'secrets/sa.json', webConfig: { apiKey: 'public' }, vapidKey: 'vapid-pub' } } });
 });
 
-test('push test fires a real push at THIS device only, and reports the relay honestly', async () => {
-  const sent: Array<{ tokens: string[]; route: string }> = [];
-  const sendPush = async (tokens: string[], payload: { route: string }) => {
-    sent.push({ tokens, route: payload.route });
-    return tokens.map((token) => ({ token, success: true, unregistered: false }));
-  };
-  await withApp(async ({ baseUrl, repo }) => {
-    const cookie = await login(baseUrl);
-    // No token yet → nothing to send to, and the message says how to fix it.
-    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 409);
-
-    await fetch(`${baseUrl}/app/api/push/register`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ fcmToken: 'fcm-abc' }) });
-    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 204);
-    assert.deepEqual(sent, [{ tokens: ['fcm-abc'], route: '/app/attention' }]);
-    assert.equal([...repo.devices.values()][0].fcmToken, 'fcm-abc');
-  }, { deps: { sendPush } });
-
-  // A dead token is dropped, so the founder can re-enable rather than retry into a void.
-  await withApp(async ({ baseUrl, repo }) => {
-    const cookie = await login(baseUrl);
-    await fetch(`${baseUrl}/app/api/push/register`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ fcmToken: 'dead' }) });
-    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 409);
-    assert.equal([...repo.devices.values()][0].pushEnabled, false);
-  }, { deps: { sendPush: async (tokens: string[]) => tokens.map((token) => ({ token, success: false, unregistered: true })) } });
-
-  // FCM unconfigured → 503, never a silent success.
-  await withApp(async ({ baseUrl }) => {
-    const cookie = await login(baseUrl);
-    await fetch(`${baseUrl}/app/api/push/register`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ fcmToken: 'fcm-abc' }) });
-    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 503);
-    // Unauthenticated callers can't make the server send pushes to anyone.
-    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST' })).status, 401);
-  });
-});
-
 test('the stored device token is a hash, never the raw cookie value', async () => {
   await withApp(async ({ baseUrl, repo }) => {
     const cookie = await login(baseUrl);

@@ -12,10 +12,50 @@
  * (getToken needs it); the worker only has to render what arrives, which is
  * ~15 lines. See the commit message for the three separate bugs the SDK-in-worker
  * arrangement cost us. */
-const CACHE = 'ao-founder-shell-v4';
+const CACHE = 'ao-founder-shell-v5';
 // icon-192.png is precached because a notification must render while offline, and
 // Android will not rasterize an SVG for a notification icon.
 const SHELL = ['/app/', '/app/index.html', '/app/offline.html', '/app/manifest.webmanifest', '/app/icon.svg', '/app/icon-192.png'];
+
+// ── Which clients are the INSTALLED app? ──────────────────────────────────────────────
+// The Clients API exposes no display mode, so a standalone PWA window and a plain browser
+// tab are indistinguishable here — and focusing the tab is exactly the bug (a notification
+// tap landed in Chrome instead of the installed app). The page reports its own display
+// mode (swClient.ts → {type:'client-mode'}) and we remember the ids that said "standalone".
+//
+// It has to be PERSISTED: a push wakes a FRESH worker, so anything in module scope is gone
+// by the time the notification is clicked. The shell cache is already open on every event,
+// so it doubles as the store rather than dragging in IndexedDB for one Set of strings.
+const CLIENTS_KEY = '/app/__standalone-clients';
+
+async function standaloneIds() {
+  try {
+    const cache = await caches.open(CACHE);
+    const stored = await cache.match(CLIENTS_KEY);
+    if (!stored) return [];
+    const ids = await stored.json();
+    return Array.isArray(ids) ? ids : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+/** Record `id` as standalone, dropping any id that no longer has a live window (self-pruning). */
+async function rememberStandalone(id) {
+  const live = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  const liveIds = new Set(live.map((client) => client.id));
+  const kept = (await standaloneIds()).filter((known) => liveIds.has(known));
+  if (!kept.includes(id)) kept.push(id);
+  const cache = await caches.open(CACHE);
+  await cache.put(CLIENTS_KEY, new Response(JSON.stringify(kept), { headers: { 'content-type': 'application/json' } }));
+}
+
+self.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data || data.type !== 'client-mode' || !data.standalone) return;
+  const id = event.source && event.source.id;
+  if (id) event.waitUntil(rememberStandalone(id));
+});
 
 // ── Background push ───────────────────────────────────────────────────────────────────
 /** Does the founder currently have the APP itself on screen? */
@@ -108,18 +148,35 @@ self.addEventListener('fetch', (event) => {
 });
 
 // ── Notification click (harmless when push is inactive) ────────────────────────────────
+// Order matters, and it is the opposite of the obvious one: the INSTALLED app wins over any
+// client we happen to find. Focusing whatever /app client existed first is what dropped the
+// founder into a Chrome tab. openWindow gets an ABSOLUTE, in-scope URL — that resolved URL is
+// what Chrome matches against the installed app's scope to launch the PWA instead of a tab.
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || '/app/';
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
-      const existing = windows.find((client) => client.url.includes('/app'));
-      if (existing) {
-        // Focus the running app and let it route in-place (SPA nav), no reload.
-        existing.postMessage({ type: 'navigate', route: target });
-        return existing.focus();
-      }
-      return self.clients.openWindow(target);
-    }),
-  );
+  const route = (event.notification.data && event.notification.data.url) || '/app/';
+  const target = new URL(route, self.registration.scope).href;
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const known = new Set(await standaloneIds());
+
+    // The installed app is already running: focus it and let it route in-place (SPA nav, no reload).
+    const installed = windows.find((client) => known.has(client.id));
+    if (installed) {
+      installed.postMessage({ type: 'navigate', route });
+      return installed.focus();
+    }
+
+    // Nothing installed on screen: ask the browser to open it, which launches the PWA when the
+    // URL is in the installed scope. Only if that is refused do we settle for an existing tab.
+    const opened = await self.clients.openWindow(target);
+    if (opened) return opened;
+
+    const tab = windows.find((client) => client.url.includes('/app'));
+    if (tab) {
+      tab.postMessage({ type: 'navigate', route });
+      return tab.focus();
+    }
+    return undefined;
+  })());
 });

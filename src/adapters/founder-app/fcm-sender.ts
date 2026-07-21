@@ -37,6 +37,17 @@ export type FcmSender = (tokens: string[], payload: FcmPayload) => Promise<FcmSe
 
 const UNREGISTERED_CODE = 'messaging/registration-token-not-registered';
 
+/** Resolve a '/app/...' route against the configured public URL; null unless it yields https. */
+function absoluteLink(route: string, publicUrl?: string | null): string | null {
+  if (!publicUrl) return null;
+  try {
+    const url = new URL(route, publicUrl);
+    return url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function notificationTitle(severity: string | null): string {
   return severity === 'warning' ? 'Founder attention needed' : 'AO Founder';
 }
@@ -51,8 +62,12 @@ function notificationTitle(severity: string | null): string {
  *      customer name or message body, so no customer content transits the FCM relay.
  * The SW reads data.title/data.body/data.tag (tag = the collapse key = the ref).
  */
-export function buildMulticastMessage(tokens: string[], payload: FcmPayload): Record<string, unknown> {
+export function buildMulticastMessage(tokens: string[], payload: FcmPayload, publicUrl?: string | null): Record<string, unknown> {
   const collapse = payload.ref || payload.messageId;
+  // fcm_options.link must be an ABSOLUTE https URL — FCM ignores (or rejects) a bare path, so
+  // for most of this app's life the field carried '/app/attention' and did nothing. It is
+  // resolved against FOUNDER_APP_PUBLIC_URL and simply omitted when that is not configured.
+  const link = absoluteLink(payload.route, publicUrl);
   return {
     tokens,
     // FCM data values must all be strings.
@@ -68,7 +83,7 @@ export function buildMulticastMessage(tokens: string[], payload: FcmPayload): Re
       route: payload.route,
     },
     android: { collapseKey: collapse, priority: 'high' },
-    webpush: { headers: { Topic: collapse }, fcmOptions: { link: payload.route } },
+    webpush: { headers: { Topic: collapse }, ...(link ? { fcmOptions: { link } } : {}) },
   };
 }
 
@@ -95,7 +110,7 @@ const APP_NAME = 'ao-founder-app';
  * package is absent or the credential file can't be read — the caller then runs with FCM
  * disabled and the rest of the app router unaffected.
  */
-export async function buildFcmSender(config: FirebaseConfig): Promise<FcmSender | null> {
+export async function buildFcmSender(config: FirebaseConfig, publicUrl?: string | null): Promise<FcmSender | null> {
   let admin: AdminModule;
   try {
     // A string-typed specifier keeps tsc from resolving (and thus requiring) the module.
@@ -132,7 +147,7 @@ export async function buildFcmSender(config: FirebaseConfig): Promise<FcmSender 
 
   return async (tokens, payload) => {
     if (tokens.length === 0) return [];
-    const res = await messaging.sendEachForMulticast(buildMulticastMessage(tokens, payload));
+    const res = await messaging.sendEachForMulticast(buildMulticastMessage(tokens, payload, publicUrl));
     return tokens.map((token, i) => {
       const r = res.responses[i];
       return {

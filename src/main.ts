@@ -289,9 +289,6 @@ async function main(): Promise<void> {
         query: buildQueryEngineService(async () => {}),
         notifier: founderAppNotifier,
         firebase: firebaseConfig,
-        // The same sender the notifier fans out with, so Settings → "Send test notification"
-        // exercises the real relay rather than a parallel code path.
-        sendPush: fcmSender,
         meetingReply: () => bookAppMeetingTime,
         // Edit reuses the exact core fn the console/Telegram edit path calls; gated by the drafter flag.
         editDraft: env.KNOWLEDGE_DRAFT_ENABLED ? replaceDraftBodyAndApprove : null,
