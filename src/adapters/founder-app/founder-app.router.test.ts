@@ -178,6 +178,9 @@ function defaultCockpit(): FounderAppCockpitReads {
     listUrgencyInbox: async () => ({ data: [], nextCursor: null, asOf: new Date().toISOString() }),
     listAttentionDecisions: async () => [],
     augmentCustomers: async () => new Map(),
+    listCustomerContacts: async () => [],
+    listAllContacts: async () => [],
+    findCustomerByEventIds: async () => new Map(),
   };
 }
 
@@ -642,6 +645,41 @@ test('push register enables the device; config echoes the public Firebase settin
     const cfg = await (await fetch(`${baseUrl}/app/api/config`, { headers: { cookie } })).json() as { firebase: unknown; vapidKey: unknown };
     assert.deepEqual(cfg, { firebase: { apiKey: 'public' }, vapidKey: 'vapid-pub' });
   }, { deps: { firebase: { serviceAccountFile: 'secrets/sa.json', webConfig: { apiKey: 'public' }, vapidKey: 'vapid-pub' } } });
+});
+
+test('push test fires a real push at THIS device only, and reports the relay honestly', async () => {
+  const sent: Array<{ tokens: string[]; route: string }> = [];
+  const sendPush = async (tokens: string[], payload: { route: string }) => {
+    sent.push({ tokens, route: payload.route });
+    return tokens.map((token) => ({ token, success: true, unregistered: false }));
+  };
+  await withApp(async ({ baseUrl, repo }) => {
+    const cookie = await login(baseUrl);
+    // No token yet → nothing to send to, and the message says how to fix it.
+    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 409);
+
+    await fetch(`${baseUrl}/app/api/push/register`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ fcmToken: 'fcm-abc' }) });
+    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 204);
+    assert.deepEqual(sent, [{ tokens: ['fcm-abc'], route: '/app/attention' }]);
+    assert.equal([...repo.devices.values()][0].fcmToken, 'fcm-abc');
+  }, { deps: { sendPush } });
+
+  // A dead token is dropped, so the founder can re-enable rather than retry into a void.
+  await withApp(async ({ baseUrl, repo }) => {
+    const cookie = await login(baseUrl);
+    await fetch(`${baseUrl}/app/api/push/register`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ fcmToken: 'dead' }) });
+    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 409);
+    assert.equal([...repo.devices.values()][0].pushEnabled, false);
+  }, { deps: { sendPush: async (tokens: string[]) => tokens.map((token) => ({ token, success: false, unregistered: true })) } });
+
+  // FCM unconfigured → 503, never a silent success.
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    await fetch(`${baseUrl}/app/api/push/register`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ fcmToken: 'fcm-abc' }) });
+    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST', headers: { cookie } })).status, 503);
+    // Unauthenticated callers can't make the server send pushes to anyone.
+    assert.equal((await fetch(`${baseUrl}/app/api/push/test`, { method: 'POST' })).status, 401);
+  });
 });
 
 test('the stored device token is a hash, never the raw cookie value', async () => {
@@ -1377,13 +1415,28 @@ test('POST /transcribe requires a device cookie', async () => {
 function fakeCalendar(overrides: Partial<NonNullable<FounderAppDeps['calendar']>> = {}): NonNullable<FounderAppDeps['calendar']> {
   return {
     listRange: async () => [
-      { id: 'e1', calendarLabel: 'Work', title: 'Standup', startsAt: new Date('2026-07-20T13:00:00Z'), endsAt: new Date('2026-07-20T13:15:00Z'), allDay: false },
+      {
+        id: 'e1',
+        calendarLabel: 'Work',
+        title: 'Standup',
+        startsAt: new Date('2026-07-20T13:00:00Z'),
+        endsAt: new Date('2026-07-20T13:15:00Z'),
+        allDay: false,
+        calendarAccountId: 'acc-1',
+        calendarId: 'work@primary',
+        color: 'sky',
+        attendeeEmails: [],
+        organizerEmail: null,
+      },
     ],
     businessHoursForDay: async () => ({ startMinutes: 540, endMinutes: 1080 }), // 09:00–18:00
     dayWindow: { startMinutes: 360, endMinutes: 1200 }, // 06:00–20:00
     softBlocksForDay: () => [{ startMinutes: 690, endMinutes: 780, label: 'Walk / gym' }], // 11:30–13:00
     meetingForCard: async () => null,
     block: async () => ({ status: 'booked' }),
+    calendars: async () => [{ id: 'acc-1', label: 'Work', color: 'sky', isHost: true }],
+    updateEvent: async () => ({ status: 'updated' }),
+    deleteEvent: async () => ({ status: 'deleted' }),
     ...overrides,
   };
 }
@@ -1393,7 +1446,7 @@ test('GET /calendar returns the day, tz, business hours and per-calendar tagged 
     const cookie = await login(baseUrl);
     const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
     assert.equal(res.status, 200);
-    const body = await res.json() as { data: { day: string; tz: string; businessHours: unknown; dayWindow: unknown; softBlocks: unknown; events: Array<Record<string, unknown>>; meeting?: unknown } };
+    const body = await res.json() as { data: { day: string; tz: string; businessHours: unknown; dayWindow: unknown; softBlocks: unknown; events: Array<Record<string, unknown>>; calendars: Array<Record<string, unknown>>; meeting?: unknown } };
     assert.equal(body.data.day, '2026-07-20');
     assert.equal(typeof body.data.tz, 'string');
     assert.deepEqual(body.data.businessHours, { startMinutes: 540, endMinutes: 1080 });
@@ -1401,7 +1454,23 @@ test('GET /calendar returns the day, tz, business hours and per-calendar tagged 
     assert.deepEqual(body.data.dayWindow, { startMinutes: 360, endMinutes: 1200 });
     assert.deepEqual(body.data.softBlocks, [{ startMinutes: 690, endMinutes: 780, label: 'Walk / gym' }]);
     assert.equal(body.data.events.length, 1);
-    assert.deepEqual(body.data.events[0], { id: 'e1', calendarLabel: 'Work', title: 'Standup', startsAt: '2026-07-20T13:00:00.000Z', endsAt: '2026-07-20T13:15:00.000Z', allDay: false });
+    // Events carry their own write-target tags (calendarAccountId + calendarId + color) so the FE
+    // can route an edit/delete back to the exact calendar that produced them.
+    assert.deepEqual(body.data.events[0], {
+      id: 'e1',
+      calendarLabel: 'Work',
+      title: 'Standup',
+      startsAt: '2026-07-20T13:00:00.000Z',
+      endsAt: '2026-07-20T13:15:00.000Z',
+      allDay: false,
+      calendarAccountId: 'acc-1',
+      calendarId: 'work@primary',
+      color: 'sky',
+      attendeeEmails: [],
+      organizerEmail: null,
+    });
+    // The calendar roster rides along so the day-view dropdown (host + others) can render.
+    assert.deepEqual(body.data.calendars, [{ id: 'acc-1', label: 'Work', color: 'sky', isHost: true }]);
     assert.equal(body.data.meeting, undefined); // no messageId → no meeting block
   }, { deps: { calendar: fakeCalendar() } });
 });
@@ -1450,7 +1519,7 @@ test('GET /calendar rejects a bad day / bad messageId, and 503s when the calenda
 });
 
 test('POST /calendar/block validates input and returns the booking status', async () => {
-  const calls: Array<{ localTime: string; durationMinutes: number; title?: string }> = [];
+  const calls: Array<{ localTime: string; durationMinutes: number; title?: string; calendarAccountId?: string; attendeeEmails?: string[]; sendUpdates?: 'all' | 'none' }> = [];
   await withApp(async ({ baseUrl }) => {
     const cookie = await login(baseUrl);
     const ok = await fetch(`${baseUrl}/app/api/calendar/block`, {
@@ -1459,7 +1528,7 @@ test('POST /calendar/block validates input and returns the booking status', asyn
     });
     assert.equal(ok.status, 200);
     assert.deepEqual(await ok.json(), { data: { status: 'booked' } });
-    assert.deepEqual(calls, [{ localTime: '2026-08-01T15:00', durationMinutes: 30, title: 'Focus' }]);
+    assert.deepEqual(calls, [{ localTime: '2026-08-01T15:00', durationMinutes: 30, title: 'Focus', calendarAccountId: undefined, attendeeEmails: undefined, sendUpdates: undefined }]);
 
     // Bad inputs never reach the builder.
     assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: 'nope', durationMinutes: 30 }) })).status, 400);
@@ -1484,4 +1553,294 @@ test('POST /calendar/block passes an unavailable status through and 503s when th
     const cookie = await login(baseUrl);
     assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30 }) })).status, 503);
   });
+});
+
+test('POST /calendar/block forwards an optional calendarAccountId to the builder (explicit target)', async () => {
+  const calls: Array<{ calendarAccountId?: string }> = [];
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const acctId = '11111111-1111-1111-1111-111111111111';
+    const res = await fetch(`${baseUrl}/app/api/calendar/block`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30, calendarAccountId: acctId }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'booked' } });
+    assert.equal(calls[0].calendarAccountId, acctId);
+    // Bad UUID → 400 (never reaches the builder).
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/block`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30, calendarAccountId: 'nope' }) })).status, 400);
+  }, { deps: { calendar: fakeCalendar({ block: async (input) => { calls.push(input); return { status: 'booked' }; } }) } });
+});
+
+test('PUT /calendar/event edits an event and returns the updated status', async () => {
+  const calls: Array<{ eventId: string; title?: string; localTime?: string; durationMinutes?: number; confirmConflict?: boolean }> = [];
+  const acctId = '22222222-2222-2222-2222-222222222222';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar/event`, {
+      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', title: 'Renamed' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'updated' } });
+    assert.equal(calls[0].eventId, 'ev-1');
+    assert.equal(calls[0].title, 'Renamed');
+    assert.equal(calls[0].confirmConflict, false);
+  }, { deps: { calendar: fakeCalendar({ updateEvent: async (input) => { calls.push(input); return { status: 'updated' }; } }) } });
+});
+
+test('PUT /calendar/event surfaces a conflict (with clash details) when confirmConflict is false', async () => {
+  const acctId = '33333333-3333-3333-3333-333333333333';
+  // First call returns the conflict; the second (with confirmConflict=true) succeeds.
+  const sequence = [{ status: 'conflict' as const, conflicts: [{ title: 'Standup', startsAt: '2026-08-01T15:00:00.000Z', endsAt: '2026-08-01T15:30:00.000Z' }] }, { status: 'updated' as const }];
+  let i = 0;
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const first = await fetch(`${baseUrl}/app/api/calendar/event`, {
+      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', localTime: '2026-08-01T15:00', durationMinutes: 30 }),
+    });
+    assert.equal(first.status, 200);
+    assert.deepEqual(await first.json(), { data: { status: 'conflict', conflicts: [{ title: 'Standup', startsAt: '2026-08-01T15:00:00.000Z', endsAt: '2026-08-01T15:30:00.000Z' }] } });
+
+    const second = await fetch(`${baseUrl}/app/api/calendar/event`, {
+      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', localTime: '2026-08-01T15:00', durationMinutes: 30, confirmConflict: true }),
+    });
+    assert.equal(second.status, 200);
+    assert.deepEqual(await second.json(), { data: { status: 'updated' } });
+  }, { deps: { calendar: fakeCalendar({ updateEvent: async () => sequence[i++] }) } });
+});
+
+test('PUT /calendar/event validates input (400 on bad shape) and 503s when the calendar dep is absent', async () => {
+  const acctId = '44444444-4444-4444-4444-444444444444';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const headers = { cookie, 'content-type': 'application/json' };
+    // Missing eventId entirely.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, title: 'X' }) })).status, 400);
+    // Bad calendarAccountId.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: 'nope', eventId: 'ev-1', title: 'X' }) })).status, 400);
+    // Empty eventId.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: '   ', title: 'X' }) })).status, 400);
+    // Nothing to update (no title/localTime/durationMinutes).
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1' }) })).status, 400);
+    // Bad localTime.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', localTime: 'nope' }) })).status, 400);
+    // Bad durationMinutes.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', durationMinutes: 0 }) })).status, 400);
+  }, { deps: { calendar: fakeCalendar() } });
+  // No calendar dep wired → 503.
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', title: 'X' }) })).status, 503);
+  });
+});
+
+test('DELETE /calendar/event cancels an event and returns the deleted status', async () => {
+  const calls: Array<{ calendarAccountId: string; eventId: string }> = [];
+  const acctId = '55555555-5555-5555-5555-555555555555';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar/event`, {
+      method: 'DELETE', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'deleted' } });
+    assert.deepEqual(calls, [{ calendarAccountId: acctId, eventId: 'ev-1' }]);
+    // Bad inputs never reach the builder.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'DELETE', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ calendarAccountId: 'nope', eventId: 'ev-1' }) })).status, 400);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'DELETE', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ calendarAccountId: acctId }) })).status, 400);
+  }, { deps: { calendar: fakeCalendar({ deleteEvent: async (input) => { calls.push(input); return { status: 'deleted' }; } }) } });
+
+  // No calendar dep wired → 503.
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'DELETE', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1' }) })).status, 503);
+  });
+});
+
+// ── Calendar invitees feature ────────────────────────────────────────────────────────
+// GET /calendar tags each event with its current invitees + (when meeting-originated) the owning
+// customer; PUT /calendar/event + POST /calendar/block accept attendeeEmails; two new GETs expose
+// the contact lists the picker reads. Together these back the day-view's "manage invitees" sheet.
+
+test('GET /calendar tags each event with the customer its meeting-request originated from', async () => {
+  // The default fakeCalendar returns one event with id 'e1'. Wire the cockpit lookup to map it.
+  const customerId = '77777777-7777-7777-7777-777777777777';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: { events: Array<Record<string, unknown>> } };
+    // The event now carries the customer tag the invitee picker reads.
+    assert.equal(body.data.events[0].customerId, customerId);
+    assert.equal(body.data.events[0].customerName, 'Acme');
+    // The new attendee fields always ride along (the default fake returns [] / null).
+    assert.deepEqual(body.data.events[0].attendeeEmails, []);
+    assert.equal(body.data.events[0].organizerEmail, null);
+  }, {
+    deps: { calendar: fakeCalendar() },
+    cockpit: { findCustomerByEventIds: async (ids) => new Map(ids.map((id) => [id, { customerId, customerName: 'Acme' }])) },
+  });
+});
+
+test('GET /calendar: an event with no meeting-request row carries no customer tag (absent = no link)', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
+    const body = await res.json() as { data: { events: Array<Record<string, unknown>> } };
+    assert.equal(body.data.events[0].customerId, undefined);
+    assert.equal(body.data.events[0].customerName, undefined);
+  }, {
+    deps: { calendar: fakeCalendar() },
+    cockpit: { findCustomerByEventIds: async () => new Map() },
+  });
+});
+
+test('GET /calendar: a failed event→customer batch is swallowed (events still return, no customer tag)', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: { events: Array<Record<string, unknown>> } };
+    assert.equal(body.data.events.length, 1);
+    assert.equal(body.data.events[0].customerId, undefined, 'a lookup miss must not break the day view');
+  }, {
+    deps: { calendar: fakeCalendar() },
+    cockpit: { findCustomerByEventIds: async () => { throw new Error('db down'); } },
+  });
+});
+
+test('GET /calendar propagates attendeeEmails + organizerEmail from the range read', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar?day=2026-07-20`, { headers: { cookie } });
+    const body = await res.json() as { data: { events: Array<{ attendeeEmails: string[]; organizerEmail: string | null }> } };
+    assert.deepEqual(body.data.events[0].attendeeEmails, ['founder@me.com', 'cust@acme.com']);
+    assert.equal(body.data.events[0].organizerEmail, 'founder@me.com');
+  }, {
+    deps: {
+      calendar: fakeCalendar({
+        listRange: async () => [{
+          id: 'e1', calendarLabel: 'Work', title: 'Standup',
+          startsAt: new Date('2026-07-20T13:00:00Z'), endsAt: new Date('2026-07-20T13:15:00Z'),
+          allDay: false, calendarAccountId: 'acc-1', calendarId: 'work@primary', color: 'sky',
+          attendeeEmails: ['founder@me.com', 'cust@acme.com'], organizerEmail: 'founder@me.com',
+        }],
+      }),
+    },
+  });
+});
+
+test('GET /customers/:id/contacts returns the customer-scoped contact list (email-only, primary-first)', async () => {
+  const customerId = '88888888-8888-8888-8888-888888888888';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/customers/${customerId}/contacts`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      data: [{ name: 'Alice', email: 'alice@acme.com', isPrimary: true }, { name: 'bob@acme.com', email: 'bob@acme.com', isPrimary: false }],
+    });
+    // Bad UUID → 400.
+    assert.equal((await fetch(`${baseUrl}/app/api/customers/nope/contacts`, { headers: { cookie } })).status, 400);
+  }, {
+    cockpit: {
+      listCustomerContacts: async () => [
+        { name: 'Alice', email: 'alice@acme.com', isPrimary: true },
+        { name: 'bob@acme.com', email: 'bob@acme.com', isPrimary: false },
+      ],
+    },
+  });
+});
+
+test('GET /contacts returns the all-customers contact list (joined with customer name)', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/contacts`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      data: [
+        { customerId: 'c-a', customerName: 'Acme', name: 'Alice', email: 'alice@acme.com', isPrimary: true },
+        { customerId: 'c-b', customerName: 'Globex', name: 'Bob', email: 'bob@globex.com', isPrimary: false },
+      ],
+    });
+  }, {
+    cockpit: {
+      listAllContacts: async () => [
+        { customerId: 'c-a', customerName: 'Acme', name: 'Alice', email: 'alice@acme.com', isPrimary: true },
+        { customerId: 'c-b', customerName: 'Globex', name: 'Bob', email: 'bob@globex.com', isPrimary: false },
+      ],
+    },
+  });
+});
+
+test('PUT /calendar/event forwards attendeeEmails + sendUpdates through to the builder', async () => {
+  const calls: Array<{ attendeeEmails?: string[]; sendUpdates?: 'all' | 'none' }> = [];
+  const acctId = '66666666-6666-6666-6666-666666666666';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar/event`, {
+      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', attendeeEmails: ['Alice@x.com', ' bob@x.com '], sendUpdates: 'all' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { data: { status: 'updated' } });
+    // The router trims wire whitespace as part of basic shape validation; lowercasing happens at
+    // the writer (Google client), not here, so 'Alice@x.com' keeps its case through to the builder.
+    assert.deepEqual(calls[0].attendeeEmails, ['Alice@x.com', 'bob@x.com']);
+    assert.equal(calls[0].sendUpdates, 'all');
+  }, { deps: { calendar: fakeCalendar({ updateEvent: async (input) => { calls.push(input); return { status: 'updated' }; } }) } });
+});
+
+test('PUT /calendar/event rejects a malformed attendeeEmails body (400)', async () => {
+  const acctId = '12345678-1234-1234-1234-123456789012';
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const headers = { cookie, 'content-type': 'application/json' };
+    // Not an array.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', attendeeEmails: 'not-array' }) })).status, 400);
+    // Bad email shape.
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', attendeeEmails: ['no-at-sign'] }) })).status, 400);
+    // Too many entries (>50).
+    const tooMany = Array.from({ length: 51 }, (_, i) => `u${i}@x.com`);
+    assert.equal((await fetch(`${baseUrl}/app/api/calendar/event`, { method: 'PUT', headers, body: JSON.stringify({ calendarAccountId: acctId, eventId: 'ev-1', attendeeEmails: tooMany }) })).status, 400);
+  }, { deps: { calendar: fakeCalendar() } });
+});
+
+test('POST /calendar/block forwards attendeeEmails + sendUpdates through, and returns the new eventId on booked', async () => {
+  const calls: Array<{ attendeeEmails?: string[]; sendUpdates?: 'all' | 'none' }> = [];
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar/block`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30, attendeeEmails: ['alice@acme.com'], sendUpdates: 'all' }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      data: { status: 'booked', eventId: 'ev-new', calendarAccountId: 'acc-1', calendarId: 'work@primary' },
+    });
+    assert.deepEqual(calls[0].attendeeEmails, ['alice@acme.com']);
+    assert.equal(calls[0].sendUpdates, 'all');
+  }, {
+    deps: {
+      calendar: fakeCalendar({
+        block: async (input) => { calls.push(input); return { status: 'booked', eventId: 'ev-new', calendarAccountId: 'acc-1', calendarId: 'work@primary' }; },
+      }),
+    },
+  });
+});
+
+test('POST /calendar/block without attendees still omits eventId (legacy private-hold path)', async () => {
+  await withApp(async ({ baseUrl }) => {
+    const cookie = await login(baseUrl);
+    const res = await fetch(`${baseUrl}/app/api/calendar/block`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ localTime: '2026-08-01T15:00', durationMinutes: 30 }),
+    });
+    assert.equal(res.status, 200);
+    // When the builder returns no eventId, the response carries only {status} (legacy shape).
+    assert.deepEqual(await res.json(), { data: { status: 'unavailable' } });
+  }, { deps: { calendar: fakeCalendar({ block: async () => ({ status: 'unavailable' }) }) } });
 });

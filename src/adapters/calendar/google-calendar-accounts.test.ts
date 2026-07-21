@@ -88,8 +88,8 @@ test('buildCalendarAccounts: reads the dynamic list, keeps only accounts with a 
   try {
     const accounts = await buildCalendarAccounts({
       listEnabled: async () => [
-        { label: 'Present', credentialName: 'GOOGLE_CALENDAR_UNITTEST_OAUTH', calendarId: 'team@grp' },
-        { label: 'Missing', credentialName: 'GOOGLE_CALENDAR_ABSENT_OAUTH', calendarId: 'primary' },
+        { label: 'Present', credentialName: 'GOOGLE_CALENDAR_UNITTEST_OAUTH', calendarId: 'team@grp', accountId: 'acc-1', color: 'sky' },
+        { label: 'Missing', credentialName: 'GOOGLE_CALENDAR_ABSENT_OAUTH', calendarId: 'primary', accountId: 'acc-2', color: 'rose' },
       ],
       legacyCalendarId: 'primary',
     });
@@ -109,11 +109,11 @@ test('buildCalendarAccounts: empty enabled list → legacy fallback only when pr
 // ── Range fan-out (day view) ────────────────────────────────────────────────────────
 // Same composite shape as the meeting-context fan-out, but per-calendar TAGGED and UNCAPPED.
 
-type RangeItem = Omit<RangeEvent, 'calendarLabel'>;
+type RangeItem = Omit<RangeEvent, 'calendarLabel' | 'calendarAccountId' | 'calendarId' | 'color'>;
 
 function rangeEv(id: string, title: string, minsFromNow: number): RangeItem {
   const startsAt = new Date(1_700_000_000_000 + minsFromNow * 60_000);
-  return { id, title, startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), allDay: false };
+  return { id, title, startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), allDay: false, attendeeEmails: [], organizerEmail: null };
 }
 
 /** A fake account client that records the calendarId it was asked for and returns fixed events. */
@@ -131,18 +131,33 @@ const RANGE_INPUT: ListEventsInRangeInput = { timeMin: new Date(1_700_000_000_00
 test('range: each account reads its OWN calendar id and events are tagged with the account label', async () => {
   const seen: string[] = [];
   const cal = buildMultiCalendarRange([
-    { label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Sync', 30)], seen), calendarId: 'work@primary' },
-    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Gym', 60)], seen), calendarId: 'personal@primary' },
+    { label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Sync', 30)], seen), calendarId: 'work@primary', accountId: 'acc-w', color: 'sky' },
+    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Gym', 60)], seen), calendarId: 'personal@primary', accountId: 'acc-p', color: 'rose' },
   ]);
   const out = await cal.listEventsInRange(RANGE_INPUT);
   assert.deepEqual(seen.sort(), ['personal@primary', 'work@primary']);
   assert.deepEqual(out.map((e) => [e.calendarLabel, e.id]), [['Work', 'w1'], ['Personal', 'p1']]); // tagged + soonest-first
 });
 
+test('buildMultiCalendarRange: tags every event with calendarLabel + calendarAccountId + calendarId + color', async () => {
+  const cal = buildMultiCalendarRange([
+    { label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Sync', 30)], []), calendarId: 'work@primary', accountId: 'acc-w', color: 'sky' },
+    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Gym', 60)], []), calendarId: 'personal@primary', accountId: 'acc-p', color: 'rose' },
+  ]);
+  const out = await cal.listEventsInRange(RANGE_INPUT);
+  assert.deepEqual(
+    out.map((e) => ({ id: e.id, calendarLabel: e.calendarLabel, calendarAccountId: e.calendarAccountId, calendarId: e.calendarId, color: e.color })),
+    [
+      { id: 'w1', calendarLabel: 'Work', calendarAccountId: 'acc-w', calendarId: 'work@primary', color: 'sky' },
+      { id: 'p1', calendarLabel: 'Personal', calendarAccountId: 'acc-p', calendarId: 'personal@primary', color: 'rose' },
+    ],
+  );
+});
+
 test('range: merges + sorts soonest-first, does NOT cap', async () => {
   const cal = buildMultiCalendarRange([
-    { label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Later', 180), rangeEv('w2', 'Latest', 240)], []), calendarId: 'primary' },
-    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Sooner', 15)], []), calendarId: 'primary' },
+    { label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Later', 180), rangeEv('w2', 'Latest', 240)], []), calendarId: 'primary', accountId: 'acc-w', color: 'sky' },
+    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Sooner', 15)], []), calendarId: 'primary', accountId: 'acc-p', color: 'rose' },
   ]);
   const out = await cal.listEventsInRange(RANGE_INPUT);
   assert.deepEqual(out.map((e) => e.title), ['Sooner', 'Later', 'Latest']); // all 3, no cap
@@ -151,8 +166,8 @@ test('range: merges + sorts soonest-first, does NOT cap', async () => {
 test('range: the SAME event on two calendars shows twice, each under its own label', async () => {
   const shared = rangeEv('shared-1', 'Board', 45);
   const cal = buildMultiCalendarRange([
-    { label: 'Work', client: fakeRangeClient([shared], []), calendarId: 'primary' },
-    { label: 'Personal', client: fakeRangeClient([{ ...shared }], []), calendarId: 'primary' },
+    { label: 'Work', client: fakeRangeClient([shared], []), calendarId: 'primary', accountId: 'acc-w', color: 'sky' },
+    { label: 'Personal', client: fakeRangeClient([{ ...shared }], []), calendarId: 'primary', accountId: 'acc-p', color: 'rose' },
   ]);
   const out = await cal.listEventsInRange(RANGE_INPUT);
   assert.deepEqual(out.map((e) => e.calendarLabel), ['Work', 'Personal']); // NOT deduped across accounts
@@ -163,8 +178,8 @@ test('range: one account throwing does not drop the other (best-effort per accou
     async listEventsInRange() { throw new Error('token refresh failed'); },
   };
   const cal = buildMultiCalendarRange([
-    { label: 'Work', client: boom, calendarId: 'primary' },
-    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Gym', 60)], []), calendarId: 'primary' },
+    { label: 'Work', client: boom, calendarId: 'primary', accountId: 'acc-w', color: 'sky' },
+    { label: 'Personal', client: fakeRangeClient([rangeEv('p1', 'Gym', 60)], []), calendarId: 'primary', accountId: 'acc-p', color: 'rose' },
   ]);
   const out = await cal.listEventsInRange(RANGE_INPUT);
   assert.deepEqual(out.map((e) => e.title), ['Gym']);
@@ -178,7 +193,7 @@ test('buildDynamicMultiCalendarRange: re-reads the account list per call but cac
   let loads = 0;
   const cal = buildDynamicMultiCalendarRange(async () => {
     loads += 1;
-    return [{ label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Sync', 30)], []), calendarId: 'primary' }];
+    return [{ label: 'Work', client: fakeRangeClient([rangeEv('w1', 'Sync', 30)], []), calendarId: 'primary', accountId: 'acc-w', color: 'sky' }];
   }, 30_000);
   await cal.listEventsInRange(RANGE_INPUT);
   await cal.listEventsInRange(RANGE_INPUT);

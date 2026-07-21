@@ -46,6 +46,8 @@ export function buildMeetingCommandDeps(): MeetingCommandDeps | null {
           label: a.label,
           credentialName: a.credentialName,
           calendarId: a.calendarId,
+          accountId: a.id,
+          color: a.color,
         })),
       legacyCalendarId: env.CALENDAR_ID,
     }),

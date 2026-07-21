@@ -56,6 +56,28 @@ export function localTimeAt(day: string, minutes: number): string {
   return `${day}T${pad2(Math.floor(c / 60))}:${pad2(c % 60)}`;
 }
 
+/** Combines a `YYYY-MM-DD` date and an `HH:MM` wall-clock into the bare datetime-local string the
+ *  calendar write endpoints expect (`YYYY-MM-DDTHH:MM`). Pure string concat — the server anchors it
+ *  in the founder tz. */
+export function makeLocalTime(date: string, hhmm: string): string {
+  return `${date}T${hhmm}`;
+}
+
+/** Splits an ISO instant (rendered in `tz`) into the `YYYY-MM-DD` date and `HH:MM` wall-clock parts
+ *  the edit-sheet's date/time inputs read. Mirrors `partsInTz` but returns the inputs' shape rather
+ *  than a minute-of-day. */
+export function splitIsoInTz(iso: string, tz: string): { date: string; time: string } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date(iso));
+  const get = (t: string): string => parts.find((p) => p.type === t)?.value ?? '00';
+  return {
+    date: `${get('year')}-${get('month')}-${get('day')}`,
+    // hour12:false yields '24' for midnight in some engines — fold it back to 0.
+    time: `${pad2(Number(get('hour')) % 24)}:${get('minute')}`,
+  };
+}
+
 /** A minute-of-day as a founder-facing "9 AM" / "1:30 PM" clock label. */
 export function clockLabel(minutes: number): string {
   const m = ((Math.round(minutes) % 1440) + 1440) % 1440;

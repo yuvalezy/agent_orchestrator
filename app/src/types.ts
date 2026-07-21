@@ -146,16 +146,59 @@ export type DetailRow = Record<string, unknown>;
 
 // ── Calendar day view ───────────────────────────────────────────────────────
 
+/** The palette keys a calendar account may be colored. This is the SINGLE source of truth shared
+ *  with the backend: the DB column `calendar_accounts.color` stores one of these keys, and the day
+ *  view looks the rendered Tailwind classes up by it (see `paletteFor` in CalendarScreen). */
+export const CALENDAR_COLOR_KEYS = ['sky', 'violet', 'emerald', 'teal', 'rose', 'indigo', 'fuchsia', 'cyan'] as const;
+export type CalendarColorKey = typeof CALENDAR_COLOR_KEYS[number];
+
 /** One event on the day grid. `startsAt`/`endsAt` are ISO instants rendered in the day's `tz`;
- *  `allDay` rows skip the grid and show as a banner. `calendarLabel` names the source calendar
- *  and drives the block's stable color. */
+ *  `allDay` rows skip the grid and show as a banner. `color` is the `CalendarColorKey` the source
+ *  calendar is colored (matched to `calendar_accounts.color` server-side) and drives the block's
+ *  palette; `calendarId`/`calendarAccountId` identify which account the event came from.
+ *  `attendeeEmails` is lowercased/deduped and always includes the organizer (empty when none);
+ *  `organizerEmail` is the host (also present in `attendeeEmails`). `customerId`/`customerName`
+ *  are present iff the event originated from a meeting request, so the invitee picker can default
+ *  to that customer's contact list. */
 export interface CalendarEvent {
   id: string;
   calendarLabel: string;
+  calendarAccountId: string;
+  calendarId: string;
+  color: CalendarColorKey;
   title: string;
   startsAt: string;
   endsAt: string;
   allDay: boolean;
+  attendeeEmails: string[];
+  organizerEmail: string | null;
+  customerId?: string;
+  customerName?: string;
+}
+
+/** One email contact — scoped form (single customer). Returned by GET /api/customers/:id/contacts. */
+export interface CustomerContact {
+  name: string;
+  email: string;
+  isPrimary: boolean;
+}
+
+/** One email contact — unscoped form (all customers). Returned by GET /api/contacts. */
+export interface DirectoryContact {
+  customerId: string;
+  customerName: string;
+  name: string;
+  email: string;
+  isPrimary: boolean;
+}
+
+/** One of the founder's calendars the day view reads from / writes to. `color` matches the
+ *  palette key above; `isHost` marks the founder's primary calendar. */
+export interface CalendarAccountSummary {
+  id: string;
+  label: string;
+  color: CalendarColorKey;
+  isHost: boolean;
 }
 
 /** When the day view is opened from a pending "pick a time" card, the meeting it will book:
@@ -176,7 +219,8 @@ export interface CalendarSoftBlock {
 
 /** GET /app/api/calendar?day=…[&messageId=…] → `{ data: CalendarDay }`. `businessHours` minutes are
  *  from local midnight in `tz`; null when no business hours are configured. `dayWindow` is the grid's
- *  base visible extent (e.g. 06:00–20:00); the view still widens it to fit any out-of-range event. */
+ *  base visible extent (e.g. 06:00–20:00); the view still widens it to fit any out-of-range event.
+ *  `calendars` is the founder's accounts the day's events are drawn from, for rendering legend/chips. */
 export interface CalendarDay {
   day: string;
   tz: string;
@@ -184,5 +228,6 @@ export interface CalendarDay {
   dayWindow?: { startMinutes: number; endMinutes: number };
   softBlocks?: CalendarSoftBlock[];
   events: CalendarEvent[];
+  calendars: CalendarAccountSummary[];
   meeting?: CalendarMeeting;
 }

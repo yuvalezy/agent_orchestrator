@@ -7,10 +7,12 @@ import type {
   CalendarWriterPort,
   CreateEventInput,
   CreatedEvent,
+  DeleteEventInput,
   FreeBusyInput,
   ListEventsInRangeInput,
   ListUpcomingEventsInput,
   RangeEvent,
+  UpdateEventInput,
 } from '../../ports/calendar.port';
 import { recordProviderRequest } from '../../observability/provider-metrics';
 
@@ -170,6 +172,60 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
     );
   }
 
+  /** PATCH a Calendar API path. Same retry/401/CalendarHttpError posture as post(). */
+  private async patch<T>(path: string, body: unknown): Promise<T> {
+    return withRetry(
+      async () => {
+        const res = await this.request(`${CAL}${path}`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        if (res.status === 401) {
+          this.accessToken = null;
+          throw new CalendarHttpError(401, 'calendar 401 (token) — retrying');
+        }
+        if (!res.ok) throw new CalendarHttpError(res.status, `calendar PATCH ${path.split('?')[0]} → ${res.status}`);
+        // PATCH may return 200 with body or (for some configs) an empty body; tolerate both.
+        if (res.status === 204) return undefined as T;
+        return (await res.json()) as T;
+      },
+      {
+        ...DEFAULT_RETRY,
+        isRetryable: (err) =>
+          !(err instanceof CalendarHttpError) || err.status === 401 || RETRYABLE_STATUS.has(err.status),
+      },
+    );
+  }
+
+  /** DELETE a Calendar API path. Same retry/401 posture; empty 200/204 body on success. */
+  private async del<T>(path: string): Promise<T> {
+    return withRetry(
+      async () => {
+        const res = await this.request(`${CAL}${path}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${await this.token()}` },
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        if (res.status === 401) {
+          this.accessToken = null;
+          throw new CalendarHttpError(401, 'calendar 401 (token) — retrying');
+        }
+        if (!res.ok) throw new CalendarHttpError(res.status, `calendar DELETE ${path.split('?')[0]} → ${res.status}`);
+        if (res.status === 204) return undefined as T;
+        // DELETE returns empty body on success; only parse when there's content.
+        const text = await res.text();
+        return (text ? JSON.parse(text) : undefined) as T;
+      },
+      {
+        ...DEFAULT_RETRY,
+        isRetryable: (err) =>
+          !(err instanceof CalendarHttpError) || err.status === 401 || RETRYABLE_STATUS.has(err.status),
+      },
+    );
+  }
+
   /**
    * events.insert one event. When `eventId` is supplied Google enforces id uniqueness, so a
    * repeat insert returns 409 — reported as `alreadyExisted: true` rather than thrown, since
@@ -250,6 +306,61 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
     }
   }
 
+  /**
+   * events.patch — partial update. Only the supplied fields are written. The URL pins the
+   * calendar+event; a missing event returns 404 (CalendarHttpError) which the caller maps to
+   * 'not_found'. conferenceDataVersion=1 is harmless when no conference field is sent, and is
+   * required when an existing conference should be preserved across a time move.
+   */
+  async updateEvent(input: UpdateEventInput): Promise<void> {
+    const calendarId = input.calendarId?.trim() || 'primary';
+    const body: Record<string, unknown> = {};
+    if (input.title !== undefined) body.summary = input.title;
+    if (input.startsAt !== undefined) {
+      if (!input.timeZone) throw new Error('updateEvent: timeZone required when startsAt is supplied');
+      body.start = googleTime(input.startsAt, false, input.timeZone);
+    }
+    if (input.endsAt !== undefined) {
+      if (!input.timeZone) throw new Error('updateEvent: timeZone required when endsAt is supplied');
+      body.end = googleTime(input.endsAt, false, input.timeZone);
+    }
+    if (input.attendeeEmails !== undefined) {
+      // Patch semantics: Google replaces `attendees` with whatever array we send, so the FE is
+      // expected to merge current + added − removed. Lowercase + dedupe here to match createEvent.
+      const attendees = [...new Set(input.attendeeEmails.map((e) => e.trim().toLowerCase()).filter(Boolean))];
+      body.attendees = attendees.map((email) => ({ email }));
+    }
+    if (Object.keys(body).length === 0) return; // nothing to do
+
+    // conferenceDataVersion=1 is harmless when no conference field is sent, and is required when
+    // an existing Meet link should survive a time move. sendUpdates is sent ONLY when the caller
+    // supplied a non-empty attendee list AND asked Google to email new invitees — Google diffs the
+    // patched list against the prior one, so only the additions actually get emailed.
+    const qs = new URLSearchParams();
+    qs.set('conferenceDataVersion', '1');
+    if (
+      input.attendeeEmails !== undefined &&
+      input.attendeeEmails.length > 0 &&
+      input.sendUpdates &&
+      input.sendUpdates !== 'none'
+    ) {
+      qs.set('sendUpdates', input.sendUpdates);
+    }
+    await this.patch<unknown>(
+      `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?${qs.toString()}`,
+      body,
+    );
+  }
+
+  /**
+   * events.delete — removes (cancels) one event. For a recurring-instance id, cancels only that
+   * instance. Returns void; a 404/410 maps to 'not_found' at the caller (CalendarHttpError).
+   */
+  async deleteEvent(input: DeleteEventInput): Promise<void> {
+    const calendarId = input.calendarId?.trim() || 'primary';
+    await this.del<unknown>(`/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}`);
+  }
+
   /** events.get, or null when it cannot be read. Needs only calendar.readonly. */
   async getEvent(calendarId: string, eventId: string): Promise<GoogleEvent | null> {
     return this.tryGetEvent(calendarId?.trim() || 'primary', eventId);
@@ -327,14 +438,15 @@ export class GoogleCalendarClient implements CalendarPort, CalendarWriterPort, C
    * events.list over an EXPLICIT `[timeMin, timeMax)` window with FULL pagination and NO cap —
    * the founder-app day view (any past/future day, all of it). `singleEvents` expands recurrences
    * and `orderBy=startTime` sorts within a page; the fan-out sorts the merged set. The returned
-   * events carry NO `calendarLabel` (the account-tagging composite adds it) and never the body.
+   * events carry NO `calendarLabel`/`calendarAccountId`/`calendarId`/`color` (the account-tagging
+   * composite adds all four) and never the body.
    */
-  async listEventsInRange(input: ListEventsInRangeInput): Promise<Omit<RangeEvent, 'calendarLabel'>[]> {
+  async listEventsInRange(input: ListEventsInRangeInput): Promise<Omit<RangeEvent, 'calendarLabel' | 'calendarAccountId' | 'calendarId' | 'color'>[]> {
     const calendarId = input.calendarId?.trim() || 'primary';
     const timeMin = input.timeMin.toISOString();
     const timeMax = input.timeMax.toISOString();
 
-    const out: Omit<RangeEvent, 'calendarLabel'>[] = [];
+    const out: Omit<RangeEvent, 'calendarLabel' | 'calendarAccountId' | 'calendarId' | 'color'>[] = [];
     let pageToken: string | undefined;
     do {
       const qs = new URLSearchParams({ timeMin, timeMax, singleEvents: 'true', orderBy: 'startTime', maxResults: '250' });
@@ -395,21 +507,33 @@ export function normalizeEvent(item: GoogleEvent, match: Set<string>): CalendarE
 }
 
 /**
- * Normalize a Google events.list item → the range-view shape (no attendee/customer machinery, no
- * label — the composite tags that). `endsAt` never null: an item with no end date falls back to
- * its start, so the day view can always draw a block. Exported for unit test (no network).
+ * Normalize a Google events.list item → the range-view shape (no label/account/calendarId/color —
+ * the composite tags all four). `endsAt` never null: an item with no end date falls back to its
+ * start, so the day view can always draw a block. Attendee/organizer emails are lowercased +
+ * deduped (organizer included) so the day-view invitee picker can pre-fill the current roster.
+ * Exported for unit test (no network).
  */
-export function normalizeRangeEvent(item: GoogleEvent): Omit<RangeEvent, 'calendarLabel'> {
+export function normalizeRangeEvent(item: GoogleEvent): Omit<RangeEvent, 'calendarLabel' | 'calendarAccountId' | 'calendarId' | 'color'> {
   const start = item.start ?? {};
   const end = item.end ?? {};
   const allDay = !start.dateTime && !!start.date;
   const startsAt = new Date(start.dateTime ?? start.date ?? 0);
   const endRaw = end.dateTime ?? end.date;
+  const emails: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [item.organizer?.email, ...(item.attendees ?? []).map((a) => a.email)]) {
+    const e = raw?.trim().toLowerCase();
+    if (!e || seen.has(e)) continue;
+    seen.add(e);
+    emails.push(e);
+  }
   return {
     id: item.id ?? '',
     title: item.summary?.trim() || 'Untitled',
     startsAt,
     endsAt: endRaw ? new Date(endRaw) : startsAt,
     allDay,
+    attendeeEmails: emails,
+    organizerEmail: item.organizer?.email?.trim().toLowerCase() || null,
   };
 }

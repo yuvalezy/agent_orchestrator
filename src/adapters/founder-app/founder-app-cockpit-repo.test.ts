@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { closePool, query } from '../../db';
 import { dismissMessage, insertMessage, type FeedMessage } from './founder-app-repo';
-import { augmentCustomers, listAttentionDecisions } from './founder-app-cockpit-repo';
+import { augmentCustomers, findCustomerByEventIds, listAttentionDecisions } from './founder-app-cockpit-repo';
 
 // 043: a dismissed card must vanish from BOTH cockpit reads at once. They are two different
 // queries over one predicate, so they are tested together — a badge that disagrees with the tab
@@ -75,4 +75,53 @@ test('an attention card carries its own "Open Task" url and origin context', asy
   assert.equal(card?.linkUrl, linkUrl);
   assert.deepEqual(card?.context, { contextRef: { kind: 'inbox', ref: '42' } });
   assert.equal(card?.dismissedAt, null);
+});
+
+// ── findCustomerByEventIds (fake-db — no real Postgres) ─────────────────────────────────
+// Batch event-id → customer resolution for the calendar day view. Pure SQL + Map build, so the
+// fake-db pattern (mirrors calendar-accounts-repo.test.ts) is enough — no migrations needed.
+
+interface Call { text: string; params?: unknown[] }
+function fakeDb(results: unknown[][]): { q: never; calls: Call[] } {
+  const calls: Call[] = [];
+  const q = (async (text: string, params?: unknown[]) => {
+    calls.push({ text, params });
+    const rows = results.shift() ?? [];
+    return { rows, rowCount: rows.length };
+  }) as unknown as never;
+  return { q, calls };
+}
+
+test('findCustomerByEventIds: empty input → empty Map (and no SQL is issued)', async () => {
+  const { q, calls } = fakeDb([]);
+  const map = await findCustomerByEventIds([], q);
+  assert.equal(map.size, 0);
+  assert.equal(calls.length, 0, 'an empty batch must short-circuit before any SQL');
+});
+
+test('findCustomerByEventIds: maps each event_id → {customerId, customerName}; absent for events with no row', async () => {
+  const { q, calls } = fakeDb([[
+    { event_id: 'ev-1', customer_id: 'c-a', display_name: 'Acme' },
+    { event_id: 'ev-3', customer_id: 'c-c', display_name: 'Globex' },
+  ]]);
+  const map = await findCustomerByEventIds(['ev-1', 'ev-2', 'ev-3'], q);
+  assert.equal(map.size, 2);
+  assert.deepEqual(map.get('ev-1'), { customerId: 'c-a', customerName: 'Acme' });
+  assert.equal(map.get('ev-2'), undefined, 'ev-2 had no meeting-request row → absent (no customer link)');
+  assert.deepEqual(map.get('ev-3'), { customerId: 'c-c', customerName: 'Globex' });
+  // SQL contract: filters NULL event_ids and uses ANY($1::text[]) for the batched IN.
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].text, /event_id IS NOT NULL/);
+  assert.match(calls[0].text, /ANY\(\$1::text\[\]\)/);
+  assert.deepEqual(calls[0].params, [['ev-1', 'ev-2', 'ev-3']]);
+});
+
+test('findCustomerByEventIds: first row wins per event_id (idempotent guard against a future drift)', async () => {
+  const { q } = fakeDb([[
+    { event_id: 'dup', customer_id: 'c-first', display_name: 'First' },
+    { event_id: 'dup', customer_id: 'c-second', display_name: 'Second' },
+  ]]);
+  const map = await findCustomerByEventIds(['dup'], q);
+  assert.equal(map.size, 1);
+  assert.deepEqual(map.get('dup'), { customerId: 'c-first', customerName: 'First' });
 });

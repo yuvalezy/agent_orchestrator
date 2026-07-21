@@ -7,6 +7,9 @@ import type { FeedMessage, MessageContext } from './founder-app-repo';
 // the customer list / detail / timeline / item-detail SQL is reused from console-repo.ts.
 // No message content is logged from here.
 
+/** The DB executor signature, so the new findCustomerByEventIds can accept a fake in unit tests. */
+type Query = typeof query;
+
 /** An undecided founder_app_messages card, joined to its customer's display name. */
 export interface AttentionDecision extends FeedMessage {
   customerName: string | null;
@@ -131,4 +134,32 @@ export async function augmentCustomers(customerIds: string[]): Promise<Map<strin
     }
   }
   return result;
+}
+
+/**
+ * Batch-resolve the customer a list of day-view events belong to. Maps
+ * `agent_meeting_requests.event_id` → `{ customerId, customerName }`. Events that aren't
+ * meeting-originated (manual blocks, deadline events, anything Google-direct) are simply absent
+ * from the map — the caller treats absence as "no customer link", which is the day view's
+ * default for an event. First row wins per event_id (a re-booked meeting leaves the older row's
+ * event_id NULL via the scheduler's update, so collisions should not happen, but the guard is
+ * cheap insurance against a future schema drift).
+ */
+export async function findCustomerByEventIds(
+  eventIds: string[],
+  q: Query = query,
+): Promise<Map<string, { customerId: string; customerName: string }>> {
+  const map = new Map<string, { customerId: string; customerName: string }>();
+  if (eventIds.length === 0) return map;
+  const { rows } = await q<{ event_id: string; customer_id: string; display_name: string }>(
+    `SELECT mr.event_id, c.id AS customer_id, c.display_name
+       FROM agent_meeting_requests mr
+       JOIN agent_customers c ON c.id = mr.customer_id
+      WHERE mr.event_id IS NOT NULL AND mr.event_id = ANY($1::text[])`,
+    [eventIds],
+  );
+  for (const r of rows) {
+    if (!map.has(r.event_id)) map.set(r.event_id, { customerId: r.customer_id, customerName: r.display_name });
+  }
+  return map;
 }

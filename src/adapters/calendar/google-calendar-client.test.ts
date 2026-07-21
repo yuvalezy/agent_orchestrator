@@ -124,13 +124,14 @@ test('listUpcomingEvents: honors a per-customer calendarId', async () => {
 
 // ── normalizeRangeEvent (pure) + listEventsInRange (fake fetch) ─────────────────────
 
-test('normalizeRangeEvent: timed event keeps title/start/end, drops attendees + body', () => {
+test('normalizeRangeEvent: timed event keeps title/start/end, dedupes+lowercases attendee + organizer emails', () => {
   const ev = normalizeRangeEvent({
     id: 'r1',
     summary: '  Standup  ',
     start: { dateTime: '2026-07-20T13:00:00Z' },
     end: { dateTime: '2026-07-20T13:15:00Z' },
-    attendees: [{ email: 'someone@x.com' }],
+    organizer: { email: 'Founder@Me.com' },
+    attendees: [{ email: 'Cust@Acme.com' }, { email: 'cust@acme.com' }],
   });
   assert.deepEqual(ev, {
     id: 'r1',
@@ -138,7 +139,15 @@ test('normalizeRangeEvent: timed event keeps title/start/end, drops attendees + 
     startsAt: new Date('2026-07-20T13:00:00Z'),
     endsAt: new Date('2026-07-20T13:15:00Z'),
     allDay: false,
+    attendeeEmails: ['founder@me.com', 'cust@acme.com'], // organizer first, deduped + lowercased
+    organizerEmail: 'founder@me.com',
   });
+});
+
+test('normalizeRangeEvent: no attendees → empty list + null organizer', () => {
+  const ev = normalizeRangeEvent({ id: 'r1b', summary: 'Solo', start: { dateTime: '2026-07-20T13:00:00Z' }, end: { dateTime: '2026-07-20T13:15:00Z' } });
+  assert.deepEqual(ev.attendeeEmails, []);
+  assert.equal(ev.organizerEmail, null);
 });
 
 test('normalizeRangeEvent: all-day → allDay true; missing summary → Untitled; no end → falls back to start', () => {
@@ -146,6 +155,8 @@ test('normalizeRangeEvent: all-day → allDay true; missing summary → Untitled
   assert.equal(allDay.title, 'Untitled');
   assert.equal(allDay.allDay, true);
   assert.equal(allDay.endsAt.toISOString(), '2026-07-21T00:00:00.000Z');
+  assert.deepEqual(allDay.attendeeEmails, []);
+  assert.equal(allDay.organizerEmail, null);
 
   const noEnd = normalizeRangeEvent({ id: 'r3', summary: 'X', start: { dateTime: '2026-07-20T13:00:00Z' } });
   assert.equal(noEnd.endsAt.toISOString(), noEnd.startsAt.toISOString()); // end := start when absent
@@ -405,6 +416,147 @@ test('createEvent 409 with an unreadable event degrades to nulls rather than thr
   const out = await client(m.fetchImpl).createEvent({ ...EVENT, eventId: 'abc123', conference: true });
   assert.equal(out.alreadyExisted, true);
   assert.equal(out.meetLink, null);
+});
+
+// ── updateEvent / deleteEvent (WRITE — events.patch / events.delete) ────────────────
+
+/** Route token + capture every PATCH/DELETE/POST. Returns the recorded requests so a test can
+ *  assert on the URL (the conferenceDataVersion=1 trap lives there) and the body. */
+function mockWriteMethod(opts: {
+  patch?: { status: number; body?: unknown };
+  delete?: { status: number; body?: unknown };
+}): { fetchImpl: typeof fetch; reqs: Array<{ method: string; url: string; body: unknown }> } {
+  const reqs: Array<{ method: string; url: string; body: unknown }> = [];
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    if (u.includes('oauth2.googleapis.com/token')) return res(200, { access_token: 'tok', expires_in: 3600 });
+    reqs.push({ method, url: u, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (method === 'PATCH') return res(opts.patch?.status ?? 200, opts.patch?.body ?? {});
+    if (method === 'DELETE') return res(opts.delete?.status ?? 204, opts.delete?.body ?? '');
+    return res(200, {});
+  }) as unknown as typeof fetch;
+  return { fetchImpl, reqs };
+}
+
+test('updateEvent: PATCHes only supplied fields with conferenceDataVersion=1', async () => {
+  const m = mockWriteMethod({ patch: { status: 200, body: { id: 'ev-1' } } });
+  await client(m.fetchImpl).updateEvent({
+    calendarId: 'work@primary',
+    eventId: 'ev-1',
+    title: 'Moved',
+    startsAt: new Date('2026-07-16T14:00:00Z'),
+    timeZone: 'America/Panama',
+  });
+
+  assert.equal(m.reqs.length, 1);
+  assert.equal(m.reqs[0].method, 'PATCH');
+  assert.match(m.reqs[0].url, /calendars\/work%40primary\/events\/ev-1/);
+  assert.match(m.reqs[0].url, /conferenceDataVersion=1/, 'conferenceDataVersion=1 is sent so an existing Meet is preserved across a time move');
+  const body = m.reqs[0].body as Record<string, unknown>;
+  assert.equal(body.summary, 'Moved', 'only the supplied title is written');
+  assert.deepEqual(body.start, { dateTime: '2026-07-16T14:00:00.000Z', timeZone: 'America/Panama' });
+  assert.equal(body.end, undefined, 'endsAt was NOT supplied → not written (patch semantics)');
+});
+
+test('updateEvent: throws when startsAt supplied without timeZone', async () => {
+  const m = mockWriteMethod({});
+  await assert.rejects(
+    () =>
+      client(m.fetchImpl).updateEvent({
+        calendarId: 'primary',
+        eventId: 'ev-1',
+        startsAt: new Date('2026-07-16T14:00:00Z'),
+      }),
+    /timeZone required/,
+  );
+  assert.equal(m.reqs.length, 0, 'a guard violation must not reach the network');
+});
+
+test('updateEvent: no-op when no fields supplied (does not call fetch)', async () => {
+  const m = mockWriteMethod({});
+  await client(m.fetchImpl).updateEvent({ calendarId: 'primary', eventId: 'ev-1' });
+  assert.equal(m.reqs.length, 0, 'an empty patch must short-circuit before any HTTP call');
+});
+
+test('updateEvent: surfaces CalendarHttpError on 404', async () => {
+  const m = mockWriteMethod({ patch: { status: 404, body: { error: 'gone' } } });
+  await assert.rejects(
+    () =>
+      client(m.fetchImpl).updateEvent({
+        calendarId: 'primary',
+        eventId: 'missing',
+        title: 'x',
+      }),
+    (err: unknown) => err instanceof CalendarHttpError && err.status === 404,
+  );
+  assert.equal(m.reqs.length, 1, 'a 404 is a decision, not a blip — it must NOT be retried');
+});
+
+test('updateEvent: attendeeEmails is lowercased + deduped, PATCHed as {email} objects', async () => {
+  const m = mockWriteMethod({ patch: { status: 200, body: { id: 'ev-1' } } });
+  await client(m.fetchImpl).updateEvent({
+    calendarId: 'primary',
+    eventId: 'ev-1',
+    attendeeEmails: ['A@x.com', 'a@x.com', ' b@x.com '],
+  });
+  assert.equal(m.reqs.length, 1);
+  const body = m.reqs[0].body as { attendees: Array<{ email: string }>; summary?: string };
+  assert.deepEqual(body.attendees, [{ email: 'a@x.com' }, { email: 'b@x.com' }]);
+  assert.equal(body.summary, undefined, 'no title supplied → not written');
+});
+
+test('updateEvent: attendees + sendUpdates=all adds the query param so new invitees get emailed', async () => {
+  const m = mockWriteMethod({ patch: { status: 200, body: { id: 'ev-1' } } });
+  await client(m.fetchImpl).updateEvent({
+    calendarId: 'primary',
+    eventId: 'ev-1',
+    attendeeEmails: ['cust@acme.com'],
+    sendUpdates: 'all',
+  });
+  assert.match(m.reqs[0].url, /sendUpdates=all/);
+  assert.match(m.reqs[0].url, /conferenceDataVersion=1/, 'conferenceDataVersion=1 rides along so an existing Meet survives');
+});
+
+test('updateEvent: attendees + sendUpdates=none omits the param (Google stays silent)', async () => {
+  const m = mockWriteMethod({ patch: { status: 200, body: { id: 'ev-1' } } });
+  await client(m.fetchImpl).updateEvent({
+    calendarId: 'primary',
+    eventId: 'ev-1',
+    attendeeEmails: ['cust@acme.com'],
+    sendUpdates: 'none',
+  });
+  assert.ok(!m.reqs[0].url.includes('sendUpdates'), 'none → do not email');
+});
+
+test('updateEvent: empty attendee list omits sendUpdates (nothing to send to)', async () => {
+  const m = mockWriteMethod({ patch: { status: 200, body: { id: 'ev-1' } } });
+  await client(m.fetchImpl).updateEvent({
+    calendarId: 'primary',
+    eventId: 'ev-1',
+    attendeeEmails: [],
+    sendUpdates: 'all',
+  });
+  assert.ok(!m.reqs[0].url.includes('sendUpdates'), 'no attendees → never email');
+  // The empty array still PATCHes (caller is clearing the roster).
+  assert.deepEqual((m.reqs[0].body as { attendees: unknown }).attendees, []);
+});
+
+test('deleteEvent: DELETEs the event by id', async () => {
+  const m = mockWriteMethod({ delete: { status: 204 } });
+  await client(m.fetchImpl).deleteEvent({ calendarId: 'work@primary', eventId: 'ev-1' });
+  assert.equal(m.reqs.length, 1);
+  assert.equal(m.reqs[0].method, 'DELETE');
+  assert.match(m.reqs[0].url, /calendars\/work%40primary\/events\/ev-1$/);
+});
+
+test('deleteEvent: surfaces CalendarHttpError on 404', async () => {
+  const m = mockWriteMethod({ delete: { status: 404, body: { error: 'gone' } } });
+  await assert.rejects(
+    () => client(m.fetchImpl).deleteEvent({ calendarId: 'primary', eventId: 'missing' }),
+    (err: unknown) => err instanceof CalendarHttpError && err.status === 404,
+  );
+  assert.equal(m.reqs.length, 1, 'a 404 is not retried — the event is already gone');
 });
 
 // ── queryFreeBusy: FAIL-CLOSED ───────────────────────────────────────────────────

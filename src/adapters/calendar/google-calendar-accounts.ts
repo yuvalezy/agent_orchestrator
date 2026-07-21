@@ -24,6 +24,10 @@ export interface CalendarAccountSpec {
   credentialName: string;
   /** Target calendar id for this account ('primary' = the account's own calendar). */
   calendarId: string;
+  /** The `calendar_accounts.id` — propagated to each event for edit/delete targeting. */
+  accountId: string;
+  /** Palette key (e.g. 'sky') — propagated to each event for color rendering. */
+  color: string;
 }
 
 export interface CalendarAccountsInput {
@@ -82,6 +86,8 @@ interface RangeAccount {
   label: string;
   client: Pick<GoogleCalendarClient, 'listEventsInRange'>;
   calendarId: string;
+  accountId: string;
+  color: string;
 }
 
 /** The enabled accounts with a present credential, as range clients (mirrors buildCalendarAccounts,
@@ -94,10 +100,12 @@ export async function buildCalendarRangeAccounts(input: CalendarAccountsInput): 
       label: s.label,
       client: new GoogleCalendarClient(() => resolveCredential(s.credentialName)),
       calendarId: s.calendarId,
+      accountId: s.accountId,
+      color: s.color,
     }));
   }
   if (tryResolveCredential('GOOGLE_CALENDAR_OAUTH')) {
-    return [{ label: 'default', client: new GoogleCalendarClient(() => resolveCredential('GOOGLE_CALENDAR_OAUTH')), calendarId: input.legacyCalendarId }];
+    return [{ label: 'default', client: new GoogleCalendarClient(() => resolveCredential('GOOGLE_CALENDAR_OAUTH')), calendarId: input.legacyCalendarId, accountId: '', color: '' }];
   }
   return [];
 }
@@ -128,7 +136,13 @@ export function buildMultiCalendarRange(accounts: RangeAccount[]): CalendarRange
           try {
             // Each account reads its OWN calendar id; tag every event with that account's label.
             const events = await a.client.listEventsInRange({ ...input, calendarId: a.calendarId });
-            return events.map((e) => ({ ...e, calendarLabel: a.label }));
+            return events.map((e) => ({
+              ...e,
+              calendarLabel: a.label,
+              calendarAccountId: a.accountId,
+              calendarId: a.calendarId,
+              color: a.color,
+            }));
           } catch (err) {
             logger.warn({ account: a.label, reason: (err as Error)?.message }, 'calendar: account range read failed — skipping this account');
             return [] as RangeEvent[];

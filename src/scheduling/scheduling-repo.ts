@@ -53,6 +53,46 @@ export async function listCustomerEmailContacts(
 }
 
 /**
+ * EVERY email contact across every customer — the "show all contacts" toggle in the calendar
+ * invitee picker. Joined with `agent_customers.display_name` so the FE can group by customer.
+ * Same channel/group filters as `listCustomerEmailContacts` (no group chats, no non-email rows).
+ * Ordered customer-name-first so a stable, scannable list hits the founder's eye first.
+ *
+ * `q` is injectable so unit tests drive a fake (no real Postgres); defaults to the shared pool.
+ */
+export async function listAllEmailContacts(
+  q: typeof query = query,
+): Promise<Array<{
+  customerId: string;
+  customerName: string;
+  name: string;
+  email: string;
+  isPrimary: boolean;
+}>> {
+  const { rows } = await q<{
+    customer_id: string;
+    customer_name: string;
+    display_name: string | null;
+    address: string;
+    is_primary: boolean;
+  }>(
+    `SELECT c.id AS customer_id, c.display_name AS customer_name,
+            cc.display_name, cc.address, COALESCE(cc.is_primary, false) AS is_primary
+       FROM agent_customer_contacts cc
+       JOIN agent_customers c ON c.id = cc.customer_id
+      WHERE cc.channel_type = 'email' AND cc.is_group = false
+      ORDER BY c.display_name ASC, cc.is_primary DESC, cc.created_at ASC`,
+  );
+  return rows.map((r) => ({
+    customerId: r.customer_id,
+    customerName: r.customer_name,
+    name: r.display_name ?? r.address,
+    email: r.address,
+    isPrimary: r.is_primary,
+  }));
+}
+
+/**
  * The founder's OWN addresses — the connected Gmail instances' account emails. Used to keep
  * "invite everyone" from emailing the founder an invitation to a meeting they are already the
  * organizer of.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockLabel, freeGaps, localTimeAt, minuteInDay, packColumns, shiftDay, tapMinuteInGap } from './calendarLayout';
+import { clockLabel, freeGaps, localTimeAt, makeLocalTime, minuteInDay, packColumns, shiftDay, splitIsoInTz, tapMinuteInGap } from './calendarLayout';
 
 describe('calendarLayout', () => {
   it('reads an instant as a minute-of-day in the given tz, clamping other days', () => {
@@ -58,5 +58,19 @@ describe('calendarLayout', () => {
     expect(gaps).toEqual([{ s: 540, e: 600 }, { s: 660, e: 1020 }]);
     // A 5-minute remainder is not offered as a slot.
     expect(freeGaps(540, 605, [{ s: 545, e: 600 }], 15)).toEqual([]);
+  });
+
+  it('splits an ISO instant into the date + HH:MM wall-clock parts the edit inputs read', () => {
+    // 2026-07-21T14:30:00Z in America/Panama (UTC-5, no DST) is 09:30 local on the same day.
+    expect(splitIsoInTz('2026-07-21T14:30:00.000Z', 'America/Panama')).toEqual({ date: '2026-07-21', time: '09:30' });
+    // The same instant in UTC is 14:30.
+    expect(splitIsoInTz('2026-07-21T14:30:00.000Z', 'UTC')).toEqual({ date: '2026-07-21', time: '14:30' });
+    // Midnight folds '24' back to '00'.
+    expect(splitIsoInTz('2026-07-21T00:00:00.000Z', 'UTC')).toEqual({ date: '2026-07-21', time: '00:00' });
+  });
+
+  it('combines a YYYY-MM-DD date + HH:MM time into a datetime-local string', () => {
+    expect(makeLocalTime('2026-07-21', '09:30')).toBe('2026-07-21T09:30');
+    expect(makeLocalTime('2026-12-31', '00:00')).toBe('2026-12-31T00:00');
   });
 });

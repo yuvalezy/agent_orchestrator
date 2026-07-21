@@ -61,16 +61,24 @@ export interface CalendarPort {
 
 /**
  * One event within an ARBITRARY range read (the founder-app day view), tagged with the
- * `calendar_accounts` label it came from so a day across N calendars stays legible. Distinct from
- * `CalendarEvent`: no attendee/customer-match machinery (the day view is not a meeting-context
- * reader), and `endsAt` is never null (Google returns an end for every `singleEvents` item; a
- * date-only all-day event's exclusive end date stands in). NEVER carries the event body — same
- * privacy posture as CalendarEvent.
+ * `calendar_accounts` row it came from so a day across N calendars stays legible AND a later
+ * edit/delete can target the exact credential + calendar that produced it. Distinct from
+ * `CalendarEvent`: the day view carries no customer-MATCH flag (it's not a meeting-context
+ * reader for one customer), but it DOES carry attendee/organizer emails because the day view
+ * is also where the founder manages a meeting's invitees. `endsAt` is never null (Google returns
+ * an end for every `singleEvents` item; a date-only all-day event's exclusive end date stands
+ * in). NEVER carries the event body — same privacy posture as CalendarEvent.
  */
 export interface RangeEvent {
   id: string;
   /** The `calendar_accounts` row's human label this event was read from. */
   calendarLabel: string;
+  /** The `calendar_accounts.id` this event came from — used by edit/delete to target the right credential. */
+  calendarAccountId: string;
+  /** The Google calendar id ('primary' or a real id) this event lives on — used in the PATCH/DELETE URL. */
+  calendarId: string;
+  /** The palette key (e.g. 'sky') for this calendar, from `calendar_accounts.color`. */
+  color: string;
   /** Event title (Google `summary`); 'Untitled' when absent. */
   title: string;
   startsAt: Date;
@@ -78,6 +86,11 @@ export interface RangeEvent {
   endsAt: Date;
   /** True for a date-only (all-day) event. */
   allDay: boolean;
+  /** Lowercased, deduped invitee emails (organizer included). Empty for events with none. The day
+   *  view ships these to the FE so the invitee picker can pre-fill the event's current roster. */
+  attendeeEmails: string[];
+  /** The event organizer's email (also included in `attendeeEmails`), or null when Google omitted it. */
+  organizerEmail: string | null;
 }
 
 export interface ListEventsInRangeInput {
@@ -167,6 +180,30 @@ export interface CreatedEvent {
   alreadyExisted: boolean;
 }
 
+/** One event to UPDATE. Only the supplied fields are sent (Google events.patch semantics). */
+export interface UpdateEventInput {
+  calendarId: string;
+  eventId: string;
+  title?: string;
+  startsAt?: Date;
+  /** EXCLUSIVE end instant (must be paired with startsAt if you want to move, or alone to resize). */
+  endsAt?: Date;
+  /** IANA zone for rendering — required when startsAt or endsAt is supplied. */
+  timeZone?: string;
+  /** Full new attendee list (the FE merges current + added − removed). Patches Google's `attendees`
+   *  array; supply an empty array to clear. Lowercased + deduped at the writer. */
+  attendeeEmails?: string[];
+  /** Whether Google emails NEW invitees (Google diffs the patched list against the prior one and
+   *  only notifies the additions). The writer caller defaults to 'all' when `attendeeEmails` is
+   *  supplied and the caller didn't pick — never silently invite someone. */
+  sendUpdates?: 'all' | 'none';
+}
+
+export interface DeleteEventInput {
+  calendarId: string;
+  eventId: string;
+}
+
 /** A block of time the founder is already committed. Half-open: [start, end). */
 export interface BusyInterval {
   start: Date;
@@ -207,7 +244,14 @@ export interface CalendarFreeBusyPort {
  * name exactly ONE calendar + ONE credential. Keeping the writer its own interface means the
  * read composite stays a valid `CalendarPort` without having to implement a write it cannot
  * sensibly perform (ISP), and a reader-only consumer (meeting context) cannot reach a write.
+ *
+ * Covers create + update (events.patch, partial) + delete (events.delete). A write ALWAYS names
+ * exactly one calendar + one credential (the multi-account read composite cannot satisfy this,
+ * which is why the writer is its own port — see `CalendarAccountSpec.accountId`/`calendarId` on
+ * `RangeEvent` for how a day-view event carries its own write target back to the caller).
  */
 export interface CalendarWriterPort {
   createEvent(input: CreateEventInput): Promise<CreatedEvent>;
+  updateEvent(input: UpdateEventInput): Promise<void>;
+  deleteEvent(input: DeleteEventInput): Promise<void>;
 }

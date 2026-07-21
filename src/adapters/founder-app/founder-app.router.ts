@@ -9,6 +9,7 @@ import type { FirebaseConfig } from '../../config/firebase';
 import type { ConversationalQueryService } from '../../query/conversational-query-service';
 import { logger } from '../../logger';
 import { DeviceAuth } from './founder-app-auth';
+import type { FcmSender } from './fcm-sender';
 import type { FounderAppFeed } from './founder-app-feed';
 import type { AppFounderNotifier } from './app-founder-notifier';
 import { decodeCursor } from './founder-app-repo';
@@ -64,6 +65,13 @@ const MAX_AUDIO_BYTES = '25mb';
 const MAX_OPTION_ID = 64;
 /** Sanity cap on a standalone block-time duration (8h) — a fat-fingered value can't reserve a week. */
 const MAX_BLOCK_MINUTES = 480;
+/** Cap on the number of attendee emails a single PUT /calendar/event or POST /calendar/block accepts.
+ *  Google's own per-event ceiling is higher; this is a blast-radius guard against a malformed body
+ *  sending thousands of emails before the writer ever reaches the API. */
+const MAX_ATTENDEES = 50;
+/** Simple email shape check — not RFC-perfect. The writer + Google both validate further; this
+ *  only stops a blatantly-wrong value (no `@`, empty, malformed) from reaching the network. */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DEFAULT_PAGE = 50;
 const MAX_PAGE = 100;
 /** How many top urgency items ride along on the attention screen. */
@@ -82,6 +90,15 @@ export interface FounderAppCockpitReads {
   listUrgencyInbox: (input: { cursor?: unknown; limit?: unknown }) => Promise<(Page<Record<string, unknown>> & { asOf: string }) | null>;
   listAttentionDecisions: (limit?: number) => Promise<AttentionDecision[]>;
   augmentCustomers: (customerIds: string[]) => Promise<Map<string, CustomerAugment>>;
+  /** One customer's individual EMAIL contacts — the invitee-picker roster when an event is
+   *  customer-linked. Mirrors listCustomerEmailContacts in scheduling-repo. */
+  listCustomerContacts: (customerId: string) => Promise<Array<{ name: string; email: string; isPrimary: boolean }>>;
+  /** EVERY email contact across every customer (joined with display_name) — the "show all" toggle
+   *  in the invitee picker. Mirrors listAllEmailContacts in scheduling-repo. */
+  listAllContacts: () => Promise<Array<{ customerId: string; customerName: string; name: string; email: string; isPrimary: boolean }>>;
+  /** Batch-resolve calendar events → the customer each meeting-originated event belongs to.
+   *  Mirrors findCustomerByEventIds in founder-app-cockpit-repo. Absent from the map = no link. */
+  findCustomerByEventIds: (eventIds: string[]) => Promise<Map<string, { customerId: string; customerName: string }>>;
 }
 
 /** Repo surface the router needs — injected so tests run without a database. */
@@ -116,6 +133,8 @@ export interface FounderAppDeps {
   notifier: AppFounderNotifier;
   /** Public Firebase config echoed to the authed client; null disables push client-side. */
   firebase: FirebaseConfig | null;
+  /** The SAME sender the notifier fans out with, for `POST /api/push/test`. null → 503. */
+  sendPush?: FcmSender | null;
   /** v2 cockpit read models (reused console-repo SQL + app-specific augmentation). */
   cockpit: FounderAppCockpitReads;
   /**
@@ -205,6 +224,33 @@ function optionalLabel(value: unknown): string | null | undefined {
   const trimmed = value.trim();
   if (trimmed.length > MAX_LABEL) return undefined;
   return trimmed || null;
+}
+
+/**
+ * Coerce a request body's `attendeeEmails` into a clean list, or `undefined` to signal a
+ * malformed body (caller → 400). `null` is treated as "absent" (no attendee change); a present
+ * array is checked for shape (string[], each a basic email, ≤ MAX_ATTENDEES). Trimming/
+ * lowercasing happens at the writer — this only guards the wire shape.
+ */
+function optionalAttendees(value: unknown): string[] | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) return undefined;
+  if (value.length > MAX_ATTENDEES) return undefined;
+  const out: string[] = [];
+  for (const e of value) {
+    if (typeof e !== 'string') return undefined;
+    const trimmed = e.trim();
+    if (!trimmed || !EMAIL_RE.test(trimmed)) return undefined;
+    out.push(trimmed);
+  }
+  return out;
+}
+
+/** Coerce a request body's `sendUpdates` ('all' | 'none') or `undefined`/`null` → undefined. Any
+ *  other value → undefined-signals-malformed sentinel is unnecessary: the writer only consumes
+ *  the value when attendeeEmails is also supplied, so a stray string is silently ignored. */
+function optionalSendUpdates(value: unknown): 'all' | 'none' | undefined {
+  return value === 'all' || value === 'none' ? value : undefined;
 }
 
 function device(res: Response): FounderAppDevice {
@@ -779,10 +825,24 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
     if (!dayStart.isValid) return void res.status(400).json({ error: 'invalid day' });
     const dayEnd = dayStart.plus({ days: 1 });
     try {
-      const [events, businessHours] = await Promise.all([
+      const [events, businessHours, calendars] = await Promise.all([
         deps.calendar.listRange({ timeMin: dayStart.toJSDate(), timeMax: dayEnd.toJSDate() }),
         deps.calendar.businessHoursForDay(day),
+        deps.calendar.calendars(),
       ]);
+      // Batch-resolve event → customer for the day's events. Meeting-originated events (those whose
+      // id appears in agent_meeting_requests.event_id) tag with {customerId, customerName} so the FE
+      // can default the invitee picker to THAT customer's contacts. Best-effort: an empty events list
+      // or a read failure leaves the map empty (no customer tag), and the day view still renders.
+      const eventIds = events.map((e) => e.id).filter(Boolean);
+      let customerByEvent = new Map<string, { customerId: string; customerName: string }>();
+      if (eventIds.length > 0) {
+        try {
+          customerByEvent = await deps.cockpit.findCustomerByEventIds(eventIds);
+        } catch (err) {
+          logger.warn({ reason: (err as Error)?.message }, 'calendar day view: event→customer batch failed — continuing without customer tags');
+        }
+      }
       const data: {
         day: string;
         tz: string;
@@ -791,7 +851,27 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
         // widens to fit any out-of-range event. Soft holds (walk / gym) are shaded, weekday-filtered.
         dayWindow: { startMinutes: number; endMinutes: number };
         softBlocks: Array<{ startMinutes: number; endMinutes: number; label: string }>;
-        events: Array<{ id: string; calendarLabel: string; title: string; startsAt: Date; endsAt: Date; allDay: boolean }>;
+        events: Array<{
+          id: string;
+          calendarLabel: string;
+          title: string;
+          startsAt: Date;
+          endsAt: Date;
+          allDay: boolean;
+          calendarAccountId: string;
+          calendarId: string;
+          color: string;
+          /** Lowercased, deduped invitee emails (organizer included). Empty when the event has none. */
+          attendeeEmails: string[];
+          /** The organizer's email (also in attendeeEmails), or null. */
+          organizerEmail: string | null;
+          /** Present ONLY when this event originated from a customer meeting request — the invitee
+           *  picker then defaults to that customer's contact list. Absent = no customer link. */
+          customerId?: string;
+          customerName?: string;
+        }>;
+        // The founder's calendar roster for the day-view dropdown (id + label + color + isHost).
+        calendars: Array<{ id: string; label: string; color: string; isHost: boolean }>;
         meeting?: { messageId: string; durationMinutes: number; proposedSlots: Array<{ startsAt: string; endsAt: string }> };
       } = {
         day,
@@ -799,7 +879,24 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
         businessHours,
         dayWindow: deps.calendar.dayWindow,
         softBlocks: deps.calendar.softBlocksForDay(day),
-        events: events.map((e) => ({ id: e.id, calendarLabel: e.calendarLabel, title: e.title, startsAt: e.startsAt, endsAt: e.endsAt, allDay: e.allDay })),
+        events: events.map((e) => {
+          const cust = customerByEvent.get(e.id);
+          return {
+            id: e.id,
+            calendarLabel: e.calendarLabel,
+            title: e.title,
+            startsAt: e.startsAt,
+            endsAt: e.endsAt,
+            allDay: e.allDay,
+            calendarAccountId: e.calendarAccountId,
+            calendarId: e.calendarId,
+            color: e.color,
+            attendeeEmails: e.attendeeEmails,
+            organizerEmail: e.organizerEmail,
+            ...(cust ? { customerId: cust.customerId, customerName: cust.customerName } : {}),
+          };
+        }),
+        calendars,
       };
       // Resolve the pending meeting the SAME way /api/meeting-time does: the card's notificationRef
       // IS the meeting id, and only a "Pick a time" card (slot buttons) carries one.
@@ -821,8 +918,21 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
   // on the founder host calendar. localTime is a bare wall-clock (datetime-local); the SERVER
   // anchors it in env.CALENDAR_TZ. FAIL-CLOSED + past-refused in the builder. Status vocabulary
   // matches /api/meeting-time ('booked'|'unavailable'|'invalid') so the FE reuses its handler.
+  //
+  // Optional attendeeEmails + sendUpdates turn a private hold into an actual invitation — the
+  // "block + invite" one-tap path for "hold a meeting with these people" without going through the
+  // full meeting-scheduling flow. When attendees are supplied and sendUpdates is omitted, the
+  // builder defaults to 'all' (never silently invite). On `booked`, the response carries the new
+  // event's id + write target so the FE can immediately re-edit (e.g. add a forgotten attendee).
   router.post('/api/calendar/block', async (req, res, next) => {
-    const body = (req.body ?? {}) as { localTime?: unknown; durationMinutes?: unknown; title?: unknown };
+    const body = (req.body ?? {}) as {
+      localTime?: unknown;
+      durationMinutes?: unknown;
+      title?: unknown;
+      calendarAccountId?: unknown;
+      attendeeEmails?: unknown;
+      sendUpdates?: unknown;
+    };
     if (typeof body.localTime !== 'string' || !LOCAL_TIME_RE.test(body.localTime)) {
       return void res.status(400).json({ error: 'invalid time' });
     }
@@ -831,9 +941,119 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
     }
     const title = optionalLabel(body.title); // null → default in the builder; undefined → wrong type/too long
     if (title === undefined) return void res.status(400).json({ error: 'invalid title' });
+    // Optional explicit target — the day-view dropdown's calendar picker. UUID-shaped; absent → host.
+    if (body.calendarAccountId !== undefined && body.calendarAccountId !== null && (typeof body.calendarAccountId !== 'string' || !UUID_RE.test(body.calendarAccountId))) {
+      return void res.status(400).json({ error: 'invalid calendar account id' });
+    }
+    const attendeeEmails = optionalAttendees(body.attendeeEmails);
+    if (attendeeEmails === undefined) return void res.status(400).json({ error: 'invalid attendeeEmails' });
+    const sendUpdates = optionalSendUpdates(body.sendUpdates);
     if (!deps.calendar) return void res.status(503).json({ error: 'calendar unavailable' });
     try {
-      const outcome = await deps.calendar.block({ localTime: body.localTime, durationMinutes: body.durationMinutes, title: title ?? undefined });
+      const calendarAccountId = typeof body.calendarAccountId === 'string' ? body.calendarAccountId : undefined;
+      const outcome = await deps.calendar.block({
+        localTime: body.localTime,
+        durationMinutes: body.durationMinutes,
+        title: title ?? undefined,
+        calendarAccountId,
+        attendeeEmails: attendeeEmails ?? undefined,
+        sendUpdates,
+      });
+      // Forward the event id + write target on `booked` so the FE can re-target an edit without a refetch.
+      const data: { status: 'booked' | 'unavailable' | 'invalid'; eventId?: string; calendarAccountId?: string; calendarId?: string } = {
+        status: outcome.status,
+        ...(outcome.eventId ? { eventId: outcome.eventId, calendarAccountId: outcome.calendarAccountId, calendarId: outcome.calendarId } : {}),
+      };
+      res.json({ data });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Edit an event (events.patch) ─────────────────────────────────────────────────────
+  // The day-view's "edit" affordance: change an event's title, time, duration, OR attendee list on
+  // the SAME calendar it already lives on (calendarAccountId names the writer). Conflict-DETECTED,
+  // not conflict-BLOCKED: when the new window overlaps another event, the FIRST call returns
+  // 'conflict' with the list of clashes; the FE confirms and re-submits with confirmConflict=true.
+  // localTime is a bare wall-clock (datetime-local); the SERVER anchors it in env.CALENDAR_TZ.
+  // A duration change WITHOUT a localTime is rejected as 'invalid' (v1 needs the start to resize).
+  //
+  // attendeeEmails is the FULL new attendee list (the FE merges current + added − removed — never
+  // a delta). When supplied and sendUpdates is omitted, the builder defaults to 'all' so a newly
+  // added invitee gets the email instead of being silently added.
+  router.put('/api/calendar/event', async (req, res, next) => {
+    const body = (req.body ?? {}) as {
+      calendarAccountId?: unknown;
+      eventId?: unknown;
+      title?: unknown;
+      localTime?: unknown;
+      durationMinutes?: unknown;
+      confirmConflict?: unknown;
+      attendeeEmails?: unknown;
+      sendUpdates?: unknown;
+    };
+    if (typeof body.calendarAccountId !== 'string' || !UUID_RE.test(body.calendarAccountId)) {
+      return void res.status(400).json({ error: 'invalid calendar account id' });
+    }
+    if (typeof body.eventId !== 'string' || !body.eventId.trim() || body.eventId.length > 256) {
+      return void res.status(400).json({ error: 'invalid event id' });
+    }
+    const title = optionalLabel(body.title);
+    if (title === undefined) return void res.status(400).json({ error: 'invalid title' });
+    if (body.localTime !== undefined && body.localTime !== null && (typeof body.localTime !== 'string' || !LOCAL_TIME_RE.test(body.localTime))) {
+      return void res.status(400).json({ error: 'invalid time' });
+    }
+    const localTime = typeof body.localTime === 'string' ? body.localTime : undefined;
+    if (
+      body.durationMinutes !== undefined &&
+      body.durationMinutes !== null &&
+      (typeof body.durationMinutes !== 'number' || !Number.isInteger(body.durationMinutes) || body.durationMinutes <= 0 || body.durationMinutes > MAX_BLOCK_MINUTES)
+    ) {
+      return void res.status(400).json({ error: 'invalid duration' });
+    }
+    const durationMinutes = typeof body.durationMinutes === 'number' ? body.durationMinutes : undefined;
+    if (body.confirmConflict !== undefined && body.confirmConflict !== null && typeof body.confirmConflict !== 'boolean') {
+      return void res.status(400).json({ error: 'invalid confirmConflict' });
+    }
+    const attendeeEmails = optionalAttendees(body.attendeeEmails);
+    if (attendeeEmails === undefined) return void res.status(400).json({ error: 'invalid attendeeEmails' });
+    const sendUpdates = optionalSendUpdates(body.sendUpdates);
+    // Must be changing SOMETHING — a PATCH with no fields is a no-op the FE should never send.
+    if (title === null && localTime === undefined && durationMinutes === undefined && attendeeEmails === null) {
+      return void res.status(400).json({ error: 'nothing to update' });
+    }
+    if (!deps.calendar) return void res.status(503).json({ error: 'calendar unavailable' });
+    try {
+      const outcome = await deps.calendar.updateEvent({
+        calendarAccountId: body.calendarAccountId,
+        eventId: body.eventId,
+        title: title ?? undefined,
+        localTime,
+        durationMinutes,
+        confirmConflict: body.confirmConflict === true,
+        attendeeEmails: attendeeEmails ?? undefined,
+        sendUpdates,
+      });
+      res.json({ data: outcome });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Delete (cancel) an event ────────────────────────────────────────────────────────
+  // The day-view's "delete" affordance: cancels the event on the SAME calendar it lives on.
+  // Express 5 carries the JSON body on DELETE; calendarAccountId + eventId name the target.
+  router.delete('/api/calendar/event', async (req, res, next) => {
+    const body = (req.body ?? {}) as { calendarAccountId?: unknown; eventId?: unknown };
+    if (typeof body.calendarAccountId !== 'string' || !UUID_RE.test(body.calendarAccountId)) {
+      return void res.status(400).json({ error: 'invalid calendar account id' });
+    }
+    if (typeof body.eventId !== 'string' || !body.eventId.trim() || body.eventId.length > 256) {
+      return void res.status(400).json({ error: 'invalid event id' });
+    }
+    if (!deps.calendar) return void res.status(503).json({ error: 'calendar unavailable' });
+    try {
+      const outcome = await deps.calendar.deleteEvent({ calendarAccountId: body.calendarAccountId, eventId: body.eventId });
       res.json({ data: { status: outcome.status } });
     } catch (err) {
       next(err);
@@ -1008,6 +1228,30 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
     }
   });
 
+  // ── Contact lists for the calendar invitee picker ───────────────────────────────────
+  // The day view's "manage invitees" affordance reads one of these: the customer-linked list when
+  // the tapped event carries a `customerId`, or the full list when the founder toggles "show all".
+  // Both exclude groups (a group is a jid, not a person) and non-email channels — same predicate
+  // as listScheduleRouteCandidates, so "invite everyone" cannot drift from what a send would target.
+  router.get('/api/customers/:id/contacts', async (req, res, next) => {
+    if (!UUID_RE.test(req.params.id)) return void res.status(400).json({ error: 'invalid customer id' });
+    try {
+      const rows = await deps.cockpit.listCustomerContacts(req.params.id);
+      res.json({ data: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/api/contacts', async (_req, res, next) => {
+    try {
+      const rows = await deps.cockpit.listAllContacts();
+      res.json({ data: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // Detail-sheet passthrough. kind picks the reused console-repo detail fn; anything else → 400.
   router.get('/api/items/:kind/:id', async (req, res, next) => {
     const detailFn =
@@ -1058,6 +1302,36 @@ export function buildFounderAppRouter(config: ConsoleConfig, assetsDir: string |
   router.delete('/api/push/register', async (_req, res, next) => {
     try {
       await deps.repo.unregisterDevicePush(device(res).id);
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // A push the founder can fire at will. Without it the only way to test the notification path
+  // (delivery, icon, and — the reason this exists — whether a tap lands in the installed PWA or a
+  // browser tab) is to wait for a real customer event, which made every attempt a guessing game.
+  // It sends to THIS device only, and carries the same generic payload every other push does.
+  router.post('/api/push/test', async (_req, res, next) => {
+    const send = deps.sendPush ?? null;
+    if (!send) return void res.status(503).json({ error: 'push is not configured on the server' });
+    const target = device(res);
+    if (!target.fcmToken) return void res.status(409).json({ error: 'this device has no push token — turn push on first' });
+    try {
+      const [result] = await send([target.fcmToken], {
+        messageId: `test-${target.id}`,
+        kind: 'notification',
+        severity: null,
+        ref: null,
+        route: '/app/attention',
+        test: true,
+      });
+      if (result?.unregistered) {
+        // The token is dead (reinstalled app, cleared data). Drop it so the UI can re-enable.
+        await deps.repo.unregisterDevicePush(target.id);
+        return void res.status(409).json({ error: 'this device\'s push token expired — turn push off and on again' });
+      }
+      if (!result?.success) return void res.status(502).json({ error: 'the push relay rejected the notification' });
       res.status(204).end();
     } catch (err) {
       next(err);

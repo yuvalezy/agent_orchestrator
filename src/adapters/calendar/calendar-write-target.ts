@@ -1,8 +1,9 @@
 import { env } from '../../config/env';
 import { resolveCredential, tryResolveCredential } from '../../config/credentials';
 import { logger } from '../../logger';
+import type { CalendarWriterPort } from '../../ports/calendar.port';
 import type { DueEventTarget } from '../../triage/due-event-sync';
-import { findCustomerCalendarAccount, findMeetingHostAccount } from '../connectors/calendar-accounts-repo';
+import { findCustomerCalendarAccount, findMeetingHostAccount, getCalendarAccount } from '../connectors/calendar-accounts-repo';
 import { GoogleCalendarClient } from './google-calendar-client';
 
 // Per-customer target-calendar resolution for the M5(d) WRITE path (task 4.1's "per-customer
@@ -85,6 +86,45 @@ export async function resolveMeetingHostTarget(): Promise<MeetingHostTarget | nu
       { account: account.label },
       'meeting: the meeting-host calendar account has no credential — cannot schedule (falling back to a task)',
     );
+    return null;
+  }
+  return {
+    writer: new GoogleCalendarClient(() => resolveCredential(account.credentialName)),
+    calendarId: account.calendarId,
+    accountId: account.id,
+    label: account.label,
+    accountEmail: account.accountEmail,
+  };
+}
+
+/** A write target resolved by account ID — used by the day-view's edit/delete/block-with-target.
+ *  Same shape as MeetingHostTarget minus the meeting-specific bits; carrying `label` keeps log lines legible. */
+export interface AccountWriteTarget {
+  writer: CalendarWriterPort;
+  calendarId: string;
+  accountId: string;
+  label: string;
+  accountEmail: string | null;
+}
+
+/**
+ * Resolve a write target by ACCOUNT ID — the explicit-target path the calendar day-view uses when
+ * the founder picks a specific calendar from a dropdown (defaulting to the host). A SIBLING of
+ * resolveMeetingHostTarget, NOT a generalization: that one answers "which identity hosts a meeting"
+ * (the tenant-wide default), this one answers "which specific calendar did the founder tap".
+ *
+ * Same posture: disabled account → null; missing credential → null (with a warn log); no legacy
+ * fallback — never guess. Returns null when the account doesn't exist (the caller maps to 404).
+ */
+export async function resolveAccountTarget(accountId: string): Promise<AccountWriteTarget | null> {
+  const account = await getCalendarAccount(accountId);
+  if (!account) return null;
+  if (!account.enabled) {
+    logger.warn({ account: account.label }, 'account target: disabled — cannot write');
+    return null;
+  }
+  if (!tryResolveCredential(account.credentialName)) {
+    logger.warn({ account: account.label }, 'account target: no credential — cannot write');
     return null;
   }
   return {

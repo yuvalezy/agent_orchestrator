@@ -36,9 +36,9 @@ import { buildFounderAppRouter } from './adapters/founder-app/founder-app.router
 import { buildFounderAppCalendar } from './adapters/founder-app/founder-app-calendar';
 import { buildAppComposeGated } from './adapters/founder-app/compose-draft.factory';
 import { buildAppMeetingDraftGated } from './adapters/founder-app/meeting-draft.factory';
-import { createAppReminder, listUpcomingReminders, cancelScheduledAction } from './scheduling/scheduling-repo';
+import { createAppReminder, listUpcomingReminders, cancelScheduledAction, listCustomerEmailContacts, listAllEmailContacts } from './scheduling/scheduling-repo';
 import { buildOpenAiTranscriptionClient } from './adapters/llm/openai-transcription.client';
-import { listAttentionDecisions, augmentCustomers } from './adapters/founder-app/founder-app-cockpit-repo';
+import { listAttentionDecisions, augmentCustomers, findCustomerByEventIds } from './adapters/founder-app/founder-app-cockpit-repo';
 import {
   listCustomers,
   customerDetail,
@@ -256,7 +256,7 @@ async function main(): Promise<void> {
     const firebaseConfig = loadFirebaseConfig();
     let fcmSender = null;
     if (firebaseConfig) {
-      fcmSender = await buildFcmSender(firebaseConfig);
+      fcmSender = await buildFcmSender(firebaseConfig, consoleConfig.founderAppUrl);
       logger.info(fcmSender ? 'founder-app FCM push enabled' : 'founder-app FCM push disabled (firebase-admin unavailable or service account invalid)');
     } else {
       logger.warn('founder-app FCM push disabled (FIREBASE_* config absent or incomplete)');
@@ -289,6 +289,9 @@ async function main(): Promise<void> {
         query: buildQueryEngineService(async () => {}),
         notifier: founderAppNotifier,
         firebase: firebaseConfig,
+        // The same sender the notifier fans out with, so Settings → "Send test notification"
+        // exercises the real relay rather than a parallel code path.
+        sendPush: fcmSender,
         meetingReply: () => bookAppMeetingTime,
         // Edit reuses the exact core fn the console/Telegram edit path calls; gated by the drafter flag.
         editDraft: env.KNOWLEDGE_DRAFT_ENABLED ? replaceDraftBodyAndApprove : null,
@@ -325,6 +328,14 @@ async function main(): Promise<void> {
           listUrgencyInbox,
           listAttentionDecisions,
           augmentCustomers,
+          // Calendar-invitee picker (Phase C of the invitees feature): the contact lists the day
+          // view's "manage invitees" sheet reads. Both are plain scheduling-repo fns — always
+          // available (no feature flag) — wired directly so the router stays a pure request handler.
+          listCustomerContacts: listCustomerEmailContacts,
+          listAllContacts: listAllEmailContacts,
+          // Event → customer batch (Phase D): tags each day-view event with the customer its
+          // meeting-request originated from, so the FE can default the picker to that customer's list.
+          findCustomerByEventIds,
         },
       },
     );

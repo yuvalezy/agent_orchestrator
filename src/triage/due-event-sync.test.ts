@@ -85,6 +85,8 @@ function harness(opts: { claim?: boolean; createEvent?: (i: CreateEventInput) =>
                   events.push(i);
                   return opts.createEvent ? opts.createEvent(i) : { id: 'ev-1', htmlLink: null, meetLink: null, alreadyExisted: false };
                 },
+                updateEvent: async () => {},
+                deleteEvent: async () => {},
               },
             },
       claim: async (taskRef: string) => {
@@ -206,6 +208,8 @@ test('idempotency: a second call for the SAME task does not double-create (the l
           events.push(i);
           return { id: 'ev-1', htmlLink: null, meetLink: null, alreadyExisted: false };
         },
+        updateEvent: async () => {},
+        deleteEvent: async () => {},
       },
     }),
     claim: async (taskRef) => (seen.has(taskRef) ? false : (seen.add(taskRef), true)),
